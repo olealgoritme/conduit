@@ -139,6 +139,7 @@ file per process.
 | `NVK_PASS_PROFILE=4` | adds the 24 most written 3D methods per pass and bind counts |
 | `NVK_PASS_PROFILE=5` | dumps the draws of one render pass matching `NVK_PASS_DUMP`, after `NVK_PASS_DUMP_DELAY_S` (20) s (`nvk-prepass-dump-<pid>.txt`) |
 | `NVK_DISPATCH_PROFILE=1` | GPU time of every dispatch per compute shader (vkd3d-proton DXIL hash, code hash, workgroup size), with grids (indirect arguments read back), GPRs and warps, every two seconds, in the `NVK_PASS_PROFILE` file; alone or with `NVK_PASS_PROFILE`; each dispatch waits for idle before and after it |
+| `NVK_DISPATCH_CAPTURE=<hash>[,...]` | captures one dispatch of each listed compute shader (DXIL hash as `NVK_DISPATCH_PROFILE` prints it) with its SPIR-V, push constants, grid and the contents of every image, buffer, sampler and root buffer address it reads, for replaying it outside the game; after `NVK_DISPATCH_CAPTURE_DELAY_S` (20) s and, if set, once the file `NVK_DISPATCH_CAPTURE_TRIGGER` exists; `_SKIP`, `_COUNT`, `_POST=1` (outputs too), `_MAX_MB`; written to `NVK_DISPATCH_CAPTURE_DIR` (`%ProgramData%\Helios\dcap`), one directory per capture, log `nvk-dcap.log` |
 | `NVK_SHADER_STATS=1` | NAK statistics of every uploaded shader (`nvk-shaders-<pid>.txt`) |
 | `NVK_WAIT_STATS=1` | CPU wait counts and times per site, woken and timed-out waits, once a second (`nvk-waits-<pid>.txt`) |
 | `NVK_DEBUG=vm` | VA and memory alloc/free/bind lines with times, threads and freeing call stacks (`NVK_VM_LOG`, else `nvk-vm-<pid>.log` in `%TEMP%`) |
@@ -206,6 +207,16 @@ was full.
 busiest window and a whole-run table per shader (ms per frame and calls per
 frame with `--fps`, the frame rate of the profiled run). `--skip` leaves out
 the first windows (loading and shader compiles).
+
+### Dispatch capture (common 0072)
+
+`NVK_DISPATCH_CAPTURE=<hash>[,...]` writes one dispatch of each listed
+compute shader (the `src` hash the profile prints) with its SPIR-V, push
+constants, grid and the contents of every image, buffer, sampler and root
+buffer address it reads. `tests/perf/dispatch-replay/` replays such a capture
+on any Vulkan driver (NVK in the guest, NVIDIA's driver on a Linux host),
+times the dispatch alone and compares what two drivers wrote; its README has
+the knobs, the capture format and the limits.
 
 ## `patches/`: the RM backend
 
@@ -299,7 +310,7 @@ Each patch builds on its own.
 ## `patches-common/`: generic NVK work
 
 Apply on top of both lineages, unchanged. One patch (5) also touches the RM
-backend. Numbers are file numbers (there is no 0016, 0025 or 0072).
+backend. Numbers are file numbers (there is no 0016 or 0025).
 
 | # | what |
 |---|---|
@@ -372,6 +383,7 @@ backend. Numbers are file numbers (there is no 0016, 0025 or 0072).
 | 0069 | async compute: a compute + transfer queue family (4 queues) whose channels sit in the first graphics queue's TSG on VEIDs of their own and run next to it (`NVK_RM_ASYNC_COMPUTE`, see "Async compute") |
 | 0070 | NAK: `nir_opt_uniform_atomics` before subgroup lowering: an atomic on an address that is the same in every active lane of a subgroup is done once per subgroup, with a subgroup reduction of the value and an exclusive scan for each lane's result (`NAK_UNIFORM_ATOMICS`, default on; part of the shader cache key) |
 | 0071 | `NVK_DISPATCH_PROFILE`: compute-class timestamps behind a WAIT_FOR_IDLE before and after every launch (direct, indirect, device-generated, internal), keyed by `vk_shader::src_hash` (the SPIR-V's `OpString "<hash>.dxil"` from vkd3d-proton, else FNV-1a 64 of the SPIR-V), code hash and local size; indirect arguments copied by I2M for the grid; per-window table of ms/s, share, calls/s, mean/median/max us, GPRs, warps, grids |
+| 0072 | `NVK_DISPATCH_CAPTURE`: `vk_device::compute_spirv_hook` hands the SPIR-V and layout of listed compute shaders to NVK, which scans push constant block, resource variables, descriptor indices of the form push constant + constant and root buffer addresses; at a captured dispatch, descriptors are mapped back to views, samplers and buffer ranges (tables from view and sampler creation, the EDB cache) and copied by the copy engine into GART staging before the launch (and after with `_POST`), a CE semaphore marks completion, files are written when the command buffer is reset |
 | 0073 | RM: `NVK_RM_UPLOAD_VRAM` defaults to `compute` on Windows, so compute root descriptor tables are CPU-mapped VRAM (0052); `0` keeps them in system memory |
 
 ## Per-draw cost (common 0001-0007)

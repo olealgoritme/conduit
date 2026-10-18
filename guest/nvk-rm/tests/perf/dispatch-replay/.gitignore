@@ -1,0 +1,8 @@
+dispatch-replay
+dispatch-replay.exe
+dreplay-guest.zip
+guest-pkg/
+captures/
+out-*/
+*.tsv
+!run-guest.cmd

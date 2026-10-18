@@ -1,0 +1,2676 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Sat, 17 Oct 2026 23:31:46 +0200
+Subject: [PATCH] nvk: NVK_DISPATCH_CAPTURE, one dispatch with its inputs for
+ replay
+
+NVK_DISPATCH_PROFILE names the compute shaders that take the time, but
+timing NAK's code against another driver's with synthetic inputs misleads:
+real data drives loops differently.  NVK_DISPATCH_CAPTURE=<hash>[,<hash>...]
+captures one dispatch of each listed compute shader (vk_shader::src_hash,
+vkd3d-proton's DXIL hash as in NVK_DISPATCH_PROFILE) with everything a
+standalone program needs to run it again on the same data: the SPIR-V, the
+push constants, the grid and the contents of every descriptor and root
+buffer address the shader reads.
+
+When a compute pipeline of a listed shader is created, the common pipeline
+code hands its SPIR-V and pipeline layout to the driver
+(vk_device::compute_spirv_hook).  NVK scans it: the push constant block,
+the resource variables (set, binding, descriptor type, writable or not),
+the array index of every descriptor access that is a push constant word
+plus a constant or a constant (how vkd3d-proton indexes its heaps from root
+table offsets), and every buffer device address loaded from a push constant
+(vkd3d-proton's root descriptors), with the pointee's size.  Other index
+expressions are listed as unsupported.
+
+When such a dispatch is recorded (direct or indirect, after
+NVK_DISPATCH_CAPTURE_DELAY_S, default 20 s, once NVK_DISPATCH_CAPTURE_TRIGGER
+exists if set, after NVK_DISPATCH_CAPTURE_SKIP matching dispatches,
+NVK_DISPATCH_CAPTURE_COUNT per shader), each referenced descriptor is read
+from its set's CPU map or a mapped descriptor buffer and mapped back to its
+image view, buffer view, sampler or buffer range through tables kept from
+view and sampler creation (and the EDB buffer view cache).  Copy engine
+copies of each view's subresources, of the buffer ranges, of the root
+buffers (to the end of their allocation or the pointee's size), and of
+indirect arguments go into a GART staging buffer behind a flush and wait
+for idle, right before the launch; with NVK_DISPATCH_CAPTURE_POST=1 the
+writable resources are copied again after it.  A copy engine semaphore marks
+the end.  When the command buffer is reset or destroyed, a capture whose
+marker landed is written to NVK_DISPATCH_CAPTURE_DIR (default
+%ProgramData%\Helios\dcap): <hash>-p<pid>-<n>\manifest.json, shader.spv,
+push.bin and one raw file per resource.  Events go to mesa_logi and
+nvk-dcap.log in that directory.
+
+Limits: no device-generated commands; single-plane, single-sample,
+non-sparse-residency images (color, or one aspect of a depth view);
+descriptors as the CPU sees them when the dispatch is recorded; root
+addresses of unsized pointees are copied up to 16 MiB; an image two
+descriptors alias is captured twice.  A capturing command buffer of the
+async compute family runs on the channel with every engine.
+---
+ src/nouveau/vulkan/meson.build            |    2 +
+ src/nouveau/vulkan/nvk_buffer_view.c      |    5 +
+ src/nouveau/vulkan/nvk_cmd_buffer.c       |    6 +
+ src/nouveau/vulkan/nvk_cmd_buffer.h       |    2 +
+ src/nouveau/vulkan/nvk_cmd_dispatch.c     |   19 +
+ src/nouveau/vulkan/nvk_device.c           |    6 +-
+ src/nouveau/vulkan/nvk_device.h           |    4 +
+ src/nouveau/vulkan/nvk_dispatch_capture.c | 2128 +++++++++++++++++++++
+ src/nouveau/vulkan/nvk_dispatch_capture.h |   61 +
+ src/nouveau/vulkan/nvk_edb_bview_cache.c  |   21 +
+ src/nouveau/vulkan/nvk_edb_bview_cache.h  |   10 +
+ src/nouveau/vulkan/nvk_image_view.c       |    5 +
+ src/nouveau/vulkan/nvk_sampler.c          |    3 +
+ src/nouveau/vulkan/nvk_shader.c           |    2 +
+ src/nouveau/vulkan/nvk_shader.h           |    5 +
+ src/vulkan/runtime/vk_device.h            |   13 +
+ src/vulkan/runtime/vk_pipeline.c          |   10 +-
+ 17 files changed, 2299 insertions(+), 3 deletions(-)
+ create mode 100644 src/nouveau/vulkan/nvk_dispatch_capture.c
+ create mode 100644 src/nouveau/vulkan/nvk_dispatch_capture.h
+
+diff --git a/src/nouveau/vulkan/meson.build b/src/nouveau/vulkan/meson.build
+index eecfb79..dec6475 100644
+--- a/src/nouveau/vulkan/meson.build
++++ b/src/nouveau/vulkan/meson.build
+@@ -77,6 +77,8 @@ nvk_files = files(
+   'nvk_physical_device.h',
+   'nvk_private.h',
+   'nvk_pass_profile.c',
++  'nvk_dispatch_capture.c',
++  'nvk_dispatch_capture.h',
+   'nvk_query_pool.c',
+   'nvk_query_pool.h',
+   'nvk_queue.c',
+diff --git a/src/nouveau/vulkan/nvk_buffer_view.c b/src/nouveau/vulkan/nvk_buffer_view.c
+index a056acb..308865d 100644
+--- a/src/nouveau/vulkan/nvk_buffer_view.c
++++ b/src/nouveau/vulkan/nvk_buffer_view.c
+@@ -8,6 +8,7 @@
+ #include "nvk_buffer.h"
+ #include "nvk_entrypoints.h"
+ #include "nvk_device.h"
++#include "nvk_dispatch_capture.h"
+ #include "nvk_format.h"
+ #include "nvk_physical_device.h"
+ 
+@@ -97,6 +98,8 @@ nvk_CreateBufferView(VkDevice _device,
+       }
+    }
+ 
++   nvk_dcap_note_buffer_view(dev, view);
++
+    *pBufferView = nvk_buffer_view_to_handle(view);
+ 
+    return VK_SUCCESS;
+@@ -113,6 +116,8 @@ nvk_DestroyBufferView(VkDevice _device,
+    if (!view)
+       return;
+ 
++   nvk_dcap_forget_buffer_view(dev, view);
++
+    if (view->desc.image_index)
+       nvk_descriptor_table_remove(dev, &dev->images, view->desc.image_index);
+ 
+diff --git a/src/nouveau/vulkan/nvk_cmd_buffer.c b/src/nouveau/vulkan/nvk_cmd_buffer.c
+index 4097310..d810686 100644
+--- a/src/nouveau/vulkan/nvk_cmd_buffer.c
++++ b/src/nouveau/vulkan/nvk_cmd_buffer.c
+@@ -4,6 +4,7 @@
+  */
+ #include "nvk_cmd_buffer.h"
+ #include "nvk_pass_profile.h"
++#include "nvk_dispatch_capture.h"
+ 
+ #include "nvk_buffer.h"
+ #include "nvk_cmd_pool.h"
+@@ -60,6 +61,8 @@ nvk_destroy_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer)
+       container_of(vk_cmd_buffer, struct nvk_cmd_buffer, vk);
+    struct nvk_cmd_pool *pool = nvk_cmd_buffer_pool(cmd);
+ 
++   nvk_dcap_cmd_reset(cmd);
++
+    nvk_descriptor_state_fini(cmd, &cmd->state.gfx.descriptors);
+    nvk_descriptor_state_fini(cmd, &cmd->state.cs.descriptors);
+ 
+@@ -100,6 +103,7 @@ nvk_create_cmd_buffer(struct vk_command_pool *vk_pool,
+       &cmd->state.gfx._dynamic_sl;
+ 
+    list_inithead(&cmd->owned_mem);
++   list_inithead(&cmd->dcaps);
+    list_inithead(&cmd->owned_gart_mem);
+    list_inithead(&cmd->owned_lat_mem);
+    list_inithead(&cmd->owned_qmd);
+@@ -127,6 +131,8 @@ nvk_reset_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer,
+ 
+    vk_command_buffer_reset(&cmd->vk);
+ 
++   nvk_dcap_cmd_reset(cmd);
++
+    nvk_descriptor_state_fini(cmd, &cmd->state.gfx.descriptors);
+    nvk_descriptor_state_fini(cmd, &cmd->state.cs.descriptors);
+ 
+diff --git a/src/nouveau/vulkan/nvk_cmd_buffer.h b/src/nouveau/vulkan/nvk_cmd_buffer.h
+index 175db22..295be4a 100644
+--- a/src/nouveau/vulkan/nvk_cmd_buffer.h
++++ b/src/nouveau/vulkan/nvk_cmd_buffer.h
+@@ -371,6 +371,8 @@ struct nvk_cmd_buffer {
+     * command buffer.
+     */
+    struct list_head owned_mem;
++   /* NVK_DISPATCH_CAPTURE: captures recorded (struct nvk_dcap) */
++   struct list_head dcaps;
+    struct list_head owned_gart_mem;
+    struct list_head owned_qmd;
+ 
+diff --git a/src/nouveau/vulkan/nvk_cmd_dispatch.c b/src/nouveau/vulkan/nvk_cmd_dispatch.c
+index ea2d53a..f320b4d 100644
+--- a/src/nouveau/vulkan/nvk_cmd_dispatch.c
++++ b/src/nouveau/vulkan/nvk_cmd_dispatch.c
+@@ -5,6 +5,7 @@
+ #include "nvk_buffer.h"
+ #include "nvk_cmd_buffer.h"
+ #include "nvk_device.h"
++#include "nvk_dispatch_capture.h"
+ #include "nvk_entrypoints.h"
+ #include "nvk_mme.h"
+ #include "nvk_physical_device.h"
+@@ -314,6 +315,11 @@ nvk_CmdDispatchBase(VkCommandBuffer commandBuffer,
+ 
+    uint32_t base_workgroup[3] = { baseGroupX, baseGroupY, baseGroupZ };
+    uint32_t global_size[3] = { groupCountX, groupCountY, groupCountZ };
++
++   /* NVK_DISPATCH_CAPTURE: copies of the inputs before anything else */
++   struct nvk_dcap *dcap = NULL;
++   if (unlikely(nvk_cmd_buffer_device(cmd)->dcap != NULL))
++      dcap = nvk_dcap_begin(cmd, base_workgroup, global_size, 0);
+    nvk_flush_compute_state(cmd, base_workgroup, global_size);
+ 
+    uint64_t qmd_addr = 0;
+@@ -365,6 +371,9 @@ nvk_CmdDispatchBase(VkCommandBuffer commandBuffer,
+ 
+    if (unlikely(prof_slot >= 0))
+       nvk_dispatch_profile_end(cmd, prof_slot);
++
++   if (unlikely(dcap != NULL))
++      nvk_dcap_end(cmd, dcap);
+ }
+ 
+ void
+@@ -490,6 +499,13 @@ nvk_CmdDispatchIndirect2KHR(VkCommandBuffer commandBuffer,
+ 
+    nvk_pass_profile_op(cmd, NVK_PASS_PROFILE_OP_DISPATCH_INDIRECT, 0);
+ 
++   /* NVK_DISPATCH_CAPTURE: copies of the inputs and arguments first */
++   struct nvk_dcap *dcap = NULL;
++   if (unlikely(dev->dcap != NULL)) {
++      const uint32_t zero[3] = { 0, 0, 0 };
++      dcap = nvk_dcap_begin(cmd, zero, NULL, dispatch_addr);
++   }
++
+    /* We set these through the MME */
+    uint32_t base_workgroup[3] = { 0, 0, 0 };
+    uint32_t global_size[3] = { 0, 0, 0 };
+@@ -605,4 +621,7 @@ nvk_CmdDispatchIndirect2KHR(VkCommandBuffer commandBuffer,
+ 
+    if (unlikely(prof_slot >= 0))
+       nvk_dispatch_profile_end(cmd, prof_slot);
++
++   if (unlikely(dcap != NULL))
++      nvk_dcap_end(cmd, dcap);
+ }
+diff --git a/src/nouveau/vulkan/nvk_device.c b/src/nouveau/vulkan/nvk_device.c
+index 3d409e1..88c8692 100644
+--- a/src/nouveau/vulkan/nvk_device.c
++++ b/src/nouveau/vulkan/nvk_device.c
+@@ -12,6 +12,7 @@
+ #include "nvk_sampler.h"
+ #include "nvk_shader.h"
+ #include "nvk_pass_profile.h"
++#include "nvk_dispatch_capture.h"
+ #include "layers/nvk_app_workarounds.h"
+ #include "nvkmd/nvkmd.h"
+ 
+@@ -444,8 +445,10 @@ nvk_CreateDevice(VkPhysicalDevice physicalDevice,
+          goto fail_mem_cache;
+    }
+ 
+-   if (queue_count > 0)
++   if (queue_count > 0) {
+       nvk_pass_profile_init(dev);
++      nvk_dcap_init(dev);
++   }
+ 
+    *pDevice = nvk_device_to_handle(dev);
+ 
+@@ -524,6 +527,7 @@ nvk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
+       nvk_device_finish_cmd_mem_cache(dev);
+ 
+       nvk_pass_profile_finish(dev);
++      nvk_dcap_finish(dev);
+ 
+       nvk_slm_area_finish(&dev->slm);
+       if (pdev->info.cls_eng3d < MAXWELL_B)
+diff --git a/src/nouveau/vulkan/nvk_device.h b/src/nouveau/vulkan/nvk_device.h
+index 92d4385..96df076 100644
+--- a/src/nouveau/vulkan/nvk_device.h
++++ b/src/nouveau/vulkan/nvk_device.h
+@@ -44,6 +44,7 @@ nvk_slm_area_get_mem_ref(struct nvk_slm_area *area,
+                          uint32_t *bytes_per_mp_out);
+ 
+ struct nvk_pass_profile;
++struct nvk_dcap_dev;
+ 
+ struct nvk_device {
+    struct vk_device vk;
+@@ -55,6 +56,9 @@ struct nvk_device {
+     */
+    struct nvk_pass_profile *pass_profile;
+ 
++   /* NVK_DISPATCH_CAPTURE (nvk_dispatch_capture.c), else NULL */
++   struct nvk_dcap_dev *dcap;
++
+    struct nvk_upload_queue upload;
+ 
+    struct nvk_layer_dispatch_tables layer_dispatch;
+diff --git a/src/nouveau/vulkan/nvk_dispatch_capture.c b/src/nouveau/vulkan/nvk_dispatch_capture.c
+new file mode 100644
+index 0000000..7725c19
+--- /dev/null
++++ b/src/nouveau/vulkan/nvk_dispatch_capture.c
+@@ -0,0 +1,2128 @@
++/*
++ * Copyright © 2026 Conduit contributors
++ * SPDX-License-Identifier: MIT
++ *
++ * NVK_DISPATCH_CAPTURE: one dispatch of a chosen compute shader, captured
++ * with everything a standalone program needs to run it again with the same
++ * inputs, so that NAK's code and another driver's can be timed and checked
++ * on a real game's data rather than on synthetic inputs, which drive loops
++ * differently.
++ *
++ *   NVK_DISPATCH_CAPTURE=<hash>[,<hash>...]  vk_shader::src_hash of the
++ *       shaders, 16 hex digits: vkd3d-proton's DXIL hash (the name of its
++ *       VKD3D_SHADER_DUMP_PATH files and of NVK_DISPATCH_PROFILE's rows)
++ *   NVK_DISPATCH_CAPTURE_DIR      where captures go (default
++ *       %ProgramData%\Helios\dcap on Windows, /tmp/nvk-dcap elsewhere)
++ *   NVK_DISPATCH_CAPTURE_DELAY_S  seconds after device creation before
++ *       dispatches count (default 20)
++ *   NVK_DISPATCH_CAPTURE_TRIGGER  a file: dispatches count only once it
++ *       exists (checked at most every 250 ms), so a capture can be started
++ *       at the right moment of a running game; unset: no file needed
++ *   NVK_DISPATCH_CAPTURE_SKIP     matching dispatches skipped after that,
++ *       per hash (default 0: the first one is captured)
++ *   NVK_DISPATCH_CAPTURE_COUNT    captures per hash (default 1)
++ *   NVK_DISPATCH_CAPTURE_POST=1   also copies what the shader may write after
++ *       the dispatch (the NVK result, for comparing a replay against)
++ *   NVK_DISPATCH_CAPTURE_MAX_MB   staging limit per capture (default 2048)
++ *
++ * The SPIR-V of every compute pipeline whose shader has a listed hash is
++ * scanned when the pipeline is created (vk_device::compute_spirv_hook): the
++ * push constant block, every resource variable with its descriptor set,
++ * binding and descriptor type, the array index of every access to a
++ * descriptor array when it is a push constant word plus a constant (how
++ * vkd3d-proton indexes its descriptor heaps from root table offsets) or a
++ * constant, and every buffer device address loaded from a push constant
++ * (vkd3d-proton's root descriptors).  Other index expressions are reported
++ * as unsupported in the manifest; the capture goes on without them.
++ *
++ * When a captured dispatch is recorded, the push constants come from the
++ * root table, each referenced descriptor is read from its set's CPU map (or
++ * from a mapped descriptor buffer) and turned back into its object through
++ * tables kept from image view, buffer view and sampler creation, and copy
++ * engine copies of every image subresource of the view, of every texel and
++ * storage buffer range, of every root buffer address (up to the end of its
++ * allocation or the type's size) and of indirect arguments go into a GART
++ * staging buffer right before the launch, behind a flush and wait for idle.
++ * A copy engine semaphore marks the end.  When the command buffer is reset
++ * or destroyed (the GPU is done with it) a capture whose marker landed is
++ * written: manifest.json, shader.spv, push.bin and one .bin per resource,
++ * in <dir>\<hash>-p<pid>-<n>.  Events are logged with mesa_logi and to
++ * <dir>\nvk-dcap.log.
++ *
++ * A command buffer of the async compute family that captures runs on the
++ * channel with every engine (it uses the copy engine).
++ *
++ * Limits: direct and indirect vkCmdDispatch only (not device-generated
++ * commands); single-plane, single-sample, non-sparse-residency images
++ * (color, or the depth or stencil aspect of a depth view); descriptors as
++ * the CPU sees them when the dispatch is recorded (an application that
++ * rewrites a heap entry between recording and execution is captured with
++ * the old entry); root buffer addresses whose pointee has no fixed size
++ * (runtime arrays) are copied up to 16 MiB; a resource two descriptors
++ * alias (the same image as SRV and UAV) is captured twice.
++ */
++#include "nvk_dispatch_capture.h"
++
++#include "nvk_buffer.h"
++#include "nvk_buffer_view.h"
++#include "nvk_cmd_buffer.h"
++#include "nvk_descriptor_set.h"
++#include "nvk_descriptor_set_layout.h"
++#include "nvk_descriptor_types.h"
++#include "nvk_device.h"
++#include "nvk_edb_bview_cache.h"
++#include "nvk_format.h"
++#include "nvk_image.h"
++#include "nvk_image_view.h"
++#include "nvk_physical_device.h"
++#include "nvk_sampler.h"
++#include "nvk_shader.h"
++#include "nvkmd/nvkmd.h"
++
++#include "nv_push_cl90b5.h"
++#include "nv_push_cla0c0.h"
++
++#include "vk_enum_to_str.h"
++#include "vk_format.h"
++#include "vk_pipeline_layout.h"
++#include "vk_sampler.h"
++
++#include "util/format/u_format.h"
++#include "util/hash_table.h"
++#include "util/log.h"
++#include "util/os_misc.h"
++#include "util/os_time.h"
++#include "util/simple_mtx.h"
++#include "util/u_debug.h"
++#include "util/u_math.h"
++
++#include <inttypes.h>
++#include <stdarg.h>
++#include <stdio.h>
++#include <string.h>
++#ifdef _WIN32
++#include <windows.h>
++#else
++#include <sys/stat.h>
++#include <unistd.h>
++#endif
++
++#define DCAP_MAX_HASHES 32
++#define DCAP_MAX_VARS   64
++#define DCAP_MAX_REFS   256
++#define DCAP_MAX_BDAS   32
++#define DCAP_MAX_RES    256
++#define DCAP_MAX_MIPS   16
++#define DCAP_NONE       0xffffffffu
++#define DCAP_BDA_RUNTIME_MAX (16ull << 20)
++#define DCAP_BUF_MAX    (256ull << 20)
++#define DCAP_HEADER_B   256u
++#define DCAP_MARKER     0xdc000000u
++
++/* Tags in the low bits of the image table registry's pointers */
++#define DCAP_TAG_SAMPLED  1u
++#define DCAP_TAG_STORAGE  2u
++#define DCAP_TAG_BVIEW    3u
++
++struct nvk_dcap_dev {
++   simple_mtx_t mutex;
++   uint64_t hashes[DCAP_MAX_HASHES];
++   uint32_t seen[DCAP_MAX_HASHES];
++   uint32_t taken[DCAP_MAX_HASHES];
++   uint32_t hash_count;
++   int64_t arm_ns;
++   char trigger[512];
++   bool triggered;
++   int64_t trigger_check_ns;
++   uint32_t skip, count;
++   bool post;
++   uint64_t max_B;
++   uint32_t serial;
++   char dir[512];
++   FILE *log;
++   /* image table index -> tagged nvk_image_view / nvk_buffer_view */
++   struct hash_table_u64 *images;
++   /* sampler table index -> struct vk_sampler_state (malloc) */
++   struct hash_table_u64 *samplers;
++};
++
++struct dcap_var {
++   uint32_t id, set, binding;
++   VkDescriptorType type;
++   bool array, writable;
++   uint8_t dim, arrayed, ms, depth;
++   /* The binding in the pipeline layout the pipeline was created with */
++   bool have_layout;
++   VkDescriptorType layout_type;
++   uint32_t layout_offset, layout_stride, layout_array_size;
++   uint32_t layout_set_flags;
++};
++
++struct dcap_ref {
++   uint16_t var;
++   uint32_t pc_off; /* byte offset of the push constant word, DCAP_NONE */
++   uint32_t add;
++};
++
++struct dcap_bda {
++   uint32_t pc_off;
++   uint64_t size_B; /* 0: unknown (runtime array) */
++   bool writable;
++};
++
++struct nvk_dcap_recipe {
++   uint64_t src_hash;
++   uint32_t *spirv;
++   size_t spirv_size;
++   uint32_t push_size;
++   uint32_t nvars, nrefs, nbdas;
++   struct dcap_var vars[DCAP_MAX_VARS];
++   struct dcap_ref refs[DCAP_MAX_REFS];
++   struct dcap_bda bdas[DCAP_MAX_BDAS];
++   uint32_t nunsupported;
++   char unsupported[1024];
++};
++
++enum dcap_res_kind {
++   DCAP_RES_NULL,
++   DCAP_RES_IMAGE,
++   DCAP_RES_TEXEL_BUFFER,
++   DCAP_RES_BUFFER,
++   DCAP_RES_SAMPLER,
++   DCAP_RES_BDA,
++   DCAP_RES_ERROR,
++};
++
++struct dcap_sub {
++   uint32_t mip;
++   VkExtent3D extent;
++   uint32_t layers;
++   uint32_t row_stride_B;
++   uint64_t image_stride_B;
++   uint64_t off_B, size_B;
++};
++
++struct dcap_res {
++   enum dcap_res_kind kind;
++   uint32_t var; /* DCAP_NONE for a root address */
++   uint32_t set, binding, index;
++   VkDescriptorType dtype;
++   uint32_t pc_off, add;
++   bool writable;
++
++   /* Image */
++   const struct nvk_image *img;
++   VkImageType image_type;
++   VkImageViewType view_type;
++   VkFormat image_format, view_format, copy_format;
++   VkImageAspectFlags aspect;
++   VkComponentMapping swizzle;
++   float min_lod;
++   uint32_t base_mip, mips, base_layer, layers;
++   VkExtent3D extent; /* the view's first level */
++   uint32_t nsubs;
++   struct dcap_sub subs[DCAP_MAX_MIPS];
++
++   /* Buffers and root addresses */
++   uint64_t addr, range_B, bound_B;
++   VkFormat buf_format;
++   bool truncated;
++
++   /* Samplers (alone, or with a combined image) */
++   bool have_sampler;
++   uint32_t sampler_index;
++   struct vk_sampler_state sampler;
++
++   /* Staging */
++   uint64_t off_B, size_B, post_off_B;
++   char note[160];
++};
++
++struct nvk_dcap {
++   struct list_head link;
++   uint32_t serial, marker;
++   uint64_t src_hash;
++   uint32_t code_hash;
++   uint32_t local[3];
++   uint32_t base_group[3];
++   uint32_t groups[3];
++   bool indirect;
++   uint64_t indirect_addr;
++   uint32_t call_index;
++   bool post;
++   bool compute_only;
++   double t_s;
++   uint8_t push[NVK_MAX_PUSH_SIZE];
++   uint32_t push_size;
++   uint32_t *spirv;
++   size_t spirv_size;
++   char unsupported[1024];
++   struct nvkmd_mem *mem;
++   uint64_t mem_size_B;
++   uint32_t nres;
++   struct dcap_res res[DCAP_MAX_RES];
++   /* Copy of the recipe's variables for the manifest's binding list */
++   uint32_t nvars;
++   struct dcap_var vars[DCAP_MAX_VARS];
++};
++
++/* ------------------------------------------------------------------------ */
++/* Logging */
++
++static void PRINTFLIKE(2, 3)
++dcap_log(struct nvk_dcap_dev *dcap, const char *fmt, ...)
++{
++   char buf[1024];
++   va_list ap;
++   va_start(ap, fmt);
++   vsnprintf(buf, sizeof(buf), fmt, ap);
++   va_end(ap);
++   mesa_logi("NVK dispatch capture: %s", buf);
++   if (dcap->log != NULL) {
++      fprintf(dcap->log, "%.3f %s\n", os_time_get_nano() / 1e9, buf);
++      fflush(dcap->log);
++   }
++}
++
++static void
++dcap_mkdir(const char *path)
++{
++#ifdef _WIN32
++   CreateDirectoryA(path, NULL);
++#else
++   mkdir(path, 0755);
++#endif
++}
++
++static bool
++dcap_file_exists(const char *path)
++{
++#ifdef _WIN32
++   return GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES;
++#else
++   struct stat st;
++   return stat(path, &st) == 0;
++#endif
++}
++
++static unsigned long
++dcap_pid(void)
++{
++#ifdef _WIN32
++   return (unsigned long)GetCurrentProcessId();
++#else
++   return (unsigned long)getpid();
++#endif
++}
++
++#ifdef _WIN32
++#define DCAP_SEP "\\"
++#else
++#define DCAP_SEP "/"
++#endif
++
++/* ------------------------------------------------------------------------ */
++/* Registry of image and sampler table indices */
++
++void
++nvk_dcap_note_image_view(struct nvk_device *dev,
++                         const struct nvk_image_view *view)
++{
++   struct nvk_dcap_dev *dcap = dev->dcap;
++   if (dcap == NULL)
++      return;
++   simple_mtx_lock(&dcap->mutex);
++   for (uint8_t p = 0; p < view->plane_count; p++) {
++      if (view->planes[p].sampled.desc_index != 0) {
++         _mesa_hash_table_u64_insert(dcap->images,
++                                     view->planes[p].sampled.desc_index,
++                                     (void *)((uintptr_t)view | DCAP_TAG_SAMPLED));
++      }
++      if (view->planes[p].storage.desc_index != 0) {
++         _mesa_hash_table_u64_insert(dcap->images,
++                                     view->planes[p].storage.desc_index,
++                                     (void *)((uintptr_t)view | DCAP_TAG_STORAGE));
++      }
++   }
++   simple_mtx_unlock(&dcap->mutex);
++}
++
++void
++nvk_dcap_forget_image_view(struct nvk_device *dev,
++                           const struct nvk_image_view *view)
++{
++   struct nvk_dcap_dev *dcap = dev->dcap;
++   if (dcap == NULL)
++      return;
++   simple_mtx_lock(&dcap->mutex);
++   for (uint8_t p = 0; p < view->plane_count; p++) {
++      const uint32_t idx[2] = {
++         view->planes[p].sampled.desc_index,
++         view->planes[p].storage.desc_index,
++      };
++      for (unsigned i = 0; i < 2; i++) {
++         if (idx[i] == 0)
++            continue;
++         void *v = _mesa_hash_table_u64_search(dcap->images, idx[i]);
++         if (v != NULL && ((uintptr_t)v & ~(uintptr_t)3) == (uintptr_t)view)
++            _mesa_hash_table_u64_remove(dcap->images, idx[i]);
++      }
++   }
++   simple_mtx_unlock(&dcap->mutex);
++}
++
++void
++nvk_dcap_note_buffer_view(struct nvk_device *dev,
++                          const struct nvk_buffer_view *view)
++{
++   struct nvk_dcap_dev *dcap = dev->dcap;
++   if (dcap == NULL || view->desc.image_index == 0)
++      return;
++   simple_mtx_lock(&dcap->mutex);
++   _mesa_hash_table_u64_insert(dcap->images, view->desc.image_index,
++                               (void *)((uintptr_t)view | DCAP_TAG_BVIEW));
++   simple_mtx_unlock(&dcap->mutex);
++}
++
++void
++nvk_dcap_forget_buffer_view(struct nvk_device *dev,
++                            const struct nvk_buffer_view *view)
++{
++   struct nvk_dcap_dev *dcap = dev->dcap;
++   if (dcap == NULL || view->desc.image_index == 0)
++      return;
++   simple_mtx_lock(&dcap->mutex);
++   void *v = _mesa_hash_table_u64_search(dcap->images, view->desc.image_index);
++   if (v != NULL && ((uintptr_t)v & ~(uintptr_t)3) == (uintptr_t)view)
++      _mesa_hash_table_u64_remove(dcap->images, view->desc.image_index);
++   simple_mtx_unlock(&dcap->mutex);
++}
++
++void
++nvk_dcap_note_sampler(struct nvk_device *dev, uint32_t desc_index,
++                      const struct vk_sampler_state *state)
++{
++   struct nvk_dcap_dev *dcap = dev->dcap;
++   if (dcap == NULL || desc_index == 0)
++      return;
++   struct vk_sampler_state *copy = malloc(sizeof(*copy));
++   if (copy == NULL)
++      return;
++   *copy = *state;
++   simple_mtx_lock(&dcap->mutex);
++   void *old = _mesa_hash_table_u64_search(dcap->samplers, desc_index);
++   _mesa_hash_table_u64_insert(dcap->samplers, desc_index, copy);
++   simple_mtx_unlock(&dcap->mutex);
++   free(old);
++}
++
++void
++nvk_dcap_forget_sampler(struct nvk_device *dev, uint32_t desc_index)
++{
++   struct nvk_dcap_dev *dcap = dev->dcap;
++   if (dcap == NULL || desc_index == 0)
++      return;
++   simple_mtx_lock(&dcap->mutex);
++   void *old = _mesa_hash_table_u64_search(dcap->samplers, desc_index);
++   if (old != NULL)
++      _mesa_hash_table_u64_remove(dcap->samplers, desc_index);
++   simple_mtx_unlock(&dcap->mutex);
++   free(old);
++}
++
++/* ------------------------------------------------------------------------ */
++/* SPIR-V scan */
++
++enum {
++   SPV_OP_EXT_INST_IMPORT = 11,
++   SPV_OP_TYPE_VOID = 19,
++   SPV_OP_TYPE_BOOL = 20,
++   SPV_OP_TYPE_INT = 21,
++   SPV_OP_TYPE_FLOAT = 22,
++   SPV_OP_TYPE_VECTOR = 23,
++   SPV_OP_TYPE_MATRIX = 24,
++   SPV_OP_TYPE_IMAGE = 25,
++   SPV_OP_TYPE_SAMPLER = 26,
++   SPV_OP_TYPE_SAMPLED_IMAGE = 27,
++   SPV_OP_TYPE_ARRAY = 28,
++   SPV_OP_TYPE_RUNTIME_ARRAY = 29,
++   SPV_OP_TYPE_STRUCT = 30,
++   SPV_OP_TYPE_POINTER = 32,
++   SPV_OP_TYPE_FUNCTION = 33,
++   SPV_OP_TYPE_FORWARD_POINTER = 39,
++   SPV_OP_CONSTANT = 43,
++   SPV_OP_VARIABLE = 59,
++   SPV_OP_LOAD = 61,
++   SPV_OP_ACCESS_CHAIN = 65,
++   SPV_OP_IN_BOUNDS_ACCESS_CHAIN = 66,
++   SPV_OP_DECORATE = 71,
++   SPV_OP_MEMBER_DECORATE = 72,
++   SPV_OP_COMPOSITE_EXTRACT = 81,
++   SPV_OP_COPY_OBJECT = 83,
++   SPV_OP_UCONVERT = 113,
++   SPV_OP_CONVERT_U_TO_PTR = 120,
++   SPV_OP_BITCAST = 124,
++   SPV_OP_IADD = 128,
++   SPV_OP_BROADCAST_FIRST = 338,
++   SPV_OP_TYPE_ACCEL = 5341,
++};
++
++enum {
++   SPV_DEC_BLOCK = 2,
++   SPV_DEC_BUFFER_BLOCK = 3,
++   SPV_DEC_ARRAY_STRIDE = 6,
++   SPV_DEC_NON_WRITABLE = 24,
++   SPV_DEC_NON_READABLE = 25,
++   SPV_DEC_BINDING = 33,
++   SPV_DEC_DESCRIPTOR_SET = 34,
++   SPV_DEC_OFFSET = 35,
++};
++
++enum {
++   SPV_SC_UNIFORM_CONSTANT = 0,
++   SPV_SC_UNIFORM = 2,
++   SPV_SC_PUSH_CONSTANT = 9,
++   SPV_SC_STORAGE_BUFFER = 12,
++   SPV_SC_PHYSICAL_STORAGE_BUFFER = 5349,
++};
++
++#define SF_NONWRITABLE  1u
++#define SF_BLOCK        2u
++#define SF_BUFFERBLOCK  4u
++
++struct spv {
++   const uint32_t *w;
++   size_t nw;
++   uint32_t bound;
++   uint32_t *def;
++   int32_t *set, *binding;
++   uint32_t *astride;
++   uint8_t *flags;
++   uint32_t pcvar, pctype;
++};
++
++#define SPV_SIZE_UNKNOWN UINT64_MAX
++
++static uint32_t
++spv_result_pos(uint16_t op)
++{
++   if (op >= SPV_OP_TYPE_VOID && op <= 38 && op != SPV_OP_TYPE_FORWARD_POINTER)
++      return 1;
++   switch (op) {
++   case SPV_OP_EXT_INST_IMPORT:
++   case SPV_OP_TYPE_ACCEL:
++      return 1;
++   case SPV_OP_CONSTANT:
++   case SPV_OP_VARIABLE:
++   case SPV_OP_LOAD:
++   case SPV_OP_ACCESS_CHAIN:
++   case SPV_OP_IN_BOUNDS_ACCESS_CHAIN:
++   case SPV_OP_COMPOSITE_EXTRACT:
++   case SPV_OP_COPY_OBJECT:
++   case SPV_OP_UCONVERT:
++   case SPV_OP_CONVERT_U_TO_PTR:
++   case SPV_OP_BITCAST:
++   case SPV_OP_IADD:
++   case SPV_OP_BROADCAST_FIRST:
++      return 2;
++   default:
++      return 0;
++   }
++}
++
++static inline uint16_t
++spv_op_at(const struct spv *s, uint32_t off)
++{
++   return s->w[off] & 0xffff;
++}
++
++static inline uint32_t
++spv_wc_at(const struct spv *s, uint32_t off)
++{
++   return s->w[off] >> 16;
++}
++
++/* The defining instruction's word offset, 0 for none */
++static inline uint32_t
++spv_def(const struct spv *s, uint32_t id)
++{
++   return id < s->bound ? s->def[id] : 0;
++}
++
++static bool
++spv_const_u32(const struct spv *s, uint32_t id, uint32_t *out)
++{
++   const uint32_t d = spv_def(s, id);
++   if (d == 0 || spv_op_at(s, d) != SPV_OP_CONSTANT)
++      return false;
++   *out = s->w[d + 3];
++   return true;
++}
++
++static bool
++spv_member_offset(const struct spv *s, uint32_t st, uint32_t m, uint32_t *out)
++{
++   for (size_t i = 5; i < s->nw;) {
++      const uint32_t wc = spv_wc_at(s, i);
++      if (wc == 0)
++         break;
++      if (spv_op_at(s, i) == SPV_OP_MEMBER_DECORATE && wc >= 5 &&
++          s->w[i + 1] == st && s->w[i + 2] == m &&
++          s->w[i + 3] == SPV_DEC_OFFSET) {
++         *out = s->w[i + 4];
++         return true;
++      }
++      i += wc;
++   }
++   return false;
++}
++
++static bool
++spv_struct_all_nonwritable(const struct spv *s, uint32_t st)
++{
++   const uint32_t d = spv_def(s, st);
++   if (d == 0 || spv_op_at(s, d) != SPV_OP_TYPE_STRUCT)
++      return false;
++   const uint32_t members = spv_wc_at(s, d) - 2;
++   if (s->flags[st] & SF_NONWRITABLE)
++      return true;
++   uint32_t nw = 0;
++   for (size_t i = 5; i < s->nw;) {
++      const uint32_t wc = spv_wc_at(s, i);
++      if (wc == 0)
++         break;
++      if (spv_op_at(s, i) == SPV_OP_MEMBER_DECORATE && wc >= 4 &&
++          s->w[i + 1] == st && s->w[i + 3] == SPV_DEC_NON_WRITABLE)
++         nw++;
++      i += wc;
++   }
++   return members > 0 && nw >= members;
++}
++
++static uint64_t
++spv_type_size(const struct spv *s, uint32_t id, unsigned depth)
++{
++   const uint32_t d = spv_def(s, id);
++   if (d == 0 || depth > 16)
++      return SPV_SIZE_UNKNOWN;
++   switch (spv_op_at(s, d)) {
++   case SPV_OP_TYPE_BOOL:
++      return 4;
++   case SPV_OP_TYPE_INT:
++   case SPV_OP_TYPE_FLOAT:
++      return s->w[d + 2] / 8;
++   case SPV_OP_TYPE_VECTOR:
++   case SPV_OP_TYPE_MATRIX: {
++      const uint64_t e = spv_type_size(s, s->w[d + 2], depth + 1);
++      return e == SPV_SIZE_UNKNOWN ? e : e * s->w[d + 3];
++   }
++   case SPV_OP_TYPE_ARRAY: {
++      uint32_t len;
++      if (!spv_const_u32(s, s->w[d + 3], &len))
++         return SPV_SIZE_UNKNOWN;
++      uint64_t stride = s->astride[id];
++      if (stride == 0)
++         stride = spv_type_size(s, s->w[d + 2], depth + 1);
++      return stride == SPV_SIZE_UNKNOWN ? stride : stride * len;
++   }
++   case SPV_OP_TYPE_POINTER:
++      return 8;
++   case SPV_OP_TYPE_STRUCT: {
++      uint64_t size = 0;
++      for (uint32_t m = 0; m + 2 < spv_wc_at(s, d); m++) {
++         uint32_t off = 0;
++         if (!spv_member_offset(s, id, m, &off))
++            return SPV_SIZE_UNKNOWN;
++         const uint64_t ms = spv_type_size(s, s->w[d + 2 + m], depth + 1);
++         if (ms == SPV_SIZE_UNKNOWN)
++            return ms;
++         size = MAX2(size, off + ms);
++      }
++      return size;
++   }
++   default:
++      return SPV_SIZE_UNKNOWN;
++   }
++}
++
++/* An index (or address) expression as push constant word + constant */
++struct spv_eval {
++   bool ok;
++   uint32_t pc_off; /* DCAP_NONE: constant */
++   uint32_t add;
++};
++
++static struct spv_eval
++spv_eval_pc_load(const struct spv *s, uint32_t ptr)
++{
++   const struct spv_eval bad = { false, 0, 0 };
++   const uint32_t pd = spv_def(s, ptr);
++   if (pd == 0 || s->pcvar == 0)
++      return bad;
++   const uint16_t pop = spv_op_at(s, pd);
++   if (pop != SPV_OP_ACCESS_CHAIN && pop != SPV_OP_IN_BOUNDS_ACCESS_CHAIN)
++      return bad;
++   if (s->w[pd + 3] != s->pcvar || spv_wc_at(s, pd) < 5)
++      return bad;
++   uint32_t m, off;
++   if (!spv_const_u32(s, s->w[pd + 4], &m) ||
++       !spv_member_offset(s, s->pctype, m, &off))
++      return bad;
++   if (spv_wc_at(s, pd) >= 6) {
++      /* A component of a vector member */
++      uint32_t c;
++      if (!spv_const_u32(s, s->w[pd + 5], &c) || spv_wc_at(s, pd) > 6)
++         return bad;
++      off += c * 4;
++   }
++   return (struct spv_eval) { true, off, 0 };
++}
++
++static struct spv_eval
++spv_eval_index(const struct spv *s, uint32_t id, unsigned depth)
++{
++   const struct spv_eval bad = { false, 0, 0 };
++   const uint32_t d = spv_def(s, id);
++   if (d == 0 || depth > 16)
++      return bad;
++   switch (spv_op_at(s, d)) {
++   case SPV_OP_CONSTANT:
++      return (struct spv_eval) { true, DCAP_NONE, s->w[d + 3] };
++   case SPV_OP_LOAD:
++      return spv_eval_pc_load(s, s->w[d + 3]);
++   case SPV_OP_BITCAST:
++   case SPV_OP_COPY_OBJECT:
++   case SPV_OP_UCONVERT:
++      return spv_eval_index(s, s->w[d + 3], depth + 1);
++   case SPV_OP_BROADCAST_FIRST:
++      return spv_eval_index(s, s->w[d + 4], depth + 1);
++   case SPV_OP_IADD: {
++      const struct spv_eval a = spv_eval_index(s, s->w[d + 3], depth + 1);
++      const struct spv_eval b = spv_eval_index(s, s->w[d + 4], depth + 1);
++      if (!a.ok || !b.ok || (a.pc_off != DCAP_NONE && b.pc_off != DCAP_NONE))
++         return bad;
++      return (struct spv_eval) {
++         true, a.pc_off != DCAP_NONE ? a.pc_off : b.pc_off, a.add + b.add,
++      };
++   }
++   default:
++      return bad;
++   }
++}
++
++static void PRINTFLIKE(2, 3)
++recipe_unsupported(struct nvk_dcap_recipe *r, const char *fmt, ...)
++{
++   r->nunsupported++;
++   const size_t len = strlen(r->unsupported);
++   if (len + 8 >= sizeof(r->unsupported))
++      return;
++   va_list ap;
++   va_start(ap, fmt);
++   if (len > 0)
++      snprintf(r->unsupported + len, sizeof(r->unsupported) - len, "; ");
++   const size_t len2 = strlen(r->unsupported);
++   vsnprintf(r->unsupported + len2, sizeof(r->unsupported) - len2, fmt, ap);
++   va_end(ap);
++}
++
++static int
++recipe_var_index(const struct nvk_dcap_recipe *r, uint32_t id)
++{
++   for (uint32_t i = 0; i < r->nvars; i++) {
++      if (r->vars[i].id == id)
++         return i;
++   }
++   return -1;
++}
++
++static void
++recipe_add_ref(struct nvk_dcap_recipe *r, uint32_t var, struct spv_eval e)
++{
++   for (uint32_t i = 0; i < r->nrefs; i++) {
++      if (r->refs[i].var == var && r->refs[i].pc_off == e.pc_off &&
++          r->refs[i].add == e.add)
++         return;
++   }
++   if (r->nrefs >= DCAP_MAX_REFS) {
++      recipe_unsupported(r, "more than %u descriptor references",
++                         DCAP_MAX_REFS);
++      return;
++   }
++   r->refs[r->nrefs++] = (struct dcap_ref) {
++      .var = var, .pc_off = e.pc_off, .add = e.add,
++   };
++}
++
++static void
++recipe_add_bda(struct nvk_dcap_recipe *r, uint32_t pc_off, uint64_t size_B,
++               bool writable)
++{
++   for (uint32_t i = 0; i < r->nbdas; i++) {
++      if (r->bdas[i].pc_off == pc_off) {
++         if (size_B == 0 || r->bdas[i].size_B == 0)
++            r->bdas[i].size_B = 0;
++         else
++            r->bdas[i].size_B = MAX2(r->bdas[i].size_B, size_B);
++         r->bdas[i].writable |= writable;
++         return;
++      }
++   }
++   if (r->nbdas >= DCAP_MAX_BDAS) {
++      recipe_unsupported(r, "more than %u root addresses", DCAP_MAX_BDAS);
++      return;
++   }
++   r->bdas[r->nbdas++] = (struct dcap_bda) {
++      .pc_off = pc_off, .size_B = size_B, .writable = writable,
++   };
++}
++
++/* The descriptor type of a resource variable's (element) type */
++static bool
++spv_var_type(const struct spv *s, uint32_t sc, uint32_t elem,
++             struct dcap_var *v)
++{
++   const uint32_t d = spv_def(s, elem);
++   if (d == 0)
++      return false;
++   switch (spv_op_at(s, d)) {
++   case SPV_OP_TYPE_IMAGE: {
++      v->dim = s->w[d + 3];
++      v->depth = s->w[d + 4];
++      v->arrayed = s->w[d + 5];
++      v->ms = s->w[d + 6];
++      const uint32_t sampled = s->w[d + 7];
++      if (v->dim == 5 /* Buffer */) {
++         v->type = sampled == 2 ? VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER :
++                                  VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER;
++      } else if (v->dim == 6 /* SubpassData */) {
++         return false;
++      } else {
++         v->type = sampled == 2 ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE :
++                                  VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
++      }
++      return true;
++   }
++   case SPV_OP_TYPE_SAMPLER:
++      v->type = VK_DESCRIPTOR_TYPE_SAMPLER;
++      return true;
++   case SPV_OP_TYPE_SAMPLED_IMAGE: {
++      const uint32_t id2 = spv_def(s, s->w[d + 2]);
++      if (id2 != 0 && spv_op_at(s, id2) == SPV_OP_TYPE_IMAGE) {
++         v->dim = s->w[id2 + 3];
++         v->depth = s->w[id2 + 4];
++         v->arrayed = s->w[id2 + 5];
++         v->ms = s->w[id2 + 6];
++      }
++      v->type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
++      return true;
++   }
++   case SPV_OP_TYPE_STRUCT:
++      if (sc == SPV_SC_STORAGE_BUFFER ||
++          (s->flags[elem] & SF_BUFFERBLOCK))
++         v->type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
++      else if (sc == SPV_SC_UNIFORM)
++         v->type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
++      else
++         return false;
++      return true;
++   default:
++      return false;
++   }
++}
++
++static struct nvk_dcap_recipe *
++dcap_scan_spirv(const uint32_t *words, size_t size_B)
++{
++   struct nvk_dcap_recipe *r = calloc(1, sizeof(*r));
++   if (r == NULL)
++      return NULL;
++   r->spirv = malloc(size_B);
++   if (r->spirv == NULL) {
++      free(r);
++      return NULL;
++   }
++   memcpy(r->spirv, words, size_B);
++   r->spirv_size = size_B;
++
++   struct spv s = { .w = r->spirv, .nw = size_B / 4 };
++   if (s.nw < 5 || s.w[0] != 0x07230203 || s.w[3] > (1u << 22)) {
++      recipe_unsupported(r, "not SPIR-V");
++      return r;
++   }
++   s.bound = s.w[3];
++   s.def = calloc(s.bound, sizeof(*s.def));
++   s.set = malloc(s.bound * sizeof(*s.set));
++   s.binding = malloc(s.bound * sizeof(*s.binding));
++   s.astride = calloc(s.bound, sizeof(*s.astride));
++   s.flags = calloc(s.bound, sizeof(*s.flags));
++   if (s.def == NULL || s.set == NULL || s.binding == NULL ||
++       s.astride == NULL || s.flags == NULL) {
++      recipe_unsupported(r, "out of memory");
++      goto done;
++   }
++   memset(s.set, 0xff, s.bound * sizeof(*s.set));
++   memset(s.binding, 0xff, s.bound * sizeof(*s.binding));
++
++   /* Definitions and decorations */
++   for (size_t i = 5; i < s.nw;) {
++      const uint32_t wc = spv_wc_at(&s, i);
++      if (wc == 0 || i + wc > s.nw)
++         break;
++      const uint16_t op = spv_op_at(&s, i);
++      const uint32_t rp = spv_result_pos(op);
++      if (rp != 0 && rp < wc && s.w[i + rp] < s.bound)
++         s.def[s.w[i + rp]] = i;
++      if (op == SPV_OP_DECORATE && wc >= 3 && s.w[i + 1] < s.bound) {
++         const uint32_t t = s.w[i + 1];
++         switch (s.w[i + 2]) {
++         case SPV_DEC_DESCRIPTOR_SET:
++            if (wc >= 4)
++               s.set[t] = s.w[i + 3];
++            break;
++         case SPV_DEC_BINDING:
++            if (wc >= 4)
++               s.binding[t] = s.w[i + 3];
++            break;
++         case SPV_DEC_ARRAY_STRIDE:
++            if (wc >= 4)
++               s.astride[t] = s.w[i + 3];
++            break;
++         case SPV_DEC_NON_WRITABLE:
++            s.flags[t] |= SF_NONWRITABLE;
++            break;
++         case SPV_DEC_BLOCK:
++            s.flags[t] |= SF_BLOCK;
++            break;
++         case SPV_DEC_BUFFER_BLOCK:
++            s.flags[t] |= SF_BUFFERBLOCK;
++            break;
++         default:
++            break;
++         }
++      }
++      i += wc;
++   }
++
++   /* Variables */
++   for (size_t i = 5; i < s.nw;) {
++      const uint32_t wc = spv_wc_at(&s, i);
++      if (wc == 0 || i + wc > s.nw)
++         break;
++      if (spv_op_at(&s, i) == SPV_OP_VARIABLE && wc >= 4) {
++         const uint32_t id = s.w[i + 2], sc = s.w[i + 3];
++         const uint32_t pd = spv_def(&s, s.w[i + 1]);
++         const uint32_t pointee = pd != 0 && spv_op_at(&s, pd) ==
++                                  SPV_OP_TYPE_POINTER ? s.w[pd + 3] : 0;
++         if (sc == SPV_SC_PUSH_CONSTANT) {
++            s.pcvar = id;
++            s.pctype = pointee;
++            const uint64_t size = spv_type_size(&s, pointee, 0);
++            r->push_size = size == SPV_SIZE_UNKNOWN ? NVK_MAX_PUSH_SIZE :
++                           (uint32_t)MIN2(size, NVK_MAX_PUSH_SIZE);
++         } else if ((sc == SPV_SC_UNIFORM_CONSTANT || sc == SPV_SC_UNIFORM ||
++                     sc == SPV_SC_STORAGE_BUFFER) && s.set[id] >= 0 &&
++                    s.binding[id] >= 0) {
++            struct dcap_var v = {
++               .id = id, .set = s.set[id], .binding = s.binding[id],
++            };
++            uint32_t elem = pointee;
++            const uint32_t ed = spv_def(&s, pointee);
++            if (ed != 0 && (spv_op_at(&s, ed) == SPV_OP_TYPE_ARRAY ||
++                            spv_op_at(&s, ed) == SPV_OP_TYPE_RUNTIME_ARRAY)) {
++               v.array = true;
++               elem = s.w[ed + 2];
++            }
++            if (!spv_var_type(&s, sc, elem, &v)) {
++               recipe_unsupported(r, "set %u binding %u: resource type",
++                                  v.set, v.binding);
++            } else if (r->nvars >= DCAP_MAX_VARS) {
++               recipe_unsupported(r, "more than %u resource variables",
++                                  DCAP_MAX_VARS);
++            } else {
++               switch (v.type) {
++               case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
++               case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
++                  v.writable = !(s.flags[id] & SF_NONWRITABLE);
++                  break;
++               case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
++                  v.writable = !(s.flags[id] & SF_NONWRITABLE) &&
++                               !spv_struct_all_nonwritable(&s, elem);
++                  break;
++               default:
++                  v.writable = false;
++                  break;
++               }
++               r->vars[r->nvars++] = v;
++               if (!v.array)
++                  recipe_add_ref(r, r->nvars - 1,
++                                 (struct spv_eval) { true, DCAP_NONE, 0 });
++            }
++         }
++      }
++      i += wc;
++   }
++
++   /* Accesses: descriptor array indices and root addresses */
++   for (size_t i = 5; i < s.nw;) {
++      const uint32_t wc = spv_wc_at(&s, i);
++      if (wc == 0 || i + wc > s.nw)
++         break;
++      const uint16_t op = spv_op_at(&s, i);
++      if ((op == SPV_OP_ACCESS_CHAIN || op == SPV_OP_IN_BOUNDS_ACCESS_CHAIN) &&
++          wc >= 5) {
++         const int vi = recipe_var_index(r, s.w[i + 3]);
++         if (vi >= 0 && r->vars[vi].array) {
++            const struct spv_eval e = spv_eval_index(&s, s.w[i + 4], 0);
++            if (e.ok) {
++               recipe_add_ref(r, vi, e);
++            } else {
++               recipe_unsupported(r, "set %u binding %u: index %%%u is not a "
++                                  "push constant plus a constant",
++                                  r->vars[vi].set, r->vars[vi].binding,
++                                  s.w[i + 4]);
++            }
++         }
++      } else if ((op == SPV_OP_BITCAST || op == SPV_OP_CONVERT_U_TO_PTR) &&
++                 wc >= 4) {
++         const uint32_t td = spv_def(&s, s.w[i + 1]);
++         if (td != 0 && spv_op_at(&s, td) == SPV_OP_TYPE_POINTER &&
++             s.w[td + 2] == SPV_SC_PHYSICAL_STORAGE_BUFFER) {
++            const uint32_t src = spv_def(&s, s.w[i + 3]);
++            struct spv_eval e = { false, 0, 0 };
++            if (src != 0 && spv_op_at(&s, src) == SPV_OP_LOAD)
++               e = spv_eval_pc_load(&s, s.w[src + 3]);
++            const uint32_t pointee = s.w[td + 3];
++            if (e.ok) {
++               const uint64_t size = spv_type_size(&s, pointee, 0);
++               recipe_add_bda(r, e.pc_off,
++                              size == SPV_SIZE_UNKNOWN ? 0 : size,
++                              !spv_struct_all_nonwritable(&s, pointee));
++            } else {
++               recipe_unsupported(r, "buffer address %%%u not loaded from a "
++                                  "push constant", s.w[i + 3]);
++            }
++         }
++      }
++      i += wc;
++   }
++
++done:
++   free(s.def);
++   free(s.set);
++   free(s.binding);
++   free(s.astride);
++   free(s.flags);
++   return r;
++}
++
++void
++nvk_dcap_recipe_free(struct nvk_dcap_recipe *recipe)
++{
++   if (recipe == NULL)
++      return;
++   free(recipe->spirv);
++   free(recipe);
++}
++
++static int
++dcap_hash_slot(const struct nvk_dcap_dev *dcap, uint64_t hash)
++{
++   for (uint32_t i = 0; i < dcap->hash_count; i++) {
++      if (dcap->hashes[i] == hash)
++         return i;
++   }
++   return -1;
++}
++
++static void
++nvk_dcap_compute_spirv_hook(struct vk_device *vk_dev,
++                            struct vk_shader *vk_shader,
++                            const uint32_t *spirv, size_t spirv_size_B,
++                            const struct vk_pipeline_layout *layout)
++{
++   struct nvk_device *dev = container_of(vk_dev, struct nvk_device, vk);
++   struct nvk_dcap_dev *dcap = dev->dcap;
++   if (dcap == NULL || dcap_hash_slot(dcap, vk_shader->src_hash) < 0)
++      return;
++   struct nvk_shader *shader = container_of(vk_shader, struct nvk_shader, vk);
++
++   simple_mtx_lock(&dcap->mutex);
++   const bool have = shader->dcap_recipe != NULL;
++   simple_mtx_unlock(&dcap->mutex);
++   if (have)
++      return;
++
++   struct nvk_dcap_recipe *r = dcap_scan_spirv(spirv, spirv_size_B);
++   if (r == NULL)
++      return;
++   r->src_hash = vk_shader->src_hash;
++
++   /* The bindings as the pipeline layout lays them out, for descriptor
++    * buffers and push descriptors (a bound set has its own layout)
++    */
++   for (uint32_t i = 0; i < r->nvars; i++) {
++      struct dcap_var *v = &r->vars[i];
++      if (layout == NULL || v->set >= layout->set_count ||
++          layout->set_layouts[v->set] == NULL)
++         continue;
++      const struct nvk_descriptor_set_layout *sl =
++         vk_to_nvk_descriptor_set_layout(
++            (struct vk_descriptor_set_layout *)layout->set_layouts[v->set]);
++      if (v->binding >= sl->binding_count)
++         continue;
++      const struct nvk_descriptor_set_binding_layout *bl =
++         &sl->binding[v->binding];
++      v->have_layout = true;
++      v->layout_type = bl->type;
++      v->layout_offset = bl->offset;
++      v->layout_stride = bl->stride;
++      v->layout_array_size = bl->array_size;
++      v->layout_set_flags = sl->flags;
++   }
++
++   simple_mtx_lock(&dcap->mutex);
++   if (shader->dcap_recipe == NULL) {
++      shader->dcap_recipe = r;
++      r = NULL;
++   }
++   simple_mtx_unlock(&dcap->mutex);
++
++   if (r != NULL) {
++      nvk_dcap_recipe_free(r);
++   } else {
++      const struct nvk_dcap_recipe *sr = shader->dcap_recipe;
++      dcap_log(dcap, "shader %016" PRIx64 ": %u bytes of SPIR-V, push "
++               "constants %u B, %u resource variables, %u descriptor "
++               "references, %u root addresses%s%s",
++               sr->src_hash, (unsigned)sr->spirv_size, sr->push_size,
++               sr->nvars, sr->nrefs, sr->nbdas,
++               sr->nunsupported ? "; unsupported: " : "",
++               sr->unsupported);
++   }
++}
++
++/* ------------------------------------------------------------------------ */
++/* Recording a capture */
++
++static void
++dcap_copy_linear(struct nvk_cmd_buffer *cmd, uint64_t src, uint64_t dst,
++                 uint64_t size_B)
++{
++   if (size_B == 0)
++      return;
++   const VkDeviceMemoryCopyKHR region = {
++      .sType = VK_STRUCTURE_TYPE_DEVICE_MEMORY_COPY_KHR,
++      .srcRange = { .address = src, .size = size_B },
++      .dstRange = { .address = dst, .size = size_B },
++   };
++   const VkCopyDeviceMemoryInfoKHR info = {
++      .sType = VK_STRUCTURE_TYPE_COPY_DEVICE_MEMORY_INFO_KHR,
++      .regionCount = 1,
++      .pRegions = &region,
++   };
++   nvk_cmd_copy_memory_ce(cmd, &info);
++}
++
++static void
++dcap_copy_image(struct nvk_cmd_buffer *cmd, const struct dcap_res *r,
++                uint64_t dst)
++{
++   for (uint32_t i = 0; i < r->nsubs; i++) {
++      const struct dcap_sub *sub = &r->subs[i];
++      const bool is_3d = r->image_type == VK_IMAGE_TYPE_3D;
++      const VkDeviceMemoryImageCopyKHR region = {
++         .sType = VK_STRUCTURE_TYPE_DEVICE_MEMORY_IMAGE_COPY_KHR,
++         .addressRange = { .address = dst + sub->off_B, .size = sub->size_B },
++         .imageSubresource = {
++            .aspectMask = r->aspect,
++            .mipLevel = sub->mip,
++            .baseArrayLayer = is_3d ? 0 : r->base_layer,
++            .layerCount = is_3d ? 1 : r->layers,
++         },
++         .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
++         .imageExtent = sub->extent,
++      };
++      const VkCopyDeviceMemoryImageInfoKHR info = {
++         .sType = VK_STRUCTURE_TYPE_COPY_DEVICE_MEMORY_IMAGE_INFO_KHR,
++         .image = nvk_image_to_handle((struct nvk_image *)r->img),
++         .regionCount = 1,
++         .pRegions = &region,
++      };
++      nvk_cmd_copy_image_to_memory_ce(cmd, &info);
++   }
++}
++
++/* Flushes shader writes and waits for the compute engine */
++static void
++dcap_flush_compute(struct nvk_cmd_buffer *cmd)
++{
++   struct nv_push *p = nvk_cmd_buffer_push(cmd, 2);
++   P_IMMD(p, NVA0C0, INVALIDATE_SHADER_CACHES, {
++      .data = DATA_TRUE,
++      .flush_data = FLUSH_DATA_TRUE,
++   });
++}
++
++/* Waits for the copy engine's earlier copies (as nvk_cmd_flush_wait_dep) */
++static void
++dcap_wait_copies(struct nvk_cmd_buffer *cmd)
++{
++   struct nv_push *p = nvk_cmd_buffer_push(cmd, 5);
++   P_MTHD(p, NV90B5, LINE_LENGTH_IN);
++   P_NV90B5_LINE_LENGTH_IN(p, 0);
++   P_NV90B5_LINE_COUNT(p, 0);
++   P_IMMD(p, NV90B5, LAUNCH_DMA, {
++      .data_transfer_type = DATA_TRANSFER_TYPE_NON_PIPELINED,
++      .multi_line_enable = false,
++      .flush_enable = FLUSH_ENABLE_TRUE,
++      .src_memory_layout = SRC_MEMORY_LAYOUT_PITCH,
++      .dst_memory_layout = DST_MEMORY_LAYOUT_PITCH,
++      .remap_enable = REMAP_ENABLE_TRUE,
++   });
++}
++
++static void
++dcap_release_marker(struct nvk_cmd_buffer *cmd, uint64_t addr, uint32_t value)
++{
++   struct nv_push *p = nvk_cmd_buffer_push(cmd, 6);
++   P_MTHD(p, NV90B5, SET_SEMAPHORE_A);
++   P_NV90B5_SET_SEMAPHORE_A(p, addr >> 32);
++   P_NV90B5_SET_SEMAPHORE_B(p, addr);
++   P_NV90B5_SET_SEMAPHORE_PAYLOAD(p, value);
++   P_IMMD(p, NV90B5, LAUNCH_DMA, {
++      .data_transfer_type = DATA_TRANSFER_TYPE_NONE,
++      .semaphore_type = SEMAPHORE_TYPE_RELEASE_ONE_WORD_SEMAPHORE,
++      .flush_enable = FLUSH_ENABLE_TRUE,
++   });
++}
++
++/* How far the allocation holding addr goes from addr, 0: none */
++static uint64_t
++dcap_bound_at(struct nvk_device *dev, uint64_t addr)
++{
++   uint64_t off = 0;
++   struct nvkmd_mem *mem = nvkmd_dev_lookup_mem_by_va(dev->nvkmd, addr, &off);
++   if (mem == NULL)
++      return 0;
++   const uint64_t left = mem->va->size_B - off;
++   nvkmd_mem_unref(mem);
++   return left;
++}
++
++/* The descriptor of v at index, as the GPU will read it */
++static const void *
++dcap_desc_ptr(struct nvk_cmd_buffer *cmd, const struct dcap_var *v,
++              uint32_t index, bool *edb_out, char *err, size_t err_size)
++{
++   struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
++   const struct nvk_physical_device *pdev = nvk_device_physical(dev);
++   struct nvk_descriptor_state *desc = &cmd->state.cs.descriptors;
++
++   if (v->set >= NVK_MAX_SETS) {
++      snprintf(err, err_size, "set %u out of range", v->set);
++      return NULL;
++   }
++   const struct nvk_descriptor_set_binding *sb = &desc->sets[v->set];
++   switch (sb->type) {
++   case NVK_DESCRIPTOR_SET_TYPE_SET: {
++      const struct nvk_descriptor_set *set = sb->set;
++      const struct nvk_descriptor_set_layout *layout = set->layout;
++      if (v->binding >= layout->binding_count) {
++         snprintf(err, err_size, "binding not in the bound set's layout");
++         return NULL;
++      }
++      const struct nvk_descriptor_set_binding_layout *bl =
++         &layout->binding[v->binding];
++      const uint64_t off = bl->offset + (uint64_t)index * bl->stride;
++      if (bl->stride == 0 || off + bl->stride > set->size_B ||
++          set->map == NULL) {
++         snprintf(err, err_size, "index %u outside the bound set (%u B)",
++                  index, set->size_B);
++         return NULL;
++      }
++      *edb_out = (layout->flags &
++                  VK_DESCRIPTOR_SET_LAYOUT_CREATE_DESCRIPTOR_BUFFER_BIT_EXT) ||
++                 nvk_use_edb_buffer_views(pdev);
++      return (const char *)set->map + off;
++   }
++   case NVK_DESCRIPTOR_SET_TYPE_PUSH: {
++      if (!v->have_layout || v->layout_stride == 0) {
++         snprintf(err, err_size, "push descriptor without a layout");
++         return NULL;
++      }
++      const uint64_t off = v->layout_offset + (uint64_t)index * v->layout_stride;
++      if (off + v->layout_stride > NVK_PUSH_DESCRIPTOR_SET_SIZE) {
++         snprintf(err, err_size, "push descriptor index out of range");
++         return NULL;
++      }
++      *edb_out = nvk_use_edb_buffer_views(pdev);
++      return sb->push->data + off;
++   }
++   case NVK_DESCRIPTOR_SET_TYPE_BUFFER: {
++      if (!v->have_layout || v->layout_stride == 0) {
++         snprintf(err, err_size, "descriptor buffer without a layout");
++         return NULL;
++      }
++      struct nvk_buffer_address sa;
++      nvk_descriptor_state_get_root(desc, sets[v->set], &sa);
++      const uint64_t addr = sa.base_addr + v->layout_offset +
++                            (uint64_t)index * v->layout_stride;
++      uint64_t off = 0;
++      struct nvkmd_mem *mem = nvkmd_dev_lookup_mem_by_va(dev->nvkmd, addr, &off);
++      if (mem == NULL) {
++         snprintf(err, err_size, "descriptor buffer address 0x%" PRIx64
++                  " not in any allocation", addr);
++         return NULL;
++      }
++      const void *map = mem->map;
++      const uint64_t size_B = mem->va->size_B;
++      nvkmd_mem_unref(mem);
++      if (map == NULL || off + v->layout_stride > size_B) {
++         snprintf(err, err_size, "descriptor buffer not mapped");
++         return NULL;
++      }
++      *edb_out = true;
++      return (const char *)map + off;
++   }
++   default:
++      snprintf(err, err_size, "set %u not bound", v->set);
++      return NULL;
++   }
++}
++
++static bool
++dcap_fill_image(struct nvk_device *dev, struct dcap_res *r,
++                const struct nvk_image_view *view)
++{
++   const struct nvk_image *img =
++      container_of(view->vk.image, struct nvk_image, vk);
++   if (view->plane_count != 1) {
++      snprintf(r->note, sizeof(r->note), "multi-plane view");
++      return false;
++   }
++   if (img->vk.samples != VK_SAMPLE_COUNT_1_BIT) {
++      snprintf(r->note, sizeof(r->note), "multisampled image (%u samples)",
++               img->vk.samples);
++      return false;
++   }
++   if (img->vk.create_flags & VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT) {
++      snprintf(r->note, sizeof(r->note), "sparse residency image");
++      return false;
++   }
++
++   r->img = img;
++   r->image_type = img->vk.image_type;
++   r->view_type = view->vk.view_type;
++   r->image_format = img->vk.format;
++   r->view_format = view->vk.view_format;
++   r->swizzle = view->vk.swizzle;
++   r->min_lod = view->vk.min_lod;
++   r->base_mip = view->vk.base_mip_level;
++   r->mips = MIN2(view->vk.level_count, DCAP_MAX_MIPS);
++   r->base_layer = view->vk.base_array_layer;
++   r->layers = view->vk.layer_count;
++   r->extent = vk_image_mip_level_extent(&img->vk, r->base_mip);
++
++   VkImageAspectFlags aspect = view->vk.aspects;
++   if (aspect & VK_IMAGE_ASPECT_DEPTH_BIT)
++      aspect = VK_IMAGE_ASPECT_DEPTH_BIT;
++   else if (aspect & VK_IMAGE_ASPECT_STENCIL_BIT)
++      aspect = VK_IMAGE_ASPECT_STENCIL_BIT;
++   else
++      aspect = VK_IMAGE_ASPECT_COLOR_BIT;
++   r->aspect = aspect;
++   r->copy_format = vk_format_get_aspect_format(img->vk.format, aspect);
++
++   if (r->image_type == VK_IMAGE_TYPE_3D &&
++       r->view_type != VK_IMAGE_VIEW_TYPE_3D) {
++      snprintf(r->note, sizeof(r->note), "2D view of a 3D image");
++      return false;
++   }
++
++   uint64_t off = 0;
++   r->nsubs = 0;
++   for (uint32_t i = 0; i < r->mips; i++) {
++      const uint32_t mip = r->base_mip + i;
++      const VkExtent3D ext = vk_image_mip_level_extent(&img->vk, mip);
++      const bool is_3d = r->image_type == VK_IMAGE_TYPE_3D;
++      const VkDeviceMemoryImageCopyKHR region = {
++         .sType = VK_STRUCTURE_TYPE_DEVICE_MEMORY_IMAGE_COPY_KHR,
++         .imageSubresource = {
++            .aspectMask = aspect,
++            .mipLevel = mip,
++            .baseArrayLayer = is_3d ? 0 : r->base_layer,
++            .layerCount = is_3d ? 1 : r->layers,
++         },
++         .imageExtent = ext,
++      };
++      const struct vk_image_buffer_layout bl =
++         vk_image_memory_copy_layout(&img->vk, &region);
++      struct dcap_sub *sub = &r->subs[r->nsubs++];
++      sub->mip = mip;
++      sub->extent = ext;
++      sub->layers = is_3d ? 1 : r->layers;
++      sub->row_stride_B = bl.row_stride_B;
++      sub->image_stride_B = bl.image_stride_B;
++      sub->off_B = off;
++      sub->size_B = bl.image_stride_B * (is_3d ? ext.depth : r->layers);
++      off += align64(sub->size_B, 256);
++   }
++   r->size_B = off;
++   r->kind = DCAP_RES_IMAGE;
++   return true;
++}
++
++static void
++dcap_fill_buffer(struct nvk_device *dev, struct dcap_res *r,
++                 enum dcap_res_kind kind, uint64_t addr, uint64_t range_B,
++                 uint64_t limit_B)
++{
++   r->kind = kind;
++   r->addr = addr;
++   r->range_B = range_B;
++   r->bound_B = addr != 0 ? dcap_bound_at(dev, addr) : 0;
++   uint64_t size = MIN2(range_B, r->bound_B);
++   if (size > limit_B) {
++      size = limit_B;
++      r->truncated = true;
++   }
++   if (size < range_B)
++      r->truncated = true;
++   r->size_B = size;
++   if (addr == 0 || r->bound_B == 0) {
++      r->kind = addr == 0 ? DCAP_RES_NULL : DCAP_RES_ERROR;
++      r->size_B = 0;
++      snprintf(r->note, sizeof(r->note), addr == 0 ? "null address" :
++               "address 0x%" PRIx64 " not in any allocation", addr);
++   }
++}
++
++static void
++dcap_resolve_ref(struct nvk_cmd_buffer *cmd, struct nvk_dcap *cap,
++                 const struct dcap_var *v, uint32_t index, struct dcap_res *r)
++{
++   struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
++   const struct nvk_physical_device *pdev = nvk_device_physical(dev);
++   struct nvk_dcap_dev *dcap = dev->dcap;
++
++   bool edb = false;
++   const uint8_t *d = dcap_desc_ptr(cmd, v, index, &edb, r->note,
++                                    sizeof(r->note));
++   if (d == NULL) {
++      r->kind = DCAP_RES_ERROR;
++      return;
++   }
++
++   switch (v->type) {
++   case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
++   case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
++   case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
++   case VK_DESCRIPTOR_TYPE_SAMPLER: {
++      uint32_t dw;
++      memcpy(&dw, d, 4);
++      const uint32_t image_index = dw & NVK_IMAGE_DESCRIPTOR_IMAGE_INDEX_MASK;
++      const uint32_t sampler_index = dw >> 20;
++      if (v->type == VK_DESCRIPTOR_TYPE_SAMPLER ||
++          v->type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) {
++         r->sampler_index = sampler_index;
++         simple_mtx_lock(&dcap->mutex);
++         const struct vk_sampler_state *st =
++            _mesa_hash_table_u64_search(dcap->samplers, sampler_index);
++         if (st != NULL) {
++            r->sampler = *st;
++            r->have_sampler = true;
++         }
++         simple_mtx_unlock(&dcap->mutex);
++         if (!r->have_sampler) {
++            r->kind = DCAP_RES_ERROR;
++            snprintf(r->note, sizeof(r->note), "sampler index %u unknown",
++                     sampler_index);
++            return;
++         }
++         if (v->type == VK_DESCRIPTOR_TYPE_SAMPLER) {
++            r->kind = DCAP_RES_SAMPLER;
++            return;
++         }
++      }
++      if (image_index == 0) {
++         r->kind = DCAP_RES_NULL;
++         snprintf(r->note, sizeof(r->note), "null image descriptor");
++         return;
++      }
++      simple_mtx_lock(&dcap->mutex);
++      const uintptr_t tagged = (uintptr_t)
++         _mesa_hash_table_u64_search(dcap->images, image_index);
++      simple_mtx_unlock(&dcap->mutex);
++      const uint32_t tag = tagged & 3;
++      if (tagged == 0 || tag == DCAP_TAG_BVIEW) {
++         r->kind = DCAP_RES_ERROR;
++         snprintf(r->note, sizeof(r->note), "image index %u is %s",
++                  image_index, tagged == 0 ? "unknown" : "a buffer view");
++         return;
++      }
++      const struct nvk_image_view *view =
++         (const struct nvk_image_view *)(tagged & ~(uintptr_t)3);
++      if (!dcap_fill_image(dev, r, view))
++         r->kind = DCAP_RES_ERROR;
++      return;
++   }
++
++   case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
++   case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER: {
++      uint64_t addr = 0, range = 0;
++      VkFormat format = VK_FORMAT_UNDEFINED;
++      if (edb) {
++         struct nvk_edb_buffer_view_descriptor e;
++         memcpy(&e, d, sizeof(e));
++         if (e.index == 0) {
++            r->kind = DCAP_RES_NULL;
++            snprintf(r->note, sizeof(r->note), "null texel buffer");
++            return;
++         }
++         uint64_t base = 0;
++         enum pipe_format pf = PIPE_FORMAT_NONE;
++         if (!nvk_edb_bview_cache_lookup_index(dev, &dev->edb_bview_cache,
++                                               e.index, &base, &pf)) {
++            r->kind = DCAP_RES_ERROR;
++            snprintf(r->note, sizeof(r->note), "texel buffer view %u unknown",
++                     e.index);
++            return;
++         }
++         const uint32_t el = util_format_get_blocksize(pf);
++         addr = base + (uint64_t)e.offset_el * el;
++         range = (uint64_t)e.size_el * el;
++         format = vk_format_from_pipe_format(pf);
++      } else {
++         uint32_t dw;
++         memcpy(&dw, d, 4);
++         const uint32_t image_index = dw & NVK_IMAGE_DESCRIPTOR_IMAGE_INDEX_MASK;
++         if (image_index == 0) {
++            r->kind = DCAP_RES_NULL;
++            snprintf(r->note, sizeof(r->note), "null texel buffer");
++            return;
++         }
++         simple_mtx_lock(&dcap->mutex);
++         const uintptr_t tagged = (uintptr_t)
++            _mesa_hash_table_u64_search(dcap->images, image_index);
++         simple_mtx_unlock(&dcap->mutex);
++         if ((tagged & 3) != DCAP_TAG_BVIEW) {
++            r->kind = DCAP_RES_ERROR;
++            snprintf(r->note, sizeof(r->note),
++                     "texel buffer index %u unknown", image_index);
++            return;
++         }
++         const struct nvk_buffer_view *bv =
++            (const struct nvk_buffer_view *)(tagged & ~(uintptr_t)3);
++         addr = vk_buffer_address(bv->vk.buffer, bv->vk.offset);
++         range = bv->vk.range;
++         format = bv->vk.format;
++      }
++      r->buf_format = format;
++      dcap_fill_buffer(dev, r, DCAP_RES_TEXEL_BUFFER, addr, range,
++                       DCAP_BUF_MAX);
++      return;
++   }
++
++   case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
++   case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER: {
++      union nvk_buffer_descriptor bd;
++      memcpy(&bd, d, sizeof(bd));
++      const struct nvk_buffer_address ba =
++         v->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER ?
++         nvk_ubo_descriptor_addr(pdev, bd) : bd.addr;
++      dcap_fill_buffer(dev, r, DCAP_RES_BUFFER, ba.base_addr, ba.size,
++                       DCAP_BUF_MAX);
++      return;
++   }
++
++   default:
++      r->kind = DCAP_RES_ERROR;
++      snprintf(r->note, sizeof(r->note), "descriptor type %s",
++               vk_DescriptorType_to_str(v->type));
++      return;
++   }
++}
++
++struct nvk_dcap *
++nvk_dcap_begin(struct nvk_cmd_buffer *cmd, const uint32_t base_group[3],
++               const uint32_t groups[3], uint64_t indirect_addr)
++{
++   struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
++   struct nvk_dcap_dev *dcap = dev->dcap;
++   struct nvk_shader *shader = cmd->state.cs.shader;
++   if (shader == NULL || shader->dcap_recipe == NULL)
++      return NULL;
++   const struct nvk_dcap_recipe *rc = shader->dcap_recipe;
++   const int slot = dcap_hash_slot(dcap, rc->src_hash);
++   if (slot < 0)
++      return NULL;
++   const int64_t now = os_time_get_nano();
++   if (now < dcap->arm_ns)
++      return NULL;
++
++   simple_mtx_lock(&dcap->mutex);
++   if (!dcap->triggered) {
++      if (now < dcap->trigger_check_ns) {
++         simple_mtx_unlock(&dcap->mutex);
++         return NULL;
++      }
++      dcap->trigger_check_ns = now + 250000000ll;
++      dcap->triggered = dcap_file_exists(dcap->trigger);
++      if (!dcap->triggered) {
++         simple_mtx_unlock(&dcap->mutex);
++         return NULL;
++      }
++      dcap_log(dcap, "trigger file %s found: armed", dcap->trigger);
++   }
++   const bool take = dcap->taken[slot] < dcap->count &&
++                     dcap->seen[slot]++ >= dcap->skip;
++   uint32_t call_index = dcap->seen[slot] - 1, serial = 0;
++   if (take) {
++      dcap->taken[slot]++;
++      serial = ++dcap->serial;
++   }
++   simple_mtx_unlock(&dcap->mutex);
++   if (!take)
++      return NULL;
++
++   struct nvk_dcap *cap = calloc(1, sizeof(*cap));
++   if (cap == NULL)
++      return NULL;
++   cap->serial = serial;
++   cap->marker = DCAP_MARKER | (serial & 0xffffff);
++   cap->src_hash = rc->src_hash;
++   cap->code_hash = shader->code_size > 0 ?
++      _mesa_hash_data(shader->code_ptr, shader->code_size) : 0;
++   for (unsigned c = 0; c < 3; c++) {
++      cap->local[c] = shader->info.cs.local_size[c];
++      cap->base_group[c] = base_group[c];
++      cap->groups[c] = groups != NULL ? groups[c] : 0;
++   }
++   cap->indirect = indirect_addr != 0;
++   cap->indirect_addr = indirect_addr;
++   cap->call_index = call_index;
++   cap->post = dcap->post;
++   cap->compute_only = cmd->compute_only;
++   cap->t_s = now / 1e9;
++   const struct nvk_root_descriptor_table *root =
++      (const struct nvk_root_descriptor_table *)cmd->state.cs.descriptors.root;
++   memcpy(cap->push, root->push, sizeof(cap->push));
++   cap->push_size = rc->push_size;
++   cap->spirv = malloc(rc->spirv_size);
++   if (cap->spirv != NULL) {
++      memcpy(cap->spirv, rc->spirv, rc->spirv_size);
++      cap->spirv_size = rc->spirv_size;
++   }
++   snprintf(cap->unsupported, sizeof(cap->unsupported), "%s",
++            rc->unsupported);
++   cap->nvars = rc->nvars;
++   memcpy(cap->vars, rc->vars, sizeof(rc->vars[0]) * rc->nvars);
++
++   /* Descriptors */
++   for (uint32_t i = 0; i < rc->nrefs && cap->nres < DCAP_MAX_RES; i++) {
++      const struct dcap_ref *ref = &rc->refs[i];
++      const struct dcap_var *v = &rc->vars[ref->var];
++      uint32_t index = ref->add;
++      if (ref->pc_off != DCAP_NONE && ref->pc_off + 4 <= NVK_MAX_PUSH_SIZE) {
++         uint32_t w;
++         memcpy(&w, cap->push + ref->pc_off, 4);
++         index += w;
++      }
++      /* Two references to the same descriptor are one resource */
++      bool dup = false;
++      for (uint32_t j = 0; j < cap->nres; j++) {
++         const struct dcap_res *o = &cap->res[j];
++         if (o->var != DCAP_NONE && o->set == v->set &&
++             o->binding == v->binding && o->index == index &&
++             o->dtype == v->type) {
++            dup = true;
++            break;
++         }
++      }
++      if (dup)
++         continue;
++      struct dcap_res *r = &cap->res[cap->nres++];
++      r->var = ref->var;
++      r->set = v->set;
++      r->binding = v->binding;
++      r->index = index;
++      r->dtype = v->type;
++      r->pc_off = ref->pc_off;
++      r->add = ref->add;
++      r->writable = v->writable;
++      dcap_resolve_ref(cmd, cap, v, index, r);
++   }
++
++   /* Root buffer addresses */
++   for (uint32_t i = 0; i < rc->nbdas && cap->nres < DCAP_MAX_RES; i++) {
++      const struct dcap_bda *b = &rc->bdas[i];
++      struct dcap_res *r = &cap->res[cap->nres++];
++      r->var = DCAP_NONE;
++      r->pc_off = b->pc_off;
++      r->writable = b->writable;
++      uint64_t addr = 0;
++      if (b->pc_off + 8 <= NVK_MAX_PUSH_SIZE)
++         memcpy(&addr, cap->push + b->pc_off, 8);
++      dcap_fill_buffer(dev, r, DCAP_RES_BDA, addr,
++                       b->size_B != 0 ? b->size_B : DCAP_BDA_RUNTIME_MAX,
++                       DCAP_BDA_RUNTIME_MAX);
++   }
++
++   /* Staging: header (marker, indirect arguments), inputs, outputs */
++   uint64_t off = DCAP_HEADER_B;
++   for (uint32_t i = 0; i < cap->nres; i++) {
++      struct dcap_res *r = &cap->res[i];
++      if (r->size_B == 0)
++         continue;
++      r->off_B = off;
++      off = align64(off + r->size_B, 256);
++   }
++   if (cap->post) {
++      for (uint32_t i = 0; i < cap->nres; i++) {
++         struct dcap_res *r = &cap->res[i];
++         if (r->size_B == 0 || !r->writable)
++            continue;
++         r->post_off_B = off;
++         off = align64(off + r->size_B, 256);
++      }
++   }
++   cap->mem_size_B = off;
++   if (off > dcap->max_B) {
++      dcap_log(dcap, "shader %016" PRIx64 " call %u: %" PRIu64 " MiB of "
++               "staging is over NVK_DISPATCH_CAPTURE_MAX_MB, not captured",
++               cap->src_hash, call_index, off >> 20);
++      free(cap->spirv);
++      free(cap);
++      return NULL;
++   }
++   VkResult result = nvkmd_dev_alloc_mapped_mem(dev->nvkmd, &dev->vk.base,
++                                                off, 0, NVKMD_MEM_GART,
++                                                NVKMD_MEM_MAP_RDWR, &cap->mem);
++   if (result != VK_SUCCESS) {
++      dcap_log(dcap, "shader %016" PRIx64 " call %u: no staging memory "
++               "(%" PRIu64 " MiB): %s", cap->src_hash, call_index, off >> 20,
++               vk_Result_to_str(result));
++      free(cap->spirv);
++      free(cap);
++      return NULL;
++   }
++   memset(cap->mem->map, 0, DCAP_HEADER_B);
++   const uint64_t va = cap->mem->va->addr;
++
++   dcap_flush_compute(cmd);
++   if (indirect_addr != 0)
++      dcap_copy_linear(cmd, indirect_addr, va + 16, 12);
++   for (uint32_t i = 0; i < cap->nres; i++) {
++      const struct dcap_res *r = &cap->res[i];
++      if (r->size_B == 0)
++         continue;
++      if (r->kind == DCAP_RES_IMAGE)
++         dcap_copy_image(cmd, r, va + r->off_B);
++      else
++         dcap_copy_linear(cmd, r->addr, va + r->off_B, r->size_B);
++   }
++   dcap_wait_copies(cmd);
++
++   list_addtail(&cap->link, &cmd->dcaps);
++
++   unsigned nerr = 0;
++   for (uint32_t i = 0; i < cap->nres; i++)
++      nerr += cap->res[i].kind == DCAP_RES_ERROR;
++   dcap_log(dcap, "shader %016" PRIx64 " call %u recorded as capture %u: "
++            "%u resources (%u not captured), %" PRIu64 " MiB of staging, "
++            "%s grid %ux%ux%u", cap->src_hash, call_index, serial, cap->nres,
++            nerr, off >> 20, cap->indirect ? "indirect" : "direct",
++            cap->groups[0], cap->groups[1], cap->groups[2]);
++   return cap;
++}
++
++void
++nvk_dcap_end(struct nvk_cmd_buffer *cmd, struct nvk_dcap *cap)
++{
++   if (cap == NULL)
++      return;
++   const uint64_t va = cap->mem->va->addr;
++   if (cap->post) {
++      dcap_flush_compute(cmd);
++      for (uint32_t i = 0; i < cap->nres; i++) {
++         const struct dcap_res *r = &cap->res[i];
++         if (r->size_B == 0 || !r->writable)
++            continue;
++         if (r->kind == DCAP_RES_IMAGE)
++            dcap_copy_image(cmd, r, va + r->post_off_B);
++         else
++            dcap_copy_linear(cmd, r->addr, va + r->post_off_B, r->size_B);
++      }
++   }
++   dcap_wait_copies(cmd);
++   dcap_release_marker(cmd, va, cap->marker);
++   dcap_wait_copies(cmd);
++}
++
++/* ------------------------------------------------------------------------ */
++/* Writing a capture */
++
++static const char *
++dcap_kind_str(enum dcap_res_kind kind)
++{
++   switch (kind) {
++   case DCAP_RES_NULL:         return "null";
++   case DCAP_RES_IMAGE:        return "image";
++   case DCAP_RES_TEXEL_BUFFER: return "texel_buffer";
++   case DCAP_RES_BUFFER:       return "buffer";
++   case DCAP_RES_SAMPLER:      return "sampler";
++   case DCAP_RES_BDA:          return "root_address";
++   default:                    return "error";
++   }
++}
++
++static bool
++dcap_write_file(const char *dir, const char *name, const void *data,
++                uint64_t size_B)
++{
++   char path[700];
++   snprintf(path, sizeof(path), "%s" DCAP_SEP "%s", dir, name);
++   FILE *f = fopen(path, "wb");
++   if (f == NULL)
++      return false;
++   const bool ok = size_B == 0 || fwrite(data, 1, size_B, f) == size_B;
++   fclose(f);
++   return ok;
++}
++
++static void
++dcap_json_str(FILE *f, const char *s)
++{
++   fputc('"', f);
++   for (; *s; s++) {
++      if (*s == '"' || *s == '\\')
++         fprintf(f, "\\%c", *s);
++      else if ((unsigned char)*s < 0x20)
++         fprintf(f, "\\u%04x", (unsigned char)*s);
++      else
++         fputc(*s, f);
++   }
++   fputc('"', f);
++}
++
++static void
++dcap_json_sampler(FILE *f, const struct vk_sampler_state *s)
++{
++   fprintf(f, "\"sampler\": {\"mag_filter\": %u, \"min_filter\": %u, "
++           "\"mipmap_mode\": %u, \"address_mode\": [%u, %u, %u], "
++           "\"mip_lod_bias\": %.9g, \"anisotropy_enable\": %u, "
++           "\"max_anisotropy\": %.9g, \"compare_enable\": %u, "
++           "\"compare_op\": %u, \"min_lod\": %.9g, \"max_lod\": %.9g, "
++           "\"border_color\": %u, \"border_color_value\": [%u, %u, %u, %u], "
++           "\"custom_border_format\": %u, \"unnormalized_coordinates\": %u, "
++           "\"reduction_mode\": %u, \"flags\": %u}",
++           s->mag_filter, s->min_filter, s->mipmap_mode, s->address_mode_u,
++           s->address_mode_v, s->address_mode_w, s->mip_lod_bias,
++           s->anisotropy_enable, s->max_anisotropy, s->compare_enable,
++           s->compare_op, s->min_lod, s->max_lod, s->border_color,
++           s->border_color_value.uint32[0], s->border_color_value.uint32[1],
++           s->border_color_value.uint32[2], s->border_color_value.uint32[3],
++           s->format, s->unnormalized_coordinates, s->reduction_mode,
++           s->flags);
++}
++
++static void
++dcap_write(struct nvk_dcap_dev *dcap, struct nvk_dcap *cap)
++{
++   char dir[600];
++   snprintf(dir, sizeof(dir), "%s" DCAP_SEP "%016" PRIx64 "-p%lu-%u",
++            dcap->dir, cap->src_hash, dcap_pid(), cap->serial);
++   dcap_mkdir(dir);
++
++   const uint8_t *map = cap->mem->map;
++   uint32_t groups[3] = { cap->groups[0], cap->groups[1], cap->groups[2] };
++   if (cap->indirect)
++      memcpy(groups, map + 16, sizeof(groups));
++
++   bool ok = true;
++   if (cap->spirv != NULL)
++      ok &= dcap_write_file(dir, "shader.spv", cap->spirv, cap->spirv_size);
++   ok &= dcap_write_file(dir, "push.bin", cap->push, sizeof(cap->push));
++   uint64_t bytes = 0;
++   for (uint32_t i = 0; i < cap->nres; i++) {
++      const struct dcap_res *r = &cap->res[i];
++      if (r->size_B == 0)
++         continue;
++      char name[64];
++      snprintf(name, sizeof(name), "r%03u.bin", i);
++      ok &= dcap_write_file(dir, name, map + r->off_B, r->size_B);
++      bytes += r->size_B;
++      if (r->post_off_B != 0) {
++         snprintf(name, sizeof(name), "r%03u.post.bin", i);
++         ok &= dcap_write_file(dir, name, map + r->post_off_B, r->size_B);
++         bytes += r->size_B;
++      }
++   }
++
++   char path[700];
++   snprintf(path, sizeof(path), "%s" DCAP_SEP "manifest.json", dir);
++   FILE *f = fopen(path, "w");
++   if (f == NULL) {
++      dcap_log(dcap, "capture %u: cannot write %s", cap->serial, path);
++      return;
++   }
++   fprintf(f, "{\n  \"format\": \"nvk-dispatch-capture\",\n"
++           "  \"version\": 1,\n"
++           "  \"src_hash\": \"%016" PRIx64 "\",\n"
++           "  \"code_hash\": \"%08x\",\n"
++           "  \"capture\": %u,\n  \"call_index\": %u,\n"
++           "  \"time_s\": %.3f,\n  \"pid\": %lu,\n"
++           "  \"compute_only_queue\": %s,\n"
++           "  \"local_size\": [%u, %u, %u],\n"
++           "  \"base_group\": [%u, %u, %u],\n"
++           "  \"grid\": [%u, %u, %u],\n  \"indirect\": %s,\n"
++           "  \"spirv\": \"shader.spv\",\n  \"entry_point\": \"main\",\n"
++           "  \"push\": \"push.bin\",\n  \"push_size\": %u,\n"
++           "  \"post\": %s,\n  \"unsupported\": ",
++           cap->src_hash, cap->code_hash, cap->serial, cap->call_index,
++           cap->t_s, dcap_pid(), cap->compute_only ? "true" : "false",
++           cap->local[0], cap->local[1], cap->local[2],
++           cap->base_group[0], cap->base_group[1], cap->base_group[2],
++           groups[0], groups[1], groups[2], cap->indirect ? "true" : "false",
++           cap->push_size, cap->post ? "true" : "false");
++   dcap_json_str(f, cap->unsupported);
++   fprintf(f, ",\n  \"bindings\": [\n");
++   for (uint32_t i = 0; i < cap->nvars; i++) {
++      const struct dcap_var *v = &cap->vars[i];
++      fprintf(f, "    {\"set\": %u, \"binding\": %u, \"descriptor_type\": %u, "
++              "\"descriptor_type_name\": \"%s\", \"array\": %s, "
++              "\"writable\": %s, \"dim\": %u, \"arrayed\": %u, \"depth\": %u, "
++              "\"nvk_layout\": {\"have\": %s, \"type\": %u, \"stride\": %u, "
++              "\"array_size\": %u, \"set_flags\": %u}}%s\n",
++              v->set, v->binding, v->type, vk_DescriptorType_to_str(v->type),
++              v->array ? "true" : "false", v->writable ? "true" : "false",
++              v->dim, v->arrayed, v->depth, v->have_layout ? "true" : "false",
++              v->layout_type, v->layout_stride, v->layout_array_size,
++              v->layout_set_flags, i + 1 < cap->nvars ? "," : "");
++   }
++   fprintf(f, "  ],\n  \"resources\": [\n");
++   for (uint32_t i = 0; i < cap->nres; i++) {
++      const struct dcap_res *r = &cap->res[i];
++      fprintf(f, "    {\"id\": %u, \"kind\": \"%s\", ", i,
++              dcap_kind_str(r->kind));
++      if (r->var != DCAP_NONE) {
++         fprintf(f, "\"set\": %u, \"binding\": %u, \"index\": %u, "
++                 "\"descriptor_type\": %u, \"descriptor_type_name\": \"%s\", ",
++                 r->set, r->binding, r->index, r->dtype,
++                 vk_DescriptorType_to_str(r->dtype));
++      }
++      if (r->pc_off != DCAP_NONE)
++         fprintf(f, "\"push_offset\": %u, \"add\": %u, ", r->pc_off, r->add);
++      fprintf(f, "\"writable\": %s", r->writable ? "true" : "false");
++      if (r->size_B != 0) {
++         fprintf(f, ", \"file\": \"r%03u.bin\", \"size\": %" PRIu64, i,
++                 r->size_B);
++         if (r->post_off_B != 0)
++            fprintf(f, ", \"post_file\": \"r%03u.post.bin\"", i);
++      }
++      switch (r->kind) {
++      case DCAP_RES_IMAGE:
++         fprintf(f, ", \"image_type\": %u, \"view_type\": %u, "
++                 "\"image_format\": %u, \"image_format_name\": \"%s\", "
++                 "\"view_format\": %u, \"view_format_name\": \"%s\", "
++                 "\"copy_format\": %u, \"copy_format_name\": \"%s\", "
++                 "\"aspect\": %u, \"extent\": [%u, %u, %u], "
++                 "\"base_mip\": %u, \"mips\": %u, \"base_layer\": %u, "
++                 "\"layers\": %u, \"swizzle\": [%u, %u, %u, %u], "
++                 "\"min_lod\": %.9g, \"subresources\": [",
++                 r->image_type, r->view_type, r->image_format,
++                 vk_Format_to_str(r->image_format), r->view_format,
++                 vk_Format_to_str(r->view_format), r->copy_format,
++                 vk_Format_to_str(r->copy_format), r->aspect,
++                 r->extent.width, r->extent.height, r->extent.depth,
++                 r->base_mip, r->mips, r->base_layer, r->layers,
++                 r->swizzle.r, r->swizzle.g, r->swizzle.b, r->swizzle.a,
++                 r->min_lod);
++         for (uint32_t s = 0; s < r->nsubs; s++) {
++            const struct dcap_sub *sub = &r->subs[s];
++            fprintf(f, "%s{\"mip\": %u, \"extent\": [%u, %u, %u], "
++                    "\"layers\": %u, \"row_stride\": %u, "
++                    "\"image_stride\": %" PRIu64 ", \"offset\": %" PRIu64
++                    ", \"size\": %" PRIu64 "}", s ? ", " : "", sub->mip,
++                    sub->extent.width, sub->extent.height, sub->extent.depth,
++                    sub->layers, sub->row_stride_B, sub->image_stride_B,
++                    sub->off_B, sub->size_B);
++         }
++         fprintf(f, "]");
++         if (r->have_sampler) {
++            fprintf(f, ", \"sampler_index\": %u, ", r->sampler_index);
++            dcap_json_sampler(f, &r->sampler);
++         }
++         break;
++      case DCAP_RES_TEXEL_BUFFER:
++      case DCAP_RES_BUFFER:
++      case DCAP_RES_BDA:
++         fprintf(f, ", \"address\": \"0x%" PRIx64 "\", \"range\": %" PRIu64
++                 ", \"allocation_left\": %" PRIu64 ", \"truncated\": %s",
++                 r->addr, r->range_B, r->bound_B,
++                 r->truncated ? "true" : "false");
++         if (r->kind == DCAP_RES_TEXEL_BUFFER) {
++            fprintf(f, ", \"format\": %u, \"format_name\": \"%s\"",
++                    r->buf_format, vk_Format_to_str(r->buf_format));
++         }
++         break;
++      case DCAP_RES_SAMPLER:
++         fprintf(f, ", \"sampler_index\": %u, ", r->sampler_index);
++         dcap_json_sampler(f, &r->sampler);
++         break;
++      default:
++         break;
++      }
++      if (r->note[0]) {
++         fprintf(f, ", \"note\": ");
++         dcap_json_str(f, r->note);
++      }
++      fprintf(f, "}%s\n", i + 1 < cap->nres ? "," : "");
++   }
++   fprintf(f, "  ]\n}\n");
++   ok &= fclose(f) == 0;
++
++   dcap_log(dcap, "capture %u (shader %016" PRIx64 " call %u, grid "
++            "%ux%ux%u) written to %s: %u resources, %" PRIu64 " MiB%s",
++            cap->serial, cap->src_hash, cap->call_index, groups[0], groups[1],
++            groups[2], dir, cap->nres, bytes >> 20,
++            ok ? "" : " (some files failed)");
++}
++
++void
++nvk_dcap_cmd_reset(struct nvk_cmd_buffer *cmd)
++{
++   if (cmd->dcaps.next == NULL)
++      return;
++   struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
++   struct nvk_dcap_dev *dcap = dev->dcap;
++   list_for_each_entry_safe(struct nvk_dcap, cap, &cmd->dcaps, link) {
++      list_del(&cap->link);
++      const uint32_t marker = *(volatile uint32_t *)cap->mem->map;
++      if (dcap != NULL) {
++         if (marker == cap->marker) {
++            dcap_write(dcap, cap);
++         } else {
++            dcap_log(dcap, "capture %u (shader %016" PRIx64 "): the command "
++                     "buffer was reset before the GPU ran it (marker 0x%x)",
++                     cap->serial, cap->src_hash, marker);
++         }
++      }
++      nvkmd_mem_unref(cap->mem);
++      free(cap->spirv);
++      free(cap);
++   }
++}
++
++/* ------------------------------------------------------------------------ */
++/* Device */
++
++void
++nvk_dcap_init(struct nvk_device *dev)
++{
++   const char *list = os_get_option("NVK_DISPATCH_CAPTURE");
++   if (list == NULL || list[0] == 0)
++      return;
++
++   struct nvk_dcap_dev *dcap = calloc(1, sizeof(*dcap));
++   if (dcap == NULL)
++      return;
++   simple_mtx_init(&dcap->mutex, mtx_plain);
++
++   for (const char *p = list; *p && dcap->hash_count < DCAP_MAX_HASHES;) {
++      while (*p == ',' || *p == ' ' || *p == ';')
++         p++;
++      if (*p == 0)
++         break;
++      char *end = NULL;
++      const uint64_t h = strtoull(p, &end, 16);
++      if (end == p)
++         break;
++      dcap->hashes[dcap->hash_count++] = h;
++      p = end;
++   }
++
++   dcap->arm_ns = os_time_get_nano() +
++      (int64_t)debug_get_num_option("NVK_DISPATCH_CAPTURE_DELAY_S", 20) *
++      1000000000ll;
++   const char *trigger = os_get_option("NVK_DISPATCH_CAPTURE_TRIGGER");
++   if (trigger != NULL && trigger[0] != 0)
++      snprintf(dcap->trigger, sizeof(dcap->trigger), "%s", trigger);
++   else
++      dcap->triggered = true;
++   dcap->skip = debug_get_num_option("NVK_DISPATCH_CAPTURE_SKIP", 0);
++   dcap->count = debug_get_num_option("NVK_DISPATCH_CAPTURE_COUNT", 1);
++   dcap->post = debug_get_bool_option("NVK_DISPATCH_CAPTURE_POST", false);
++   dcap->max_B = (uint64_t)debug_get_num_option("NVK_DISPATCH_CAPTURE_MAX_MB",
++                                                2048) << 20;
++
++   const char *dir = os_get_option("NVK_DISPATCH_CAPTURE_DIR");
++   if (dir != NULL && dir[0] != 0) {
++      snprintf(dcap->dir, sizeof(dcap->dir), "%s", dir);
++   } else {
++#ifdef _WIN32
++      char pd[MAX_PATH];
++      DWORD n = GetEnvironmentVariableA("ProgramData", pd, sizeof(pd));
++      char helios[MAX_PATH + 16];
++      snprintf(helios, sizeof(helios), "%s\\Helios",
++               n > 0 && n < sizeof(pd) ? pd : "C:\\ProgramData");
++      dcap_mkdir(helios);
++      snprintf(dcap->dir, sizeof(dcap->dir), "%s\\dcap", helios);
++#else
++      snprintf(dcap->dir, sizeof(dcap->dir), "/tmp/nvk-dcap");
++#endif
++   }
++   dcap_mkdir(dcap->dir);
++   char path[600];
++   snprintf(path, sizeof(path), "%s" DCAP_SEP "nvk-dcap.log", dcap->dir);
++   dcap->log = fopen(path, "a");
++
++   dcap->images = _mesa_hash_table_u64_create(NULL);
++   dcap->samplers = _mesa_hash_table_u64_create(NULL);
++   if (dcap->images == NULL || dcap->samplers == NULL) {
++      if (dcap->images != NULL)
++         _mesa_hash_table_u64_destroy(dcap->images);
++      if (dcap->samplers != NULL)
++         _mesa_hash_table_u64_destroy(dcap->samplers);
++      if (dcap->log != NULL)
++         fclose(dcap->log);
++      simple_mtx_destroy(&dcap->mutex);
++      free(dcap);
++      return;
++   }
++
++   dev->dcap = dcap;
++   dev->vk.compute_spirv_hook = nvk_dcap_compute_spirv_hook;
++
++   char hashes[DCAP_MAX_HASHES * 18 + 1] = "";
++   for (uint32_t i = 0; i < dcap->hash_count; i++) {
++      snprintf(hashes + strlen(hashes), sizeof(hashes) - strlen(hashes),
++               "%s%016" PRIx64, i ? "," : "", dcap->hashes[i]);
++   }
++   dcap_log(dcap, "on for device %p (pid %lu): shaders %s, armed in %u s%s%s, "
++            "skip %u, %u per shader, outputs %s, limit %" PRIu64 " MiB, "
++            "directory %s", (void *)dev, dcap_pid(), hashes,
++            (unsigned)debug_get_num_option("NVK_DISPATCH_CAPTURE_DELAY_S", 20),
++            dcap->triggered ? "" : " and when this file exists: ",
++            dcap->trigger, dcap->skip, dcap->count,
++            dcap->post ? "too" : "no", dcap->max_B >> 20, dcap->dir);
++}
++
++void
++nvk_dcap_finish(struct nvk_device *dev)
++{
++   struct nvk_dcap_dev *dcap = dev->dcap;
++   if (dcap == NULL)
++      return;
++   dev->vk.compute_spirv_hook = NULL;
++   dev->dcap = NULL;
++   hash_table_u64_foreach(dcap->samplers, entry)
++      free(entry.data);
++   _mesa_hash_table_u64_destroy(dcap->samplers);
++   _mesa_hash_table_u64_destroy(dcap->images);
++   if (dcap->log != NULL)
++      fclose(dcap->log);
++   simple_mtx_destroy(&dcap->mutex);
++   free(dcap);
++}
+diff --git a/src/nouveau/vulkan/nvk_dispatch_capture.h b/src/nouveau/vulkan/nvk_dispatch_capture.h
+new file mode 100644
+index 0000000..59ff238
+--- /dev/null
++++ b/src/nouveau/vulkan/nvk_dispatch_capture.h
+@@ -0,0 +1,61 @@
++/*
++ * Copyright © 2026 Conduit contributors
++ * SPDX-License-Identifier: MIT
++ */
++#ifndef NVK_DISPATCH_CAPTURE_H
++#define NVK_DISPATCH_CAPTURE_H 1
++
++#include "nvk_private.h"
++
++struct nvk_buffer_view;
++struct nvk_cmd_buffer;
++struct nvk_dcap;
++struct nvk_dcap_recipe;
++struct nvk_device;
++struct nvk_image_view;
++struct vk_sampler_state;
++
++/* NVK_DISPATCH_CAPTURE=<hash>[,<hash>...]: everything one dispatch of a
++ * compute shader with that source hash (vk_shader::src_hash, the
++ * vkd3d-proton DXIL hash) needs to be replayed outside the application --
++ * SPIR-V, push constants, grid and the contents of every descriptor and
++ * root buffer address the shader reads -- written to a directory per
++ * capture (see nvk_dispatch_capture.c).  dev->dcap is NULL without it.
++ */
++void nvk_dcap_init(struct nvk_device *dev);
++void nvk_dcap_finish(struct nvk_device *dev);
++
++void nvk_dcap_recipe_free(struct nvk_dcap_recipe *recipe);
++
++/* Image table and sampler table indices back to their objects */
++void nvk_dcap_note_image_view(struct nvk_device *dev,
++                              const struct nvk_image_view *view);
++void nvk_dcap_forget_image_view(struct nvk_device *dev,
++                                const struct nvk_image_view *view);
++void nvk_dcap_note_buffer_view(struct nvk_device *dev,
++                               const struct nvk_buffer_view *view);
++void nvk_dcap_forget_buffer_view(struct nvk_device *dev,
++                                 const struct nvk_buffer_view *view);
++void nvk_dcap_note_sampler(struct nvk_device *dev, uint32_t desc_index,
++                           const struct vk_sampler_state *state);
++void nvk_dcap_forget_sampler(struct nvk_device *dev, uint32_t desc_index);
++
++/* Around a dispatch's launch: begin before anything of the dispatch is
++ * recorded (it records copies of the inputs), end after the launch (copies
++ * of the outputs with NVK_DISPATCH_CAPTURE_POST, the completion marker).
++ * begin returns NULL when this dispatch is not captured.  groups is the
++ * grid of a direct dispatch, indirect_addr the arguments of an indirect
++ * one (0 for direct).
++ */
++struct nvk_dcap *nvk_dcap_begin(struct nvk_cmd_buffer *cmd,
++                                const uint32_t base_group[3],
++                                const uint32_t groups[3],
++                                uint64_t indirect_addr);
++void nvk_dcap_end(struct nvk_cmd_buffer *cmd, struct nvk_dcap *cap);
++
++/* The command buffer is reset or destroyed: the GPU is done with it, so
++ * captures it ran are written and all are freed.
++ */
++void nvk_dcap_cmd_reset(struct nvk_cmd_buffer *cmd);
++
++#endif
+diff --git a/src/nouveau/vulkan/nvk_edb_bview_cache.c b/src/nouveau/vulkan/nvk_edb_bview_cache.c
+index 8d8fb1d..d73a447 100644
+--- a/src/nouveau/vulkan/nvk_edb_bview_cache.c
++++ b/src/nouveau/vulkan/nvk_edb_bview_cache.c
+@@ -257,3 +257,24 @@ nvk_edb_bview_cache_get_descriptor(struct nvk_device *dev,
+       .oob_alpha = oob_alpha,
+    };
+ }
++
++bool
++nvk_edb_bview_cache_lookup_index(struct nvk_device *dev,
++                                 struct nvk_edb_bview_cache *cache,
++                                 uint32_t index, uint64_t *base_addr_out,
++                                 enum pipe_format *format_out)
++{
++   if (cache->cache == NULL || index == 0)
++      return false;
++   hash_table_foreach(cache->cache, entry) {
++      if ((uint32_t)(uintptr_t)entry->data != index)
++         continue;
++      struct bvdesc_key key;
++      memcpy(&key, &entry->key, sizeof(key));
++      *base_addr_out = base_addr_for_chunk(dev, key.chunk, key.format) +
++                       key.rgb_offset;
++      *format_out = key.format;
++      return true;
++   }
++   return false;
++}
+diff --git a/src/nouveau/vulkan/nvk_edb_bview_cache.h b/src/nouveau/vulkan/nvk_edb_bview_cache.h
+index a764d10..84eaf91 100644
+--- a/src/nouveau/vulkan/nvk_edb_bview_cache.h
++++ b/src/nouveau/vulkan/nvk_edb_bview_cache.h
+@@ -64,4 +64,14 @@ nvk_edb_bview_cache_get_descriptor(struct nvk_device *dev,
+                                    uint64_t base_addr, uint64_t size_B,
+                                    enum pipe_format format);
+ 
++/* The base address and format of the HW descriptor at index in the image
++ * table, if the cache made it (NVK_DISPATCH_CAPTURE: an EDB buffer view
++ * descriptor back to its memory).  Walks the whole cache.
++ */
++bool
++nvk_edb_bview_cache_lookup_index(struct nvk_device *dev,
++                                 struct nvk_edb_bview_cache *cache,
++                                 uint32_t index, uint64_t *base_addr_out,
++                                 enum pipe_format *format_out);
++
+ #endif /* NVK_EDB_BVIEW_CACHE_H */
+diff --git a/src/nouveau/vulkan/nvk_image_view.c b/src/nouveau/vulkan/nvk_image_view.c
+index 34d202f..631fd5f 100644
+--- a/src/nouveau/vulkan/nvk_image_view.c
++++ b/src/nouveau/vulkan/nvk_image_view.c
+@@ -5,6 +5,7 @@
+ #include "nvk_image_view.h"
+ 
+ #include "nvk_device.h"
++#include "nvk_dispatch_capture.h"
+ #include "nvk_entrypoints.h"
+ #include "nvk_format.h"
+ #include "nvk_image.h"
+@@ -297,6 +298,8 @@ nvk_image_view_init(struct nvk_device *dev,
+       }
+    }
+ 
++   nvk_dcap_note_image_view(dev, view);
++
+    return VK_SUCCESS;
+ }
+ 
+@@ -312,6 +315,8 @@ void
+ nvk_image_view_finish(struct nvk_device *dev,
+                       struct nvk_image_view *view)
+ {
++   nvk_dcap_forget_image_view(dev, view);
++
+    for (uint8_t plane = 0; plane < view->plane_count; plane++) {
+       nvk_image_view_descriptor_finish(dev, &view->planes[plane].sampled);
+       nvk_image_view_descriptor_finish(dev, &view->planes[plane].storage);
+diff --git a/src/nouveau/vulkan/nvk_sampler.c b/src/nouveau/vulkan/nvk_sampler.c
+index 32f7f9b..9a41ebd 100644
+--- a/src/nouveau/vulkan/nvk_sampler.c
++++ b/src/nouveau/vulkan/nvk_sampler.c
+@@ -5,6 +5,7 @@
+ #include "nvk_sampler.h"
+ 
+ #include "nvk_device.h"
++#include "nvk_dispatch_capture.h"
+ #include "nvk_entrypoints.h"
+ #include "nvk_physical_device.h"
+ 
+@@ -353,6 +354,7 @@ nvk_CreateSampler(VkDevice device,
+          }
+ 
+          sampler->planes[0].desc_index = desc_index;
++         nvk_dcap_note_sampler(dev, desc_index, &state);
+       }
+    }
+ 
+@@ -421,6 +423,7 @@ nvk_DestroySampler(VkDevice device,
+ 
+    if (dev->nvkmd) {
+       for (uint8_t plane = 0; plane < sampler->plane_count; plane++) {
++         nvk_dcap_forget_sampler(dev, sampler->planes[plane].desc_index);
+          nvk_descriptor_table_remove(dev, &dev->samplers,
+                                      sampler->planes[plane].desc_index);
+       }
+diff --git a/src/nouveau/vulkan/nvk_shader.c b/src/nouveau/vulkan/nvk_shader.c
+index 05b2e51..ca869fb 100644
+--- a/src/nouveau/vulkan/nvk_shader.c
++++ b/src/nouveau/vulkan/nvk_shader.c
+@@ -16,6 +16,7 @@
+ #include "nvk_physical_device.h"
+ #include "nvk_sampler.h"
+ #include "nvk_shader.h"
++#include "nvk_dispatch_capture.h"
+ 
+ #include "vk_nir_convert_ycbcr.h"
+ #include "vk_pipeline.h"
+@@ -1249,6 +1250,7 @@ nvk_shader_destroy(struct vk_device *vk_dev,
+    struct nvk_shader *shader = container_of(vk_shader, struct nvk_shader, vk);
+ 
+    vk_free2(&dev->vk.alloc, pAllocator, shader->push_dw);
++   nvk_dcap_recipe_free(shader->dcap_recipe);
+ 
+    if (shader->upload_size > 0) {
+       nvk_heap_free(dev, &dev->shader_heap,
+diff --git a/src/nouveau/vulkan/nvk_shader.h b/src/nouveau/vulkan/nvk_shader.h
+index 31940a3..a4f9015 100644
+--- a/src/nouveau/vulkan/nvk_shader.h
++++ b/src/nouveau/vulkan/nvk_shader.h
+@@ -155,6 +155,11 @@ struct nvk_shader {
+     * its first profiled dispatch (0: not yet)
+     */
+    uint32_t dispatch_profile_sig;
++
++   /* NVK_DISPATCH_CAPTURE: what the SPIR-V reads, for a shader whose source
++    * hash is listed (nvk_dispatch_capture.c), else NULL
++    */
++   struct nvk_dcap_recipe *dcap_recipe;
+ };
+ 
+ VK_DEFINE_NONDISP_HANDLE_CASTS(nvk_shader, vk.base, VkShaderEXT,
+diff --git a/src/vulkan/runtime/vk_device.h b/src/vulkan/runtime/vk_device.h
+index ce975c0..c17155e 100644
+--- a/src/vulkan/runtime/vk_device.h
++++ b/src/vulkan/runtime/vk_device.h
+@@ -42,6 +42,8 @@ extern "C" {
+ struct vk_acceleration_structure_build_ops;
+ struct vk_command_buffer_ops;
+ struct vk_device_shader_ops;
++struct vk_pipeline_layout;
++struct vk_shader;
+ struct vk_sync_signal;
+ struct vk_sync_wait;
+ 
+@@ -143,6 +145,17 @@ struct vk_device {
+    /** Shader vtable for VK_EXT_shader_object and common pipelines */
+    const struct vk_device_shader_ops *shader_ops;
+ 
++   /** Called by the common compute pipeline code for every compute pipeline
++    * it creates from SPIR-V, after the shader has its source hash
++    * (vk_shader::src_hash), with the SPIR-V and the pipeline layout (which
++    * may be NULL).  The shader may come from a cache and be shared with
++    * earlier pipelines.  NULL: not called.
++    */
++   void (*compute_spirv_hook)(struct vk_device *device,
++                              struct vk_shader *shader,
++                              const uint32_t *spirv, size_t spirv_size_B,
++                              const struct vk_pipeline_layout *layout);
++
+    /** Acceleration structure build vtable for common BVH building. */
+    const struct vk_acceleration_structure_build_ops *as_build_ops;
+ 
+diff --git a/src/vulkan/runtime/vk_pipeline.c b/src/vulkan/runtime/vk_pipeline.c
+index fbca8c0..5538199 100644
+--- a/src/vulkan/runtime/vk_pipeline.c
++++ b/src/vulkan/runtime/vk_pipeline.c
+@@ -2774,11 +2774,17 @@ vk_create_compute_pipeline(struct vk_device *device,
+          goto fail_pipeline;
+ 
+       /* Once per shader: a cache hit shares the shader object */
+-      if (stage.shader != NULL && stage.shader->src_hash == 0) {
++      if (stage.shader != NULL &&
++          (stage.shader->src_hash == 0 || device->compute_spirv_hook)) {
+          size_t spirv_size = 0;
+          const uint32_t *spirv = vk_stage_spirv(&pCreateInfo->stage,
+                                                 &spirv_size);
+-         stage.shader->src_hash = vk_spirv_source_hash(spirv, spirv_size);
++         if (stage.shader->src_hash == 0)
++            stage.shader->src_hash = vk_spirv_source_hash(spirv, spirv_size);
++         if (device->compute_spirv_hook != NULL && spirv != NULL) {
++            device->compute_spirv_hook(device, stage.shader, spirv,
++                                       spirv_size, pipeline_layout);
++         }
+       }
+    }
+ 
+-- 
+2.43.0
+
