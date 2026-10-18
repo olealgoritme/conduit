@@ -571,6 +571,26 @@ pub(crate) fn nvk_blt_fence() -> bool {
     *CELL.get_or_init(|| env_bool("HELIOS_NVK_BLT_FENCE").unwrap_or_else(|| NVK_BLT_FENCE.get()))
 }
 
+/// `NvkBltGpuCopy`: 0 (default) = a windowed blt-model present without a DXGI destination is
+/// copied into the window's redirection surface by the KMD (its copy engine, behind the frame).
+/// 1 = the UMD copies the frame into that surface itself, on the app's own NVK queue right after
+/// the frame (the KMD names the surface, `HELIOS_ESCAPE_BLT_TARGET`, and the app imports it by
+/// resource id), and the present carries the frame's RM fence plus the `HOWW` tag: the KMD
+/// completes the Blt with no copy and no read-ledger claim, and the present retires when the
+/// fence fires. No CPU wait for the frame on the presenting thread. Any step that cannot be taken
+/// (no surface recorded yet, an import that fails, a format pair it does not cover, no RM fence)
+/// leaves that present to the KMD's copy as with 0. `HELIOS_NVK_BLT_GPU_COPY` overrides it per
+/// process.
+pub(crate) static NVK_BLT_GPU_COPY: BoolKnob = BoolKnob::new(c"NvkBltGpuCopy", false);
+
+/// `NvkBltGpuCopy`, or `HELIOS_NVK_BLT_GPU_COPY` from the environment.
+pub(crate) fn nvk_blt_gpu_copy() -> bool {
+    static CELL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CELL.get_or_init(|| {
+        env_bool("HELIOS_NVK_BLT_GPU_COPY").unwrap_or_else(|| NVK_BLT_GPU_COPY.get())
+    })
+}
+
 /// `NvkRmCopyRecord`: 1 (default) = a composed NVK frame whose WDDM present
 /// carries an RM fence also carries the copy-engine Present record (`'HEF3'`,
 /// the 168-byte `HERF` / 192-byte `HEPR`, docs/rm-copy-engine-present.md 12)

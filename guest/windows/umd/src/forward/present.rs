@@ -789,6 +789,12 @@ impl RuntimeSubmission {
                 helios_protocol::HELIOS_ONSCANOUT_HERF_BYTES as u32,
                 "Present",
             ),
+            // The window-written tag in the same slot, behind the fence tail: 72 bytes
+            // (`protocol/src/window_copy.rs`).
+            Self::MarkerPresent { correlation, .. } if window_written_tag(*correlation).is_some() => (
+                helios_protocol::HELIOS_WINDOW_WRITTEN_HERF_BYTES as u32,
+                "Present",
+            ),
             // The copy-engine record at 72, behind the zero on-scanout slot:
             // 168 bytes.
             Self::MarkerPresent { correlation, .. } if rm_copy_record(*correlation).is_some() => (
@@ -883,7 +889,23 @@ fn rm_copy_record(
 ) -> Option<helios_protocol::HeliosRmFenceTailV3> {
     let tail = rm_fence_tail(correlation)?;
     let record = correlation.rm_copy?;
-    (correlation.on_scanout.is_none() && record.matches_fence(&tail)).then_some(record)
+    (correlation.on_scanout.is_none()
+        && correlation.window_written.is_none()
+        && record.matches_fence(&tail))
+    .then_some(record)
+}
+
+/// The window-written tag of a present marker (`NvkBltGpuCopy`, `protocol/src/window_copy.rs`):
+/// only behind a fence tail (the fence orders the producer's copy before the KMD retires the
+/// present) and never with the on-scanout claim (the two share bytes 48..72).
+fn window_written_tag(
+    correlation: PresentStreamCorrelation,
+) -> Option<helios_protocol::HeliosWindowWrittenTag> {
+    rm_fence_tail(correlation)?;
+    if correlation.on_scanout.is_some() {
+        return None;
+    }
+    correlation.window_written
 }
 
 /// Submit a runtime-owned WDDM command buffer.
@@ -986,6 +1008,17 @@ pub(crate) unsafe fn submit_runtime_submission(
                 (command as *mut helios_protocol::HeliosPresentRefreshCmdOnScanout)
                     .write_unaligned(onscanout_marker(correlation, claim));
                 NVK_ONSCANOUT_TAGGED.fetch_add(1, Ordering::Relaxed);
+            } else if let (Some(tail), Some(tag)) =
+                (rm_fence_tail(correlation), window_written_tag(correlation))
+            {
+                (command as *mut helios_protocol::HeliosPresentRefreshCmdWindowWritten)
+                    .write_unaligned(helios_protocol::HeliosPresentRefreshCmdWindowWritten {
+                        base: helios_protocol::HeliosPresentRefreshCmdFence {
+                            base: present_refresh_cmd(correlation),
+                            fence: tail,
+                        },
+                        tag,
+                    });
             } else if let (Some(tail), Some(record)) =
                 (rm_fence_tail(correlation), rm_copy_record(correlation))
             {
@@ -2226,12 +2259,25 @@ unsafe fn nvk_present_impl_timed(
     t: &mut present_timing::Stamps,
 ) -> i32 {
     let mut shown = src_h;
+    let present_flags = *(&a.Flags as *const ddi::DXGI_DDI_PRESENT_FLAGS as *const u32);
+    // `NvkBltGpuCopy`: the tag of a frame this queue copied into the window's redirection
+    // surface itself (recorded below, before the flush, so the frame's RM fence follows it).
+    let mut window_tag: Option<helios_protocol::HeliosWindowWrittenTag> = None;
     // `NvkSkipBltCopy` (A/B, off by default): the KMD's Blt reads `src_h` and writes the window's
     // surface itself; the UMD's copy into DXGI's destination is then the same pixels twice.
     let skip_copy = crate::knobs::nvk_skip_blt_copy();
     if let Some(context) = d3d11_context(h) {
         if skip_copy {
             // Nothing copied: `shown` stays the source.
+        } else if dst_h.pDrvPrivate.is_null()
+            && nvk_blt_model(present_flags)
+            && crate::knobs::nvk_blt_gpu_copy()
+        {
+            // No DXGI destination: the window's surface is the KMD's Blt destination. Copy the
+            // frame into it here, on this queue, when the KMD names it.
+            window_tag = present_timing::sub(0, || {
+                nvk_window_copy(h, &context, src_h, a.SrcSubResourceIndex)
+            });
         } else if let (Some(dst), Some(src)) = (load_resource(dst_h), load_resource(src_h)) {
             present_timing::sub(0, || {
                 context.CopySubresourceRegion(
@@ -2262,11 +2308,12 @@ unsafe fn nvk_present_impl_timed(
         }
     }
     t.mark(0);
-    let present_flags = *(&a.Flags as *const ddi::DXGI_DDI_PRESENT_FLAGS as *const u32);
+    // A frame this queue copied into the window itself carries the RM fence like a blt-model
+    // frame under `NvkBltFence`: nothing reads its source after the present but this queue.
     let dwm_reads_source = nvk_dwm_reads_source(
         dst_h.pDrvPrivate.is_null(),
         present_flags,
-        crate::knobs::nvk_blt_fence(),
+        crate::knobs::nvk_blt_fence() || window_tag.is_some(),
     );
     let frame = match nvk_present_frame(h, shown, src_h, dwm_reads_source) {
         Ok(f) => f,
@@ -2276,16 +2323,30 @@ unsafe fn nvk_present_impl_timed(
     if !nvk_scanout_compose(frame) {
         return 0;
     }
-    // The KMD's Blt copy of this source may still be queued when Present
-    // returns (BltAsync), and nothing else orders the next frame's NVK writes
-    // into it after that copy: tag it so DXVK's next command lists that touch
-    // it wait for the KMD's read-ledger claim (zero-copy-present.md 24.10.3).
-    // Once per resource; later calls are an atomic load in the bridge.
-    if let (Some(dev), Some(src)) = (helios_device(h), load_resource(src_h)) {
+    let mut correlation = frame.correlation;
+    // The tag rides only a marker with the frame's RM fence (the KMD retires the present on it,
+    // after the copy) and no on-scanout claim; it replaces the copy-engine record (the KMD copies
+    // nothing). A frame that got no fence (the CPU wait above: the copy is complete) is the
+    // ordinary Blt: the KMD copies the same pixels again.
+    let window_written = window_tag.filter(|_| {
+        correlation.on_scanout.is_none() && rm_fence_tail(correlation).is_some()
+    });
+    nvk_note_window_present(window_tag.is_some(), window_written.is_some());
+    if window_written.is_some() {
+        correlation.window_written = window_written;
+        correlation.rm_copy = None;
+    } else if let (Some(dev), Some(src)) = (helios_device(h), load_resource(src_h)) {
+        // The KMD's Blt copy of this source may still be queued when Present
+        // returns (BltAsync), and nothing else orders the next frame's NVK writes
+        // into it after that copy: tag it so DXVK's next command lists that touch
+        // it wait for the KMD's read-ledger claim (zero-copy-present.md 24.10.3).
+        // Once per resource; later calls are an atomic load in the bridge. A
+        // window-written frame makes no claim (the KMD reads nothing), so it is
+        // not marked: the next frame's writes follow this queue's copy in queue
+        // order.
         let _ = dev.dxvk.mark_blt_source(src.as_raw() as usize);
     }
     t.mark(2);
-    let correlation = frame.correlation;
     let result = finish_present(
         h,
         src_h,
@@ -2307,6 +2368,290 @@ unsafe fn nvk_present_impl_timed(
         Ok(hr) => hr,
         Err(hr) => hr,
     }
+}
+
+/// A windowed blt-model present: DXGI's `Blt` flag without `Flip`.
+fn nvk_blt_model(present_flags: u32) -> bool {
+    present_flags & DXGI_PRESENT_FLAG_BLT != 0 && present_flags & DXGI_PRESENT_FLAG_FLIP == 0
+}
+
+/// `NvkBltGpuCopy` counters: presents that tried the copy, copies recorded, presents tagged,
+/// and the reasons a present fell back to the KMD's copy.
+static NVK_WINDOW_TRIED: AtomicUsize = AtomicUsize::new(0);
+static NVK_WINDOW_COPIED: AtomicUsize = AtomicUsize::new(0);
+static NVK_WINDOW_TAGGED: AtomicUsize = AtomicUsize::new(0);
+static NVK_WINDOW_NO_TARGET: AtomicUsize = AtomicUsize::new(0);
+static NVK_WINDOW_FORMAT: AtomicUsize = AtomicUsize::new(0);
+static NVK_WINDOW_IMPORT_FAILED: AtomicUsize = AtomicUsize::new(0);
+static NVK_WINDOW_COPY_FAILED: AtomicUsize = AtomicUsize::new(0);
+static NVK_WINDOW_NO_FENCE: AtomicUsize = AtomicUsize::new(0);
+
+/// Count one present of the window-copy path and log the totals every 4096.
+fn nvk_note_window_present(copied: bool, tagged: bool) {
+    if copied && !tagged {
+        NVK_WINDOW_NO_FENCE.fetch_add(1, Ordering::Relaxed);
+    }
+    if tagged {
+        NVK_WINDOW_TAGGED.fetch_add(1, Ordering::Relaxed);
+    }
+    let n = NVK_WINDOW_TRIED.load(Ordering::Relaxed);
+    if n == 1 || (n != 0 && n % 4096 == 0) {
+        log_error!(
+            "NvkBltGpuCopy: {n} windowed blt-model presents, {} copied into the window by this \
+             queue, {} tagged (no target {}, format {}, import failed {}, copy refused {}, no RM \
+             fence {})",
+            NVK_WINDOW_COPIED.load(Ordering::Relaxed),
+            NVK_WINDOW_TAGGED.load(Ordering::Relaxed),
+            NVK_WINDOW_NO_TARGET.load(Ordering::Relaxed),
+            NVK_WINDOW_FORMAT.load(Ordering::Relaxed),
+            NVK_WINDOW_IMPORT_FAILED.load(Ordering::Relaxed),
+            NVK_WINDOW_COPY_FAILED.load(Ordering::Relaxed),
+            NVK_WINDOW_NO_FENCE.load(Ordering::Relaxed),
+        );
+    }
+}
+
+/// The copy a window-written frame needs for this source / surface format pair: `Some(false)` a
+/// plain copy (the same format), `Some(true)` a conversion between the 8-bit UNORM layouts the
+/// KMD's copy engine also swizzles between (RGBA, BGRA, BGRX), `None` anything else (left to the
+/// KMD's copy).
+fn nvk_window_copy_kind(src_format: u32, dst_format: u32) -> Option<bool> {
+    const RGBA8_UNORM: u32 = 28;
+    const BGRA8_UNORM: u32 = 87;
+    const BGRX8_UNORM: u32 = 88;
+    let unorm8 = |f: u32| matches!(f, RGBA8_UNORM | BGRA8_UNORM | BGRX8_UNORM);
+    if src_format == 0 || dst_format == 0 {
+        None
+    } else if src_format == dst_format {
+        Some(false)
+    } else if unorm8(src_format) && unorm8(dst_format) {
+        Some(true)
+    } else {
+        None
+    }
+}
+
+/// How many window surfaces a device keeps imported (one window per device is the normal case;
+/// the newest are kept).
+const NVK_WINDOW_TARGETS: usize = 2;
+
+/// The window surface the KMD named in `q`, imported into this device by resource id, from the
+/// device's cache or imported now. `None`: the import failed (remembered, not retried while it
+/// is the target).
+unsafe fn nvk_window_target(
+    dev: &HeliosDevice,
+    q: &helios_protocol::HeliosBltTargetQuery,
+) -> Option<ID3D11Resource> {
+    let matches = |t: &crate::device_funcs::WindowTarget| {
+        t.destination == q.out_destination_resource_id
+            && t.width == q.out_width
+            && t.height == q.out_height
+            && t.dxgi_format == q.out_dxgi_format
+    };
+    {
+        let targets = dev.owned.window_targets.borrow();
+        if let Some(t) = targets.iter().find(|&t| matches(t)) {
+            return t.resource.clone();
+        }
+    }
+    let imported = nvk_window_import(dev, q);
+    if imported.is_none() {
+        NVK_WINDOW_IMPORT_FAILED.fetch_add(1, Ordering::Relaxed);
+    }
+    let mut targets = dev.owned.window_targets.borrow_mut();
+    while targets.len() >= NVK_WINDOW_TARGETS {
+        // The oldest goes (its texture is released; DXVK keeps it alive for queued work).
+        targets.remove(0);
+    }
+    targets.push(crate::device_funcs::WindowTarget {
+        destination: q.out_destination_resource_id,
+        width: q.out_width,
+        height: q.out_height,
+        dxgi_format: q.out_dxgi_format,
+        resource: imported.clone(),
+    });
+    imported
+}
+
+/// Import the window surface of `q` by resource id, as DWM's open of it does (the KMD's
+/// foreign layout record: LINEAR, the surface's pitch). The KMD allows the import because this
+/// process's Blts land in that surface.
+unsafe fn nvk_window_import(
+    dev: &HeliosDevice,
+    q: &helios_protocol::HeliosBltTargetQuery,
+) -> Option<ID3D11Resource> {
+    let layout = crate::bridge::ForeignLayout {
+        modifier: q.out_modifier,
+        stride: q.out_pitch,
+        offset: q.out_offset,
+        fourcc: q.out_fourcc,
+        plane1_modifier: 0,
+        plane1_stride: 0,
+        plane1_offset: 0,
+    };
+    let bind = D3D11_BIND_RENDER_TARGET.0 as u32 | D3D11_BIND_SHADER_RESOURCE.0 as u32;
+    let res = dev.dxvk.open_texture2d(
+        q.out_width,
+        q.out_height,
+        q.out_dxgi_format,
+        bind,
+        0,
+        // Nonzero selects the import; the resource id is the identity.
+        q.out_destination_resource_id,
+        q.out_destination_resource_id,
+        q.out_alloc_size,
+        q.out_memory_type_index,
+        0,
+        false,
+        false,
+        false,
+        false,
+        0,
+        false,
+        Some(layout),
+    );
+    let Some(res) = res else {
+        log_error!(
+            "NvkBltGpuCopy: import of window surface res_id={} {}x{} fmt={} failed",
+            q.out_destination_resource_id,
+            q.out_width,
+            q.out_height,
+            q.out_dxgi_format
+        );
+        return None;
+    };
+    // A failed foreign import comes back as a blank placeholder (no MISC_SHARED, the bridge's
+    // fallback for openers): never copy into one, the window would never update.
+    let mut desc = D3D11_TEXTURE2D_DESC::default();
+    match res.cast::<ID3D11Texture2D>() {
+        Ok(tex) => tex.GetDesc(&mut desc),
+        Err(_) => return None,
+    }
+    if desc.MiscFlags & D3D11_RESOURCE_MISC_SHARED.0 as u32 == 0
+        || desc.Width != q.out_width
+        || desc.Height != q.out_height
+    {
+        log_error!(
+            "NvkBltGpuCopy: window surface res_id={} did not import (placeholder {}x{} misc=0x{:x})",
+            q.out_destination_resource_id,
+            desc.Width,
+            desc.Height,
+            desc.MiscFlags
+        );
+        return None;
+    }
+    log_error!(
+        "NvkBltGpuCopy: window surface res_id={} {}x{} fmt={} pitch={} imported",
+        q.out_destination_resource_id,
+        q.out_width,
+        q.out_height,
+        q.out_dxgi_format,
+        q.out_pitch
+    );
+    Some(res)
+}
+
+/// `NvkBltGpuCopy`: copy this windowed blt-model frame into the window's redirection surface on
+/// this device's immediate context, before the present's flush, so the frame's RM fence (signalled
+/// after the flushed work) follows the copy. The KMD names the surface and the exact rectangles
+/// (`HELIOS_ESCAPE_BLT_TARGET`, from its record of the last Blt of this source); the tag returned
+/// tells it the Blt is done. `None`: nothing was recorded, and the present is the KMD's ordinary
+/// Blt (no target yet, an unsupported format pair, a failed import, a refused copy).
+///
+/// The back buffer cannot be overwritten before this copy runs: the app's later work is recorded
+/// on this queue after it.
+unsafe fn nvk_window_copy(
+    h: Hdevice,
+    context: &ID3D11DeviceContext,
+    src_h: ddi::D3D10DDI_HRESOURCE,
+    src_subresource: u32,
+) -> Option<helios_protocol::HeliosWindowWrittenTag> {
+    NVK_WINDOW_TRIED.fetch_add(1, Ordering::Relaxed);
+    let dev = helios_device(h)?;
+    let source = nvk_source_resource_id(src_h).filter(|id| *id != 0);
+    let Some(q) = source.and_then(|id| crate::scanout_acquire::blt_target(dev, id)) else {
+        NVK_WINDOW_NO_TARGET.fetch_add(1, Ordering::Relaxed);
+        return None;
+    };
+    let source = source?;
+    let Some(convert) =
+        nvk_window_copy_kind(resource_dxgi_format(src_h).0 as u32, q.out_dxgi_format)
+    else {
+        NVK_WINDOW_FORMAT.fetch_add(1, Ordering::Relaxed);
+        return None;
+    };
+    let src = load_resource(src_h)?;
+    // The rectangle must lie in a single-sampled, single-subresource source.
+    let mut sd = D3D11_TEXTURE2D_DESC::default();
+    match (*src).cast::<ID3D11Texture2D>() {
+        Ok(tex) => tex.GetDesc(&mut sd),
+        Err(_) => {
+            NVK_WINDOW_COPY_FAILED.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+    }
+    let (left, top) = (q.out_src_left, q.out_src_top);
+    let (right, bottom) = (
+        left.checked_add(q.out_copy_width)?,
+        top.checked_add(q.out_copy_height)?,
+    );
+    if src_subresource != 0
+        || sd.SampleDesc.Count != 1
+        || right > sd.Width
+        || bottom > sd.Height
+    {
+        NVK_WINDOW_COPY_FAILED.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    let dst = nvk_window_target(dev, &q)?;
+    if convert {
+        let rc = dev.dxvk.dxgi_blt_convert(
+            DstRes(dst.as_raw() as usize),
+            0,
+            q.out_dst_left,
+            q.out_dst_top,
+            SrcRes(src.as_raw() as usize),
+            0,
+            true,
+            left,
+            top,
+            right,
+            bottom,
+        );
+        if rc != 0 {
+            NVK_WINDOW_COPY_FAILED.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+    } else {
+        let bx = D3D11_BOX {
+            left,
+            top,
+            front: 0,
+            right,
+            bottom,
+            back: 1,
+        };
+        context.CopySubresourceRegion(
+            &dst,
+            0,
+            q.out_dst_left,
+            q.out_dst_top,
+            0,
+            &*src,
+            0,
+            Some(&bx as *const D3D11_BOX),
+        );
+    }
+    NVK_WINDOW_COPIED.fetch_add(1, Ordering::Relaxed);
+    Some(helios_protocol::HeliosWindowWrittenTag {
+        magic: helios_protocol::HELIOS_WINDOW_WRITTEN_MAGIC,
+        version: helios_protocol::HELIOS_WINDOW_WRITTEN_VERSION,
+        flags: 0,
+        source_resource_id: source,
+        destination_resource_id: q.out_destination_resource_id,
+        ticket: q.out_ticket,
+        reserved: 0,
+    })
 }
 
 pub(crate) unsafe extern "system" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT) -> i32 {
@@ -3775,6 +4120,32 @@ mod nvk_frame_composes_tests {
         assert!(!nvk_frame_composes(true, None, 0));
         // DWM that does not import NVK surfaces composes nothing.
         assert!(!nvk_frame_composes(false, Some(7), 1));
+    }
+}
+
+#[cfg(test)]
+mod nvk_window_copy_tests {
+    use super::{nvk_blt_model, nvk_window_copy_kind, DXGI_PRESENT_FLAG_BLT, DXGI_PRESENT_FLAG_FLIP};
+
+    #[test]
+    fn only_blt_model_presents_take_the_window_copy() {
+        assert!(nvk_blt_model(DXGI_PRESENT_FLAG_BLT));
+        assert!(!nvk_blt_model(DXGI_PRESENT_FLAG_FLIP));
+        assert!(!nvk_blt_model(DXGI_PRESENT_FLAG_BLT | DXGI_PRESENT_FLAG_FLIP));
+        assert!(!nvk_blt_model(0));
+    }
+
+    #[test]
+    fn format_pairs() {
+        assert_eq!(nvk_window_copy_kind(87, 87), Some(false));
+        assert_eq!(nvk_window_copy_kind(24, 24), Some(false));
+        assert_eq!(nvk_window_copy_kind(28, 87), Some(true));
+        assert_eq!(nvk_window_copy_kind(87, 88), Some(true));
+        // sRGB, 10-bit, unknown: the KMD's copy.
+        assert_eq!(nvk_window_copy_kind(29, 87), None);
+        assert_eq!(nvk_window_copy_kind(24, 87), None);
+        assert_eq!(nvk_window_copy_kind(0, 87), None);
+        assert_eq!(nvk_window_copy_kind(87, 0), None);
     }
 }
 

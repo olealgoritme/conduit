@@ -692,6 +692,12 @@ read = "once per process"
 effect = "0: a windowed blt-model present (DXGI's Blt flag) without a DXGI destination waits for the frame on the presenting thread before the WDDM present (the NvkComposedComplete CPU wait), so the present retires at once. 1: it carries the frame's RM fence and does not wait; the KMD's Blt into the window's redirection surface waits for the fence, but the present retires only after the KMD sees the copy done and dxgkrnl throttles the app (stutter). HELIOS_NVK_BLT_FENCE overrides it per process."
 see = "[dwm-on-nvk.md](dwm-on-nvk.md)"
 
+[umd.NvkBltGpuCopy]
+class = "tuning"
+read = "once per process"
+effect = "1: a windowed blt-model present without a DXGI destination copies the frame into the window's redirection surface on the app's own NVK queue right after the frame (the KMD names the surface, the app imports it by resource id) and carries the frame's RM fence plus the HOWW tag; the KMD completes the Blt with no copy and no read-ledger claim, and the present retires when the fence fires. No CPU wait on the presenting thread. A present the path cannot take (no surface recorded yet, a failed import, an unsupported format pair, no RM fence) is copied by the KMD as with 0. HELIOS_NVK_BLT_GPU_COPY overrides it per process."
+see = "[dwm-on-nvk.md](dwm-on-nvk.md)"
+
 [umd.NvkComposedComplete]
 class = "supported"
 read = "once per process"
@@ -1073,6 +1079,11 @@ see = "[shared-surfaces.md](../guest/windows/docs/shared-surfaces.md)"
 class = "debug"
 read = "once per process"
 effect = "0 or 1 overrides HKLM\\SOFTWARE\\Helios NvkAsyncPresentFence for this process."
+
+[env.HELIOS_NVK_BLT_GPU_COPY]
+class = "debug"
+read = "once per process"
+effect = "0 or 1 overrides HKLM\\SOFTWARE\\Helios NvkBltGpuCopy for this process."
 
 [env.HELIOS_NVK_BLT_FENCE]
 class = "debug"

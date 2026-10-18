@@ -116,6 +116,11 @@ pub struct ContextContext {
     /// relaxed atomic and take the lock only for a context that carries a tag.
     onscanout_tag: crate::sync::SpinLock<Option<helios_kmd_logic::onscanout::Tag>>,
     onscanout_flag: AtomicU32,
+    /// The window-written tag (`HOWW`, `ddi/window_copy.rs`) the last `HERF` Render parsed, for
+    /// the Present that follows on this context; same pairing, orphan bound and lock-free flag as
+    /// the on-scanout tag.
+    window_tag: crate::sync::SpinLock<Option<helios_kmd_logic::window_copy::Tag>>,
+    window_flag: AtomicU32,
     /// The copy-engine Present record (`'HEF3'`, `ddi/ce_record.rs`) the last `HERF` / `HEPR`
     /// Render with an attached RM fence parsed, keyed by that fence's boundary so the Present that
     /// carries the same boundary (`StashedMarker::Resolved`) is the only one it can pair with.
@@ -304,6 +309,33 @@ impl<'a> ContextHandleRef<'a> {
         let mut slot = ctx.onscanout_tag.lock();
         let tag = slot.take();
         ctx.onscanout_flag.store(0, Ordering::Relaxed);
+        tag
+    }
+
+    /// Replace the stashed window-written tag with `tag` (`None` clears it). Returns true if a tag
+    /// no Present took was thrown away (an orphan). One relaxed load when there is nothing to do.
+    pub fn stash_window_tag(&self, tag: Option<helios_kmd_logic::window_copy::Tag>) -> bool {
+        let ctx = self.context;
+        if tag.is_none() && ctx.window_flag.load(Ordering::Relaxed) == 0 {
+            return false;
+        }
+        let mut slot = ctx.window_tag.lock();
+        let orphan = slot.is_some();
+        *slot = tag;
+        ctx.window_flag.store(u32::from(tag.is_some()), Ordering::Relaxed);
+        orphan
+    }
+
+    /// Take (read + clear) the stashed window-written tag: the Present's half of the pairing,
+    /// called on every Present that resolves its context. One relaxed load for an untagged one.
+    pub fn take_window_tag(&self) -> Option<helios_kmd_logic::window_copy::Tag> {
+        let ctx = self.context;
+        if ctx.window_flag.load(Ordering::Relaxed) == 0 {
+            return None;
+        }
+        let mut slot = ctx.window_tag.lock();
+        let tag = slot.take();
+        ctx.window_flag.store(0, Ordering::Relaxed);
         tag
     }
 
@@ -654,6 +686,8 @@ pub unsafe extern "C" fn dxgkddi_create_context(
         present_stream_marker: crate::sync::SpinLock::new(None),
         onscanout_tag: crate::sync::SpinLock::new(None),
         onscanout_flag: AtomicU32::new(0),
+        window_tag: crate::sync::SpinLock::new(None),
+        window_flag: AtomicU32::new(0),
         ce_record: crate::sync::SpinLock::new(None),
         ce_record_flag: AtomicU32::new(0),
         execution_stream: AtomicU64::new(0),

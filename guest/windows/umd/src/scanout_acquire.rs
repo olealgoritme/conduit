@@ -404,6 +404,52 @@ pub(crate) fn windowed_snapshot_idle(dev: &HeliosDevice, resource_id: u32) -> bo
     hr == 0 && payload.out_state == HELIOS_SNAPSHOT_IDLE
 }
 
+/// `HELIOS_ESCAPE_BLT_TARGET` (`NvkBltGpuCopy`): where the KMD's windowed Blt of the back buffer
+/// `source_resource_id` lands for this process. `None` when the KMD has no record (no Blt of it
+/// seen yet), does not know the verb (an older KMD: asked once, then never again), or the escape
+/// fails. One escape on this device's callback, no wait in the KMD.
+pub(crate) fn blt_target(
+    dev: &HeliosDevice,
+    source_resource_id: u32,
+) -> Option<helios_protocol::HeliosBltTargetQuery> {
+    // 0 unknown, 1 served, 2 refused once (an older KMD): never asked again.
+    static SERVED: AtomicU32 = AtomicU32::new(0);
+    if source_resource_id == 0 || SERVED.load(Ordering::Relaxed) == 2 {
+        return None;
+    }
+    let context = dev.context.as_ref()?;
+    let rt_adapter = dev.rt_adapter;
+    if rt_adapter == 0 || dev.kt_callbacks.is_null() {
+        return None;
+    }
+    let mut payload = helios_protocol::HeliosBltTargetQuery::new(source_resource_id);
+    // SAFETY: device/context and callback table outlive this DDI; payload is a writable stack
+    // struct with the exact advertised size.
+    let hr = unsafe {
+        call_escape(
+            dev.kt_callbacks,
+            rt_adapter,
+            dev.h_rt_device as usize,
+            context.handle.as_ptr() as usize,
+            (&mut payload as *mut helios_protocol::HeliosBltTargetQuery).cast(),
+            size_of::<helios_protocol::HeliosBltTargetQuery>() as u32,
+        )
+    };
+    if hr != 0 {
+        if SERVED.load(Ordering::Relaxed) == 0 {
+            SERVED.store(2, Ordering::Relaxed);
+            log_error!(
+                "NvkBltGpuCopy: HELIOS_ESCAPE_BLT_TARGET refused hr=0x{:08x}: the KMD copies \
+                 windowed blt-model frames",
+                hr as u32
+            );
+        }
+        return None;
+    }
+    SERVED.store(1, Ordering::Relaxed);
+    payload.found().then_some(payload)
+}
+
 /// Acquire-load one `u32` field of the mapped ledger page.
 ///
 /// # Safety

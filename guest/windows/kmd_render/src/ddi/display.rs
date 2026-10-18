@@ -380,6 +380,11 @@ unsafe fn dxgkddi_present_inner(
     let onscanout_tag = present_context
         .as_ref()
         .and_then(ContextHandleRef::take_onscanout_tag);
+    // The window-written tag (`HOWW`, `NvkBltGpuCopy`) the same Render left, taken on every Present
+    // that resolves its context, like the on-scanout tag.
+    let window_tag = present_context
+        .as_ref()
+        .and_then(ContextHandleRef::take_window_tag);
     let present_stream_boundary = stashed_stream_marker.and_then(|marker| {
         let (ctx_id, value, cookie) = match marker {
             // An RM fence attached at Render: only its boundary travels.
@@ -540,6 +545,50 @@ unsafe fn dxgkddi_present_inner(
                     dst_info,
                 )
             };
+        }
+        // The producer already wrote this Blt's destination (the window's VRAM redirection
+        // surface) on its own queue, before the RM fence this Present carries, and the KMD's record
+        // backs the claim (`ddi/window_copy.rs`): complete it with no copy and no read-ledger
+        // claim. Its DMA buffer keeps the fence's boundary, so it retires when the fence fires.
+        if let Some(tag) = window_tag {
+            let blt = present_arm == PresentArm::Blt
+                && present_flags & 1 != 0
+                && present_flags & (1 << 1) == 0
+                && stashed_snapshot.is_none();
+            let rects = match (src_info.as_ref(), dst_info.as_ref()) {
+                (Some(source), Some(destination)) => {
+                    crate::ddi::vram_redirect::rects(args, source, destination)
+                }
+                _ => None,
+            };
+            if crate::ddi::window_copy::decide(
+                present_context.as_ref(),
+                tag,
+                blt,
+                src_info.as_ref(),
+                dst_info.as_ref(),
+                rects,
+                present_stream_boundary.is_some(),
+            ) {
+                // SAFETY: `args` is this call's present struct and names the Blt arm.
+                let status = unsafe {
+                    present_blt_no_copy(
+                        args,
+                        present_allocations,
+                        present_stream_boundary,
+                        adapter,
+                        src_info,
+                        dst_info,
+                    )
+                };
+                if status == STATUS_SUCCESS {
+                    crate::diag::record_named_on_change(b"PBCpy", 9, &PB_CPY_LAST);
+                    crate::ddi::window_copy::note_skip();
+                } else {
+                    crate::ddi::window_copy::note_retry();
+                }
+                return status;
+            }
         }
         // dxgkrnl's independent-flip candidate presents (`RedirectedFlip` on the Blt arm,
         // `DdiPresentForIFlip`; only with `IndepFlip`). One with no destination has nothing to

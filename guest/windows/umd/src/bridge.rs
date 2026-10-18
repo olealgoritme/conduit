@@ -736,6 +736,12 @@ pub(crate) struct PresentStreamCorrelation {
     /// fence and no on-scanout claim; already checked against the fence and
     /// every rule the KMD applies (`helios_protocol::producer_record`).
     pub(crate) rm_copy: Option<helios_protocol::HeliosRmFenceTailV3>,
+    /// NVK (`NvkBltGpuCopy`): the frame's queue already copied it into the window's redirection
+    /// surface, ordered before the RM fence: the `HERF` marker carries the `HOWW` tag
+    /// (`protocol/src/window_copy.rs`) beside the fence so the KMD completes the Blt with no copy.
+    /// Only with an RM fence; it takes the place of the copy-engine record (the KMD copies
+    /// nothing) and never comes with an on-scanout claim.
+    pub(crate) window_written: Option<helios_protocol::HeliosWindowWrittenTag>,
 }
 
 /// The already-on-scanout claim: the KMD's own names for the frame.

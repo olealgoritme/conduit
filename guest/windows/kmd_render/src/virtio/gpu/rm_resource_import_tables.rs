@@ -6,13 +6,14 @@
 //! The rule itself is `helios_kmd_logic::rm_resource_import::authorize`.
 
 use super::*;
-use helios_kmd_logic::rm_resource_import::{authorize, authorize_kmd, Refusal};
+use helios_kmd_logic::rm_resource_import::{authorize_kmd, authorize_or_granted, Refusal};
 
 impl VirtioGpu {
     /// Whether `owner` may ask the host for a GEM handle of `resource_id` in its
     /// DRM file `rm_handle`: the handle is the caller's DRM node, the resource is
     /// a live foreign one the caller's device created or the caller's `process`
-    /// holds an open of, and it is not destroyed. The handle's `device_type` and
+    /// holds an open of (or `granted`: the caller's process presented into it, the
+    /// window-copy record), and it is not destroyed. The handle's `device_type` and
     /// the foreign record are read in the same hold, so neither can be stale
     /// against the other.
     ///
@@ -22,16 +23,18 @@ impl VirtioGpu {
         &self,
         owner: DeviceOwner,
         process: usize,
+        granted: bool,
         rm_handle: u32,
         resource_id: u32,
     ) -> Result<u64, Refusal> {
-        authorize(
+        authorize_or_granted(
             &self.foreign,
             self.nvrm_handle_device_type(owner, rm_handle),
             owner.raw() as u64,
             process as u64,
             rm_handle,
             resource_id,
+            granted,
         )?;
         Ok(self.nvrm_epoch())
     }

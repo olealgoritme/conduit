@@ -331,6 +331,9 @@ pub(crate) fn publish_nvrm_counters() {
     // (`HOSC`): `OsTag`, `OsSkip`, `OsRej` / `OsRejWhy` / `OsWhyMask`, `OsBytes`, `OsLast`, written
     // once a tag was seen.
     crate::ddi::onscanout::publish_counters();
+    // Windowed Blts the producer wrote itself (`HOWW`, `NvkBltGpuCopy`): `Gw*`, once anything
+    // happened.
+    crate::ddi::window_copy::publish_counters();
     // The asynchronous composed present and the dropped CPU mirror (`BltAsync`, `BltNoMirror`):
     // `BltAsync*`, `BltWait*`, `BltMirror*`, `BltNoMirInv`, written once an event happened.
     crate::ddi::blt_async::publish_counters();
@@ -2463,6 +2466,12 @@ pub unsafe extern "C" fn dxgkddi_render(
                 // SAFETY: `cmd_len` bytes are readable at `pCommand` (checked at the top).
                 unsafe {
                     crate::ddi::onscanout::note_render(context, args.pCommand as *const u8, cmd_len)
+                };
+                // The window-written tag (`HOWW`, `ddi/window_copy.rs`) in the same slot: stashed
+                // for the Present that follows, or (none) the stash cleared.
+                // SAFETY: as above.
+                unsafe {
+                    crate::ddi::window_copy::note_render(context, args.pCommand as *const u8, cmd_len)
                 };
             }
             if let Some(adapter) = context.as_ref().and_then(|c| c.adapter()) {

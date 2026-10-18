@@ -554,6 +554,34 @@ DWM cannot import RM video memory (run with `DwmIcd=nvk`); the synchronous uploa
 Present thread (bounded by `XFER_MS` 250 ms plus `IO_MS` 2 s of RM I/O for the first bounce allocation);
 sub-rectangles (`pDstSubRects`) are covered by copying the whole `DstRect`.
 
+### 5.10 The producer's own copy (`NvkBltGpuCopy`, UMD knob, default 0)
+
+With `NvkBltGpuCopy` 1 an NVK app writes its windowed blt-model frame into the window's VRAM
+redirection surface itself, on its own queue, and the KMD's Blt copies nothing:
+
+| step | where | what |
+|---|---|---|
+| record | `ddi/vram_redirect.rs` `foreign_arm` -> `ddi/window_copy.rs` | every redirected Blt of an NVK image into a VRAM surface notes (source, destination, process, rectangles, the surface's import facts); a changed entry gets a new ticket (`kmd_logic::window_copy::Table`, 16 entries, LRU) |
+| query | `HELIOS_ESCAPE_BLT_TARGET` (`protocol/src/window_copy.rs`) | the UMD asks per present for its back buffer's entry (`scanout_acquire::blt_target`) |
+| import | `RM_RESOURCE_IMPORT` | the UMD imports the surface by resource id like DWM's open does (`forward/present.rs` `nvk_window_import`, cached per device); the KMD allows it because the record says this process presents into it (`rm_resource_import::authorize_or_granted`) |
+| copy | `forward/present.rs` `nvk_window_copy` | `CopySubresourceRegion` of the recorded rectangle (same format) or `dxgi_blt_convert` (RGBA/BGRA/BGRX UNORM), recorded before the present's flush, so the frame's RM fence follows it; the app's next frame follows it in queue order |
+| present | `HERF` + fence tail + `HOWW` tag (72 bytes) | the source is not marked as a Blt source (no read-ledger claim will exist) |
+| complete | `ddi/display.rs` -> `window_copy::decide` | the KMD verifies the tag against its record and the Present (Blt, NVK source, VRAM destination, ids, ticket, rectangles, an attached fence) and completes with `present_blt_no_copy`: no route, no ledger claim, no worker pass (`PBCpy` 9). Anything else is the ordinary Blt |
+
+Ordering for DWM: the Present's DMA buffer keeps the fence's boundary (the RM gate point the fence
+tail attached), so dxgkrnl sees the Present retire only when the fence fires (the `EventReady` DPC,
+no timed poll), which is after the app's copy. That is the point the routed copy's Present retired
+at (after its copy-engine copy, seen by the worker); whatever orders DWM's composition of the window
+after the Present orders it after the app's copy. A present the path cannot take (no record yet, an
+import that failed, a format pair it does not cover, no RM fence) is the KMD's Blt as with 0.
+
+Counters `Gw*` (`kmd_logic::window_copy::COUNTERS`): `GwTag` tags seen, `GwSkip` presents completed
+with no copy, `GwRej` / `GwRejWhy` / `GwWhyMask` refusals (1 short, 2 version, 3 flags, 4 fields,
+5 not a Blt, 6 surfaces, 7 source, 8 destination, 9 no record, 10 ticket, 11 rectangles, 12 no
+boundary, 13 orphan, 14 retry), `GwQuery` / `GwQFound` target queries, `GwGrant` imports allowed
+by the record, `GwNote` / `GwTicket` Blts recorded. UMD log: `NvkBltGpuCopy: N windowed blt-model
+presents, ... copied, ... tagged (...)` every 4096 presents.
+
 ## 6. Staged plan and knobs
 
 | stage | what | knob (default) | pass |

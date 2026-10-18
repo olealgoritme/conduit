@@ -240,6 +240,8 @@ fn start_generation_mirrors() {
     crate::ddi::flip_keep::reset_for_start();
     crate::ddi::present_foreign::reset_for_start();
     crate::ddi::onscanout::reset_for_start();
+    // The GPU-ordered window copy (`HOWW`, `NvkBltGpuCopy`): the record and `Gw*` zeroed.
+    crate::ddi::window_copy::reset_for_start();
     // `BltAsync` / `BltNoMirror` (default 0): the knobs read again and mirrored, counters zeroed.
     crate::ddi::blt_async::reset_for_start();
     // `GuestBlob` (default 0): the knob read again and mirrored (`GbKnob`), counters zeroed.
