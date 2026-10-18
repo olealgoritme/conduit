@@ -63,13 +63,13 @@ const FD_RESID_OFF: usize = core::mem::offset_of!(helios_protocol::HeliosFrameDo
 const FD_OWNER_OFF: usize = core::mem::offset_of!(helios_protocol::HeliosFrameDoneSlot, owner);
 const FD_SUBMITTED_OFF: usize = core::mem::offset_of!(helios_protocol::HeliosFrameDoneSlot, submitted);
 const FD_COMPLETED_OFF: usize = core::mem::offset_of!(helios_protocol::HeliosFrameDoneSlot, completed);
+const FD_WRITING_OFF: usize = core::mem::offset_of!(helios_protocol::HeliosFrameDoneSlot, writing);
 const _: () = assert!(helios_kmd_logic::frame_done::SLOTS == helios_protocol::HELIOS_FRAME_DONE_SLOTS);
 
 /// Write frame-done slot `i` into the page (`virtio_lock`, any IRQL: plain atomic stores to
 /// nonpaged memory). A slot given to another buffer is written resid 0 first, its fields, then
 /// the resid, so a reader that re-checks the resid never pairs one buffer's counters with
-/// another's id. `completed` before `submitted` within a slot is what readers do not rely on:
-/// they load `completed` first, so a race reads "in flight", never "done" early.
+/// another's id.
 pub(crate) fn publish_frame_done(i: usize, e: &helios_kmd_logic::frame_done::Entry) {
     let base = FRAME_DONE_VA.load(Ordering::Acquire);
     if base == 0 || i >= helios_protocol::HELIOS_FRAME_DONE_SLOTS {
@@ -83,11 +83,15 @@ pub(crate) fn publish_frame_done(i: usize, e: &helios_kmd_logic::frame_done::Ent
         let owner = &*((slot + FD_OWNER_OFF) as *const AtomicU32);
         let submitted = &*((slot + FD_SUBMITTED_OFF) as *const AtomicU64);
         let completed = &*((slot + FD_COMPLETED_OFF) as *const AtomicU64);
+        let writing = &*((slot + FD_WRITING_OFF) as *const AtomicU32);
         let moved = resid.load(Ordering::Relaxed) != e.resid;
         if moved {
             resid.store(0, Ordering::Release);
         }
         owner.store(e.owner, Ordering::Release);
+        // `writing` before `submitted` and `completed` after both: a reader (completed,
+        // writing, submitted) can see a buffer as busy too early, never as readable too early.
+        writing.store(e.writing as u32, Ordering::Release);
         submitted.store(e.submitted, Ordering::Release);
         completed.store(e.completed, Ordering::Release);
         if moved {

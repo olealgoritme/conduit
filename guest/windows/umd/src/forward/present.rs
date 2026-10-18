@@ -1864,6 +1864,8 @@ unsafe fn nvk_present_frame(
 static DWM_PRESENTS: AtomicUsize = AtomicUsize::new(0);
 static DWM_READ_POINTS: AtomicUsize = AtomicUsize::new(0);
 static DWM_READ_REFUSED: AtomicUsize = AtomicUsize::new(0);
+/// `DWM_FLIP_NEW_FRAMES` at the previous rate line.
+static DWM_SHOWN_AT: AtomicUsize = AtomicUsize::new(0);
 static DWM_RATE_WINDOW: std::sync::Mutex<Option<(std::time::Instant, usize)>> =
     std::sync::Mutex::new(None);
 
@@ -1893,12 +1895,16 @@ unsafe fn dwm_flip_read_points(dev: &HeliosDevice) {
             let elapsed = since.elapsed();
             if elapsed >= std::time::Duration::from_secs(1) {
                 let frames = n - at;
+                let shown = super::bindings::DWM_FLIP_NEW_FRAMES.load(Ordering::Relaxed);
                 log_error!(
-                    "DWM on NVK: {:.1} presents/s over {:.2} s; FlipLedger {}: app flip frames \
-                     bound done {}, replaced by the newest done frame {}, last frame kept {}, \
-                     bound in flight (no done frame to show) {}, not tracked {}; {} read points \
-                     on app flip buffers, {} refused (totals; DWM never waits for app frames)",
+                    "DWM on NVK: {:.1} presents/s, {:.1} new app flip frames shown/s over {:.2} s; \
+                     FlipLedger {}: binds of app flip buffers: newest frame done {}, newest done \
+                     frame chosen {}, last frame kept {}, bound in flight (nothing to choose) {}, \
+                     not tracked {} (in a tracked chain {}); {} read points, {} refused (totals; \
+                     DWM never waits for app frames)",
                     frames as f64 / elapsed.as_secs_f64(),
+                    shown.saturating_sub(DWM_SHOWN_AT.swap(shown, Ordering::Relaxed)) as f64
+                        / elapsed.as_secs_f64(),
                     elapsed.as_secs_f64(),
                     crate::knobs::flip_ledger(),
                     super::bindings::DWM_FLIP_DONE.load(Ordering::Relaxed),
@@ -1906,6 +1912,7 @@ unsafe fn dwm_flip_read_points(dev: &HeliosDevice) {
                     super::bindings::DWM_FLIP_REPEATED.load(Ordering::Relaxed),
                     super::bindings::DWM_FLIP_AS_BOUND.load(Ordering::Relaxed),
                     super::bindings::DWM_FLIP_UNTRACKED.load(Ordering::Relaxed),
+                    super::bindings::DWM_FLIP_UNTRACKED_IN_CHAIN.load(Ordering::Relaxed),
                     DWM_READ_POINTS.load(Ordering::Relaxed),
                     DWM_READ_REFUSED.load(Ordering::Relaxed),
                 );

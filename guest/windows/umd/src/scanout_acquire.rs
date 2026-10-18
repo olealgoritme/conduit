@@ -493,12 +493,21 @@ const SLOT_RETIRED_OFF: usize = offset_of!(HeliosReadLedgerSlot, retired);
 pub(crate) struct FrameDone {
     pub(crate) owner: u32,
     pub(crate) submitted: u64,
+    /// The newest finished frame in the buffer (0 = none): the content it holds.
     pub(crate) completed: u64,
+    /// The GPU may be writing the buffer now (its pending frame is the oldest of its context).
+    pub(crate) writing: bool,
 }
 
 impl FrameDone {
+    /// No frame of the buffer pending.
     pub(crate) fn idle(self) -> bool {
         self.completed >= self.submitted
+    }
+
+    /// The buffer holds a finished frame nothing is writing: DWM may sample it.
+    pub(crate) fn readable(self) -> bool {
+        self.completed != 0 && !self.writing
     }
 }
 
@@ -511,6 +520,7 @@ const FD_RESID_OFF: usize = offset_of!(helios_protocol::HeliosFrameDoneSlot, res
 const FD_OWNER_OFF: usize = offset_of!(helios_protocol::HeliosFrameDoneSlot, owner);
 const FD_SUBMITTED_OFF: usize = offset_of!(helios_protocol::HeliosFrameDoneSlot, submitted);
 const FD_COMPLETED_OFF: usize = offset_of!(helios_protocol::HeliosFrameDoneSlot, completed);
+const FD_WRITING_OFF: usize = offset_of!(helios_protocol::HeliosFrameDoneSlot, writing);
 
 /// The frame-done table's address in a live ledger mapping, when the KMD wrote one.
 ///
@@ -527,7 +537,7 @@ unsafe fn frame_done_table(va: usize) -> Option<usize> {
     ok.then_some(base)
 }
 
-/// Does the KMD publish the frame-done table (a KMD from 22.22.405.124 on)?
+/// Does the KMD publish the frame-done table (version 2: a KMD from 22.22.405.125 on)?
 pub(crate) fn frame_done_available() -> bool {
     let Ok(reg) = REGISTRY.lock() else {
         return false;
@@ -540,8 +550,9 @@ pub(crate) fn frame_done_available() -> bool {
 }
 
 /// The frame-done line of buffer `resid`. `None`: no table, or the KMD tracks no frame of it.
-/// Reads `completed` before `submitted`, so a frame submitted meanwhile reads as in flight,
-/// never as done early; the resid is re-checked after the counters.
+/// Reads `completed`, `writing`, `submitted` in that order (the KMD writes them in the reverse
+/// order), so a race reads a buffer as busy, never as readable too early; the resid is re-checked
+/// after the fields.
 pub(crate) fn frame_done_lookup(resid: u32) -> Option<FrameDone> {
     if resid == 0 {
         return None;
@@ -558,11 +569,12 @@ pub(crate) fn frame_done_lookup(resid: u32) -> Option<FrameDone> {
             }
             let owner = ledger_load(slot, FD_OWNER_OFF);
             let completed = ledger_load_u64(slot, FD_COMPLETED_OFF);
+            let writing = ledger_load(slot, FD_WRITING_OFF) != 0;
             let submitted = ledger_load_u64(slot, FD_SUBMITTED_OFF);
             if ledger_load(slot, FD_RESID_OFF) != resid {
                 return None;
             }
-            return Some(FrameDone { owner, submitted, completed });
+            return Some(FrameDone { owner, submitted, completed, writing });
         }
     }
     None

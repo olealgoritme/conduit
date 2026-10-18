@@ -482,35 +482,41 @@ pub(crate) unsafe fn set_shader_resources_common(
 /// `FlipLedger` 1, dwm.exe: what DWM's binds of app flip-model buffers became (since start).
 pub(crate) static DWM_FLIP_DONE: AtomicUsize = AtomicUsize::new(0);
 pub(crate) static DWM_FLIP_UNTRACKED: AtomicUsize = AtomicUsize::new(0);
+pub(crate) static DWM_FLIP_UNTRACKED_IN_CHAIN: AtomicUsize = AtomicUsize::new(0);
 pub(crate) static DWM_FLIP_SUBSTITUTED: AtomicUsize = AtomicUsize::new(0);
 pub(crate) static DWM_FLIP_REPEATED: AtomicUsize = AtomicUsize::new(0);
 pub(crate) static DWM_FLIP_AS_BOUND: AtomicUsize = AtomicUsize::new(0);
+/// Binds that showed a newer finished app frame than the chain's previous bind: the app frames
+/// DWM put on screen (`dwm_flip_read_points` logs it per second).
+pub(crate) static DWM_FLIP_NEW_FRAMES: AtomicUsize = AtomicUsize::new(0);
 
-/// `FlipLedger` 1, dwm.exe, at each shader-resource bind: DWM composes the newest DONE frame of
-/// an app's flip-model swap chain and never waits for one.
+/// `FlipLedger` 1, dwm.exe, at each shader-resource bind: DWM composes the newest FINISHED frame
+/// of an app's flip-model swap chain and never waits for one.
 ///
-/// Whether a buffer's frame is done is the KMD's frame-done table
-/// (`helios_protocol::HeliosFrameDoneTable`, read through the ledger mapping): the KMD records
-/// each frame with its RM fence when the present's marker is rendered and marks it done when the
-/// fence fires, so the table is never behind the GPU by more than the fence's interrupt.
+/// What is finished is the KMD's frame-done table (`helios_protocol::HeliosFrameDoneTable`, read
+/// through the ledger mapping): per buffer, the newest frame in it the GPU finished
+/// (`completed`) and whether the GPU may be writing it now (`writing`, the buffer's pending frame
+/// is the oldest of its context). A fence finishes its frame and every earlier frame of its
+/// context, so the table follows the GPU within a fence's interrupt.
 ///
-/// * A bound app buffer the table does not track (an app that completed its frame before the
-///   present, an older KMD) or whose frame is done stays.
-/// * One whose frame is in flight is replaced by a view of the buffer of the same swap chain
-///   (the same presenting process, size and format; three buffers or more) whose done frame is
-///   the newest; when none is done, by the buffer DWM composed for that chain last time (the
-///   window keeps its last frame). With three buffers the app renders into the oldest meanwhile;
-///   DWM's read of the replacement is published at DWM's present (`dwm_flip_read_points`) and
-///   the app's next access of that buffer waits for it.
-/// * A chain DWM cannot replace in (fewer than three buffers seen, its first frame) is bound as
-///   it is; DWM still does not wait (the app publishes no points on its buffers).
+/// * A bound app buffer the table does not track (an app that completes its frame before the
+///   present, an older KMD) stays.
+/// * A bound buffer with nothing pending holds the newest presented frame, finished: it stays.
+/// * Otherwise the buffer of the same swap chain (the same presenting process, size and format;
+///   three buffers or more) that holds the newest finished frame and is not being written is
+///   bound instead (that can be the bound buffer itself, when its new frame is queued behind
+///   others); when none is, the buffer DWM composed for that chain last time (the window keeps
+///   its last frame). DWM's read of a replacement is published at DWM's present
+///   (`dwm_flip_read_points`) and the app's next access of that buffer waits for it.
+/// * A chain DWM cannot choose in (fewer than three buffers seen, its first frame) is bound as it
+///   is; DWM still does not wait (the app publishes no points on its buffers).
 ///
 /// Every app buffer DWM ends up binding is noted as read this frame. `None`: nothing replaced.
 pub(crate) unsafe fn dwm_flip_views(
     h: Hdevice,
     views: &[Option<ID3D11ShaderResourceView>],
 ) -> Option<Vec<Option<ID3D11ShaderResourceView>>> {
-    use crate::scanout_acquire::frame_done_lookup;
+    use crate::scanout_acquire::{frame_done_lookup, FrameDone};
     let dev = helios_device(h)?;
     let flips = lock_ignore_poison(&dev.nvk_flip_buffers).clone();
     if flips.is_empty() {
@@ -529,55 +535,67 @@ pub(crate) unsafe fn dwm_flip_views(
         let Some(&(_, _, width, height, format, resid)) = flips.iter().find(|f| f.1 == raw) else {
             continue;
         };
-        let state = frame_done_lookup(resid);
-        let bound = match state {
-            None => {
+        let dims = (width, height, format);
+        let same_dims = |f: &&(usize, usize, u32, u32, u32, u32)| f.2 == width && f.3 == height && f.4 == format;
+        let Some(bound) = frame_done_lookup(resid) else {
+            // An app that completes its frames before their present, or the chain's buffers the
+            // KMD did not see yet.
+            if flips.iter().filter(same_dims).any(|f| f.1 != raw && frame_done_lookup(f.5).is_some()) {
+                DWM_FLIP_UNTRACKED_IN_CHAIN.fetch_add(1, Ordering::Relaxed);
+            } else {
                 DWM_FLIP_UNTRACKED.fetch_add(1, Ordering::Relaxed);
-                reads.push(raw);
-                continue;
             }
-            Some(s) if s.idle() => {
-                DWM_FLIP_DONE.fetch_add(1, Ordering::Relaxed);
-                reads.push(raw);
-                dwm_flip_note_last(dev, s.owner, (width, height, format), raw);
-                continue;
-            }
-            Some(s) => s,
+            reads.push(raw);
+            continue;
         };
+        if bound.idle() {
+            DWM_FLIP_DONE.fetch_add(1, Ordering::Relaxed);
+            reads.push(raw);
+            dwm_flip_note_shown(dev, bound.owner, dims, raw, bound.completed);
+            continue;
+        }
         // The same swap chain: the same presenting process, size and format.
-        let chain: Vec<(usize, Option<crate::scanout_acquire::FrameDone>)> = flips
+        let chain: Vec<(usize, FrameDone)> = flips
             .iter()
-            .filter(|f| f.1 != raw && f.2 == width && f.3 == height && f.4 == format)
-            .map(|f| (f.1, frame_done_lookup(f.5)))
-            .filter(|(_, d)| d.is_some_and(|d| d.owner == bound.owner))
+            .filter(same_dims)
+            .filter_map(|f| {
+                let d = if f.1 == raw { Some(bound) } else { frame_done_lookup(f.5) };
+                d.filter(|d| d.owner == bound.owner).map(|d| (f.1, d))
+            })
             .collect();
-        let mut substitute = None;
-        let mut repeated = false;
-        if chain.len() + 1 >= 3 {
-            substitute = chain
+        let mut choice: Option<(usize, u64, bool)> = None;
+        if chain.len() >= 3 {
+            choice = chain
                 .iter()
-                .filter_map(|&(c, d)| d.filter(|d| d.idle()).map(|d| (c, d.completed)))
-                .max_by_key(|&(_, completed)| completed)
-                .map(|(c, _)| c);
-            if substitute.is_none() {
-                substitute = dwm_flip_last(dev, bound.owner, (width, height, format)).filter(|&c| c != raw);
-                repeated = substitute.is_some();
+                .filter(|(_, d)| d.readable())
+                .max_by_key(|(_, d)| d.completed)
+                .map(|&(c, d)| (c, d.completed, false));
+            if choice.is_none() {
+                choice = dwm_flip_last(dev, bound.owner, dims)
+                    .filter(|&(c, _)| chain.iter().any(|&(cc, d)| cc == c && !d.writing))
+                    .map(|(c, completed)| (c, completed, true));
             }
         }
-        let made = substitute.and_then(|c| dwm_flip_view_for(dev, view, c).map(|v| (c, v)));
-        let Some((sub, sub_view)) = made else {
+        let Some((chosen, completed, repeated)) = choice else {
             DWM_FLIP_AS_BOUND.fetch_add(1, Ordering::Relaxed);
             reads.push(raw);
             continue;
         };
+        if chosen != raw {
+            let Some(sub_view) = dwm_flip_view_for(dev, view, chosen) else {
+                DWM_FLIP_AS_BOUND.fetch_add(1, Ordering::Relaxed);
+                reads.push(raw);
+                continue;
+            };
+            out.get_or_insert_with(|| views.to_vec())[i] = Some(sub_view);
+        }
         if repeated {
             DWM_FLIP_REPEATED.fetch_add(1, Ordering::Relaxed);
         } else {
             DWM_FLIP_SUBSTITUTED.fetch_add(1, Ordering::Relaxed);
-            dwm_flip_note_last(dev, bound.owner, (width, height, format), sub);
         }
-        reads.push(sub);
-        out.get_or_insert_with(|| views.to_vec())[i] = Some(sub_view);
+        reads.push(chosen);
+        dwm_flip_note_shown(dev, bound.owner, dims, chosen, completed);
     }
     if !reads.is_empty() {
         let mut noted = lock_ignore_poison(&dev.nvk_flip_reads);
@@ -590,23 +608,43 @@ pub(crate) unsafe fn dwm_flip_views(
     out
 }
 
-/// The buffer DWM last composed for the swap chain `(owner, size and format)`.
-fn dwm_flip_last(dev: &crate::device_funcs::HeliosDevice, owner: u32, dims: (u32, u32, u32)) -> Option<usize> {
+/// The buffer DWM last composed for the swap chain `(owner, size and format)` and the finished
+/// frame it held then.
+fn dwm_flip_last(
+    dev: &crate::device_funcs::HeliosDevice,
+    owner: u32,
+    dims: (u32, u32, u32),
+) -> Option<(usize, u64)> {
     lock_ignore_poison(&dev.nvk_flip_last)
         .iter()
         .find(|e| e.0 == owner && e.1 == dims)
-        .map(|e| e.2)
+        .map(|e| (e.2, e.3))
 }
 
-fn dwm_flip_note_last(dev: &crate::device_funcs::HeliosDevice, owner: u32, dims: (u32, u32, u32), com: usize) {
+/// DWM binds `com` holding finished frame `completed` for the chain; a newer frame than the
+/// chain's previous bind counts as a new app frame shown.
+fn dwm_flip_note_shown(
+    dev: &crate::device_funcs::HeliosDevice,
+    owner: u32,
+    dims: (u32, u32, u32),
+    com: usize,
+    completed: u64,
+) {
     let mut last = lock_ignore_poison(&dev.nvk_flip_last);
     match last.iter_mut().find(|e| e.0 == owner && e.1 == dims) {
-        Some(e) => e.2 = com,
+        Some(e) => {
+            if completed > e.3 {
+                DWM_FLIP_NEW_FRAMES.fetch_add(1, Ordering::Relaxed);
+                e.3 = completed;
+            }
+            e.2 = com;
+        }
         None => {
             if last.len() >= 64 {
                 last.remove(0);
             }
-            last.push((owner, dims, com));
+            DWM_FLIP_NEW_FRAMES.fetch_add(1, Ordering::Relaxed);
+            last.push((owner, dims, com, completed));
         }
     }
 }

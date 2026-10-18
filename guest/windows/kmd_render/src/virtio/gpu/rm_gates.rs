@@ -65,11 +65,14 @@ pub static RMG_EXPIRE_MS: AtomicU32 = AtomicU32::new(0);
 /// 4 no gate or stream slot free, 5 the process's gate has no point free) and every reason seen
 /// (`RmGWhyMsk`, bit `1 << (code - 1)`).
 /// The frame-done table (`FlipLedger`): frames recorded with their buffer (`FdSub`), fences that
-/// marked a buffer's frame done (`FdFire`), frames not recorded for lack of an idle slot
-/// (`FdOvf`).
+/// finished at least one frame (`FdFire`; a fence also finishes the earlier frames of its
+/// context, so `FdFire` can stay below `FdSub` with nothing left pending), frames not tracked
+/// (`FdOvf`, the table's overflow count), frames pending now (`FdPend`).
 pub static FD_SUBMITTED: AtomicU32 = AtomicU32::new(0);
 pub static FD_FIRED: AtomicU32 = AtomicU32::new(0);
 pub static FD_OVERFLOW: AtomicU32 = AtomicU32::new(0);
+/// Frames pending in the frame-done table after its last change (`FdPend`).
+pub static FD_PENDING: AtomicU32 = AtomicU32::new(0);
 pub static RMG_WHY: AtomicU32 = AtomicU32::new(0);
 pub static RMG_WHY_MASK: AtomicU32 = AtomicU32::new(0);
 /// Completion hints (`HELIOS_ESCAPE_ECL_DONE`, `helios_kmd_logic::ecl_done`): escapes
@@ -130,6 +133,7 @@ pub fn publish_rm_gate_counters() {
     rec(b"FdSub", FD_SUBMITTED.load(Ordering::Relaxed));
     rec(b"FdFire", FD_FIRED.load(Ordering::Relaxed));
     rec(b"FdOvf", FD_OVERFLOW.load(Ordering::Relaxed));
+    rec(b"FdPend", FD_PENDING.load(Ordering::Relaxed));
 }
 
 /// One gate: the process and context it belongs to (context 0: shared by the process's
@@ -374,7 +378,7 @@ impl VirtioGpu {
         };
         RMG_ATTACHED.fetch_add(1, Ordering::Relaxed);
         if frame_resid != 0 {
-            self.frame_done_submit(frame_resid, process, fence, early.is_some());
+            self.frame_done_submit(frame_resid, process, gi as u8, fence, early.is_some());
         }
         if shared {
             // From now on the gate is the process's: no context's teardown purges it.
@@ -474,29 +478,42 @@ impl VirtioGpu {
         self.fence_want_close(fence);
     }
 
-    /// `FlipLedger`: a frame of buffer `resid` was submitted with `fence` (fired already:
-    /// `fired`); the frame-done table and its page copy follow.
-    fn frame_done_submit(&mut self, resid: u32, process: usize, fence: u32, fired: bool) {
+    /// `FlipLedger`: a frame of buffer `resid` was submitted on gate `gate` with `fence` (fired
+    /// already: `fired`); the frame-done table and its page copy follow.
+    fn frame_done_submit(&mut self, resid: u32, process: usize, gate: u8, fence: u32, fired: bool) {
         use helios_kmd_logic::frame_done::owner_of;
-        match self.frame_done.submit(resid, owner_of(process), fence, fired) {
-            Some(i) => {
-                FD_SUBMITTED.fetch_add(1, Ordering::Relaxed);
-                crate::adapter::read_ledger::publish_frame_done(i, &self.frame_done.entries[i]);
-            }
-            None => {
-                FD_OVERFLOW.fetch_add(1, Ordering::Relaxed);
-                crate::adapter::read_ledger::publish_frame_done_overflow(self.frame_done.overflow);
-            }
+        let overflow = self.frame_done.overflow;
+        let changed = self.frame_done.submit(resid, owner_of(process), gate, fence, fired);
+        if changed != 0 {
+            FD_SUBMITTED.fetch_add(1, Ordering::Relaxed);
         }
+        if self.frame_done.overflow != overflow {
+            FD_OVERFLOW.store(self.frame_done.overflow, Ordering::Relaxed);
+            crate::adapter::read_ledger::publish_frame_done_overflow(self.frame_done.overflow);
+        }
+        self.frame_done_publish(changed);
     }
 
-    /// `FlipLedger`: `fence` of `process` fired, expired or was cancelled.
+    /// `FlipLedger`: `fence` of `process` fired, expired or was cancelled: its frame and every
+    /// earlier frame of its gate are finished.
     fn frame_done_fire(&mut self, fence: u32, process: usize) {
         use helios_kmd_logic::frame_done::owner_of;
-        if let Some(i) = self.frame_done.fire(fence, owner_of(process)) {
+        let changed = self.frame_done.fire(fence, owner_of(process));
+        if changed != 0 {
             FD_FIRED.fetch_add(1, Ordering::Relaxed);
+        }
+        self.frame_done_publish(changed);
+    }
+
+    /// Copy the changed frame-done slots into the read-ledger page.
+    fn frame_done_publish(&self, changed: helios_kmd_logic::frame_done::Changed) {
+        let mut bits = changed;
+        while bits != 0 {
+            let i = bits.trailing_zeros() as usize;
+            bits &= bits - 1;
             crate::adapter::read_ledger::publish_frame_done(i, &self.frame_done.entries[i]);
         }
+        FD_PENDING.store(self.frame_done.pending_count() as u32, Ordering::Relaxed);
     }
 
     /// A completion hint (`HELIOS_ESCAPE_ECL_DONE`) from process `process` (its
@@ -575,6 +592,12 @@ impl VirtioGpu {
     /// many points were pending.
     fn rm_gate_cancel(&mut self, gi: usize) -> u32 {
         let pending = self.rm_gates[gi].gate.pending();
+        {
+            // Its frames are no longer pending for anyone reading the frame-done table.
+            let owner = helios_kmd_logic::frame_done::owner_of(self.rm_gates[gi].process);
+            let changed = self.frame_done.finish_gate(gi as u8, owner);
+            self.frame_done_publish(changed);
+        }
         loop {
             let Some(fence) = self.rm_gates[gi].gate.take_unfired() else {
                 break;
