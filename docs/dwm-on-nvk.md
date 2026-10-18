@@ -247,6 +247,89 @@ resource. Whether the host shows that is part of experiment T2.
   forces the WDDM flip for `dwm.exe`; done on this branch). Otherwise most frames would bypass
   dxgkrnl.
 
+### 4.5 Windowed apps without a copy (`FlipUpgrade`, `FlipLedger`; both off by default)
+
+A windowed blt-model swap chain (Heaven: `DISCARD`, one buffer, interval 0; PresentMon
+"Composed: Copy with GPU GDI") reaches DWM only through the window's redirection surface: dxgkrnl
+turns each present into a Blt into that surface, and DWM never opens the app's buffer. Here the
+surface is a CPU-visible standard buffer (`vram-redirection.md` 0), so the Blt is a copy the app
+waits for. Only a flip-model chain is shared with DWM ("In the flip model, all back buffers are
+shared with the Desktop Window Manager (DWM). Therefore, the DWM can compose straight from those
+back buffers without any additional copy operations", win32 `direct3ddxgi/dxgi-flip-model.md`).
+
+**Why the driver upgrades the chain itself.** Windows' own upgrade ("optimizations for windowed
+games", `SwapEffectUpgradeEnable=1;`) is applied only to processes DXGI classifies as games: its
+`DXGI_ETW_SWAPCHAIN_CREATE` event for Heaven carries `WINDOWEDSWAPEFFECTUPGRADE_REASON_NONGAME`
+(`guest/windows/docs/independent-flip.md` 11.5). Microsoft's descriptions of the feature (the
+DirectX blog "Updates in Graphics and Gaming", the support article "Optimizations for windowed
+games in Windows 11") name DX10/DX11 windowed games and no driver capability, and the driver
+already reports what windowed flip promotion needs (`SupportDirectFlip`, `FlipIndependent |
+DdiPresentForIFlip`: `kmd_render/src/ddi/query_adapter_info.rs`, `kmd_logic/src/independent_flip.rs`;
+the UMD's `CheckDirectFlipSupport`). There is no cap left that would make DXGI upgrade a non-game.
+
+**`FlipUpgrade=1`** (`HKLM\SOFTWARE\Helios`, REG_DWORD; `helios_umd_common::flip_upgrade`). In an
+NVK process under a DWM that imports NVK surfaces (not `dwm.exe`; optionally only the programs
+`FlipUpgradeList` names), the D3D11 UMD hooks DXGI's swap-chain creation in the process
+(`IDXGIFactory::CreateSwapChain`, `IDXGIFactory2::CreateSwapChainForHwnd`). A windowed `DISCARD`
+chain with one sample, an R8G8B8A8 or B8G8R8A8 UNORM buffer and no flag but `ALLOW_MODE_SWITCH` is
+created `FLIP_DISCARD` with `FlipUpgradeBuffers` buffers (default 3). The flip model's documented
+extra requirements (`direct3ddxgi/for-best-performance--use-dxgi-flip-model.md`, "What do I have
+to do to use the flip model?") are met for the app:
+
+| requirement | how |
+|---|---|
+| at least 2 buffers | `FlipUpgradeBuffers`; `ResizeBuffers` keeps the count |
+| the back buffer is re-bound after `Present` | the hooked `Present` / `Present1` binds the immediate context's render targets and depth view again after the real call, as a blt-model present leaves them |
+| `ResizeBuffers` after `SetFullscreenState` | only windowed chains are upgraded; exclusive fullscreen keeps its scanout path |
+| no MSAA buffers | multisampled chains are not upgraded |
+
+`GetDesc` / `GetDesc1` report what the app asked for. Interval-0 presents stay unthrottled when
+DWM promotes the window to independent flip: the chain is created with `ALLOW_TEARING` when DXGI
+allows it and such presents add `DXGI_PRESENT_ALLOW_TEARING` (`FlipUpgradeTearing`, default 1;
+the conditions are `direct3ddxgi/dxgi-present.md`). `GDI_COMPATIBLE`, sRGB, 10-bit and fp16 chains
+are left alone (GDI content in a flip window is not shown, `dxgi-flip-model.md`; NVK mints
+resource ids for the 8-bit formats). The UMD is pinned in memory once the hooks are in.
+
+Once the chain is flip-model, DWM opens its buffers by resource id at creation (as for any NVK
+flip-model chain) and composes the presented buffer; superseded frames are DWM's to drop, and the
+app runs uncapped.
+
+**`FlipLedger=1`** (REG_DWORD, set before DWM starts). Without it a flip-model NVK frame is
+completed on the presenting thread before its present (`NvkComposedComplete`), because DWM on NVK
+samples the buffer from its own RM channel, which the RM fence that retires the present's DMA
+buffer does not hold. With it:
+
+1. Each DXGI present buffer of an NVK device holds its hand-off ledger key while it lives
+   (`forward/resource.rs` `note_nvk_flip_buffer`); in DWM, opening an app's buffer does the same and
+   installs the ledger's reader hooks.
+2. The app's present publishes a ledger point of its device on the presented buffer's resource id
+   (`forward/present.rs` `nvk_flip_ledger_publish`, the bridge's `handoff_publish`). The point is
+   signalled on the DXVK stream after the frame; its fence worker marks it complete when the GPU
+   has run it. The present then carries the frame's RM fence (the marker fence path), and the
+   presenting thread does not wait.
+3. DWM's DXVK samples the ledger at the first access of the buffer in a command list and its
+   submission worker waits for the point before submitting (DXVK patches 0007/0008). DWM therefore
+   composes the frame only after the app's GPU work for it, and nothing in the app waits for DWM.
+
+The ledger key of an app's own image is asked again at each publish
+(`dxvk_bridge.cpp` `handoff_key`): `RotateResourceIdentities` moves storages between a
+flip-model chain's images, so a key cached on the image would name the buffer it held first.
+
+**Not covered yet.**
+
+* Buffer release: dxgkrnl's wait for DWM to release a buffer before the app renders into it again
+  holds the app's WDDM context, which NVK's submissions bypass. With three buffers an uncapped app
+  renders into a buffer again two presents after it showed it; DWM latches and samples a buffer
+  within its frame, so the window is small, but a DWM frame delayed behind other GPU work can see
+  the app's next writes. The fix is an admission point per frame: a Render packet on the app's
+  context after `Present`, which dxgkrnl schedules only after its buffer waits, and a wait for it
+  in DXVK's submission worker before the next frame's first access of the back buffer (the D3D12
+  queue's admission, `umd12/src/forward12/queue.rs`, does this for D3D12).
+* D3D12 flip-model frames publish no ledger points; they carry the RM fence and DWM does not wait
+  for it (as before).
+* A blt-model window DWM never flips (a child window, or `FlipUpgrade` 0) is still copied into the
+  redirection surface.
+
 ## 5. Test sequence
 
 Run each step only in a quiet window agreed with the install agent. Always end with `DwmIcd` removed

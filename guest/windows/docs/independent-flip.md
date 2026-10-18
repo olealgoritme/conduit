@@ -1063,6 +1063,8 @@ What gates it, and what the driver can do:
   adds an executable to it) whether the process is a game. Nothing in the KMD caps or the UMD DDI is an input to that answer, so **the
   driver cannot influence `REASON_NONGAME`**. The user-side levers to test: Game Bar's "Remember this is a game" with Heaven focused, then
   the per-app `SwapEffectUpgradeEnable=1;` value, then re-run the capture.
+* **The driver's own upgrade (`FlipUpgrade`, `docs/dwm-on-nvk.md` 4.5)** does not depend on that classification: the D3D11 UMD creates
+  such chains `FLIP_DISCARD` itself, in the app's process, for NVK apps under a DWM on NVK.
 * **The other reasons are listed by DXGI's own manifest**, which no doc on disk has: `ci/vmtest/swapeffect-upgrade.ps1 -ListOnly` prints
   every `WINDOWEDSWAPEFFECTUPGRADE_REASON_*` the provider defines. Any of them that name a driver property are the ones the driver can
   act on. The single-buffer and `ALLOW_MODE_SWITCH` properties of Heaven's chain are app-side (`d3d11_triangle` options `modeswitch`,
