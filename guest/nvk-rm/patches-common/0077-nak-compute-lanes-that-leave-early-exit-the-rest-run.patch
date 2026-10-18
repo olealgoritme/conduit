@@ -1,0 +1,570 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Sun, 18 Oct 2026 13:43:06 +0200
+Subject: [PATCH] nak: compute lanes that leave early exit, the rest runs
+ convergent (NAK_EARLY_EXIT)
+
+Most compute shaders end in one of two shapes: the whole body inside
+"if (in_bounds) { ... }", or an early return that the front-end turned
+into a loop that never iterates ("loop { if (oob) { ...; break; } ...;
+break; }", as vkd3d-proton's shaders have).  Either way the body sits in
+divergent control flow, and NAK never puts the values of divergent blocks
+in uniform registers, so these shaders run without the uniform datapath:
+every descriptor index, handle and root-constant address is computed per
+lane in GPRs.  In the Steel Nomad compute shader 88825d04 (8x8, 1920x1080)
+only UR0-UR5 were used at all, against UR0-UR45 in the reference
+compiler's code for the same shader, which exits the out-of-bounds lanes
+(@P0 BRA to EXIT) and runs the rest with uniform registers.
+
+nak_nir_lower_early_exit, before nak_nir_lower_cf in compute shaders:
+
+ - a trailing loop whose header has no back edge loses its breaks (they
+   become halts, EXIT) and its body moves out of it;
+ - a trailing if with a divergent condition keeps its smaller side in the
+   if, followed by "if (cond) halt" (or the inverse), and the larger side
+   moves after it to the top level.  The guarded side reconverges (its
+   own BSSY/BSYNC) before the exit, so no lane runs it while the others run
+   the code after it.  Only when the guarded side is small next to the
+   other (at most 16 instructions or a quarter of it);
+ - past the exit, and inside the guarded side, the condition is a known
+   constant: later bounds checks on it fold away.
+
+Reaching the end of a compute shader is the same as exiting, and halted
+lanes never block a later sync, so nothing else changes: subgroup ops see
+the same active lanes, and a barrier after a partial early return was
+undefined before as well.  Shaders with compute derivatives are skipped.
+
+With more code convergent, three passes that ran on the old shapes run
+again or see the new ones: nak_nir_opt_uniform_address runs again for the
+newly convergent blocks (it skips accesses it already split); the
+rematerializer accepts a UGPR pair of constant-buffer copies as the base
+of a constant load, as it does a pinned pair; and divergent loops at the
+top level keep pinned uniform address bases, as they had inside the
+divergent if.
+
+Results (GB202 / SM120, NVK under drm-shim):
+
+  88825d04 (Steel Nomad, 8x8): 168 -> 128 GPRs (12 -> 16 warps/SM, as
+    the reference compiler's 128), instructions 2245 -> 2292
+  fb2df990: 56 -> 48 GPRs, 593 -> 674 instructions
+  94b6df80: 48 GPRs, 553 -> 572 instructions
+  compute corpus (115 shaders): GPRs -3.5%, warps/SM +1.5%,
+    instructions +0.9% (mostly uniform-datapath address math), no memory
+    spills added
+
+On an RTX 5090 with the captured Steel Nomad inputs, compute shader
+88825d04 runs 17% faster (2230 -> 1861 us; 168 -> 128 GPRs) with
+bit-identical outputs.  Steel Nomad scores +2% (73.8 / 72.9 fps against
+72.2 / 71.2 fps).
+
+On by default.  NAK_EARLY_EXIT=0 restores the previous structure (the
+divergent if or the loop around the whole body).  The knob is bit 17 of
+nak_knobs_key(), so shaders cached with the knob off and on have
+different keys.
+---
+ src/nouveau/compiler/meson.build              |   1 +
+ src/nouveau/compiler/nak/knobs.rs             |  20 ++
+ src/nouveau/compiler/nak/spill_remat.rs       |  13 +-
+ src/nouveau/compiler/nak_nir.c                |  22 +-
+ .../compiler/nak_nir_lower_early_exit.c       | 313 ++++++++++++++++++
+ .../compiler/nak_nir_lower_non_uniform_ldcx.c |   9 +-
+ src/nouveau/compiler/nak_private.h            |   2 +
+ 7 files changed, 376 insertions(+), 4 deletions(-)
+ create mode 100644 src/nouveau/compiler/nak_nir_lower_early_exit.c
+
+diff --git a/src/nouveau/compiler/meson.build b/src/nouveau/compiler/meson.build
+index 98d2e46..9697491 100644
+--- a/src/nouveau/compiler/meson.build
++++ b/src/nouveau/compiler/meson.build
+@@ -19,6 +19,7 @@ libnak_c_files = files(
+   'nak.h',
+   'nak_nir.c',
+   'nak_nir_lower_cf.c',
++  'nak_nir_lower_early_exit.c',
+   'nak_nir_lower_cmat.c',
+   'nak_nir_lower_fs_inputs.c',
+   'nak_nir_lower_gs_intrinsics.c',
+diff --git a/src/nouveau/compiler/nak/knobs.rs b/src/nouveau/compiler/nak/knobs.rs
+index f62e365..7ac2fbc 100644
+--- a/src/nouveau/compiler/nak/knobs.rs
++++ b/src/nouveau/compiler/nak/knobs.rs
+@@ -58,6 +58,12 @@
+ //!   breaks escape through it).  Off, loops with no continue skip that sync
+ //!   and breaks go to the loop's exit sync directly, as in the reference
+ //!   compiler's code (nak_nir_lower_cf.c)
++//! - NAK_EARLY_EXIT (default on): in compute shaders, the lanes that leave
++//!   early (a trailing divergent if, or an early return that the front-end
++//!   made a loop that never iterates) exit, and the rest of the shader runs
++//!   in convergent control flow, where its uniform values can use the
++//!   uniform datapath (nak_nir_lower_early_exit.c).  0 keeps the divergent
++//!   if or the loop around the whole body
+ 
+ use std::env;
+ use std::sync::OnceLock;
+@@ -96,6 +102,7 @@ static WEAK_MEM: OnceLock<bool> = OnceLock::new();
+ static UNIFORM_ATOMICS: OnceLock<bool> = OnceLock::new();
+ static F16_CVT: OnceLock<bool> = OnceLock::new();
+ static LOOP_CONT_SYNC: OnceLock<bool> = OnceLock::new();
++static EARLY_EXIT: OnceLock<bool> = OnceLock::new();
+ 
+ /// NAK_IMM_CSE for a shader: compute shaders unless set
+ pub fn imm_cse(compute: bool) -> bool {
+@@ -205,6 +212,13 @@ pub fn loop_cont_sync() -> bool {
+     *v
+ }
+ 
++pub fn early_exit() -> bool {
++    let v = EARLY_EXIT.get_or_init(|| {
++        parse("NAK_EARLY_EXIT", env::var("NAK_EARLY_EXIT"), true)
++    });
++    *v
++}
++
+ pub fn vec_cse() -> bool {
+     let v = VEC_CSE
+         .get_or_init(|| parse("NAK_VEC_CSE", env::var("NAK_VEC_CSE"), true));
+@@ -260,6 +274,11 @@ pub extern "C" fn nak_knob_loop_cont_sync() -> bool {
+     loop_cont_sync()
+ }
+ 
++#[unsafe(no_mangle)]
++pub extern "C" fn nak_knob_early_exit() -> bool {
++    early_exit()
++}
++
+ /// The knobs that do not fit in nak_gpr_cap_key(), for the low 12 bits of
+ /// NVK's compiler flags
+ #[unsafe(no_mangle)]
+@@ -283,4 +302,5 @@ pub extern "C" fn nak_knobs_key() -> u32 {
+         | (u32::from(uniform_atomics()) << 14)
+         | (u32::from(f16_cvt()) << 15)
+         | (u32::from(!loop_cont_sync()) << 16)
++        | (u32::from(early_exit()) << 17)
+ }
+diff --git a/src/nouveau/compiler/nak/spill_remat.rs b/src/nouveau/compiler/nak/spill_remat.rs
+index f79c6d4..a808dc4 100644
+--- a/src/nouveau/compiler/nak/spill_remat.rs
++++ b/src/nouveau/compiler/nak/spill_remat.rs
+@@ -622,9 +622,18 @@ impl Remat {
+             return None;
+         };
+         // [Rx.U32 + UR] or [rZ + UR] through a pinned pair that holds a
+-        // constant buffer address (nak_nir_pin_uniform_addresses)
++        // constant buffer address (nak_nir_pin_uniform_addresses), or
++        // through a UGPR pair of copies of one (a load in convergent control
++        // flow, NAK_EARLY_EXIT)
+         if let Some(uvec) = ld.uniform_addr.src_ref.as_ssa() {
+-            let src = self.pin_srcs.get(&uvec[0])?;
++            let src = match self.pin_srcs.get(&uvec[0]) {
++                Some(src) => src,
++                None if crate::knobs::early_exit() => uvec,
++                None => return None,
++            };
++            if src.comps() != 2 {
++                return None;
++            }
+             let lo = self.ucbufs.get(&src[0])?;
+             let hi = self.ucbufs.get(&src[1])?;
+             if lo.buf != hi.buf || hi.offset != lo.offset + 4 {
+diff --git a/src/nouveau/compiler/nak_nir.c b/src/nouveau/compiler/nak_nir.c
+index 1a35137..b30e5a8 100644
+--- a/src/nouveau/compiler/nak_nir.c
++++ b/src/nouveau/compiler/nak_nir.c
+@@ -1378,7 +1378,12 @@ nak_nir_opt_uniform_address_impl(struct nir_builder *b,
+       nir_def *uniform_offset = uniform_offset_src->ssa;
+       nir_block *use_block = intr->instr.block;
+ 
+-      assert(nir_src_as_uint(*uniform_offset_src) == 0);
++      /* Already split (when this runs again after nak_nir_lower_early_exit
++       * made more blocks convergent)
++       */
++      if (!nir_src_is_const(*uniform_offset_src) ||
++          nir_src_as_uint(*uniform_offset_src) != 0)
++         return false;
+ 
+       /* Nak can't collect vectors in non uniform control flow, so don't
+        * even try */
+@@ -1857,6 +1862,21 @@ nak_postprocess_nir(nir_shader *nir,
+       OPT(nir, nir_split_conversions, &split_conv_opts);
+    }
+ 
++   /* Lanes that leave a compute shader early exit, so that the rest of the
++    * shader runs in convergent control flow (NAK_EARLY_EXIT).
++    */
++   if (nak->sm >= 70 && nak_knob_early_exit()) {
++      if (OPT(nir, nak_nir_lower_early_exit)) {
++         OPT(nir, nir_opt_constant_folding);
++         OPT(nir, nir_opt_dead_cf);
++         /* Addresses used in blocks that are now convergent can take the
++          * uniform address forms
++          */
++         if (nak->sm >= 73)
++            OPT(nir, nak_nir_opt_uniform_address);
++      }
++   }
++
+    /* Re-materialize load_const instructions in the blocks that use them.
+     * This is both a register pressure optimization and a ensures correctness
+     * in the presence of all of the control flow modifications we're about to
+diff --git a/src/nouveau/compiler/nak_nir_lower_early_exit.c b/src/nouveau/compiler/nak_nir_lower_early_exit.c
+new file mode 100644
+index 0000000..41de945
+--- /dev/null
++++ b/src/nouveau/compiler/nak_nir_lower_early_exit.c
+@@ -0,0 +1,313 @@
++/*
++ * Copyright © 2026 Conduit contributors
++ * SPDX-License-Identifier: MIT
++ */
++
++#include "nak_private.h"
++#include "nir_builder.h"
++#include "nir_control_flow.h"
++
++/*
++ * Compute shaders often end in one of two shapes:
++ *
++ *    if (in_bounds) {
++ *       ... the whole shader ...
++ *    }
++ *
++ * or, for an early return that the front-end lowered to a loop that never
++ * iterates:
++ *
++ *    loop {
++ *       if (out_of_bounds) {
++ *          ...
++ *          break;
++ *       }
++ *       ... the whole shader ...
++ *       break;
++ *    }
++ *
++ * Either way the rest of the shader sits in divergent control flow, and NAK
++ * never puts values of divergent blocks in uniform registers, so the whole
++ * shader runs without the uniform datapath: every descriptor index, handle
++ * and uniform address is computed per lane in GPRs.  In a compute shader,
++ * reaching the end of the shader is the same as exiting, so we rewrite these
++ * shapes so that the lanes that leave early exit (halt, which maps to EXIT
++ * and doesn't block later syncs) and the rest of the shader runs in
++ * convergent control flow at the top level:
++ *
++ *    if (out_of_bounds) {
++ *       ...
++ *    }
++ *    if (out_of_bounds)
++ *       halt;
++ *    ... the whole shader ...
++ *
++ * The side that stays guarded keeps its own if, which reconverges before the
++ * halt, so no lane runs it while the other lanes run the code after it.
++ */
++
++/* Most instructions the guarded side of a split if may have regardless of
++ * the other side's size
++ */
++#define MAX_GUARDED_INSTRS 16
++
++static unsigned
++cf_list_instr_count(struct exec_list *list)
++{
++   unsigned count = 0;
++   foreach_list_typed(nir_cf_node, node, node, list) {
++      switch (node->type) {
++      case nir_cf_node_block:
++         count += exec_list_length(&nir_cf_node_as_block(node)->instr_list);
++         break;
++      case nir_cf_node_if: {
++         nir_if *nif = nir_cf_node_as_if(node);
++         count += cf_list_instr_count(&nif->then_list);
++         count += cf_list_instr_count(&nif->else_list);
++         break;
++      }
++      case nir_cf_node_loop:
++         count += cf_list_instr_count(&nir_cf_node_as_loop(node)->body);
++         break;
++      default:
++         UNREACHABLE("Unknown CF node type");
++      }
++   }
++   return count;
++}
++
++static bool
++cf_list_is_empty(struct exec_list *list)
++{
++   if (!exec_list_is_singular(list))
++      return false;
++
++   nir_block *block = nir_cf_node_as_block(exec_node_data(nir_cf_node,
++                                           exec_list_get_head(list), node));
++   return exec_list_is_empty(&block->instr_list);
++}
++
++/* The last CF node of the function body before its (empty) last block, or
++ * NULL if the last block has instructions.
++ */
++static nir_cf_node *
++trailing_cf_node(nir_function_impl *impl)
++{
++   nir_block *last = nir_impl_last_block(impl);
++   if (!exec_list_is_empty(&last->instr_list))
++      return NULL;
++
++   return nir_cf_node_prev(&last->cf_node);
++}
++
++/* Replaces the breaks of a loop (not of loops nested in it) with halts */
++static void
++breaks_to_halts(nir_builder *b, struct exec_list *list)
++{
++   foreach_list_typed(nir_cf_node, node, node, list) {
++      switch (node->type) {
++      case nir_cf_node_block: {
++         nir_block *block = nir_cf_node_as_block(node);
++         nir_instr *last = nir_block_last_instr(block);
++         if (last != NULL && last->type == nir_instr_type_jump &&
++             nir_instr_as_jump(last)->type == nir_jump_break) {
++            b->cursor = nir_instr_remove(last);
++            nir_jump(b, nir_jump_halt);
++         }
++         break;
++      }
++      case nir_cf_node_if: {
++         nir_if *nif = nir_cf_node_as_if(node);
++         breaks_to_halts(b, &nif->then_list);
++         breaks_to_halts(b, &nif->else_list);
++         break;
++      }
++      case nir_cf_node_loop:
++         break;
++      default:
++         UNREACHABLE("Unknown CF node type");
++      }
++   }
++}
++
++/* A trailing loop that never iterates (its header's only predecessor is the
++ * block before it): its breaks become halts and its body moves out of it.
++ */
++static bool
++unwrap_trailing_loop(nir_builder *b, nir_loop *loop)
++{
++   if (nir_loop_has_continue_construct(loop))
++      return false;
++
++   if (nir_block_num_preds(nir_loop_first_block(loop)) != 1)
++      return false;
++
++   breaks_to_halts(b, &loop->body);
++
++   nir_cf_list body;
++   nir_cf_list_extract(&body, &loop->body);
++   nir_cf_reinsert(&body, nir_before_cf_node(&loop->cf_node));
++   nir_cf_node_remove(&loop->cf_node);
++
++   return true;
++}
++
++/* A trailing if with a divergent condition: the larger side runs after it
++ * at the top level, the other side stays in the if and then exits.
++ */
++static bool
++split_trailing_if(nir_builder *b, nir_if *nif)
++{
++   if (!nir_src_is_divergent(&nif->condition))
++      return false;
++
++   const bool then_empty = cf_list_is_empty(&nif->then_list);
++   const bool else_empty = cf_list_is_empty(&nif->else_list);
++   if (then_empty && else_empty)
++      return false;
++
++   bool keep_then;
++   if (then_empty || else_empty) {
++      keep_then = else_empty;
++   } else {
++      const unsigned then_count = cf_list_instr_count(&nif->then_list);
++      const unsigned else_count = cf_list_instr_count(&nif->else_list);
++      keep_then = then_count >= else_count;
++
++      /* The side that stays guarded is still divergent, and its uniform
++       * values are computed apart from the rest's.  Only worth it when that
++       * side is small next to the one that becomes convergent.
++       */
++      const unsigned guarded = keep_then ? else_count : then_count;
++      const unsigned kept = keep_then ? then_count : else_count;
++      if (guarded > MAX_GUARDED_INSTRS && guarded * 4 > kept)
++         return false;
++   }
++
++   nir_def *cond = nif->condition.ssa;
++
++   b->cursor = nir_after_cf_node(&nif->cf_node);
++   nir_if *exit_if = nir_push_if(b, cond);
++   if (keep_then) {
++      nir_push_else(b, exit_if);
++      nir_jump(b, nir_jump_halt);
++   } else {
++      nir_jump(b, nir_jump_halt);
++   }
++   nir_pop_if(b, exit_if);
++
++   nir_cf_list rest;
++   nir_cf_list_extract(&rest, keep_then ? &nif->then_list
++                                        : &nif->else_list);
++   nir_cf_reinsert(&rest, nir_after_cf_node(&exit_if->cf_node));
++
++   /* Past the exit, the condition has the same value in every lane that is
++    * left.  Shaders often test it again (one bounds check per block of
++    * work); those tests become constants, which nir_opt_dead_cf folds.
++    */
++   nir_progress(true, b->impl, nir_metadata_none);
++   nir_metadata_require(b->impl, nir_metadata_block_index |
++                                 nir_metadata_dominance);
++   nir_block *after = nir_cf_node_as_block(nir_cf_node_next(&exit_if->cf_node));
++   nir_block *then_first = nir_if_first_then_block(nif);
++   nir_block *else_first = nir_if_first_else_block(nif);
++   nir_def *values[2] = { NULL, NULL };
++   nir_foreach_use_including_if_safe(use, cond) {
++      if (!nir_src_is_if(use) &&
++          nir_src_use_instr(use)->type == nir_instr_type_phi)
++         continue;
++
++      /* Within the guarded side, the condition is known too */
++      nir_block *use_block = nir_src_get_block(use);
++      nir_block *def_block;
++      bool value;
++      if (nir_block_dominates(after, use_block)) {
++         def_block = after;
++         value = keep_then;
++      } else if (nir_block_dominates(then_first, use_block)) {
++         def_block = then_first;
++         value = true;
++      } else if (nir_block_dominates(else_first, use_block)) {
++         def_block = else_first;
++         value = false;
++      } else {
++         continue;
++      }
++
++      nir_def **v = &values[def_block == after ? 0 : 1];
++      if (*v == NULL || nir_def_block(*v) != def_block) {
++         b->cursor = nir_before_block(def_block);
++         *v = nir_imm_bool(b, value);
++      }
++      nir_src_rewrite(use, *v);
++   }
++
++   /* An if with both sides empty is left for nir_opt_dead_cf */
++   return true;
++}
++
++static bool
++remove_trailing_halt(nir_function_impl *impl)
++{
++   nir_block *last = nir_impl_last_block(impl);
++   nir_instr *instr = nir_block_last_instr(last);
++   if (instr == NULL || instr->type != nir_instr_type_jump ||
++       nir_instr_as_jump(instr)->type != nir_jump_halt)
++      return false;
++
++   nir_instr_remove(instr);
++   return true;
++}
++
++static bool
++lower_early_exit_impl(nir_function_impl *impl)
++{
++   nir_builder b = nir_builder_create(impl);
++   bool progress = false;
++
++   /* Each round moves at most one CF node and the trailing nodes of a
++    * shader are few, so this terminates quickly; the bound is a safety net.
++    */
++   for (unsigned round = 0; round < 64; round++) {
++      nir_metadata_require(impl, nir_metadata_block_index |
++                                 nir_metadata_dominance |
++                                 nir_metadata_divergence);
++
++      nir_cf_node *node = trailing_cf_node(impl);
++      if (node == NULL)
++         break;
++
++      bool changed = false;
++      if (node->type == nir_cf_node_loop) {
++         changed = unwrap_trailing_loop(&b, nir_cf_node_as_loop(node));
++      } else if (node->type == nir_cf_node_if) {
++         changed = split_trailing_if(&b, nir_cf_node_as_if(node));
++      }
++
++      if (!changed)
++         break;
++
++      remove_trailing_halt(impl);
++      nir_progress(true, impl, nir_metadata_none);
++      progress = true;
++   }
++
++   return progress;
++}
++
++bool
++nak_nir_lower_early_exit(nir_shader *nir)
++{
++   if (!mesa_shader_stage_is_compute(nir->info.stage))
++      return false;
++
++   if (nir->info.derivative_group != DERIVATIVE_GROUP_NONE)
++      return false;
++
++   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
++   if (impl == NULL)
++      return false;
++
++   bool progress = lower_early_exit_impl(impl);
++   return progress;
++}
+diff --git a/src/nouveau/compiler/nak_nir_lower_non_uniform_ldcx.c b/src/nouveau/compiler/nak_nir_lower_non_uniform_ldcx.c
+index 0f72b23..2959ed3 100644
+--- a/src/nouveau/compiler/nak_nir_lower_non_uniform_ldcx.c
++++ b/src/nouveau/compiler/nak_nir_lower_non_uniform_ldcx.c
+@@ -833,7 +833,14 @@ pin_uniform_addresses_cf_list(nir_builder *b, struct exec_list *cf_list)
+ 
+       case nir_cf_node_loop: {
+          nir_loop *loop = nir_cf_node_as_loop(node);
+-         if (nir_loop_is_divergent(loop)) {
++         if (nir_loop_is_divergent(loop) && nak_knob_early_exit()) {
++            /* With NAK_EARLY_EXIT, a divergent loop at the top level was
++             * inside the divergent region of the trailing if before, which
++             * pinned its bases; keep doing that.
++             */
++            nir_block *succ = nir_cf_node_as_block(nir_cf_node_next(node));
++            progress |= pin_uniform_addresses_region(b, node, block, succ);
++         } else if (nir_loop_is_divergent(loop)) {
+             /* Not for divergent loops: there the pinned bases change what
+              * the occupancy target (NAK_OCC_TARGET) expects spilling to
+              * cost, and on the two big Steel Nomad compute shaders it then
+diff --git a/src/nouveau/compiler/nak_private.h b/src/nouveau/compiler/nak_private.h
+index 13824ab..fe60ed9 100644
+--- a/src/nouveau/compiler/nak_private.h
++++ b/src/nouveau/compiler/nak_private.h
+@@ -20,6 +20,7 @@ bool nak_knob_uaddr_pin(void);
+ bool nak_knob_nir_flatten(void);
+ bool nak_knob_uniform_atomics(void);
+ bool nak_knob_loop_cont_sync(void);
++bool nak_knob_early_exit(void);
+ 
+ struct nak_compiler {
+    uint8_t sm;
+@@ -446,6 +447,7 @@ bool nak_nir_lower_non_uniform_ldcx(nir_shader *nir, const struct nak_compiler *
+ bool nak_nir_pin_uniform_addresses(nir_shader *nir);
+ bool nak_nir_add_barriers(nir_shader *nir, const struct nak_compiler *nak);
+ bool nak_nir_lower_cf(nir_shader *nir);
++bool nak_nir_lower_early_exit(nir_shader *nir);
+ bool nak_nir_lower_cmat(nir_shader *shader, const struct nak_compiler *nak);
+ 
+ /**
+-- 
+2.43.0
+

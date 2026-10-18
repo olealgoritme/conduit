@@ -1354,6 +1354,11 @@ class = "tuning"
 read = "first shader compile (once per process)"
 effect = "On by default (unset or 1); 0 turns it off. An atomic whose address is the same in every active lane of a subgroup is done once by one lane, with a subgroup reduction of the value and an exclusive scan giving each lane its result (nir_opt_uniform_atomics), instead of one atomic per lane serialized in L2. Part of the shader cache key."
 
+[env.NAK_EARLY_EXIT]
+class = "tuning"
+read = "first shader compile (once per process)"
+effect = "On by default (unset or 1); 0 turns it off. In compute shaders, the lanes that leave early (a trailing divergent if, or an early return that the front-end made a loop that never iterates) exit, and the rest of the shader runs in convergent control flow, where its uniform values (descriptor indices, handles, root-constant addresses) use the uniform datapath instead of per-lane GPRs. Off keeps the divergent if or the loop around the whole body. Part of the shader cache key."
+
 [env.NAK_LOOP_CONT_SYNC]
 class = "tuning"
 read = "first shader compile (once per process)"

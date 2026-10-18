@@ -100,6 +100,7 @@ Patch numbers are file numbers in the directory named in the patch tables.
 | `NAK_BSSY_RECONVERGENT` | 0 | SM100+ if/else barriers in `.RECONVERGENT` mode without BMOV.CLEAR (common 61) |
 | `NAK_PHI_AVOID` | 1 | new values stay out of the registers the block's phi copies want (common 62) |
 | `NAK_F16_CVT` | 1 | scalar f16 conversions on SM86+ run on the ALU (F2FP) and FMA (HADD2.F32) pipes instead of F2F on the quarter-rate conversion pipe (common 74) |
+| `NAK_EARLY_EXIT` | 1 | in compute shaders, the lanes that leave early exit and the rest runs in convergent control flow with uniform registers; 0 keeps the divergent if or loop around the body (common 77) |
 | `NAK_LOOP_CONT_SYNC` | 0 | 1 syncs lanes at the end of every divergent loop iteration; off, loops without a continue skip that sync (common 75) |
 | `NAK_UNROLL_MAX` | 32 | most iterations NIR fully unrolls a loop with a known trip count (common 65) |
 | `NAK_VEC_CSE` | 1 | the copies that make a splat a register vector serve its later uses in the block (common 66) |
@@ -389,6 +390,8 @@ backend. Numbers are file numbers (there is no 0016 or 0025).
 | 0073 | RM: `NVK_RM_UPLOAD_VRAM` defaults to `compute` on Windows, so compute root descriptor tables are CPU-mapped VRAM (0052); `0` keeps them in system memory |
 | 0074 | NAK: on SM86+ a scalar f32-to-f16 conversion is F2FP.F16.F32.PACK_AB with a zero high half (ALU pipe) and an f16-to-f32 conversion is HADD2.F32 with -0 (FMA pipe) instead of F2F on the quarter-rate conversion pipe shared with MUFU; copy propagation leaves HADD2.F32 alone (`NAK_F16_CVT`, default on; part of the shader cache key) |
 | 0075 | NAK: a divergent loop with no continue skips the per-iteration lane sync (BSSY/BSYNC around the body) and its breaks go to the loop's exit sync directly (`NAK_LOOP_CONT_SYNC=1` restores the sync; part of the shader cache key) |
+| 0076 | NAK: the GPR copy of a uniform value that the legalizer makes serves the block's non-ALU uses too (`NAK_DEBUG=noucse` makes a copy per use) |
+| 0077 | NAK: in compute shaders, a trailing loop that never iterates and a trailing divergent if with a small guarded side become an early exit (EXIT for the lanes that leave) followed by the rest of the shader at the top level, where its uniform values use the uniform datapath; the rematerializer, `nak_nir_opt_uniform_address` and divergent top-level loops follow (`NAK_EARLY_EXIT=0` restores the old structure; part of the shader cache key) |
 
 ## Per-draw cost (common 0001-0007)
 

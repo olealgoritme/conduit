@@ -1,0 +1,43 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Sun, 18 Oct 2026 11:43:44 +0200
+Subject: [PATCH] nak: one GPR copy of a uniform value serves the block's
+ non-ALU uses too
+
+The legalizer already reuses the GPR copy of a uniform value for later
+ALU sources in the same block (NAK_DEBUG=noucse turns that off).  Store
+data, texture coordinates and the other sources that go through
+copy_ssa_ref_if_uniform() got a fresh copy per use, so a run of stores of
+the same uniform value (zeroing a buffer, say) paid one MOV per store.
+They now take the cached copy as well.
+
+Compute corpus (115 vkd3d-proton shaders, GB202): 24 shaders lose
+instructions, none gain, -0.82% instructions in total, GPRs unchanged.
+---
+ src/nouveau/compiler/nak/legalize.rs | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/src/nouveau/compiler/nak/legalize.rs b/src/nouveau/compiler/nak/legalize.rs
+index 1f0b164..7d0ecd0 100644
+--- a/src/nouveau/compiler/nak/legalize.rs
++++ b/src/nouveau/compiler/nak/legalize.rs
+@@ -469,8 +469,16 @@ pub trait LegalizeBuildHelpers: SSABuilder {
+     fn copy_ssa_ref_if_uniform(&mut self, ssa_ref: &mut SSARef) {
+         for ssa in &mut ssa_ref[..] {
+             if ssa.is_uniform() {
++                // As in copy_alu_src: one GPR copy of a uniform value
++                // serves the later uses in the block (stores, texture
++                // coordinates and other non-ALU sources)
++                if let Some(copy) = self.cached_warp_copy(ssa) {
++                    *ssa = copy;
++                    continue;
++                }
+                 let warp = self.alloc_ssa(ssa.file().to_warp());
+                 self.copy_to(warp.into(), (*ssa).into());
++                self.note_warp_copy(*ssa, warp);
+                 *ssa = warp;
+             }
+         }
+-- 
+2.43.0
+
