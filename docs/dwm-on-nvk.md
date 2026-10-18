@@ -137,9 +137,11 @@ while DWM runs on NVK, every D3D11 process goes to NVK as well:
   the marker is there, as with `ForeignImport=1`; otherwise an NVK app took the whole screen and
   DWM's own flips showed through about once a second. This holds for D3D11 and D3D12 swap chains.
   A D3D12 back buffer that covers the output (a primary, or at least the desktop's size) still
-  takes scanout 0 (`Nvk12Present` 0, `umd_common/src/nvk_present.rs`); a composed D3D12 frame is
-  complete on the GPU before its present (`NvkComposedComplete`), as a D3D11 one is, because
-  DWM samples it from its own RM channel.
+  takes scanout 0 (`Nvk12Present` 0, `umd_common/src/nvk_present.rs`). A composed D3D12 frame's
+  present marker carries an RM fence for the frame's last ExecuteCommandLists and the
+  copy-engine record of the presented buffer, as a D3D11 blt-model frame's does. A window DWM
+  does not flip (DXGI copies the frame with the D3D12 `pfnBlt` into a GDI-compatible buffer of
+  the window's size and presents that) reaches the window through the KMD's Blt of that buffer.
 
 The choice is made once per process: processes that started before DWM moved (the shell after a
 `restart-device`) keep Venus until they restart.

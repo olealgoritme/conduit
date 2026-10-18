@@ -392,6 +392,9 @@ unsafe fn present_body(
     // is ordered before this present on the context by the NVK ECL sync
     // (`nvk12.rs`), so the identity record carries no stream tail.
     if unsafe { queue::queue_is_nvk(h_queue) } {
+        // SAFETY: the union's `Value` arm overlays the bitfield; any bit pattern
+        // is a valid `UINT`.
+        let flags = unsafe { arg.Flags.__bindgen_anon_1.Value };
         // SAFETY: live runtime arguments of this pfnPresent, on its thread.
         unsafe {
             present_nvk(
@@ -400,6 +403,7 @@ unsafe fn present_body(
                 engine.as_raw() as usize,
                 &identity,
                 arg.OptimizeForComposition != 0,
+                flags,
                 p_out,
                 p_contexts,
             )
@@ -724,9 +728,11 @@ fn desktop_extent() -> Option<(u32, u32)> {
 /// * **composed** -- the WDDM present below names the allocation, which adopted
 ///   the KMD resource id NVK minted for the buffer (IMPORT_RM). DWM opens that id
 ///   and composes the window: a DWM on NVK natively, a Venus DWM with
-///   `ForeignImport=1`. The frame is complete on the GPU first
-///   (`NvkComposedComplete`), because a DWM on NVK samples it from its own RM
-///   channel, which nothing on the queue's WDDM context orders.
+///   `ForeignImport=1`; or, for a window DWM does not flip, the KMD copies it
+///   into the window's surface (a Blt present). The marker carries an RM fence
+///   for the frame's last ECL and the copy-engine record of the buffer, so that
+///   copy and the present's packet wait for the frame's work; nothing waits on
+///   the CPU.
 /// * **scanout 0** -- the frame is shown zero-copy through the KMD's foreign
 ///   scanout source (the desktop is hidden while the app presents), and the
 ///   WDDM present still runs so DXGI's flip queue and frame statistics behave.
@@ -737,12 +743,14 @@ fn desktop_extent() -> Option<(u32, u32)> {
 ///
 /// # Safety
 /// The live runtime arguments of the `pfnPresent` that called this, on its thread.
+#[allow(clippy::too_many_arguments)]
 unsafe fn present_nvk(
     h_queue: ddi12::D3D12DDI_HCOMMANDQUEUE,
     h_context: *mut core::ffi::c_void,
     engine_resource: usize,
     identity: &identity12::AllocationIdentity,
     optimize_for_composition: bool,
+    present_flags: u32,
     p_out: *mut ddi12::D3D12DDI_PRESENT_0051,
     p_contexts: *mut ddi12::D3D12DDI_PRESENT_CONTEXTS_0051,
 ) {
@@ -773,7 +781,8 @@ unsafe fn present_nvk(
     note_nvk_route(scanout, || {
         log_error!(
             "L8: NVK present route: {} ({}) -- {}x{} fmt={} res_id={} primary={} desktop={:?} \
-             dwm_imports={} mode={} OptimizeForComposition={}",
+             dwm_imports={} mode={} OptimizeForComposition={} flags={:#x} heap_flags={:#x} \
+             km_resource={:#x}",
             if scanout { "scanout 0" } else { "composed by DWM" },
             reason.as_str(),
             identity.geometry.width,
@@ -785,6 +794,9 @@ unsafe fn present_nvk(
             dwm_imports,
             mode,
             optimize_for_composition,
+            present_flags,
+            identity.heap_flags,
+            identity.h_km_resource,
         );
     });
     // `Nvk12EclSync=2` + `Nvk12ScanoutFence`: the flip waits for the frame's
@@ -828,26 +840,74 @@ unsafe fn present_nvk(
             note_refusal(&L8_REFUSALS.nvk_scanout_failed);
         }
     } else {
-        // DWM may read the buffer as soon as the WDDM present below reaches it,
-        // through its own RM channel: the frame is finished first. The same
-        // CPU wait the scanout arm above takes without an ECL fence.
-        let complete = crate::knobs12::nvk_composed_complete();
-        if complete {
-            L8_REFUSALS.nvk_composed_complete.bump();
-            // SAFETY: forwarded precondition.
-            if !unsafe { queue::nvk_wait_queue_idle(h_queue, NVK_SCANOUT_WAIT_NS) } {
-                note_refusal(&L8_REFUSALS.nvk_composed_wait_timeout);
-            }
-        }
         L8_REFUSALS.nvk_composed_presents.bump();
+    }
+
+    // A composed frame's marker carries an RM fence for the queue's last ECL
+    // fence value (it fires when the frame's work is done) and, when the ICD can
+    // describe the back buffer, the copy-engine record: the KMD's copy of this
+    // frame into a window surface (a Blt present) waits for the fence and reads
+    // the image through the record, and the present's packet retires behind the
+    // frame's work. Nothing here waits for the GPU.
+    // SAFETY: forwarded precondition; the live engine resource of this present.
+    let fence = if !scanout && has_id {
+        unsafe { queue::nvk_present_fence(h_queue, engine_resource) }
+    } else {
+        None
+    };
+    let rm_copy = fence.and_then(|(handle, value, copy)| {
+        let tail = helios_protocol::HeliosRmFenceTail {
+            rm_fence_handle: handle,
+            flags: helios_protocol::HELIOS_RM_FENCE_TAIL_FLAG_FENCE,
+            rm_fence_value: value,
+        };
+        match copy.map(|c| helios_protocol::producer_record(&c, &tail)) {
+            Some(Ok(record)) => Some(record),
+            Some(Err(why)) => {
+                note_refusal(&L8_REFUSALS.nvk_copy_record_refused);
+                if L8_REFUSALS.nvk_copy_record_refused.get() <= LOG_BUDGET {
+                    log_error!("L8: NVK present: copy-engine record not sent: {why:?}");
+                }
+                None
+            }
+            None => None,
+        }
+    });
+    if !scanout {
+        match (fence, rm_copy) {
+            (Some(_), Some(_)) => L8_REFUSALS.nvk_composed_fenced_copy.bump(),
+            (Some(_), None) => L8_REFUSALS.nvk_composed_fenced.bump(),
+            (None, _) => L8_REFUSALS.nvk_composed_unfenced.bump(),
+        }
         let n = L8_REFUSALS.nvk_composed_presents.get();
         if n == 1 || n % 1024 == 0 {
             log_error!(
                 "L8: NVK present: {n} frames composed by DWM from foreign resource id {} \
-                 ({} completed before their present, wait timeouts {})",
+                 (fence + copy record {}, fence only {}, no fence {})",
                 identity.venus_res_id,
-                L8_REFUSALS.nvk_composed_complete.get(),
-                L8_REFUSALS.nvk_composed_wait_timeout.get(),
+                L8_REFUSALS.nvk_composed_fenced_copy.get(),
+                L8_REFUSALS.nvk_composed_fenced.get(),
+                L8_REFUSALS.nvk_composed_unfenced.get(),
+            );
+        }
+        if let (Some(record), 1) = (rm_copy, n) {
+            let src = &record.source;
+            log_error!(
+                "L8: NVK present: copy-engine record: semaphore {:#x}/{:#x}+{} value {}, source \
+                 {:#x}/{:#x} {}x{} pitch {} fourcc {:#010x} modifier {:#018x} offset {} size {}",
+                record.semaphore.h_client,
+                record.semaphore.h_memory,
+                record.semaphore.offset,
+                record.semaphore.value,
+                src.h_client,
+                src.h_memory,
+                src.width,
+                src.height,
+                src.pitch,
+                src.fourcc,
+                src.modifier,
+                src.offset,
+                src.size,
             );
         }
     }
@@ -872,13 +932,43 @@ unsafe fn present_nvk(
             snapshot_memory_type_index: 0,
             snapshot_purpose: helios_protocol::HELIOS_PRESENT_SNAPSHOT_PURPOSE_NONE,
         };
-        let record = helios_protocol::HeliosPresentRenderCmd {
+        let mut record = helios_protocol::HeliosPresentRenderCmd {
             magic: helios_protocol::HELIOS_PRESENT_RENDER_MAGIC,
             version: helios_protocol::HELIOS_PRESENT_RENDER_VERSION,
             present: private,
         };
-        // SAFETY: forwarded precondition (inside pfnPresent, entering thread).
-        match unsafe { queue::submit_present_identity(h_queue, &record) } {
+        // SAFETY (all three arms): forwarded precondition (inside pfnPresent,
+        // entering thread). The KMD takes a parsed fence in every case; only a
+        // Render that never went in leaves it with this process.
+        let submitted = match fence {
+            Some((handle, value, _)) => {
+                record.present.reserved |= helios_protocol::HELIOS_PRESENT_PRIVATE_FLAG_RM_FENCE;
+                let fenced = helios_protocol::HeliosPresentRenderCmdFence {
+                    base: record,
+                    fence: helios_protocol::HeliosRmFenceTail {
+                        rm_fence_handle: handle,
+                        flags: helios_protocol::HELIOS_RM_FENCE_TAIL_FLAG_FENCE,
+                        rm_fence_value: value,
+                    },
+                };
+                let outcome = match rm_copy {
+                    Some(copy) => unsafe {
+                        queue::submit_present_identity(
+                            h_queue,
+                            &helios_protocol::HeliosPresentRenderCmdRmCopy::new(fenced, copy),
+                        )
+                    },
+                    None => unsafe { queue::submit_present_identity(h_queue, &fenced) },
+                };
+                if !matches!(outcome, queue::WddmSubmit::Submitted) {
+                    // SAFETY: forwarded precondition.
+                    unsafe { queue::nvk_close_fence(h_queue, handle) };
+                }
+                outcome
+            }
+            None => unsafe { queue::submit_present_identity(h_queue, &record) },
+        };
+        match submitted {
             queue::WddmSubmit::Submitted => {}
             queue::WddmSubmit::Unavailable => {
                 note_refusal(&L8_REFUSALS.present_identity_unavailable);
@@ -919,18 +1009,17 @@ pub(crate) fn install_core(
 ///
 /// Chain position: `CopySlots` -> `PresentSlots` on the command-list table.
 ///
-/// ⚠ **`pfnBlt` is deliberately left on its counting noop.** It is L8's third slot
-/// and it is a *different* present model — the legacy DXGI blt path, which
-/// `docs/archive/WINDOWED_BLT_DESIGN` and the 34th session's
-/// `DXGI_STATUS_OCCLUDED` finding are about. Nothing in `PENDING.md` §S-3 asks for
-/// it, no measured D3D12 present has taken it, and installing an untested handler
-/// beside the one that matters would put two present models in review at once. Its
-/// noop counter is what says whether it is ever entered.
+/// `pfnBlt` is DXGI's copy of a back buffer into the surface it presents when a
+/// swap chain is not flipped to DWM (a window DWM cannot flip: the frame is
+/// copied into a GDI-compatible buffer of the window's size, and that buffer is
+/// presented). It is a copy on the command list, so the body is L3c's
+/// ([`super::copy::blt`]).
 pub(crate) fn install_cmdlist(
     mut filling: Filling<'_, CommandListTable, stage::CopySlots>,
 ) -> Filling<'_, CommandListTable, stage::PresentSlots> {
     let table = filling.table();
     table.pfnPresent = Some(present);
+    table.pfnBlt = Some(super::copy::blt);
     filling.advance()
 }
 
@@ -1041,17 +1130,23 @@ struct L8Refusals {
     /// instead (no ECL fence value on the queue, or the flip was refused).
     nvk_scanout_fence_fallback: RefusalCounter,
     nvk_composed_presents: RefusalCounter,
-    /// Composed presents that waited on the CPU for the frame's GPU work first
-    /// (`NvkComposedComplete`).
-    nvk_composed_complete: RefusalCounter,
-    /// ... and those whose wait timed out (the frame was presented anyway).
-    nvk_composed_wait_timeout: RefusalCounter,
+    /// Composed presents whose marker carried an RM fence and the copy-engine
+    /// record.
+    nvk_composed_fenced_copy: RefusalCounter,
     /// Presents whose route (scanout 0 / composed) differed from the previous
     /// present's, the first one included.
     nvk_route_changes: RefusalCounter,
     /// Reads of the desktop's size that GDI could not answer (the automatic
     /// route then sends only a primary to scanout 0).
     nvk_desktop_extent_unknown: RefusalCounter,
+    /// ... an RM fence without the record (the ICD could not describe the
+    /// buffer, or an older ICD).
+    nvk_composed_fenced: RefusalCounter,
+    /// ... no fence (no ECL fence on the queue, or no ECL fences here).
+    nvk_composed_unfenced: RefusalCounter,
+    /// Copy-engine records the ICD gave that break a rule the KMD applies (not
+    /// sent; the fence goes alone).
+    nvk_copy_record_refused: RefusalCounter,
 }
 
 static L8_REFUSALS: L8Refusals = L8Refusals {
@@ -1075,10 +1170,12 @@ static L8_REFUSALS: L8Refusals = L8Refusals {
     nvk_scanout_fenced: RefusalCounter::new("Nvk12ScanoutFenced"),
     nvk_scanout_fence_fallback: RefusalCounter::new("Nvk12ScanoutFenceFallback"),
     nvk_composed_presents: RefusalCounter::new("Nvk12ComposedPresents"),
-    nvk_composed_complete: RefusalCounter::new("Nvk12ComposedComplete"),
-    nvk_composed_wait_timeout: RefusalCounter::new("Nvk12ComposedWaitTimeout"),
+    nvk_composed_fenced_copy: RefusalCounter::new("Nvk12ComposedFencedCopy"),
     nvk_route_changes: RefusalCounter::new("Nvk12RouteChanges"),
     nvk_desktop_extent_unknown: RefusalCounter::new("Nvk12DesktopExtentUnknown"),
+    nvk_composed_fenced: RefusalCounter::new("Nvk12ComposedFenced"),
+    nvk_composed_unfenced: RefusalCounter::new("Nvk12ComposedUnfenced"),
+    nvk_copy_record_refused: RefusalCounter::new("Nvk12CopyRecordRefused"),
 };
 
 /// L8's refusal counters, printed by `crate::log_refusal_summary` at this lane's
@@ -1121,8 +1218,10 @@ pub(crate) static REFUSALS: &[&RefusalCounter] = &[
     &L8_REFUSALS.nvk_scanout_fenced,
     &L8_REFUSALS.nvk_scanout_fence_fallback,
     &L8_REFUSALS.nvk_composed_presents,
-    &L8_REFUSALS.nvk_composed_complete,
-    &L8_REFUSALS.nvk_composed_wait_timeout,
+    &L8_REFUSALS.nvk_composed_fenced_copy,
     &L8_REFUSALS.nvk_route_changes,
     &L8_REFUSALS.nvk_desktop_extent_unknown,
+    &L8_REFUSALS.nvk_composed_fenced,
+    &L8_REFUSALS.nvk_composed_unfenced,
+    &L8_REFUSALS.nvk_copy_record_refused,
 ];

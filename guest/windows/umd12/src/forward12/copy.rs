@@ -916,6 +916,155 @@ unsafe extern "system" fn copy_texture_region(
     }
 }
 
+/// `pfnBlt` -> `ID3D12GraphicsCommandList::CopyTextureRegion` (or
+/// `ResolveSubresource` for a multisampled source).
+///
+/// DXGI records it when a swap chain's frame is not flipped to DWM: it copies
+/// the back buffer into a surface of its own (for a window it cannot flip, a
+/// GDI-compatible `B8G8R8X8` buffer of the window's size) and then presents
+/// that surface. A Blt left undone presents a buffer nothing ever wrote.
+///
+/// The copy is unscaled and unrotated: a source and destination rectangle of
+/// different sizes copy their overlapping top-left part, and a rotation is
+/// ignored, each counted and logged. `B8G8R8A8` and `B8G8R8X8` share the engine
+/// format, so the common conversion is a plain copy.
+///
+/// # Safety
+/// `h_list` must be a live handle from `queue::create_command_list` and
+/// `p_blt`, when non-null, a live `D3D12DDIARG_BLT` naming resources this driver
+/// created.
+pub(crate) unsafe extern "system" fn blt(
+    h_list: ddi12::D3D12DDI_HCOMMANDLIST,
+    p_blt: *const ddi12::D3D12DDIARG_BLT,
+) {
+    ddi_time!("blt");
+    L3C_REFUSALS.blt_entered.bump();
+    // SAFETY: the caller guarantees a live handle from `create_command_list`.
+    let Some(state) = (unsafe { queue::command_list_state(h_list) }) else {
+        note_refusal(&L3C_REFUSALS.command_list_missing);
+        return;
+    };
+    // SAFETY: `_In_ CONST` and live for the call when non-null.
+    let Some(arg) = (unsafe { p_blt.as_ref() }) else {
+        note_refusal(&L3C_REFUSALS.blt_bad_arg);
+        // SAFETY: `state` is the live list state this call resolved.
+        unsafe { report_error(state, E_INVALIDARG) };
+        return;
+    };
+    // SAFETY: the runtime handed both handles in this call, so both are live.
+    let (Some(dst), Some(src)) = (unsafe { resource_of(arg.hDstResource) }, unsafe {
+        resource_of(arg.hSrcResource)
+    }) else {
+        note_refusal(&L3C_REFUSALS.blt_bad_arg);
+        if let Some(n) = budget(&COPY_LOG) {
+            log_error!(
+                "Blt: dst={:p} src={:p} -- one of them carries no engine resource (x{})",
+                arg.hDstResource.pDrvPrivate,
+                arg.hSrcResource.pDrvPrivate,
+                n + 1,
+            );
+        }
+        // SAFETY: `state` is the live list state this call resolved.
+        unsafe { report_error(state, E_INVALIDARG) };
+        return;
+    };
+    let src_w = arg.SrcRight.saturating_sub(arg.SrcLeft);
+    let src_h = arg.SrcBottom.saturating_sub(arg.SrcTop);
+    let dst_w = arg.DstRight.saturating_sub(arg.DstLeft);
+    let dst_h = arg.DstBottom.saturating_sub(arg.DstTop);
+    // SAFETY: the union's `Value` arm overlays the bitfield; any bit pattern is a
+    // valid `UINT`.
+    let flags = unsafe { arg.Flags.__bindgen_anon_1.Value };
+    let n = L3C_REFUSALS.blt_entered.get();
+    if n == 1 || n % 4096 == 0 {
+        log_error!(
+            "Blt #{n}: src={:p}[{}] ({},{})-({},{}) -> dst={:p}[{}] ({},{})-({},{}) flags={flags:#x} \
+             rotate={}",
+            arg.hSrcResource.pDrvPrivate,
+            arg.SrcSubresource,
+            arg.SrcLeft,
+            arg.SrcTop,
+            arg.SrcRight,
+            arg.SrcBottom,
+            arg.hDstResource.pDrvPrivate,
+            arg.DstSubresource,
+            arg.DstLeft,
+            arg.DstTop,
+            arg.DstRight,
+            arg.DstBottom,
+            arg.Rotate,
+        );
+    }
+    if arg.Rotate != ddi12::DXGI_DDI_MODE_ROTATION_DXGI_DDI_MODE_ROTATION_UNSPECIFIED
+        && arg.Rotate != ddi12::DXGI_DDI_MODE_ROTATION_DXGI_DDI_MODE_ROTATION_IDENTITY
+    {
+        note_refusal(&L3C_REFUSALS.blt_rotation_unsupported);
+    }
+    let w = src_w.min(dst_w);
+    let h = src_h.min(dst_h);
+    if w != src_w || h != src_h || w != dst_w || h != dst_h {
+        note_refusal(&L3C_REFUSALS.blt_stretch_unsupported);
+        if let Some(n) = budget(&COPY_LOG) {
+            log_error!(
+                "Blt: source {src_w}x{src_h} and destination {dst_w}x{dst_h} differ -- the \
+                 overlapping {w}x{h} is copied unscaled (x{})",
+                n + 1,
+            );
+        }
+    }
+    if w == 0 || h == 0 {
+        return;
+    }
+    // SAFETY: a live engine resource borrowed for this call.
+    let src_desc = unsafe { src.GetDesc() };
+    if src_desc.SampleDesc.Count > 1 {
+        // SAFETY: as above.
+        let format = unsafe { dst.GetDesc() }.Format;
+        // SAFETY: `engine()` borrows the list this box owns; both resources are
+        // borrowed references live for this call.
+        unsafe {
+            state
+                .engine()
+                .ResolveSubresource(dst, arg.DstSubresource, src, arg.SrcSubresource, format);
+        }
+        return;
+    }
+    let dst_location = D3D12_TEXTURE_COPY_LOCATION {
+        pResource: borrowed(dst),
+        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+            SubresourceIndex: arg.DstSubresource,
+        },
+    };
+    let src_location = D3D12_TEXTURE_COPY_LOCATION {
+        pResource: borrowed(src),
+        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+            SubresourceIndex: arg.SrcSubresource,
+        },
+    };
+    let src_box = D3D12_BOX {
+        left: arg.SrcLeft,
+        top: arg.SrcTop,
+        front: 0,
+        right: arg.SrcLeft + w,
+        bottom: arg.SrcTop + h,
+        back: 1,
+    };
+    // SAFETY: `engine()` borrows the list this box owns; both locations borrow
+    // resources live for this call and the box is a live local.
+    unsafe {
+        state.engine().CopyTextureRegion(
+            &dst_location,
+            arg.DstLeft,
+            arg.DstTop,
+            0,
+            &src_location,
+            Some(&src_box as *const D3D12_BOX),
+        );
+    }
+}
+
 /// `pfnResourceCopy` -> `ID3D12GraphicsCommandList::CopyResource`.
 ///
 /// # Safety
@@ -2649,6 +2798,16 @@ pub(crate) struct L3cRefusals {
     /// than the old reading and is why it stays a named counter rather than a
     /// silent `else`.
     set_error_cb_absent: RefusalCounter,
+    /// `pfnBlt` calls (the census): DXGI's copy of a back buffer into the
+    /// surface it presents when the swap chain is not flipped to DWM.
+    blt_entered: RefusalCounter,
+    /// `pfnBlt` with a null argument, or a resource with no engine resource.
+    blt_bad_arg: RefusalCounter,
+    /// `pfnBlt` whose source and destination rectangles differ in size: the
+    /// overlapping top-left part is copied unscaled.
+    blt_stretch_unsupported: RefusalCounter,
+    /// `pfnBlt` with a rotation: copied unrotated.
+    blt_rotation_unsupported: RefusalCounter,
 }
 
 pub(crate) static L3C_REFUSALS: L3cRefusals = L3cRefusals {
@@ -2685,6 +2844,10 @@ pub(crate) static L3C_REFUSALS: L3cRefusals = L3cRefusals {
     predication_resource_missing: RefusalCounter::new("L3cPredicationResourceMissing"),
     set_error_no_device: RefusalCounter::new("L3cSetErrorNoDevice"),
     set_error_cb_absent: RefusalCounter::new("L3cSetErrorCbAbsent"),
+    blt_entered: RefusalCounter::new("L3cBltEntered"),
+    blt_bad_arg: RefusalCounter::new("L3cBltBadArg"),
+    blt_stretch_unsupported: RefusalCounter::new("L3cBltStretchUnsupported"),
+    blt_rotation_unsupported: RefusalCounter::new("L3cBltRotationUnsupported"),
 };
 
 /// L3c's refusal counters, printed by `crate::log_refusal_summary` at this
@@ -2733,4 +2896,8 @@ pub(crate) static REFUSALS: &[&RefusalCounter] = &[
     &L3C_REFUSALS.predication_resource_missing,
     &L3C_REFUSALS.set_error_no_device,
     &L3C_REFUSALS.set_error_cb_absent,
+    &L3C_REFUSALS.blt_entered,
+    &L3C_REFUSALS.blt_bad_arg,
+    &L3C_REFUSALS.blt_stretch_unsupported,
+    &L3C_REFUSALS.blt_rotation_unsupported,
 ];

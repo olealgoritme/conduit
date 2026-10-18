@@ -611,26 +611,6 @@ pub(crate) fn dwm_imports_nvk() -> bool {
     *CELL.get_or_init(|| foreign_import() || helios_umd_common::knobs::dwm_on_nvk_marker())
 }
 
-/// `NvkComposedComplete` (shared with the D3D11 driver; default 1): a composed
-/// NVK frame is complete on the GPU before its WDDM present. A DWM on NVK reads
-/// the back buffer from its own RM channel, which no WDDM wait holds, so the
-/// present's ordering on the queue's context does not keep it from composing a
-/// half-drawn frame. 0 presents without the wait.
-pub(crate) static NVK_COMPOSED_COMPLETE: BoolKnob = BoolKnob::new(c"NvkComposedComplete", true);
-
-/// `NvkComposedComplete`, or `HELIOS_NVK_COMPOSED_COMPLETE` (0/1) from the
-/// process environment. Read once per process.
-pub(crate) fn nvk_composed_complete() -> bool {
-    static CELL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CELL.get_or_init(|| {
-        match std::env::var("HELIOS_NVK_COMPOSED_COMPLETE").ok().as_deref().map(str::trim) {
-            Some("0") => false,
-            Some("1") => true,
-            _ => NVK_COMPOSED_COMPLETE.get(),
-        }
-    })
-}
-
 /// `Umd12PipelineLibrary`: the six pipeline-library DDI slots forward to the
 /// engine's `ID3D12PipelineLibrary1` (`forward12::pso`). Absent = ON; explicit
 /// 0 = every slot refuses with `E_NOTIMPL`, the behaviour before the

@@ -684,7 +684,7 @@ effect = "1: a composed NVK present's RM fence takes a value reserved at the Pre
 [umd.NvkComposedComplete]
 class = "supported"
 read = "once per process"
-effect = "1: a composed NVK frame that DWM samples directly (a flip-model swap chain's own buffer, D3D11 or D3D12) is complete on the GPU before its WDDM present, so a DWM on NVK never composes a half-drawn frame. 0: a D3D11 frame carries an RM fence instead, as blt-model frames do; a D3D12 frame is presented without waiting. HELIOS_NVK_COMPOSED_COMPLETE overrides it per process."
+effect = "1: a composed NVK frame that DWM samples directly (a flip-model swap chain's own buffer) is complete on the GPU before its WDDM present, so a DWM on NVK never composes a half-drawn frame. 0 lets the frame carry an RM fence instead, as blt-model frames do. HELIOS_NVK_COMPOSED_COMPLETE overrides it per process."
 see = "[dwm-on-nvk.md](dwm-on-nvk.md)"
 
 [umd.NvkDefaults]

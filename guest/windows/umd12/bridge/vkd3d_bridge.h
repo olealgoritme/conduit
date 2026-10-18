@@ -88,6 +88,17 @@ struct HeliosVkd3dDevice {
   // done (no fence or no fenced scanout), and the caller presents another way.
   std::int32_t nvk_scanout_present_fenced(std::size_t resource, std::size_t queue,
                                           std::uint64_t value) const noexcept;
+  // NVK only: an RM fence for ECL fence value `value` of `queue` (a borrowed
+  // engine ID3D12CommandQueue*) for a composed present of `resource`, and the
+  // copy-engine record of `resource` (helios_icd_interface version 8,
+  // ecl_fence_create_v3: `copy_len` = 80 bytes of helios_icd_rm_copy at
+  // `out_copy`). 0 = fence and record; 1 = the fence alone (no record:
+  // an older ICD, or a source it cannot describe; `out_copy` all zero);
+  // negative = no fence. The fence is the caller's.
+  std::int32_t nvk_present_fence_v3(std::size_t resource, std::size_t queue,
+                                    std::uint64_t value, std::uint32_t* out_fence,
+                                    std::uint8_t* out_copy,
+                                    std::size_t copy_len) const noexcept;
 
   // BORROWED — the bridge keeps the owning reference. 0 if not created.
   // The caller must NOT `Release()` this, and on the Rust side must not let a
