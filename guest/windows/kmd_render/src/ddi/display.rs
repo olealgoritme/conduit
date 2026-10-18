@@ -2216,7 +2216,8 @@ unsafe fn present_blt_to_rm_primary(
 /// prepares/reserves; SubmitCommand admits exact residency; this worker submits
 /// only when both that admission and the producer stream boundary are ready.
 /// There is no timer or producer poll: every promotion/completion signals HPD.
-pub(crate) fn service_windowed_blt(passive: PassiveLevel, adapter: &AdapterContext) {
+/// Returns whether a request was taken (dispatched or terminalized): one per call.
+pub(crate) fn service_windowed_blt(passive: PassiveLevel, adapter: &AdapterContext) -> bool {
     adapter.with_scanout_lifecycle(passive, |lock| {
         let submit = lock.with_venus_client(|client| {
             let request = adapter
@@ -2314,6 +2315,7 @@ pub(crate) fn service_windowed_blt(passive: PassiveLevel, adapter: &AdapterConte
                 )
             })
         });
+        let took = matches!(submit, Ok(Some(_)));
         if let Ok(Some((token, boundary, (t_present, t_queue), destination_buffer, result))) =
             submit
         {
@@ -2396,7 +2398,17 @@ pub(crate) fn service_windowed_blt(passive: PassiveLevel, adapter: &AdapterConte
                 request.destination_resource_id,
             );
         }
-    });
+        took
+    })
+}
+
+/// Whether a WindowedBlt request could be dispatched right now (admitted, its producer's boundary
+/// reached, its destination writable): the HPD worker looks again at once instead of waiting for
+/// a wake. Spinlock only.
+pub(crate) fn windowed_blt_dispatchable(adapter: &AdapterContext) -> bool {
+    adapter
+        .with_virtio(|v| v.windowed_blt_dispatchable())
+        .unwrap_or(false)
 }
 
 pub unsafe extern "C" fn dxgkddi_set_pointer_position(

@@ -1208,6 +1208,11 @@ pub mod knobs {
     /// the worker to refresh the heartbeat block every 2 s. 0 never arms it. Read at every
     /// StartDevice; mirrored as `VsWdTmEff`.
     pub const VS_WD_TIMER: KnobName = KnobName::new(b"VsWdTimer");
+    /// `HpdHiResWait` (default 1 = on): the HPD worker's timed waits shorter than one default
+    /// clock tick (the copy-engine route's 0.5 ms poll, the control poll, the foreign waits) are
+    /// woken by a high-resolution Ex timer instead of ending on the next 15.6 ms clock tick. 0 =
+    /// the plain timed wait only. Read at every StartDevice; mirrored as `HpdHrEff`.
+    pub const HPD_HIRES_WAIT: KnobName = KnobName::new(b"HpdHiResWait");
     /// `RestSeed` (default 1 = on): persist the newest flip address dxgkrnl issued in the
     /// service key (`RestIssLo` / `RestIssHi` / `RestUpS` / `RestChk`) and seed the restarted
     /// heartbeat from it after a `pnputil /restart-device` that RELOADED the image (every static

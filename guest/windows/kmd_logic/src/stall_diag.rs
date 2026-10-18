@@ -197,7 +197,7 @@ pub mod site {
 ///   `VsWdSCbI`, `VsWdSCbO`, `VsWdSSyT`: what it saw the last time it acted (when, armed, the
 ///   reference and deadline in ms, the silence, the callback counts, when the last synchronized
 ///   call began).
-pub const COUNTERS: [&str; 150] = [
+pub const COUNTERS: [&str; 153] = [
     "HpdLoopN",
     "HpdLoopT",
     "HpdSite",
@@ -305,6 +305,11 @@ pub const COUNTERS: [&str; 150] = [
     "HpdStep100N",
     "HpdPass100N",
     "HpdPass500N",
+    // `HpdHiResWait`: in force, the short waits that armed the high-resolution timer, and those
+    // it ended.
+    "HpdHrEff",
+    "HpdHrArm",
+    "HpdHrWake",
     "VsGap100N",
     "VsGap1000N",
     "VsGapT",

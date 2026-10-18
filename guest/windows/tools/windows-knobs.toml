@@ -234,6 +234,11 @@ read = "StartDevice"
 effect = "1: while VidMm keeps a standard Present buffer in system memory, the Blt copy writes its pages through a virtio-gpu guest blob and skips the CPU mirror. Needs the host's guest-blob support (`conduit config venus.guest_blobs true`); without it nothing changes."
 see = "[zero-copy-present.md](../guest/windows/docs/zero-copy-present.md)"
 
+[kmd.HpdHiResWait]
+class = "tuning"
+read = "StartDevice"
+effect = "1: the HPD worker's timed waits shorter than one default clock tick (the copy-engine route's 0.5 ms poll for its copies, the control poll, the foreign-scanout waits) are woken by a high-resolution timer at their due time instead of on the next 15.6 ms clock tick, so a finished copy retires its Present without waiting a tick. 0: the plain timed wait only."
+
 [kmd.HwCursor]
 class = "supported"
 read = "AddAdapter and StartDevice"

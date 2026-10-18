@@ -226,6 +226,8 @@ pub(crate) fn publish_hpd_wake() {
     use hpd_wake::cause;
     rec(b"HpdWkEvt", WK_EVT.load(Ordering::Relaxed));
     rec(b"HpdWkTmo", WK_TMO.load(Ordering::Relaxed));
+    rec(b"HpdHrArm", HPD_HR_ARM.load(Ordering::Relaxed));
+    rec(b"HpdHrWake", HPD_HR_WAKE.load(Ordering::Relaxed));
     rec(b"HpdWkSrc", WK_SRC_LAST.load(Ordering::Relaxed));
     rec(b"HpdWait", WAIT_US.load(Ordering::Relaxed));
     let min = WAIT_US_MIN.load(Ordering::Relaxed);
@@ -423,6 +425,11 @@ static DEFER_BUDGET: AtomicU32 = AtomicU32::new(0);
 static VS_POWER_MODE: AtomicU32 = AtomicU32::new(0);
 static VS_WATCHDOG: AtomicU32 = AtomicU32::new(0);
 static VS_IDLE_WAKE: AtomicU32 = AtomicU32::new(0);
+/// `HpdHiResWait` in force (1 = short worker waits on the high-resolution timer), and the waits
+/// that armed it (`HpdHrArm`) and that it ended (`HpdHrWake`).
+static HPD_HIRES: AtomicU32 = AtomicU32::new(0);
+static HPD_HR_ARM: AtomicU32 = AtomicU32::new(0);
+static HPD_HR_WAKE: AtomicU32 = AtomicU32::new(0);
 
 /// The tick callback ran for `dwell_100ns` (entry to return, whatever the callback did, the time it
 /// was preempted included). A callback that takes a whole period or more holds up the NEXT tick of
@@ -460,6 +467,21 @@ pub(crate) fn vs_watchdog() -> u32 {
 /// `VsIdleWake` in force (1 = the worker's 4 Hz idle wake).
 pub(crate) fn vs_idle_wake() -> u32 {
     VS_IDLE_WAKE.load(Ordering::Relaxed)
+}
+
+/// `HpdHiResWait` in force.
+pub(crate) fn hpd_hires_wait() -> bool {
+    HPD_HIRES.load(Ordering::Relaxed) != 0
+}
+
+/// A worker wait armed the high-resolution timer (`armed`), and whether the timer ended it.
+pub(crate) fn note_hires_wait(armed: bool, fired: bool) {
+    if armed {
+        HPD_HR_ARM.fetch_add(1, Ordering::Relaxed);
+    }
+    if fired {
+        HPD_HR_WAKE.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// One vsync tick of bookkeeping (`VsPendN`, its maximum) and, with `FlipWdogMs` set, the
@@ -1174,6 +1196,12 @@ pub(crate) fn reread_knobs() {
     VS_POWER_MODE.store(pm, Ordering::Relaxed);
     VS_WATCHDOG.store(wd, Ordering::Relaxed);
     VS_IDLE_WAKE.store(idle, Ordering::Relaxed);
+    let hires = hpd_wake::clamp_hires_wait(crate::diag::read_config_dword(
+        crate::diag::knobs::HPD_HIRES_WAIT,
+        1,
+    ));
+    HPD_HIRES.store(hires, Ordering::Relaxed);
+    crate::diag::record_named_bytes(b"HpdHrEff", hires);
     crate::diag::record_named_bytes(b"VsPwrEff", pm);
     crate::diag::record_named_bytes(b"VsWdgEff", wd);
     crate::diag::record_named_bytes(b"VsIdlEff", idle);
@@ -1548,6 +1576,8 @@ pub(crate) fn start_generation() {
         &DEFER_ATTEMPTS,
         &WK_EVT,
         &WK_TMO,
+        &HPD_HR_ARM,
+        &HPD_HR_WAKE,
         &WK_SRC_PENDING,
         &WK_SRC_LAST,
         &SG_COALESCED,

@@ -672,9 +672,10 @@ unsafe fn foreign_arm(
     ) else {
         return skip(Why::Rect);
     };
-    // Retire the route's finished copies now, at this Present: the HPD worker polls them only at
-    // its timer-quantum waits (about 15.6 ms), and every Present whose copy is not retired holds
-    // the app's frame-latency budget (382.1: 89 fps).
+    // Retire the route's finished copies now, at this Present: between its passes the HPD worker
+    // polls them only at its timed waits (0.5 ms on the high-resolution timer, a 15.6 ms clock
+    // tick with `HpdHiResWait` 0), and every Present whose copy is not retired holds the app's
+    // frame-latency budget (382.1: 89 fps).
     crate::ddi::ce_present_route::settle_from_present(passive, adapter);
     let t_rt = crate::ddi::blt_async::now_100ns();
     // SAFETY: the caller's contract.

@@ -161,6 +161,36 @@ const fn floor(t: i64) -> i64 {
     }
 }
 
+/// `HpdHiResWait` (default 1): the worker's timed waits shorter than one default clock tick are
+/// woken by a high-resolution timer. A `KeWaitForSingleObject` timeout ends on the next clock
+/// interrupt at or after the due time, so at the default resolution (15.625 ms) the copy-engine
+/// route's 0.5 ms poll ([`crate::ce_route::POLL_DUE_100NS`]), the control poll and the foreign
+/// waits all became a whole tick: a copy finished just after the settle spin stayed unretired,
+/// with its Present's DMA fence and the source's read-ledger claim, for up to 15.6 ms. 0 = the
+/// plain timed wait only.
+pub const fn clamp_hires_wait(v: u32) -> u32 {
+    if v == 0 {
+        0
+    } else {
+        1
+    }
+}
+
+/// One default clock tick (15.625 ms) in 100 ns units: a timed wait at least this long gains
+/// nothing from the high-resolution timer.
+pub const DEFAULT_TICK_100NS: i64 = 156_250;
+
+/// The due time (relative, negative 100 ns) to arm the worker's high-resolution timer with for
+/// the wait [`wait_plan`] planned, or `None`: the knob is off, the wait is infinite, or it is a
+/// tick or longer. The plain timeout stays on the wait as its bound either way, so a timer that
+/// cannot be armed only loses the precision.
+pub const fn hires_due(on: bool, due: Option<i64>) -> Option<i64> {
+    match due {
+        Some(d) if on && d < 0 && d > -DEFAULT_TICK_100NS => Some(d),
+        _ => None,
+    }
+}
+
 /// The published `HpdWait`: the timeout in microseconds (0 = infinite).
 pub const fn wait_us(t: Option<i64>) -> u32 {
     match t {
@@ -469,6 +499,35 @@ mod tests {
     use super::*;
 
     // ---- 15.18.16: the inline dump never runs between two flips -------------------------------
+
+    #[test]
+    fn short_waits_take_the_high_resolution_timer() {
+        // the route's poll, the control poll, a foreign wait, the msi poll
+        for d in [crate::ce_route::POLL_DUE_100NS, CTRL_INFLIGHT_POLL_100NS, -10_000, MSI_POLL_100NS] {
+            assert_eq!(hires_due(true, Some(d)), Some(d), "{d}");
+            assert_eq!(hires_due(false, Some(d)), None, "{d}");
+        }
+        // a tick or longer, an infinite wait, a malformed (absolute or zero) one: never
+        assert_eq!(hires_due(true, Some(REFRESH_RETRY_100NS)), None);
+        assert_eq!(hires_due(true, Some(-DEFAULT_TICK_100NS)), None);
+        assert_eq!(hires_due(true, Some(VSYNC_WATCH_100NS)), None);
+        assert_eq!(hires_due(true, None), None);
+        assert_eq!(hires_due(true, Some(0)), None);
+        assert_eq!(hires_due(true, Some(5_000)), None);
+        // whatever the inputs, a planned wait the timer takes is the planned wait itself
+        let (t, _) = wait_plan(WaitInputs {
+            ctrl_inflight: false,
+            retry_pending: false,
+            foreign: None,
+            mirror: Some(crate::ce_route::POLL_DUE_100NS),
+            watch: None,
+            poll: None,
+        });
+        assert_eq!(hires_due(true, t), t);
+        assert_eq!(clamp_hires_wait(0), 0);
+        assert_eq!(clamp_hires_wait(1), 1);
+        assert_eq!(clamp_hires_wait(7), 1);
+    }
 
     #[test]
     fn the_inline_dump_waits_for_an_idle_worker() {

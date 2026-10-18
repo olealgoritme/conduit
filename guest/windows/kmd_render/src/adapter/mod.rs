@@ -814,6 +814,11 @@ pub struct AdapterContext {
     /// allocated) and whether it is meant to run (set by `start_vsync`, cleared by `stop_vsync`).
     /// Deleted with `vsync_ex_timer` at RemoveDevice.
     pub vsync_wd_timer: AtomicUsize,
+    /// The HPD worker's high-resolution wake (`HpdHiResWait`): a `PEX_TIMER` (0 = allocation
+    /// failed: the worker's plain timed waits only) whose callback sets `hpd_hr_fired` and
+    /// signals `hpd_event`. Deleted with `vsync_ex_timer` at RemoveDevice.
+    pub hpd_hr_timer: AtomicUsize,
+    pub hpd_hr_fired: AtomicU32,
     pub vsync_wd_on: AtomicU32,
     /// Interrupt-time deadline (100 ns units) of the one-shot tick currently
     /// armed. Advancing this fixed phase avoids both the old 16 ms/62.5 Hz mode
@@ -1400,6 +1405,8 @@ impl AdapterContext {
             vsync_dpc: UnsafeCell::new(unsafe { core::mem::zeroed() }),
             vsync_ex_timer: AtomicUsize::new(0),
             vsync_wd_timer: AtomicUsize::new(0),
+            hpd_hr_timer: AtomicUsize::new(0),
+            hpd_hr_fired: AtomicU32::new(0),
             vsync_wd_on: AtomicU32::new(0),
             vsync_deadline_100ns: AtomicU64::new(0),
             vsync_enabled: AtomicU32::new(0),
