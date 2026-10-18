@@ -1379,6 +1379,47 @@ class = "debug"
 read = "first pipeline barrier recorded (once per process)"
 effect = "1 logs once a second (mesa_logi, MESA_LOG_FILE on Windows) how many idles pipeline barriers recorded per second: explicit WAIT_FOR_IDLE, shader data flushes, and the ones NVK_DIAG_NO_WFI_BARRIER skipped."
 
+[env.NVK_DISPATCH_CAPTURE]
+class = "debug"
+read = "device creation"
+effect = "Comma-separated 16-digit source hashes (vkd3d-proton DXIL hashes, as NVK_DISPATCH_PROFILE prints them) of compute shaders to capture: one dispatch each is written with its SPIR-V, push constants, grid and the contents of every image, buffer, sampler and root buffer address it reads, for replaying it outside the game. Each capture is a directory <hash>-p<pid>-<n> with manifest.json, shader.spv, push.bin and one raw file per resource; events go to nvk-dcap.log there."
+
+[env.NVK_DISPATCH_CAPTURE_COUNT]
+class = "debug"
+read = "device creation"
+effect = "With NVK_DISPATCH_CAPTURE: captures per listed shader."
+
+[env.NVK_DISPATCH_CAPTURE_DELAY_S]
+class = "debug"
+read = "device creation"
+effect = "With NVK_DISPATCH_CAPTURE: seconds after device creation before matching dispatches count."
+
+[env.NVK_DISPATCH_CAPTURE_DIR]
+class = "debug"
+read = "device creation"
+effect = "With NVK_DISPATCH_CAPTURE: directory the captures are written to."
+default_note = "unset: %ProgramData%\\Helios\\dcap on Windows, /tmp/nvk-dcap elsewhere"
+
+[env.NVK_DISPATCH_CAPTURE_MAX_MB]
+class = "debug"
+read = "device creation"
+effect = "With NVK_DISPATCH_CAPTURE: largest staging buffer one capture may allocate, in MiB; a dispatch needing more is not captured (logged)."
+
+[env.NVK_DISPATCH_CAPTURE_POST]
+class = "debug"
+read = "device creation"
+effect = "With NVK_DISPATCH_CAPTURE: 1 also copies every resource the shader may write after the dispatch (r<N>.post.bin), NVK's result to compare a replay with."
+
+[env.NVK_DISPATCH_CAPTURE_SKIP]
+class = "debug"
+read = "device creation"
+effect = "With NVK_DISPATCH_CAPTURE: matching dispatches of each shader skipped once armed before the first capture."
+
+[env.NVK_DISPATCH_CAPTURE_TRIGGER]
+class = "debug"
+read = "device creation; the file is checked at most every 250 ms"
+effect = "With NVK_DISPATCH_CAPTURE: path of a file whose creation arms the capture (after the delay), to pick the moment in a running game; unset: armed by the delay alone."
+
 [env.NVK_DISPATCH_PROFILE]
 class = "debug"
 read = "device creation"
