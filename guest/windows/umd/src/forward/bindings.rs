@@ -459,7 +459,17 @@ pub(crate) unsafe fn set_shader_resources_common(
             );
         }
     }
-    let view_slice = views.as_com_slice::<ID3D11ShaderResourceView>();
+    let mut view_slice = views.as_com_slice::<ID3D11ShaderResourceView>();
+    // `FlipLedger` 1, dwm.exe: an app's flip-model frame that is not done yet is replaced by the
+    // newest done frame of the same swap chain (DWM never waits for an app frame).
+    let substituted = if crate::knobs::is_dwm_process() && crate::knobs::flip_ledger() == 1 {
+        dwm_flip_views(h, view_slice)
+    } else {
+        None
+    };
+    if let Some(list) = substituted.as_ref() {
+        view_slice = list.as_slice();
+    }
     match stage {
         ShaderStage::Vs => c.VSSetShaderResources(start, Some(view_slice)),
         ShaderStage::Ps => c.PSSetShaderResources(start, Some(view_slice)),
@@ -469,6 +479,118 @@ pub(crate) unsafe fn set_shader_resources_common(
         ShaderStage::Cs => c.CSSetShaderResources(start, Some(view_slice)),
     }
 }
+/// `FlipLedger` 1, dwm.exe: what DWM's binds of app flip-model buffers became (since start).
+pub(crate) static DWM_FLIP_READY: AtomicUsize = AtomicUsize::new(0);
+pub(crate) static DWM_FLIP_SUBSTITUTED: AtomicUsize = AtomicUsize::new(0);
+pub(crate) static DWM_FLIP_UNREADY: AtomicUsize = AtomicUsize::new(0);
+
+/// `FlipLedger` 1, dwm.exe, at each shader-resource bind: DWM composes the newest READY frame
+/// of an app's flip-model swap chain and never waits for one that is not done.
+///
+/// * A bound view of an opened app present buffer whose newest ledger point (the app publishes
+///   one per present) is complete stays.
+/// * One whose point is pending is replaced by a view of the buffer of the same swap chain (same
+///   publishing device, same size and format, at least three buffers) whose newest point is the
+///   newest complete one: the frame before. dxgkrnl released that buffer to the app when DWM
+///   took the newer one, so DWM's read of it is published as a read point at DWM's present and
+///   the app's next access waits for it (`forward/present.rs` `dwm_flip_read_points`). With three
+///   buffers the app renders into the oldest one meanwhile, not this one.
+/// * With no complete frame (the chain's first frames) the view stays and DWM's DXVK waits for
+///   the point (the ledger wait, bounded).
+///
+/// Every app buffer DWM ends up binding is noted as read this frame. `None`: nothing replaced.
+pub(crate) unsafe fn dwm_flip_views(
+    h: Hdevice,
+    views: &[Option<ID3D11ShaderResourceView>],
+) -> Option<Vec<Option<ID3D11ShaderResourceView>>> {
+    let dev = helios_device(h)?;
+    let flips = lock_ignore_poison(&dev.nvk_flip_buffers).clone();
+    if flips.is_empty() {
+        return None;
+    }
+    let mut out: Option<Vec<Option<ID3D11ShaderResourceView>>> = None;
+    let mut reads: Vec<usize> = Vec::new();
+    for (i, view) in views.iter().enumerate() {
+        let Some(view) = view else {
+            continue;
+        };
+        let Ok(resource) = view.GetResource() else {
+            continue;
+        };
+        let raw = resource.as_raw() as usize;
+        let Some(&(_, _, width, height, format)) = flips.iter().find(|f| f.1 == raw) else {
+            continue;
+        };
+        let (state, record, point) = dev.dxvk.handoff_flip_state(raw);
+        if state != 2 {
+            DWM_FLIP_READY.fetch_add(1, Ordering::Relaxed);
+            reads.push(raw);
+            continue;
+        }
+        // The same swap chain: the same publishing device, size and format.
+        let chain: Vec<usize> = flips
+            .iter()
+            .filter(|f| f.2 == width && f.3 == height && f.4 == format)
+            .map(|f| f.1)
+            .filter(|&c| c == raw || dev.dxvk.handoff_flip_state(c).1 == record)
+            .collect();
+        let mut best: Option<(usize, u64)> = None;
+        if chain.len() >= 3 {
+            for &c in chain.iter().filter(|&&c| c != raw) {
+                let (st, rec, pt) = dev.dxvk.handoff_flip_state(c);
+                if st == 1 && rec == record && pt < point && best.map_or(true, |(_, b)| pt > b) {
+                    best = Some((c, pt));
+                }
+            }
+        }
+        let Some((substitute, _)) = best else {
+            DWM_FLIP_UNREADY.fetch_add(1, Ordering::Relaxed);
+            reads.push(raw);
+            continue;
+        };
+        let Some(sub_view) = dwm_flip_view_for(dev, view, substitute) else {
+            DWM_FLIP_UNREADY.fetch_add(1, Ordering::Relaxed);
+            reads.push(raw);
+            continue;
+        };
+        DWM_FLIP_SUBSTITUTED.fetch_add(1, Ordering::Relaxed);
+        reads.push(substitute);
+        out.get_or_insert_with(|| views.to_vec())[i] = Some(sub_view);
+    }
+    if !reads.is_empty() {
+        let mut noted = lock_ignore_poison(&dev.nvk_flip_reads);
+        for raw in reads {
+            if !noted.contains(&raw) {
+                noted.push(raw);
+            }
+        }
+    }
+    out
+}
+
+/// A shader-resource view of the opened app buffer `resource` shaped like `like` (DWM's view
+/// of another buffer of the same swap chain), made once per buffer and kept until the buffer
+/// goes (`forget_nvk_keyed_resource`).
+unsafe fn dwm_flip_view_for(
+    dev: &crate::device_funcs::HeliosDevice,
+    like: &ID3D11ShaderResourceView,
+    resource: usize,
+) -> Option<ID3D11ShaderResourceView> {
+    if let Some((_, v)) = lock_ignore_poison(&dev.nvk_flip_views).iter().find(|e| e.0 == resource) {
+        return Some(v.clone());
+    }
+    let device = dev.dxvk.d3d11_device()?;
+    let raw = resource as *mut core::ffi::c_void;
+    let target = ID3D11Resource::from_raw_borrowed(&raw)?;
+    let mut desc = D3D11_SHADER_RESOURCE_VIEW_DESC::default();
+    like.GetDesc(&mut desc);
+    let mut made: Option<ID3D11ShaderResourceView> = None;
+    device.CreateShaderResourceView(target, Some(&desc), Some(&mut made)).ok()?;
+    let made = made?;
+    lock_ignore_poison(&dev.nvk_flip_views).push((resource, made.clone()));
+    Some(made)
+}
+
 stage_set_shader_resources!(vs_set_shader_resources, Vs);
 stage_set_shader_resources!(gs_set_shader_resources, Gs);
 stage_set_shader_resources!(hs_set_shader_resources, Hs);

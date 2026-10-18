@@ -417,9 +417,19 @@ pub struct HeliosDevice {
     /// `(pDrvPrivate, created here)`; an opened resource has `false`.
     pub nvk_keyed_resources: std::sync::Mutex<Vec<(usize, bool)>>,
     /// NVK, `FlipLedger`: DXGI present buffers this device created or opened
-    /// (`pDrvPrivate` of each) that hold their hand-off ledger key
-    /// (`forward::resource::note_nvk_flip_buffer`).
-    pub nvk_flip_buffers: std::sync::Mutex<Vec<usize>>,
+    /// that hold their hand-off ledger key, as `(pDrvPrivate, ID3D11Resource*,
+    /// width, height, DXGI format)` (`forward::resource::note_nvk_flip_buffer`).
+    pub nvk_flip_buffers: std::sync::Mutex<Vec<(usize, usize, u32, u32, u32)>>,
+    /// NVK, `FlipLedger` 1, dwm.exe: DWM's replacement views of opened app
+    /// present buffers, `(ID3D11Resource*, view)` (`forward::bindings::dwm_flip_views`).
+    pub nvk_flip_views: std::sync::Mutex<
+        Vec<(usize, windows::Win32::Graphics::Direct3D11::ID3D11ShaderResourceView)>,
+    >,
+    /// NVK, `FlipLedger` 1, dwm.exe: the opened app present buffers
+    /// (`ID3D11Resource*`) bound as shader resources since DWM's last present;
+    /// DWM's present publishes a read point on them
+    /// (`forward::bindings::dwm_flip_views`).
+    pub nvk_flip_reads: std::sync::Mutex<Vec<usize>>,
     pub direct_scanout_allocations:
         std::sync::Mutex<Vec<(u32, helios_protocol::HeliosPresentPrivateData)>>,
     /// Runtime corelayer handle + callbacks (pfnSetErrorCb) so VOID-returning

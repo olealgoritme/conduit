@@ -591,14 +591,15 @@ pub(crate) fn nvk_blt_gpu_copy() -> bool {
     })
 }
 
-/// `FlipUpgrade`: 0 (default) = swap chains are created as the app asks. 1 = in an NVK process
-/// under a DWM that imports NVK surfaces (not dwm.exe itself), a windowed blt-model D3D11 swap
-/// chain (`DISCARD`, one sample, R8G8B8A8 / B8G8R8A8 UNORM, no flag but `ALLOW_MODE_SWITCH`) is
-/// created `FLIP_DISCARD` with `FlipUpgradeBuffers` buffers: DWM composes the app's own buffers
-/// (no copy into the window's redirection surface), and the app sees its own description
+/// `FlipUpgrade`: 1 (default) = in an NVK process under a DWM that imports NVK surfaces (not
+/// dwm.exe itself), a windowed blt-model D3D11 swap chain (`DISCARD`, one sample, R8G8B8A8 /
+/// B8G8R8A8 UNORM, no flag but `ALLOW_MODE_SWITCH`) is created `FLIP_DISCARD` with
+/// `FlipUpgradeBuffers` buffers: DWM composes the app's own buffers (no copy into the window's
+/// redirection surface), and the app sees its own description
 /// (`helios_umd_common::flip_upgrade`). `FlipUpgradeList` (REG_SZ, `;`-separated executable
-/// names) limits it to those programs. `HELIOS_FLIP_UPGRADE` overrides it per process.
-pub(crate) static FLIP_UPGRADE: DwordKnob = DwordKnob::new(c"FlipUpgrade", 0);
+/// names) limits it to those programs. 0 = swap chains as the app asks. `HELIOS_FLIP_UPGRADE`
+/// overrides it per process.
+pub(crate) static FLIP_UPGRADE: DwordKnob = DwordKnob::new(c"FlipUpgrade", 1);
 
 /// `FlipUpgradeBuffers`: buffers of an upgraded chain (default 3, clamped to 2..=16).
 pub(crate) static FLIP_UPGRADE_BUFFERS: DwordKnob = DwordKnob::new(c"FlipUpgradeBuffers", 3);
@@ -619,19 +620,34 @@ pub(crate) fn flip_upgrade() -> u32 {
     })
 }
 
-/// `FlipLedger`: 0 (default) = a composed NVK frame that DWM samples directly (a flip-model
-/// buffer) takes the `NvkComposedComplete` rule. 1 = the frame does not wait: the present
-/// publishes a hand-off ledger point on the buffer's resource id (completed when the frame's GPU
-/// work is), the WDDM present carries the frame's RM fence, and a DWM on NVK waits for the point
-/// before its command list that samples the buffer is submitted (DXVK patches 0007/0008). Must
-/// be set before DWM starts (DWM installs the ledger's reader hooks only with it).
+/// `FlipLedger`: how a composed NVK frame that DWM samples directly (a flip-model buffer) is
+/// ordered for a DWM on NVK. Read once per process; DWM reads it at its start.
+///
+/// * 1 (default): the presenting thread does not wait. The WDDM present carries the frame's RM
+///   fence and publishes a hand-off ledger point on the buffer's resource id (complete when the
+///   frame's GPU work is). DWM composes the newest DONE frame: a bound view of an app buffer
+///   whose newest point is still pending is replaced by a view of the newest done buffer of the
+///   same swap chain (three buffers or more), so DWM never waits for an app frame
+///   (`forward/bindings.rs` `dwm_flip_views`); only a chain with no done frame yet makes DWM's
+///   DXVK wait. DWM publishes a read point on the app buffers it bound in each frame, and the
+///   app's next access of such a buffer waits for that read in its DXVK submission worker
+///   (flip-model buffer release).
+/// * 2: as 1, but DWM binds what it binds and its DXVK waits for the app's point (DWM can miss
+///   vblanks while the app renders faster than the refresh); no read points.
+/// * 0: the `NvkComposedComplete` rule (the frame is complete before its present).
+///
 /// `HELIOS_FLIP_LEDGER` overrides it per process.
-pub(crate) static FLIP_LEDGER: BoolKnob = BoolKnob::new(c"FlipLedger", false);
+pub(crate) static FLIP_LEDGER: DwordKnob = DwordKnob::new(c"FlipLedger", 1);
 
 /// `FlipLedger`, or `HELIOS_FLIP_LEDGER` from the environment.
-pub(crate) fn flip_ledger() -> bool {
-    static CELL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CELL.get_or_init(|| env_bool("HELIOS_FLIP_LEDGER").unwrap_or_else(|| FLIP_LEDGER.get()))
+pub(crate) fn flip_ledger() -> u32 {
+    static CELL: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *CELL.get_or_init(|| {
+        std::env::var("HELIOS_FLIP_LEDGER")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or_else(|| FLIP_LEDGER.get())
+    })
 }
 
 /// `NvkRmCopyRecord`: 1 (default) = a composed NVK frame whose WDDM present

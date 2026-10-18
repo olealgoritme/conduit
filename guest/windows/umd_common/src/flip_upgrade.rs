@@ -35,10 +35,10 @@
 //! | "MSAA swapchains are not directly supported in the flip model" | multisampled chains are not upgraded |
 //!
 //! And from `dxgi-flip-model.md` ("Use flip model in an HWND that is not also
-//! targeted by other APIs ... GDI"): `GDI_COMPATIBLE` chains are not upgraded,
-//! and the knob is off by default because an app drawing GDI into the same
-//! window would lose that content (that is why Windows limits its upgrade to
-//! games). `FlipUpgradeList` narrows it to named executables.
+//! targeted by other APIs ... GDI"): `GDI_COMPATIBLE` chains are not upgraded. An app that
+//! draws GDI into its D3D window without that flag would lose the GDI content (that is why
+//! Windows limits its upgrade to games): `FlipUpgradeList` narrows the upgrade to named
+//! executables, and `FlipUpgrade=0` turns it off.
 //!
 //! Only `R8G8B8A8_UNORM` and `B8G8R8A8_UNORM` are upgraded: those are the flip
 //! formats NVK mints KMD resource ids for, which DWM needs to import the

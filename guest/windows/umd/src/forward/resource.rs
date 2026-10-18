@@ -875,7 +875,9 @@ unsafe fn note_nvk_keyed_resource(
 /// app's points (`nvk_flip_ledger_publish`) land in a slot DWM samples, and DWM's DXVK installs
 /// the ledger's reader hooks. The slot is let go at destroy (`forget_nvk_keyed_resource`).
 unsafe fn note_nvk_flip_buffer(h: Hdevice, h_resource: ddi::D3D10DDI_HRESOURCE, created: bool) {
-    if !crate::knobs::flip_ledger() {
+    // An app's own buffers (it publishes on them); DWM's opens of apps' buffers (it reads them).
+    // Not DWM's own swap chain, not an app opening another's present buffer.
+    if crate::knobs::flip_ledger() == 0 || crate::knobs::is_dwm_process() == created {
         return;
     }
     let Some(dev) = helios_device(h) else {
@@ -888,10 +890,21 @@ unsafe fn note_nvk_flip_buffer(h: Hdevice, h_resource: ddi::D3D10DDI_HRESOURCE, 
         return;
     };
     let key = h_resource.pDrvPrivate as usize;
+    let com = res.as_raw() as usize;
+    // Size and format: DWM groups an app's swap-chain buffers by them (with the publishing
+    // device) when it replaces a frame that is not done (`forward/bindings.rs` `dwm_flip_views`).
+    let (width, height, format) = match res.cast::<ID3D11Texture2D>() {
+        Ok(texture) => {
+            let mut desc = D3D11_TEXTURE2D_DESC::default();
+            texture.GetDesc(&mut desc);
+            (desc.Width, desc.Height, desc.Format.0 as u32)
+        }
+        Err(_) => (0, 0, 0),
+    };
     let mut list = lock_ignore_poison(&dev.nvk_flip_buffers);
-    if !list.contains(&key) {
-        dev.dxvk.handoff_register(res.as_raw() as usize);
-        list.push(key);
+    if !list.iter().any(|f| f.0 == key) {
+        dev.dxvk.handoff_register(com);
+        list.push((key, com, width, height, format));
         if list.len() <= 4 {
             log_error!(
                 "FlipLedger: present buffer hDrv=0x{key:x} ({}) holds its ledger key ({} live)",
@@ -911,9 +924,16 @@ pub(crate) unsafe fn forget_nvk_keyed_resource(h: Hdevice, h_resource: ddi::D3D1
     {
         let key = h_resource.pDrvPrivate as usize;
         let mut flips = lock_ignore_poison(&dev.nvk_flip_buffers);
-        if let Some(i) = flips.iter().position(|&k| k == key) {
-            flips.swap_remove(i);
+        if let Some(i) = flips.iter().position(|f| f.0 == key) {
+            let (_, com, _, _, _) = flips.swap_remove(i);
             drop(flips);
+            lock_ignore_poison(&dev.nvk_flip_reads).retain(|&r| r != com);
+            // DWM's replacement view of this buffer holds a reference to it: drop it first.
+            let view = {
+                let mut views = lock_ignore_poison(&dev.nvk_flip_views);
+                views.iter().position(|e| e.0 == com).map(|j| views.swap_remove(j))
+            };
+            drop(view);
             if let Some(res) = load_resource(h_resource) {
                 dev.dxvk.handoff_unregister(res.as_raw() as usize);
             }

@@ -1638,6 +1638,7 @@ unsafe fn nvk_present_frame(
     if crate::knobs::is_dwm_process() {
         // DWM is up on NVK: the crash-loop guard's healthy mark (docs/dwm-on-nvk.md 4.1).
         crate::bridge::note_dwm_nvk_present();
+        dwm_flip_read_points(dev);
     }
     nvk_log_present_source(shown);
     if let Some(context) = d3d11_context(h) {
@@ -1685,7 +1686,7 @@ unsafe fn nvk_present_frame(
         && fences
         && dwm_reads_source
         && !crate::knobs::is_dwm_process()
-        && crate::knobs::flip_ledger()
+        && crate::knobs::flip_ledger() != 0
         && !nvk_source_is_primary(shown)
         && nvk_flip_ledger_publish(dev, shown);
     // A frame DWM samples directly is complete before DWM can see it (the S3 wait below):
@@ -1838,6 +1839,57 @@ unsafe fn nvk_present_frame(
         }
     }
     Ok(NvkFrame::default())
+}
+
+static DWM_PRESENTS: AtomicUsize = AtomicUsize::new(0);
+static DWM_READ_POINTS: AtomicUsize = AtomicUsize::new(0);
+static DWM_READ_REFUSED: AtomicUsize = AtomicUsize::new(0);
+static DWM_RATE_WINDOW: std::sync::Mutex<Option<(std::time::Instant, usize)>> =
+    std::sync::Mutex::new(None);
+
+/// dwm.exe, at each of its presents: `FlipLedger` 1 publishes a read point on the app present
+/// buffers this frame sampled (the app's next access of one waits for it: flip-model buffer
+/// release), and once a second the log says how many frames DWM presented (its composition rate)
+/// and how many read points went out.
+unsafe fn dwm_flip_read_points(dev: &HeliosDevice) {
+    let n = DWM_PRESENTS.fetch_add(1, Ordering::Relaxed) + 1;
+    if crate::knobs::flip_ledger() == 1 {
+        let reads = core::mem::take(&mut *lock_ignore_poison(&dev.nvk_flip_reads));
+        if !reads.is_empty() {
+            match dev.dxvk.handoff_publish(&reads) {
+                0 | 1 => {
+                    DWM_READ_POINTS.fetch_add(1, Ordering::Relaxed);
+                }
+                _ => {
+                    DWM_READ_REFUSED.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+    let mut window = lock_ignore_poison(&DWM_RATE_WINDOW);
+    match *window {
+        None => *window = Some((std::time::Instant::now(), n)),
+        Some((since, at)) => {
+            let elapsed = since.elapsed();
+            if elapsed >= std::time::Duration::from_secs(1) {
+                let frames = n - at;
+                log_error!(
+                    "DWM on NVK: {:.1} presents/s over {:.2} s; FlipLedger {}: app flip frames \
+                     bound done {}, replaced by the newest done frame {}, bound not done (DXVK \
+                     waits) {}; {} read points on app flip buffers, {} refused (totals)",
+                    frames as f64 / elapsed.as_secs_f64(),
+                    elapsed.as_secs_f64(),
+                    crate::knobs::flip_ledger(),
+                    super::bindings::DWM_FLIP_READY.load(Ordering::Relaxed),
+                    super::bindings::DWM_FLIP_SUBSTITUTED.load(Ordering::Relaxed),
+                    super::bindings::DWM_FLIP_UNREADY.load(Ordering::Relaxed),
+                    DWM_READ_POINTS.load(Ordering::Relaxed),
+                    DWM_READ_REFUSED.load(Ordering::Relaxed),
+                );
+                *window = Some((std::time::Instant::now(), n));
+            }
+        }
+    }
 }
 
 static FLIP_LEDGER_POINTS: AtomicUsize = AtomicUsize::new(0);
@@ -3455,6 +3507,13 @@ pub(crate) unsafe fn rotate_ring(
     if !dev.dxvk.rotate_resource_backings(ptrs.as_ptr(), ptrs.len()) {
         ROTATE_REFUSED.fetch_add(1, Ordering::Relaxed);
         return RotationOutcome::BridgeRefused;
+    }
+    // `FlipLedger`: the images now hold other storages; their ledger keys (resource ids, which
+    // DXVK samples at an access) follow, or the app would wait for DWM's reads of another buffer.
+    if crate::knobs::flip_ledger() != 0 && dev.dxvk.is_nvk() {
+        for &p in &ptrs {
+            dev.dxvk.handoff_refresh_key(p);
+        }
     }
 
     // Rotate the WDDM identity records in lockstep with the storages.
