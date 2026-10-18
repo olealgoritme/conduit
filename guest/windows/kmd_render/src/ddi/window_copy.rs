@@ -5,7 +5,9 @@
 //! `protocol/src/window_copy.rs`.
 //!
 //! THE FLOW. The `RedirVram` foreign arm (`vram_redirect::foreign_arm`) notes every redirected
-//! Blt of an NVK image into a VRAM redirection surface ([`note_blt`]). The producer asks for its
+//! Blt of an NVK image into a VRAM redirection surface ([`note_blt`]); the Blt arm notes one into
+//! a CPU-visible standard buffer (the redirection surface without GDI acceleration) as unwritable,
+//! so the query says why the producer has nothing to write. The producer asks for its
 //! back buffer's entry ([`query`]), imports the surface by resource id (its process presented into
 //! it: [`import_granted`] lifts the opener rule of `RM_RESOURCE_IMPORT` for it), copies the frame
 //! into it on its own queue right after the frame, and presents with the `HOWW` tag beside the
@@ -50,6 +52,7 @@ static FOUND: AtomicU32 = AtomicU32::new(0);
 static GRANTS: AtomicU32 = AtomicU32::new(0);
 static NOTES: AtomicU32 = AtomicU32::new(0);
 static LAST_TICKET: AtomicU32 = AtomicU32::new(0);
+static UNWRITABLE: AtomicU32 = AtomicU32::new(0);
 
 /// The record. A LEAF spinlock: its holders call only the pure table. Taken at PASSIVE by the
 /// Present, the Render-side escape and the import's authorization (before the device lock).
@@ -65,6 +68,7 @@ pub(crate) fn note_blt(
     surface: Surface,
     src: Rect,
     dst: Rect,
+    writable: bool,
 ) {
     let Some(process) = context.and_then(ContextHandleRef::creator_process) else {
         return;
@@ -76,8 +80,16 @@ pub(crate) fn note_blt(
         src,
         dst,
         surface,
+        writable,
         ticket: 0,
     });
+    if !writable {
+        let n = UNWRITABLE.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+        // Once, then every 4096th: the reason a producer's query finds nothing to write.
+        if n == 1 || n % 4096 == 0 {
+            crate::diag::record_named_bytes(b"GwUnwritable", n);
+        }
+    }
     if ticket != 0 {
         let n = NOTES.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
         if LAST_TICKET.swap(ticket, Ordering::Relaxed) != ticket || n == 1 {
@@ -245,6 +257,7 @@ pub(crate) fn reset_for_start() {
         &GRANTS,
         &NOTES,
         &LAST_TICKET,
+        &UNWRITABLE,
     ] {
         c.store(0, Ordering::Relaxed);
     }
@@ -257,6 +270,7 @@ pub(crate) fn reset_for_start() {
 /// Mirror the counters to the service key once anything happened. PASSIVE only.
 pub(crate) fn publish_counters() {
     if NOTES.load(Ordering::Relaxed) == 0
+        && UNWRITABLE.load(Ordering::Relaxed) == 0
         && TAGS.load(Ordering::Relaxed) == 0
         && QUERIES.load(Ordering::Relaxed) == 0
     {
@@ -273,4 +287,5 @@ pub(crate) fn publish_counters() {
     rec(b"GwGrant", GRANTS.load(Ordering::Relaxed));
     rec(b"GwNote", NOTES.load(Ordering::Relaxed));
     rec(b"GwTicket", LAST_TICKET.load(Ordering::Relaxed));
+    rec(b"GwUnwritable", UNWRITABLE.load(Ordering::Relaxed));
 }

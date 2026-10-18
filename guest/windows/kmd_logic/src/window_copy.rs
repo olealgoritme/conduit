@@ -165,6 +165,11 @@ pub struct Target {
     pub src: Rect,
     pub dst: Rect,
     pub surface: Surface,
+    /// The destination is a surface a producer can import and write: a VRAM redirection surface
+    /// (`RedirVram` with GDI acceleration). A CPU-visible standard buffer (the redirection surface
+    /// without GDI acceleration, its content in VidMm's system pages) is recorded with `false`, so
+    /// the query can say why there is nothing to write; it is never granted or verified.
+    pub writable: bool,
     /// Names this content; a changed entry gets a new one. Nonzero.
     pub ticket: u32,
 }
@@ -175,6 +180,7 @@ impl Target {
             && self.src == other.src
             && self.dst == other.dst
             && self.surface == other.surface
+            && self.writable == other.writable
     }
 }
 
@@ -272,7 +278,7 @@ impl Table {
                 .entries
                 .iter()
                 .flatten()
-                .any(|(e, _)| e.process == process && e.destination == destination)
+                .any(|(e, _)| e.writable && e.process == process && e.destination == destination)
     }
 
     /// The surface `destination` is gone: forget every entry naming it.
@@ -342,6 +348,9 @@ pub fn verify(tag: &Tag, record: Option<&Target>, facts: &Facts) -> Verdict {
     }) else {
         return Verdict::Reject(Why::NoRecord);
     };
+    if !r.writable {
+        return Verdict::Reject(Why::Surfaces);
+    }
     if r.ticket != tag.ticket {
         return Verdict::Reject(Why::Ticket);
     }
@@ -359,8 +368,9 @@ pub fn verify(tag: &Tag, record: Option<&Target>, facts: &Facts) -> Verdict {
 /// `GwTag` claims seen, `GwSkip` Presents completed with no copy, `GwRej` claims refused,
 /// `GwRejWhy` the last reason, `GwWhyMask` every reason seen (bit `code - 1`), `GwQuery` target
 /// queries, `GwQFound` queries answered with a record, `GwGrant` imports allowed by the record,
-/// `GwNote` Blts recorded, `GwTicket` the newest ticket.
-pub const COUNTERS: [&str; 10] = [
+/// `GwNote` Blts recorded, `GwTicket` the newest ticket, `GwUnwritable` Blts of NVK images into
+/// a destination no producer can write (a CPU-visible standard buffer: no GDI acceleration).
+pub const COUNTERS: [&str; 11] = [
     "GwTag",
     "GwSkip",
     "GwRej",
@@ -371,6 +381,7 @@ pub const COUNTERS: [&str; 10] = [
     "GwGrant",
     "GwNote",
     "GwTicket",
+    "GwUnwritable",
 ];
 
 #[cfg(test)]
@@ -405,6 +416,7 @@ mod tests {
                 dxgi_format: 87,
                 ..Surface::default()
             },
+            writable: true,
             ticket: 0,
         }
     }
@@ -500,6 +512,31 @@ mod tests {
         // Nothing recorded for zero ids.
         assert_eq!(t.note_blt(target(0, 11, P)), 0);
         assert_eq!(t.note_blt(target(1, 11, 0)), 0);
+    }
+
+    #[test]
+    fn an_unwritable_destination_is_recorded_but_never_granted_or_verified() {
+        let mut t = Table::new();
+        let mut std_dst = target(1, 10, P);
+        std_dst.writable = false;
+        let ticket = t.note_blt(std_dst);
+        assert_ne!(ticket, 0);
+        let r = t.lookup(1, P).unwrap();
+        assert!(!r.writable);
+        assert!(!t.granted(P, 10));
+        let tag = Tag {
+            source: 1,
+            destination: 10,
+            ticket,
+        };
+        assert_eq!(
+            verify(&tag, Some(&r), &facts_for(&r)),
+            Verdict::Reject(Why::Surfaces)
+        );
+        // The window got a VRAM surface: a new ticket, writable.
+        let t2 = t.note_blt(target(1, 10, P));
+        assert_ne!(t2, ticket);
+        assert!(t.granted(P, 10));
     }
 
     #[test]

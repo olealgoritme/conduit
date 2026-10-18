@@ -695,7 +695,7 @@ see = "[dwm-on-nvk.md](dwm-on-nvk.md)"
 [umd.NvkBltGpuCopy]
 class = "tuning"
 read = "once per process"
-effect = "1: a windowed blt-model present without a DXGI destination copies the frame into the window's redirection surface on the app's own NVK queue right after the frame (the KMD names the surface, the app imports it by resource id) and carries the frame's RM fence plus the HOWW tag; the KMD completes the Blt with no copy and no read-ledger claim, and the present retires when the fence fires. No CPU wait on the presenting thread. A present the path cannot take (no surface recorded yet, a failed import, an unsupported format pair, no RM fence) is copied by the KMD as with 0. HELIOS_NVK_BLT_GPU_COPY overrides it per process."
+effect = "1: a windowed blt-model present without a DXGI destination copies the frame into the window's redirection surface on the app's own NVK queue right after the frame (the KMD names the surface, the app imports it by resource id) and carries the frame's RM fence plus the HOWW tag; the KMD completes the Blt with no copy and no read-ledger claim, and the present retires when the fence fires. No CPU wait on the presenting thread. Needs a VRAM redirection surface (the KMD's GdiAccel=1 with RedirVram=1); with GdiAccel=0 the surface is a CPU-visible standard buffer and the KMD keeps copying (logged once). A present the path cannot take (no surface recorded yet, a failed import, an unsupported format pair, no RM fence) is copied by the KMD as with 0. HELIOS_NVK_BLT_GPU_COPY overrides it per process."
 see = "[dwm-on-nvk.md](dwm-on-nvk.md)"
 
 [umd.NvkComposedComplete]

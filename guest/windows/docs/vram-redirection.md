@@ -557,7 +557,12 @@ sub-rectangles (`pDstSubRects`) are covered by copying the whole `DstRect`.
 ### 5.10 The producer's own copy (`NvkBltGpuCopy`, UMD knob, default 0)
 
 With `NvkBltGpuCopy` 1 an NVK app writes its windowed blt-model frame into the window's VRAM
-redirection surface itself, on its own queue, and the KMD's Blt copies nothing:
+redirection surface itself, on its own queue, and the KMD's Blt copies nothing. It needs a VRAM
+redirection surface, which exists only with GDI acceleration (`GdiAccel` 1) and `RedirVram` 1:
+with `GdiAccel` 0 the redirection surface is a CPU-visible standard buffer whose content is in
+VidMm's system pages, which no producer can import; the KMD records such Blts as unwritable
+(`GwUnwritable`), the query answers `HELIOS_BLT_TARGET_UNWRITABLE`, the UMD logs that once and
+asks again only every 256 presents, and the KMD keeps copying.
 
 | step | where | what |
 |---|---|---|
@@ -579,8 +584,9 @@ Counters `Gw*` (`kmd_logic::window_copy::COUNTERS`): `GwTag` tags seen, `GwSkip`
 with no copy, `GwRej` / `GwRejWhy` / `GwWhyMask` refusals (1 short, 2 version, 3 flags, 4 fields,
 5 not a Blt, 6 surfaces, 7 source, 8 destination, 9 no record, 10 ticket, 11 rectangles, 12 no
 boundary, 13 orphan, 14 retry), `GwQuery` / `GwQFound` target queries, `GwGrant` imports allowed
-by the record, `GwNote` / `GwTicket` Blts recorded. UMD log: `NvkBltGpuCopy: N windowed blt-model
-presents, ... copied, ... tagged (...)` every 4096 presents.
+by the record, `GwNote` / `GwTicket` Blts recorded, `GwUnwritable` Blts into a standard buffer. UMD
+log: `NvkBltGpuCopy: present #N left to the KMD's copy: <reason> (<values>)` once per reason, and
+`NvkBltGpuCopy: N windowed blt-model presents, ... copied, ... tagged (...)` every 4096 presents.
 
 ## 6. Staged plan and knobs
 

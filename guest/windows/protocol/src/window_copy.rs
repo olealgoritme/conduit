@@ -54,6 +54,11 @@ pub const HELIOS_WINDOW_WRITTEN_HERF_BYTES: usize = 72;
 pub const HELIOS_BLT_TARGET_NONE: u32 = 0;
 /// [`HeliosBltTargetQuery::out_state`]: the `out_*` fields describe the destination.
 pub const HELIOS_BLT_TARGET_FOUND: u32 = 1;
+/// [`HeliosBltTargetQuery::out_state`]: the KMD's Blt of this source lands in a surface no
+/// producer can write (a CPU-visible standard buffer: the redirection surface of an adapter
+/// without GDI acceleration, `GdiAccel` 0); only `out_destination_resource_id` and the extent are
+/// filled. The copy stays the KMD's.
+pub const HELIOS_BLT_TARGET_UNWRITABLE: u32 = 2;
 
 /// The tag, 24 bytes. The claim is "my queue wrote the frame of resource `source_resource_id`
 /// into resource `destination_resource_id` with the rectangles of record `ticket`, before the RM
@@ -95,7 +100,8 @@ pub struct HeliosBltTargetQuery {
     pub hdr: HeliosEscapeHeader,
     /// In: the back buffer's resource id.
     pub source_resource_id: u32,
-    /// Out: [`HELIOS_BLT_TARGET_NONE`] or [`HELIOS_BLT_TARGET_FOUND`].
+    /// Out: [`HELIOS_BLT_TARGET_NONE`], [`HELIOS_BLT_TARGET_FOUND`] or
+    /// [`HELIOS_BLT_TARGET_UNWRITABLE`].
     pub out_state: u32,
     /// Out: the redirection surface's resource id (what an NVK import by id names).
     pub out_destination_resource_id: u32,

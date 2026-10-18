@@ -831,6 +831,31 @@ unsafe fn dxgkddi_present_inner(
                     None => {}
                 }
             }
+            // An NVK frame whose redirected Blt lands in anything but a VRAM surface (the arm above
+            // took those): a CPU-visible standard buffer, the redirection surface without GDI
+            // acceleration. Recorded as unwritable, so a producer asking where its frames land
+            // (`NvkBltGpuCopy`) learns why it cannot write them.
+            if source.foreign.is_some() {
+                if let Some((src_rect, dst_rect)) =
+                    crate::ddi::vram_redirect::rects(args, &source, &destination)
+                {
+                    crate::ddi::window_copy::note_blt(
+                        present_context.as_ref(),
+                        &source,
+                        &destination,
+                        helios_kmd_logic::window_copy::Surface {
+                            width: destination.width,
+                            height: destination.height,
+                            pitch: destination.pitch,
+                            dxgi_format: destination_dxgi_format,
+                            ..helios_kmd_logic::window_copy::Surface::default()
+                        },
+                        src_rect,
+                        dst_rect,
+                        false,
+                    );
+                }
+            }
             if source.kind != HELIOS_WDDM_ALLOC_KIND_DEVICE_MEMORY {
                 blt_foreign_skip!(Refusal::BltSourceKind);
                 crate::diag::record_named_on_change(b"PBCpy", 0xE6, &PB_CPY_LAST);

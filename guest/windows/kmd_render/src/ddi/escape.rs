@@ -977,28 +977,36 @@ fn escape_blt_target(buf: &mut [u8], hdr: &HeliosEscapeHeader, process: usize) -
         return STATUS_INVALID_PARAMETER;
     }
     let mut out = helios_protocol::HeliosBltTargetQuery::new(source);
-    if let Some(t) = crate::ddi::window_copy::query(process, source) {
-        out.out_state = helios_protocol::HELIOS_BLT_TARGET_FOUND;
-        out.out_destination_resource_id = t.destination;
-        out.out_ticket = t.ticket;
-        out.out_width = t.surface.width;
-        out.out_height = t.surface.height;
-        out.out_pitch = t.surface.pitch;
-        out.out_dxgi_format = t.surface.dxgi_format;
-        out.out_bind_flags = t.surface.bind_flags;
-        out.out_memory_type_index = t.surface.memory_type_index;
-        out.out_alloc_size = t.surface.alloc_size;
-        out.out_modifier = t.surface.modifier;
-        out.out_offset = t.surface.offset;
-        out.out_fourcc = t.surface.fourcc;
-        out.out_src_left = t.src.left;
-        out.out_src_top = t.src.top;
-        out.out_dst_left = t.dst.left;
-        out.out_dst_top = t.dst.top;
-        out.out_copy_width = t.src.right - t.src.left;
-        out.out_copy_height = t.src.bottom - t.src.top;
-    } else {
-        out.out_state = helios_protocol::HELIOS_BLT_TARGET_NONE;
+    match crate::ddi::window_copy::query(process, source) {
+        Some(t) if !t.writable => {
+            // A destination no producer can write: say so (the extent for the log), nothing else.
+            out.out_state = helios_protocol::HELIOS_BLT_TARGET_UNWRITABLE;
+            out.out_destination_resource_id = t.destination;
+            out.out_width = t.surface.width;
+            out.out_height = t.surface.height;
+        }
+        Some(t) => {
+            out.out_state = helios_protocol::HELIOS_BLT_TARGET_FOUND;
+            out.out_destination_resource_id = t.destination;
+            out.out_ticket = t.ticket;
+            out.out_width = t.surface.width;
+            out.out_height = t.surface.height;
+            out.out_pitch = t.surface.pitch;
+            out.out_dxgi_format = t.surface.dxgi_format;
+            out.out_bind_flags = t.surface.bind_flags;
+            out.out_memory_type_index = t.surface.memory_type_index;
+            out.out_alloc_size = t.surface.alloc_size;
+            out.out_modifier = t.surface.modifier;
+            out.out_offset = t.surface.offset;
+            out.out_fourcc = t.surface.fourcc;
+            out.out_src_left = t.src.left;
+            out.out_src_top = t.src.top;
+            out.out_dst_left = t.dst.left;
+            out.out_dst_top = t.dst.top;
+            out.out_copy_width = t.src.right - t.src.left;
+            out.out_copy_height = t.src.bottom - t.src.top;
+        }
+        None => out.out_state = helios_protocol::HELIOS_BLT_TARGET_NONE,
     }
     wire.write_back(&out);
     STATUS_SUCCESS

@@ -405,9 +405,9 @@ pub(crate) fn windowed_snapshot_idle(dev: &HeliosDevice, resource_id: u32) -> bo
 }
 
 /// `HELIOS_ESCAPE_BLT_TARGET` (`NvkBltGpuCopy`): where the KMD's windowed Blt of the back buffer
-/// `source_resource_id` lands for this process. `None` when the KMD has no record (no Blt of it
-/// seen yet), does not know the verb (an older KMD: asked once, then never again), or the escape
-/// fails. One escape on this device's callback, no wait in the KMD.
+/// `source_resource_id` lands for this process: the KMD's answer, whatever its `out_state`.
+/// `None` when the KMD does not know the verb (an older KMD: asked once, then never again) or the
+/// escape fails. One escape on this device's callback, no wait in the KMD.
 pub(crate) fn blt_target(
     dev: &HeliosDevice,
     source_resource_id: u32,
@@ -447,7 +447,7 @@ pub(crate) fn blt_target(
         return None;
     }
     SERVED.store(1, Ordering::Relaxed);
-    payload.found().then_some(payload)
+    Some(payload)
 }
 
 /// Acquire-load one `u32` field of the mapped ledger page.

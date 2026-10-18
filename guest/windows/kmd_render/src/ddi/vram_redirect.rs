@@ -647,6 +647,7 @@ unsafe fn foreign_arm(
             },
             src_rect,
             dst_rect,
+            true,
         );
     }
     // The route is the default; `RvOff` 0x1000 takes the synchronous copy instead.

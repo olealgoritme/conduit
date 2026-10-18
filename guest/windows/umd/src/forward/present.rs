@@ -2266,18 +2266,20 @@ unsafe fn nvk_present_impl_timed(
     // `NvkSkipBltCopy` (A/B, off by default): the KMD's Blt reads `src_h` and writes the window's
     // surface itself; the UMD's copy into DXGI's destination is then the same pixels twice.
     let skip_copy = crate::knobs::nvk_skip_blt_copy();
+    // Decided before `NvkSkipBltCopy` (default 1 under the KMD's `RedirVram`), which only skips
+    // the copy into a DXGI destination: a present without one has nothing for it to skip, and
+    // checking it first kept this path from ever running (405.120).
+    let window_path = crate::knobs::nvk_blt_gpu_copy()
+        && nvk_window_eligible(dst_h.pDrvPrivate.is_null(), present_flags);
     if let Some(context) = d3d11_context(h) {
-        if skip_copy {
-            // Nothing copied: `shown` stays the source.
-        } else if dst_h.pDrvPrivate.is_null()
-            && nvk_blt_model(present_flags)
-            && crate::knobs::nvk_blt_gpu_copy()
-        {
+        if window_path {
             // No DXGI destination: the window's surface is the KMD's Blt destination. Copy the
             // frame into it here, on this queue, when the KMD names it.
             window_tag = present_timing::sub(0, || {
                 nvk_window_copy(h, &context, src_h, a.SrcSubResourceIndex)
             });
+        } else if skip_copy {
+            // Nothing copied: `shown` stays the source.
         } else if let (Some(dst), Some(src)) = (load_resource(dst_h), load_resource(src_h)) {
             present_timing::sub(0, || {
                 context.CopySubresourceRegion(
@@ -2375,6 +2377,82 @@ fn nvk_blt_model(present_flags: u32) -> bool {
     present_flags & DXGI_PRESENT_FLAG_BLT != 0 && present_flags & DXGI_PRESENT_FLAG_FLIP == 0
 }
 
+/// Why a present did not take the window copy (`NvkBltGpuCopy`), each logged once per process
+/// at the decision point.
+#[derive(Clone, Copy)]
+#[repr(u32)]
+enum WindowSkip {
+    DxgiDestination = 0,
+    NotBltModel = 1,
+    NoSourceId = 2,
+    EscapeRefused = 3,
+    NoRecord = 4,
+    Unwritable = 5,
+    BadAnswer = 6,
+    Format = 7,
+    Source = 8,
+    Import = 9,
+    Convert = 10,
+    NoFence = 11,
+}
+
+impl WindowSkip {
+    fn text(self) -> &'static str {
+        match self {
+            Self::DxgiDestination => "DXGI gives a destination (the UMD copies into it)",
+            Self::NotBltModel => "not a blt-model present (Flip flag, or no Blt flag)",
+            Self::NoSourceId => "the back buffer has no KMD resource id (a placeholder)",
+            Self::EscapeRefused => "HELIOS_ESCAPE_BLT_TARGET refused (an older KMD)",
+            Self::NoRecord => "the KMD has no Blt of this back buffer recorded yet",
+            Self::Unwritable => {
+                "the KMD's Blt lands in a CPU-visible standard buffer, not a VRAM surface the app \
+                 can import (the redirection surface is GPU-only only with the KMD's GdiAccel=1 \
+                 and RedirVram=1)"
+            }
+            Self::BadAnswer => "the KMD's answer is incomplete",
+            Self::Format => "a source/surface format pair the copy does not cover",
+            Self::Source => "the source rectangle is not in a single-sampled subresource 0",
+            Self::Import => "the window surface did not import",
+            Self::Convert => "the format conversion was refused",
+            Self::NoFence => "the frame carries no RM fence (the CPU wait ran)",
+        }
+    }
+}
+
+static NVK_WINDOW_SKIP_SEEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Log `why` the first time this process sees it (`detail`: the values behind it).
+fn nvk_window_skip(why: WindowSkip, detail: core::fmt::Arguments<'_>) {
+    let bit = 1u32 << (why as u32);
+    if NVK_WINDOW_SKIP_SEEN.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
+        log_error!(
+            "NvkBltGpuCopy: present #{} left to the KMD's copy: {} ({})",
+            NVK_WINDOW_TRIED.load(Ordering::Relaxed),
+            why.text(),
+            detail
+        );
+    }
+}
+
+/// Does this present take the window copy (with the knob on)? No DXGI destination and a
+/// blt-model present; the reason is logged once otherwise.
+fn nvk_window_eligible(no_destination: bool, present_flags: u32) -> bool {
+    if !no_destination {
+        nvk_window_skip(WindowSkip::DxgiDestination, format_args!("flags=0x{present_flags:x}"));
+        return false;
+    }
+    if !nvk_blt_model(present_flags) {
+        nvk_window_skip(WindowSkip::NotBltModel, format_args!("flags=0x{present_flags:x}"));
+        return false;
+    }
+    true
+}
+
+/// After an answer with nothing to write, the next query waits this many window-copy presents (an
+/// escape per present would buy nothing while the KMD keeps copying).
+const NVK_WINDOW_REQUERY: usize = 256;
+static NVK_WINDOW_NEXT_QUERY: AtomicUsize = AtomicUsize::new(0);
+
 /// `NvkBltGpuCopy` counters: presents that tried the copy, copies recorded, presents tagged,
 /// and the reasons a present fell back to the KMD's copy.
 static NVK_WINDOW_TRIED: AtomicUsize = AtomicUsize::new(0);
@@ -2390,6 +2468,7 @@ static NVK_WINDOW_NO_FENCE: AtomicUsize = AtomicUsize::new(0);
 fn nvk_note_window_present(copied: bool, tagged: bool) {
     if copied && !tagged {
         NVK_WINDOW_NO_FENCE.fetch_add(1, Ordering::Relaxed);
+        nvk_window_skip(WindowSkip::NoFence, format_args!("NvkRmFence/NvkRmFencePresent or caps"));
     }
     if tagged {
         NVK_WINDOW_TAGGED.fetch_add(1, Ordering::Relaxed);
@@ -2566,18 +2645,49 @@ unsafe fn nvk_window_copy(
     src_h: ddi::D3D10DDI_HRESOURCE,
     src_subresource: u32,
 ) -> Option<helios_protocol::HeliosWindowWrittenTag> {
-    NVK_WINDOW_TRIED.fetch_add(1, Ordering::Relaxed);
+    let n = NVK_WINDOW_TRIED.fetch_add(1, Ordering::Relaxed) + 1;
     let dev = helios_device(h)?;
-    let source = nvk_source_resource_id(src_h).filter(|id| *id != 0);
-    let Some(q) = source.and_then(|id| crate::scanout_acquire::blt_target(dev, id)) else {
+    let Some(source) = nvk_source_resource_id(src_h).filter(|id| *id != 0) else {
         NVK_WINDOW_NO_TARGET.fetch_add(1, Ordering::Relaxed);
+        nvk_window_skip(
+            WindowSkip::NoSourceId,
+            format_args!("alloc=0x{:x}", resource_allocation(src_h)),
+        );
         return None;
     };
-    let source = source?;
-    let Some(convert) =
-        nvk_window_copy_kind(resource_dxgi_format(src_h).0 as u32, q.out_dxgi_format)
-    else {
+    if n < NVK_WINDOW_NEXT_QUERY.load(Ordering::Relaxed) {
+        NVK_WINDOW_NO_TARGET.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    let Some(q) = crate::scanout_acquire::blt_target(dev, source) else {
+        NVK_WINDOW_NO_TARGET.fetch_add(1, Ordering::Relaxed);
+        nvk_window_skip(WindowSkip::EscapeRefused, format_args!("source res_id={source}"));
+        return None;
+    };
+    if !q.found() {
+        NVK_WINDOW_NO_TARGET.fetch_add(1, Ordering::Relaxed);
+        NVK_WINDOW_NEXT_QUERY.store(n + NVK_WINDOW_REQUERY, Ordering::Relaxed);
+        let why = match q.out_state {
+            helios_protocol::HELIOS_BLT_TARGET_NONE => WindowSkip::NoRecord,
+            helios_protocol::HELIOS_BLT_TARGET_UNWRITABLE => WindowSkip::Unwritable,
+            _ => WindowSkip::BadAnswer,
+        };
+        nvk_window_skip(
+            why,
+            format_args!(
+                "source res_id={source} state={} destination res_id={} {}x{}",
+                q.out_state, q.out_destination_resource_id, q.out_width, q.out_height
+            ),
+        );
+        return None;
+    }
+    let src_format = resource_dxgi_format(src_h).0 as u32;
+    let Some(convert) = nvk_window_copy_kind(src_format, q.out_dxgi_format) else {
         NVK_WINDOW_FORMAT.fetch_add(1, Ordering::Relaxed);
+        nvk_window_skip(
+            WindowSkip::Format,
+            format_args!("source fmt={src_format} surface fmt={}", q.out_dxgi_format),
+        );
         return None;
     };
     let src = load_resource(src_h)?;
@@ -2601,9 +2711,22 @@ unsafe fn nvk_window_copy(
         || bottom > sd.Height
     {
         NVK_WINDOW_COPY_FAILED.fetch_add(1, Ordering::Relaxed);
+        nvk_window_skip(
+            WindowSkip::Source,
+            format_args!(
+                "sub={src_subresource} samples={} {}x{} rect=({left},{top})-({right},{bottom})",
+                sd.SampleDesc.Count, sd.Width, sd.Height
+            ),
+        );
         return None;
     }
-    let dst = nvk_window_target(dev, &q)?;
+    let Some(dst) = nvk_window_target(dev, &q) else {
+        nvk_window_skip(
+            WindowSkip::Import,
+            format_args!("destination res_id={}", q.out_destination_resource_id),
+        );
+        return None;
+    };
     if convert {
         let rc = dev.dxvk.dxgi_blt_convert(
             DstRes(dst.as_raw() as usize),
@@ -2620,6 +2743,10 @@ unsafe fn nvk_window_copy(
         );
         if rc != 0 {
             NVK_WINDOW_COPY_FAILED.fetch_add(1, Ordering::Relaxed);
+            nvk_window_skip(
+                WindowSkip::Convert,
+                format_args!("rc={rc} source fmt={src_format} surface fmt={}", q.out_dxgi_format),
+            );
             return None;
         }
     } else {
