@@ -689,7 +689,7 @@ effect = "1: a composed NVK present's RM fence takes a value reserved at the Pre
 [umd.NvkBltFence]
 class = "tuning"
 read = "once per process"
-effect = "1: a windowed blt-model present (DXGI's Blt flag) carries the frame's RM fence and does not wait for the GPU on the presenting thread, even with no DXGI destination: the KMD's Blt into the window's redirection surface waits for the fence. NvkComposedComplete then applies only to flip-model buffers DWM samples directly. 0: blt-model presents without a DXGI destination take the NvkComposedComplete CPU wait too. HELIOS_NVK_BLT_FENCE overrides it per process."
+effect = "0: a windowed blt-model present (DXGI's Blt flag) without a DXGI destination waits for the frame on the presenting thread before the WDDM present (the NvkComposedComplete CPU wait), so the present retires at once. 1: it carries the frame's RM fence and does not wait; the KMD's Blt into the window's redirection surface waits for the fence, but the present retires only after the KMD sees the copy done and dxgkrnl throttles the app (stutter). HELIOS_NVK_BLT_FENCE overrides it per process."
 see = "[dwm-on-nvk.md](dwm-on-nvk.md)"
 
 [umd.NvkComposedComplete]

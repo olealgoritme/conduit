@@ -554,16 +554,16 @@ pub(crate) fn nvk_composed_complete() -> bool {
     })
 }
 
-/// `NvkBltFence`: 1 (default) = a blt-model present (DXGI's `Blt` flag, no
-/// `Flip`) is never treated as a frame DWM samples directly, even when DXGI
-/// gives no destination: the KMD's Blt copies the source into the window's
-/// redirection surface, and that copy waits for the frame's RM fence on the
-/// copy engine or the HPD worker, so the frame carries the fence and the
-/// presenting thread does not wait for it (`NvkComposedComplete` keeps its CPU
-/// wait for flip-model buffers). 0 = such presents take the
-/// `NvkComposedComplete` rule too (the CPU wait before every windowed blt-model
-/// present). `HELIOS_NVK_BLT_FENCE` overrides it per process.
-pub(crate) static NVK_BLT_FENCE: BoolKnob = BoolKnob::new(c"NvkBltFence", true);
+/// `NvkBltFence`: 0 (default) = a blt-model present (DXGI's `Blt` flag, no
+/// `Flip`) without a DXGI destination takes the `NvkComposedComplete` rule: the
+/// presenting thread waits for the frame on the CPU before the WDDM present, so
+/// dxgkrnl retires the present at once and does not throttle the app. 1 = such
+/// a present carries the frame's RM fence and does not wait: the KMD's Blt into
+/// the window's redirection surface waits for the fence on the copy engine or
+/// the HPD worker, but the present retires only after the KMD's worker sees the
+/// copy done, and dxgkrnl throttles the app on those late retirements (visible
+/// stutter). `HELIOS_NVK_BLT_FENCE` overrides it per process.
+pub(crate) static NVK_BLT_FENCE: BoolKnob = BoolKnob::new(c"NvkBltFence", false);
 
 /// `NvkBltFence`, or `HELIOS_NVK_BLT_FENCE` from the environment.
 pub(crate) fn nvk_blt_fence() -> bool {
