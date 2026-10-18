@@ -135,7 +135,11 @@ while DWM runs on NVK, every D3D11 process goes to NVK as well:
   `DesktopFollowsDwm=0` (REG_DWORD) turns it off. D3D12 is unchanged (already NVK by default).
 * NVK apps' presents go to DWM (composed by resource id) rather than straight to scanout 0 while
   the marker is there, as with `ForeignImport=1`; otherwise an NVK app took the whole screen and
-  DWM's own flips showed through about once a second.
+  DWM's own flips showed through about once a second. This holds for D3D11 and D3D12 swap chains.
+  A D3D12 back buffer that covers the output (a primary, or at least the desktop's size) still
+  takes scanout 0 (`Nvk12Present` 0, `umd_common/src/nvk_present.rs`); a composed D3D12 frame is
+  complete on the GPU before its present (`NvkComposedComplete`), as a D3D11 one is, because
+  DWM samples it from its own RM channel.
 
 The choice is made once per process: processes that started before DWM moved (the shell after a
 `restart-device`) keep Venus until they restart.

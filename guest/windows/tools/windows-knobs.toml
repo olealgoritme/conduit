@@ -658,7 +658,7 @@ effect = "How the D3D12 runtime's context is ordered behind NVK work: 2 an RM fe
 [umd.Nvk12Present]
 class = "supported"
 read = "once per process"
-effect = "How a D3D12 NVK swap chain presents: 0 automatic (DWM composes it when it can import NVK surfaces, else scanout 0); 1 always scanout 0 (zero-copy flip, the desktop hidden while the app presents); 2 always the WDDM present (DWM composes). HELIOS_NVK_PRESENT overrides it per process."
+effect = "How a D3D12 NVK swap chain presents: 0 automatic (a window is composed by DWM when DWM imports NVK surfaces, i.e. DWM runs on NVK or ForeignImport=1; a back buffer that covers the output (a primary, or at least the desktop's size) takes scanout 0, as does every buffer when DWM cannot import NVK surfaces); 1 always scanout 0 (zero-copy flip, the desktop hidden while the app presents); 2 always the WDDM present (DWM composes). HELIOS_NVK_PRESENT overrides it per process."
 
 [umd.Nvk12ScanoutFence]
 class = "tuning"
@@ -684,7 +684,7 @@ effect = "1: a composed NVK present's RM fence takes a value reserved at the Pre
 [umd.NvkComposedComplete]
 class = "supported"
 read = "once per process"
-effect = "1: a composed NVK frame that DWM samples directly (a flip-model swap chain's own buffer) is complete on the GPU before its WDDM present, so a DWM on NVK never composes a half-drawn frame. 0 lets the frame carry an RM fence instead, as blt-model frames do. HELIOS_NVK_COMPOSED_COMPLETE overrides it per process."
+effect = "1: a composed NVK frame that DWM samples directly (a flip-model swap chain's own buffer, D3D11 or D3D12) is complete on the GPU before its WDDM present, so a DWM on NVK never composes a half-drawn frame. 0: a D3D11 frame carries an RM fence instead, as blt-model frames do; a D3D12 frame is presented without waiting. HELIOS_NVK_COMPOSED_COMPLETE overrides it per process."
 see = "[dwm-on-nvk.md](dwm-on-nvk.md)"
 
 [umd.NvkDefaults]

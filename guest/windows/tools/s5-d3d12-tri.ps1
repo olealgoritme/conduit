@@ -8,8 +8,9 @@
 # Expects, under -Dir: app\d3d12_tri.exe, app\run-in-session.ps1 and
 # nvk64\vulkan_nouveau.dll + nvk64\librmclient.dll (64-bit). No registry write:
 # HELIOS_ICD12 / HELIOS_NVK_ICD / HELIOS_NVK_PRESENT are per-process overrides.
-# -Present: 0 auto (DWM composes the back buffer's NVK resource id when
-# ForeignImport=1, else scanout 0), 1 scanout 0, 2 WDDM present (DWM composes).
+# -Present: 0 auto (DWM composes a window's back buffer by its NVK resource id
+# when DWM runs on NVK or ForeignImport=1; a buffer covering the output, or any
+# buffer without such a DWM, takes scanout 0), 1 scanout 0, 2 WDDM present.
 # -Offscreen: caps, compute and the offscreen pixel check only (no swap chain).
 param(
     [ValidateSet("nvk", "venus")][string]$Icd = "nvk",

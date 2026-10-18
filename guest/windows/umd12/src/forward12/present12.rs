@@ -393,7 +393,17 @@ unsafe fn present_body(
     // (`nvk12.rs`), so the identity record carries no stream tail.
     if unsafe { queue::queue_is_nvk(h_queue) } {
         // SAFETY: live runtime arguments of this pfnPresent, on its thread.
-        unsafe { present_nvk(h_queue, h_context, engine.as_raw() as usize, &identity, p_out, p_contexts) };
+        unsafe {
+            present_nvk(
+                h_queue,
+                h_context,
+                engine.as_raw() as usize,
+                &identity,
+                arg.OptimizeForComposition != 0,
+                p_out,
+                p_contexts,
+            )
+        };
         return;
     }
 
@@ -627,18 +637,103 @@ pub(crate) fn nvk_scanout_used() -> bool {
 /// scanout 0.
 const NVK_SCANOUT_WAIT_NS: u64 = 2_000_000_000;
 
+/// The last route [`present_nvk`] took in this process: 0 none yet, 1 scanout 0,
+/// 2 composed.
+static NVK_LAST_ROUTE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Log the route of the first NVK present and of every present whose route
+/// differs from the previous one (budgeted), so a run shows what the automatic
+/// choice decided and why without a line per frame.
+fn note_nvk_route(scanout: bool, log: impl FnOnce()) {
+    let now = if scanout { 1 } else { 2 };
+    let before = NVK_LAST_ROUTE.swap(now, core::sync::atomic::Ordering::Relaxed);
+    if before == now {
+        return;
+    }
+    L8_REFUSALS.nvk_route_changes.bump();
+    if L8_REFUSALS.nvk_route_changes.get() <= LOG_BUDGET {
+        log();
+    }
+}
+
+/// How long a read of the desktop's size is reused. A mode change shows up in
+/// the automatic route within this time.
+const DESKTOP_EXTENT_TTL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The desktop's size in physical pixels (`DESKTOPHORZRES` x `DESKTOPVERTRES` of
+/// the display DC: not scaled for a process that is not DPI aware), read at most
+/// once per [`DESKTOP_EXTENT_TTL`]. `None` when GDI cannot answer.
+fn desktop_extent() -> Option<(u32, u32)> {
+    #[link(name = "gdi32")]
+    unsafe extern "system" {
+        fn CreateDCW(
+            driver: *const u16,
+            device: *const u16,
+            port: *const u16,
+            mode: *const core::ffi::c_void,
+        ) -> *mut core::ffi::c_void;
+        fn GetDeviceCaps(hdc: *mut core::ffi::c_void, index: i32) -> i32;
+        fn DeleteDC(hdc: *mut core::ffi::c_void) -> i32;
+    }
+    const DESKTOPVERTRES: i32 = 117;
+    const DESKTOPHORZRES: i32 = 118;
+    /// When the size was read, and what was read.
+    type Cached = Option<(std::time::Instant, Option<(u32, u32)>)>;
+    static CACHE: std::sync::Mutex<Cached> = std::sync::Mutex::new(None);
+
+    let mut cache = CACHE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((at, extent)) = *cache {
+        if at.elapsed() < DESKTOP_EXTENT_TTL {
+            return extent;
+        }
+    }
+    let display: Vec<u16> = "DISPLAY\0".encode_utf16().collect();
+    // SAFETY: a NUL-terminated driver name and null optional arguments; the DC
+    // is deleted before return.
+    let extent = unsafe {
+        let hdc = CreateDCW(display.as_ptr(), core::ptr::null(), core::ptr::null(), core::ptr::null());
+        if hdc.is_null() {
+            None
+        } else {
+            let w = GetDeviceCaps(hdc, DESKTOPHORZRES);
+            let h = GetDeviceCaps(hdc, DESKTOPVERTRES);
+            DeleteDC(hdc);
+            (w > 0 && h > 0).then_some((w as u32, h as u32))
+        }
+    };
+    if extent.is_none() {
+        // Counted, and logged a few times: this is re-read every second, so a
+        // refusal summary per failure would be the per-frame logger again.
+        L8_REFUSALS.nvk_desktop_extent_unknown.bump();
+        let n = L8_REFUSALS.nvk_desktop_extent_unknown.get();
+        if n <= 4 {
+            log_error!(
+                "L8: the desktop's size is unknown (display DC refused) -- only a primary \
+                 back buffer counts as covering the output (x{n})"
+            );
+        }
+    }
+    *cache = Some((std::time::Instant::now(), extent));
+    extent
+}
+
 /// `present` on NVK on RM (dxvk-on-nvk S5).
 ///
-/// The back buffer reaches the screen one of two ways (`Nvk12Present`):
+/// The back buffer reaches the screen one of two ways (`Nvk12Present`,
+/// [`helios_umd_common::nvk_present::route`]):
 /// * **composed** -- the WDDM present below names the allocation, which adopted
-///   the KMD resource id NVK minted for the buffer (IMPORT_RM), and DWM's Venus
-///   DXVK imports it as a foreign surface (`ForeignImport=1`);
+///   the KMD resource id NVK minted for the buffer (IMPORT_RM). DWM opens that id
+///   and composes the window: a DWM on NVK natively, a Venus DWM with
+///   `ForeignImport=1`. The frame is complete on the GPU first
+///   (`NvkComposedComplete`), because a DWM on NVK samples it from its own RM
+///   channel, which nothing on the queue's WDDM context orders.
 /// * **scanout 0** -- the frame is shown zero-copy through the KMD's foreign
-///   scanout source after a CPU wait for the queue's work (the desktop is hidden
-///   while the app presents), and the WDDM present still runs so DXGI's flip
-///   queue and frame statistics behave.
-/// Automatic: composed when DWM imports foreign surfaces and the buffer has an
-/// id, else scanout.
+///   scanout source (the desktop is hidden while the app presents), and the
+///   WDDM present still runs so DXGI's flip queue and frame statistics behave.
+///
+/// Automatic: composed when DWM imports NVK surfaces and the buffer is a window;
+/// scanout 0 when the buffer covers the output (a primary, or at least the
+/// desktop's size), when DWM cannot import it, or when it has no resource id.
 ///
 /// # Safety
 /// The live runtime arguments of the `pfnPresent` that called this, on its thread.
@@ -647,18 +742,51 @@ unsafe fn present_nvk(
     h_context: *mut core::ffi::c_void,
     engine_resource: usize,
     identity: &identity12::AllocationIdentity,
+    optimize_for_composition: bool,
     p_out: *mut ddi12::D3D12DDI_PRESENT_0051,
     p_contexts: *mut ddi12::D3D12DDI_PRESENT_CONTEXTS_0051,
 ) {
+    use helios_umd_common::nvk_present::{covers_output, route, Inputs, Route};
+
     let has_id = identity.venus_res_id != 0;
     // Diagnostic `Nvk12AdmitAfterPresentOnly`: the next ECL of every queue
     // waits for the runtime again (flip-model buffer waits follow presents).
     queue::nvk_admit_after_present(h_queue);
-    let scanout = match crate::knobs12::nvk12_present_mode() {
-        1 => true,
-        2 => false,
-        _ => !(crate::knobs12::foreign_import() && has_id),
+    let mode = crate::knobs12::nvk12_present_mode();
+    let dwm_imports = crate::knobs12::dwm_imports_nvk();
+    let primary = identity.heap_flags & (ddi12::D3D12DDI_HEAP_FLAGS_D3D12DDI_HEAP_FLAG_PRIMARY as u32) != 0;
+    // The desktop's size only matters for the automatic choice under an
+    // importing DWM; it is not read otherwise.
+    let desktop = if mode == 0 && has_id && dwm_imports && !primary {
+        desktop_extent()
+    } else {
+        None
     };
+    let covers = covers_output(identity.geometry.width, identity.geometry.height, primary, desktop);
+    let (route, reason) = route(Inputs {
+        mode,
+        has_resource_id: has_id,
+        dwm_imports,
+        covers_output: covers,
+    });
+    let scanout = route == Route::Scanout;
+    note_nvk_route(scanout, || {
+        log_error!(
+            "L8: NVK present route: {} ({}) -- {}x{} fmt={} res_id={} primary={} desktop={:?} \
+             dwm_imports={} mode={} OptimizeForComposition={}",
+            if scanout { "scanout 0" } else { "composed by DWM" },
+            reason.as_str(),
+            identity.geometry.width,
+            identity.geometry.height,
+            identity.geometry.dxgi_format,
+            identity.venus_res_id,
+            primary,
+            desktop,
+            dwm_imports,
+            mode,
+            optimize_for_composition,
+        );
+    });
     // `Nvk12EclSync=2` + `Nvk12ScanoutFence`: the flip waits for the frame's
     // last ECL fence in the KMD (or an ICD thread); this thread does not.
     // SAFETY: forwarded precondition.
@@ -700,12 +828,26 @@ unsafe fn present_nvk(
             note_refusal(&L8_REFUSALS.nvk_scanout_failed);
         }
     } else {
+        // DWM may read the buffer as soon as the WDDM present below reaches it,
+        // through its own RM channel: the frame is finished first. The same
+        // CPU wait the scanout arm above takes without an ECL fence.
+        let complete = crate::knobs12::nvk_composed_complete();
+        if complete {
+            L8_REFUSALS.nvk_composed_complete.bump();
+            // SAFETY: forwarded precondition.
+            if !unsafe { queue::nvk_wait_queue_idle(h_queue, NVK_SCANOUT_WAIT_NS) } {
+                note_refusal(&L8_REFUSALS.nvk_composed_wait_timeout);
+            }
+        }
         L8_REFUSALS.nvk_composed_presents.bump();
         let n = L8_REFUSALS.nvk_composed_presents.get();
         if n == 1 || n % 1024 == 0 {
             log_error!(
-                "L8: NVK present: {n} frames composed by DWM from foreign resource id {}",
-                identity.venus_res_id
+                "L8: NVK present: {n} frames composed by DWM from foreign resource id {} \
+                 ({} completed before their present, wait timeouts {})",
+                identity.venus_res_id,
+                L8_REFUSALS.nvk_composed_complete.get(),
+                L8_REFUSALS.nvk_composed_wait_timeout.get(),
             );
         }
     }
@@ -899,6 +1041,17 @@ struct L8Refusals {
     /// instead (no ECL fence value on the queue, or the flip was refused).
     nvk_scanout_fence_fallback: RefusalCounter,
     nvk_composed_presents: RefusalCounter,
+    /// Composed presents that waited on the CPU for the frame's GPU work first
+    /// (`NvkComposedComplete`).
+    nvk_composed_complete: RefusalCounter,
+    /// ... and those whose wait timed out (the frame was presented anyway).
+    nvk_composed_wait_timeout: RefusalCounter,
+    /// Presents whose route (scanout 0 / composed) differed from the previous
+    /// present's, the first one included.
+    nvk_route_changes: RefusalCounter,
+    /// Reads of the desktop's size that GDI could not answer (the automatic
+    /// route then sends only a primary to scanout 0).
+    nvk_desktop_extent_unknown: RefusalCounter,
 }
 
 static L8_REFUSALS: L8Refusals = L8Refusals {
@@ -922,6 +1075,10 @@ static L8_REFUSALS: L8Refusals = L8Refusals {
     nvk_scanout_fenced: RefusalCounter::new("Nvk12ScanoutFenced"),
     nvk_scanout_fence_fallback: RefusalCounter::new("Nvk12ScanoutFenceFallback"),
     nvk_composed_presents: RefusalCounter::new("Nvk12ComposedPresents"),
+    nvk_composed_complete: RefusalCounter::new("Nvk12ComposedComplete"),
+    nvk_composed_wait_timeout: RefusalCounter::new("Nvk12ComposedWaitTimeout"),
+    nvk_route_changes: RefusalCounter::new("Nvk12RouteChanges"),
+    nvk_desktop_extent_unknown: RefusalCounter::new("Nvk12DesktopExtentUnknown"),
 };
 
 /// L8's refusal counters, printed by `crate::log_refusal_summary` at this lane's
@@ -964,4 +1121,8 @@ pub(crate) static REFUSALS: &[&RefusalCounter] = &[
     &L8_REFUSALS.nvk_scanout_fenced,
     &L8_REFUSALS.nvk_scanout_fence_fallback,
     &L8_REFUSALS.nvk_composed_presents,
+    &L8_REFUSALS.nvk_composed_complete,
+    &L8_REFUSALS.nvk_composed_wait_timeout,
+    &L8_REFUSALS.nvk_route_changes,
+    &L8_REFUSALS.nvk_desktop_extent_unknown,
 ];

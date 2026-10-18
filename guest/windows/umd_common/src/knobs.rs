@@ -182,3 +182,36 @@ impl BoolKnob {
             .get_or_init(|| reg_dword(self.name).map_or(self.default, |v| v != 0))
     }
 }
+
+/// Does a DWM on NVK compose this desktop? True when `HKLM\SOFTWARE\Helios!DwmIcd`
+/// is `nvk` and the marker event that DWM holds while it composes on NVK
+/// (`Local\HeliosDwmOnNvk`, `umd_common/bridge/bridge_icd_backend.cpp`, "the
+/// desktop follows DWM") exists. `ERROR_ACCESS_DENIED` on the open (a sandboxed
+/// caller) also means it exists.
+///
+/// Both drivers use it to send an NVK swap chain's frames to DWM (composed by
+/// resource id) rather than straight to scanout 0, which under a DWM on NVK
+/// shows a window-sized frame on the whole output, interleaved with DWM's own
+/// flips. Not cached here; callers read it once per process.
+pub fn dwm_on_nvk_marker() -> bool {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn OpenEventA(access: u32, inherit: i32, name: *const u8) -> *mut c_void;
+        fn CloseHandle(h: *mut c_void) -> i32;
+        fn GetLastError() -> u32;
+    }
+    const SYNCHRONIZE: u32 = 0x0010_0000;
+    const ERROR_ACCESS_DENIED: u32 = 5;
+    if !reg_sz(c"DwmIcd").is_some_and(|v| v.trim().eq_ignore_ascii_case("nvk")) {
+        return false;
+    }
+    // SAFETY: a NUL-terminated name; the handle is closed at once.
+    unsafe {
+        let h = OpenEventA(SYNCHRONIZE, 0, c"Local\\HeliosDwmOnNvk".as_ptr().cast());
+        if !h.is_null() {
+            CloseHandle(h);
+            return true;
+        }
+        GetLastError() == ERROR_ACCESS_DENIED
+    }
+}
