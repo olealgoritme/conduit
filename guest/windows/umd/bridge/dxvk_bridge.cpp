@@ -670,13 +670,31 @@ namespace helios_handoff {
     return s_table;
   }
 
+  // HKLM\SOFTWARE\Helios!FlipLedger (REG_DWORD, absent 0), or
+  // HELIOS_FLIP_LEDGER: flip-model presents of NVK apps are ordered for DWM by
+  // ledger points (forward/present.rs nvk_flip_ledger_publish), and a reader
+  // (DWM) installs the ledger hooks. Read once per process, like the Rust knob.
+  bool flip_ledger() {
+    static const bool on = []() {
+      if (const char* v = std::getenv("HELIOS_FLIP_LEDGER"))
+        return v[0] == '1';
+      DWORD value = 0, size = sizeof(value);
+      return RegGetValueA(HKEY_LOCAL_MACHINE, "SOFTWARE\\Helios", "FlipLedger",
+                          RRF_RT_REG_DWORD | RRF_SUBKEY_WOW6464KEY, nullptr, &value,
+                          &size) == ERROR_SUCCESS && value != 0;
+    }();
+    return on;
+  }
+
   // Opt-in (HELIOS_HANDOFF_LEDGER=1, in every sharing process) until the
   // cross-process table is verified; the default is the releaser CPU wait
-  // (forward/transfer.rs).
+  // (forward/transfer.rs). FlipLedger enables the table too: the keyed-mutex
+  // hand-offs still publish only with HELIOS_HANDOFF_LEDGER (the Rust side
+  // decides that), so it adds readers' samples, which find nothing pending.
   bool enabled() {
     static const bool on = []() {
       const char* v = std::getenv("HELIOS_HANDOFF_LEDGER");
-      return v && v[0] == '1';
+      return (v && v[0] == '1') || flip_ledger();
     }();
     return on;
   }
@@ -1213,7 +1231,12 @@ namespace {
       return 0;
     auto image = texture->GetImage();
     std::uint32_t key = image->heliosHandoffKey();
-    if (key || !d.icd.memory_res_id || d.device == nullptr)
+    // An import keeps the id it was opened with. Our own image is asked again
+    // (the ICD caches the id per memory): RotateResourceIdentities moves
+    // storages between a flip-model chain's images, so an id cached on the
+    // image names the buffer it held first, not the one it holds now.
+    const bool own = image->info().sharing.mode != dxvk::DxvkSharedHandleMode::Import;
+    if ((key && !own) || !d.icd.memory_res_id || d.device == nullptr)
       return key;
     VkImage vkImage = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;

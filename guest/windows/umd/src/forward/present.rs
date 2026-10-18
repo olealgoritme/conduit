@@ -1675,11 +1675,25 @@ unsafe fn nvk_present_frame(
     };
     let caps = dev.dxvk.nvk_icd_caps();
     let fences = crate::knobs::nvk_rm_fence() && caps & HELIOS_ICD_CAP_RM_FENCE != 0;
+    // `FlipLedger`: a flip-model buffer DWM samples directly is ordered for DWM by a hand-off
+    // ledger point on its resource id instead of the CPU wait below: DWM's submission of the
+    // command list that samples it waits for the point (DXVK patches 0007/0008), so this thread
+    // does not wait and the present carries the frame's RM fence. Needs the RM fence path (the
+    // marker fence retires the present's packet behind the frame); without it, or when the
+    // ledger refuses, the frame completes as before.
+    let ledger = !scanout
+        && fences
+        && dwm_reads_source
+        && !crate::knobs::is_dwm_process()
+        && crate::knobs::flip_ledger()
+        && !nvk_source_is_primary(shown)
+        && nvk_flip_ledger_publish(dev, shown);
     // A frame DWM samples directly is complete before DWM can see it (the S3 wait below):
     // nothing on DWM's RM channel waits for a fence in the marker.
     // DWM's own frame too (measured: the transients stayed with only the producers' frames
     // completed, and went with DWM's as well).
     let must_complete = !scanout
+        && !ledger
         && crate::knobs::nvk_composed_complete()
         && (crate::knobs::is_dwm_process() || (dwm_reads_source && !nvk_source_is_primary(shown)));
     if must_complete {
@@ -1824,6 +1838,87 @@ unsafe fn nvk_present_frame(
         }
     }
     Ok(NvkFrame::default())
+}
+
+static FLIP_LEDGER_POINTS: AtomicUsize = AtomicUsize::new(0);
+static FLIP_LEDGER_UNCHANGED: AtomicUsize = AtomicUsize::new(0);
+static FLIP_LEDGER_REFUSED: AtomicUsize = AtomicUsize::new(0);
+
+/// `FlipLedger`: publish a hand-off ledger point of this device on the presented flip-model
+/// buffer `shown` (the frame was flushed by the caller; the point completes when everything
+/// recorded before it has run on the GPU). True when the buffer is covered: a new point, or no
+/// work since the last point (that point covers it). False: no ledger here (the bridge reports
+/// none, the table is full, or the buffer has no resource id), and the caller waits as before.
+unsafe fn nvk_flip_ledger_publish(dev: &HeliosDevice, shown: ddi::D3D10DDI_HRESOURCE) -> bool {
+    if nvk_source_resource_id(shown).map_or(true, |id| id == 0) {
+        FLIP_LEDGER_REFUSED.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+    let Some(res) = load_resource(shown) else {
+        FLIP_LEDGER_REFUSED.fetch_add(1, Ordering::Relaxed);
+        return false;
+    };
+    let rc = dev.dxvk.handoff_publish(&[res.as_raw() as usize]);
+    let (n, ok) = match rc {
+        1 => (FLIP_LEDGER_POINTS.fetch_add(1, Ordering::Relaxed) + 1, true),
+        0 => {
+            FLIP_LEDGER_UNCHANGED.fetch_add(1, Ordering::Relaxed);
+            (FLIP_LEDGER_POINTS.load(Ordering::Relaxed), true)
+        }
+        _ => {
+            let r = FLIP_LEDGER_REFUSED.fetch_add(1, Ordering::Relaxed) + 1;
+            if r <= 8 || r % 4096 == 0 {
+                log_error!(
+                    "FlipLedger: no ledger point for the flip-model buffer (rc {rc}, x{r}); the \
+                     frame completes on the CPU before its present"
+                );
+            }
+            return false;
+        }
+    };
+    if ok && (n == 1 || n % 4096 == 0) && rc == 1 {
+        log_error!(
+            "FlipLedger: {n} flip-model presents ordered for DWM by ledger points, no CPU wait \
+             ({} with no new work, {} refused)",
+            FLIP_LEDGER_UNCHANGED.load(Ordering::Relaxed),
+            FLIP_LEDGER_REFUSED.load(Ordering::Relaxed),
+        );
+    }
+    ok
+}
+
+/// `FlipUpgrade` (`helios_umd_common::flip_upgrade`): install the swap-effect upgrade for this
+/// process when its device is on NVK, a DWM that imports NVK surfaces composes (only then are
+/// the app's flip-model buffers composed from their resource ids, zero-copy), it is not DWM,
+/// and `FlipUpgradeList` (if set) names it. Once per process; called after CreateDevice.
+pub(crate) fn maybe_install_flip_upgrade(dev: &HeliosDevice) {
+    static DONE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    if crate::knobs::flip_upgrade() == 0 || !dev.dxvk.is_nvk() || crate::knobs::is_dwm_process() {
+        return;
+    }
+    if DONE.set(()).is_err() {
+        return;
+    }
+    let exe = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_default();
+    let list = helios_umd_common::knobs::reg_sz(c"FlipUpgradeList");
+    if !helios_umd_common::flip_upgrade::exe_allowed(list.as_deref(), &exe) {
+        log_error!("FlipUpgrade: {exe} is not in FlipUpgradeList; swap chains as the app asks");
+        return;
+    }
+    if !nvk_dwm_composes() {
+        log_error!(
+            "FlipUpgrade: no DWM that imports NVK surfaces (DwmIcd=nvk marker / ForeignImport); \
+             swap chains as the app asks"
+        );
+        return;
+    }
+    helios_umd_common::flip_upgrade::install(helios_umd_common::flip_upgrade::Options {
+        buffers: crate::knobs::FLIP_UPGRADE_BUFFERS.get(),
+        tearing: crate::knobs::FLIP_UPGRADE_TEARING.get(),
+    });
 }
 
 /// `DXGI_DDI_PRESENT_FLAGS`: `Blt` (bit 0) and `Flip` (bit 1).

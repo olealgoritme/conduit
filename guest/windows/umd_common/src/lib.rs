@@ -75,6 +75,7 @@
 
 pub mod cmd_queue;
 pub mod cmd_record;
+pub mod flip_upgrade;
 pub mod format;
 pub mod frame_trace;
 pub mod hr;

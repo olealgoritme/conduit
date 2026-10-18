@@ -605,6 +605,36 @@ class = "debug"
 read = "once per process"
 effect = "The D3D11 feature-level caps profile the UMD reports: 1 the full FL11_0 profile (pipeline 11_0, real MSAA, unmasked format bits); 0 the FL10_0 profile; 2 a diagnostic mix (pipeline 11_0 with the FL10 MSAA and format caps)."
 
+[umd.FlipLedger]
+class = "experiment"
+read = "once per process (set it before DWM starts: DWM installs the ledger's reader hooks only with it)"
+effect = "1: a flip-model buffer of an NVK app that DWM composes directly does not wait for its frame on the presenting thread (the NvkComposedComplete CPU wait): the present publishes a hand-off ledger point on the buffer's resource id, completed when the frame's GPU work is, the WDDM present carries the frame's RM fence, and a DWM on NVK waits for the point before it submits the command list that samples the buffer. When no point can be published (no ledger section, the table full, no resource id, no RM fence path) the frame waits as with 0. D3D11 only. HELIOS_FLIP_LEDGER overrides it per process."
+see = "[dwm-on-nvk.md](dwm-on-nvk.md)"
+
+[umd.FlipUpgrade]
+class = "experiment"
+read = "once per process (at its first D3D11 device on NVK)"
+effect = "1: in an NVK process under a DWM that imports NVK surfaces (not dwm.exe), a windowed blt-model D3D11 swap chain (DISCARD, one sample, R8G8B8A8 or B8G8R8A8 UNORM, no flag but ALLOW_MODE_SWITCH) is created FLIP_DISCARD: DWM composes the app's own buffers by resource id instead of a copy into the window's redirection surface (PresentMon: Composed: Flip instead of Composed: Copy with GPU GDI). The app keeps its description (GetDesc), its render targets after Present, and its unthrottled interval-0 presents. An app that draws GDI into its D3D window loses that content, hence opt-in. 0 or absent: swap chains as the app asks. HELIOS_FLIP_UPGRADE overrides it per process."
+see = "[dwm-on-nvk.md](dwm-on-nvk.md)"
+
+[umd.FlipUpgradeBuffers]
+class = "experiment"
+read = "once per process"
+effect = "Buffers of a FlipUpgrade chain (2 to 16; an app that asks for more keeps its count)."
+see = "[dwm-on-nvk.md](dwm-on-nvk.md)"
+
+[umd.FlipUpgradeList]
+class = "experiment"
+read = "once per process"
+effect = "REG_SZ, executable names separated by ';': FlipUpgrade applies only to these programs. Absent or empty: every eligible program."
+see = "[dwm-on-nvk.md](dwm-on-nvk.md)"
+
+[umd.FlipUpgradeTearing]
+class = "experiment"
+read = "once per process"
+effect = "1 (default): a FlipUpgrade chain is created with ALLOW_TEARING when DXGI allows it, and its interval-0 presents in a window add DXGI_PRESENT_ALLOW_TEARING, so they stay unthrottled when the window is promoted to independent flip. 0: neither."
+see = "[dwm-on-nvk.md](dwm-on-nvk.md)"
+
 [umd.ForeignImport]
 class = "experiment"
 read = "once per process"
@@ -1012,6 +1042,16 @@ read = "front-end ring creation"
 effect = "Pause instructions the D3D11 threaded front end's worker spends between two looks at its empty ring before it sleeps (at most 4096). Unset: 32."
 default_note = "unset = 32 (DEFAULT_POLL_PAUSES)"
 see = "[d3d11-threaded-frontend.md](../guest/windows/docs/d3d11-threaded-frontend.md)"
+
+[env.HELIOS_FLIP_LEDGER]
+class = "debug"
+read = "once per process"
+effect = "0 or 1 overrides HKLM\\SOFTWARE\\Helios FlipLedger for this process (the D3D11 UMD and its DXVK bridge)."
+
+[env.HELIOS_FLIP_UPGRADE]
+class = "debug"
+read = "once per process"
+effect = "A number overrides HKLM\\SOFTWARE\\Helios FlipUpgrade for this process."
 
 [env.HELIOS_FLUSH_GATE_CPU_WAIT]
 class = "debug"

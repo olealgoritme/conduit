@@ -845,10 +845,11 @@ unsafe fn note_nvk_keyed_resource(
     bind: u32,
     created: bool,
 ) {
-    if misc & DDI_MISC_SHARED_FLAG == 0
-        || bind & DDI_BIND_PRESENT_FLAG != 0
-        || load_resource(h_resource).is_none()
-    {
+    if bind & DDI_BIND_PRESENT_FLAG != 0 {
+        note_nvk_flip_buffer(h, h_resource, created);
+        return;
+    }
+    if misc & DDI_MISC_SHARED_FLAG == 0 || load_resource(h_resource).is_none() {
         return;
     }
     let Some(dev) = helios_device(h) else {
@@ -869,12 +870,56 @@ unsafe fn note_nvk_keyed_resource(
     }
 }
 
+/// `FlipLedger`: a DXGI present buffer of an NVK device (created here, or opened: DWM opening
+/// an app's flip-model buffer) holds its hand-off ledger key while it lives, so the presenting
+/// app's points (`nvk_flip_ledger_publish`) land in a slot DWM samples, and DWM's DXVK installs
+/// the ledger's reader hooks. The slot is let go at destroy (`forget_nvk_keyed_resource`).
+unsafe fn note_nvk_flip_buffer(h: Hdevice, h_resource: ddi::D3D10DDI_HRESOURCE, created: bool) {
+    if !crate::knobs::flip_ledger() {
+        return;
+    }
+    let Some(dev) = helios_device(h) else {
+        return;
+    };
+    if !dev.dxvk.is_nvk() {
+        return;
+    }
+    let Some(res) = load_resource(h_resource) else {
+        return;
+    };
+    let key = h_resource.pDrvPrivate as usize;
+    let mut list = lock_ignore_poison(&dev.nvk_flip_buffers);
+    if !list.contains(&key) {
+        dev.dxvk.handoff_register(res.as_raw() as usize);
+        list.push(key);
+        if list.len() <= 4 {
+            log_error!(
+                "FlipLedger: present buffer hDrv=0x{key:x} ({}) holds its ledger key ({} live)",
+                if created { "created" } else { "opened" },
+                list.len()
+            );
+        }
+    }
+}
+
 /// Forget a resource `note_nvk_keyed_resource` remembered (any resource may be
 /// passed).
 pub(crate) unsafe fn forget_nvk_keyed_resource(h: Hdevice, h_resource: ddi::D3D10DDI_HRESOURCE) {
     let Some(dev) = helios_device(h) else {
         return;
     };
+    {
+        let key = h_resource.pDrvPrivate as usize;
+        let mut flips = lock_ignore_poison(&dev.nvk_flip_buffers);
+        if let Some(i) = flips.iter().position(|&k| k == key) {
+            flips.swap_remove(i);
+            drop(flips);
+            if let Some(res) = load_resource(h_resource) {
+                dev.dxvk.handoff_unregister(res.as_raw() as usize);
+            }
+            return;
+        }
+    }
     let mut list = lock_ignore_poison(&dev.nvk_keyed_resources);
     if list.is_empty() {
         return;

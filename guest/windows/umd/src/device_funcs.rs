@@ -416,6 +416,10 @@ pub struct HeliosDevice {
     /// the keyed mutex itself is invisible at the DDI.
     /// `(pDrvPrivate, created here)`; an opened resource has `false`.
     pub nvk_keyed_resources: std::sync::Mutex<Vec<(usize, bool)>>,
+    /// NVK, `FlipLedger`: DXGI present buffers this device created or opened
+    /// (`pDrvPrivate` of each) that hold their hand-off ledger key
+    /// (`forward::resource::note_nvk_flip_buffer`).
+    pub nvk_flip_buffers: std::sync::Mutex<Vec<usize>>,
     pub direct_scanout_allocations:
         std::sync::Mutex<Vec<(u32, helios_protocol::HeliosPresentPrivateData)>>,
     /// Runtime corelayer handle + callbacks (pfnSetErrorCb) so VOID-returning
