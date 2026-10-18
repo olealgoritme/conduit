@@ -1,0 +1,137 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Sun, 18 Oct 2026 00:11:13 +0200
+Subject: [PATCH] nak: f16 conversions on the ALU and FMA pipes (NAK_F16_CVT)
+
+On SM86+, F2F runs on the quarter-rate conversion pipe that MUFU also
+uses.  Shaders with native 16-bit types (DXIL 6.2 half, as in Steel
+Nomad's heaviest compute shader) convert between f32 and f16 dozens of
+times per loop iteration, and that pipe becomes the bottleneck.
+
+Like the reference compiler's code for the same shaders:
+
+- a scalar f32-to-f16 conversion is F2FP.F16.F32.PACK_AB with RZ as the
+  high half (ALU pipe; vec2 conversions already used F2FP), when fp16
+  denormals are not flushed
+- an f16-to-f32 conversion is HADD2.F32 dst, -RZ, src.H0_H0 (FMA pipe):
+  adding -0 is exact and keeps the sign of a zero
+
+Copy propagation treated any HADD2 with a -0 source as a copy; it now
+leaves HADD2.F32 alone.
+
+NAK_F16_CVT=0 restores F2F.  Part of nak_knobs_key() (bit 15).
+---
+ src/nouveau/compiler/nak/from_nir.rs      | 38 +++++++++++++++++++++++
+ src/nouveau/compiler/nak/knobs.rs         | 13 ++++++++
+ src/nouveau/compiler/nak/opt_copy_prop.rs |  3 +-
+ 3 files changed, 53 insertions(+), 1 deletion(-)
+
+diff --git a/src/nouveau/compiler/nak/from_nir.rs b/src/nouveau/compiler/nak/from_nir.rs
+index cbf92c7..b85aa5d 100644
+--- a/src/nouveau/compiler/nak/from_nir.rs
++++ b/src/nouveau/compiler/nak/from_nir.rs
+@@ -894,6 +894,44 @@ impl<'a> ShaderFromNir<'a> {
+                 });
+                 dst.into()
+             }
++            nir_op_f2f16 | nir_op_f2f16_rtne | nir_op_f2f16_rtz
++                if b.sm() >= 86
++                    && crate::knobs::f16_cvt()
++                    && alu.get_src(0).bit_size() == 32
++                    && !self.float_ctl[FloatType::F16].ftz =>
++            {
++                // F2FP runs on the ALU pipe; F2F on the quarter-rate
++                // conversion pipe.  The high half of the result is zero.
++                let dst = b.alloc_ssa(RegFile::GPR);
++                b.push_op(OpF2FP {
++                    dst: dst.into(),
++                    srcs: [Src::ZERO, srcs(0)],
++                    rnd_mode: match alu.op {
++                        nir_op_f2f16_rtne => FRndMode::NearestEven,
++                        nir_op_f2f16_rtz => FRndMode::Zero,
++                        _ => self.float_ctl[FloatType::F16].rnd_mode,
++                    },
++                });
++                dst.into()
++            }
++            nir_op_f2f32
++                if b.sm() >= 86
++                    && crate::knobs::f16_cvt()
++                    && alu.def.num_components == 1
++                    && alu.get_src(0).bit_size() == 16 =>
++            {
++                // HADD2.F32 x + -0 is the exact conversion (-0 keeps the
++                // sign of a zero) on the FMA pipe.
++                let dst = b.alloc_ssa(RegFile::GPR);
++                b.push_op(OpHAdd2 {
++                    dst: dst.into(),
++                    srcs: [Src::ZERO.fneg(), restrict_f16v2_src(srcs(0))],
++                    saturate: false,
++                    ftz: self.float_ctl[FloatType::F16].ftz,
++                    f32: true,
++                });
++                dst.into()
++            }
+             nir_op_f2f16 | nir_op_f2f16_rtne | nir_op_f2f16_rtz
+             | nir_op_f2f32 | nir_op_f2f64 => {
+                 let src_bits = alu.get_src(0).src.bit_size();
+diff --git a/src/nouveau/compiler/nak/knobs.rs b/src/nouveau/compiler/nak/knobs.rs
+index 4fbe138..2ab6488 100644
+--- a/src/nouveau/compiler/nak/knobs.rs
++++ b/src/nouveau/compiler/nak/knobs.rs
+@@ -48,6 +48,11 @@
+ //!   if/else regions (barriers no BREAK uses) use the .RECONVERGENT mode,
+ //!   as the reference compiler's SM120 code does, without the BMOV.CLEAR
+ //!   before the BSSY.  Off until it has run on hardware
++//! - NAK_F16_CVT (default on): on SM86+, scalar f32-to-f16 conversions are
++//!   F2FP.PACK_AB with a zero high half and f16-to-f32 conversions are
++//!   HADD2.F32 with -0, as in the reference compiler's code, instead of
++//!   F2F, which runs on the quarter-rate conversion pipe shared with MUFU
++//!   (from_nir.rs)
+ 
+ use std::env;
+ use std::sync::OnceLock;
+@@ -84,6 +89,7 @@ static UNROLL_MAX: OnceLock<u32> = OnceLock::new();
+ static VEC_CSE: OnceLock<bool> = OnceLock::new();
+ static WEAK_MEM: OnceLock<bool> = OnceLock::new();
+ static UNIFORM_ATOMICS: OnceLock<bool> = OnceLock::new();
++static F16_CVT: OnceLock<bool> = OnceLock::new();
+ 
+ /// NAK_IMM_CSE for a shader: compute shaders unless set
+ pub fn imm_cse(compute: bool) -> bool {
+@@ -180,6 +186,12 @@ pub fn uniform_atomics() -> bool {
+     *v
+ }
+ 
++pub fn f16_cvt() -> bool {
++    let v = F16_CVT
++        .get_or_init(|| parse("NAK_F16_CVT", env::var("NAK_F16_CVT"), true));
++    *v
++}
++
+ pub fn vec_cse() -> bool {
+     let v = VEC_CSE
+         .get_or_init(|| parse("NAK_VEC_CSE", env::var("NAK_VEC_CSE"), true));
+@@ -251,4 +263,5 @@ pub extern "C" fn nak_knobs_key() -> u32 {
+         | (u32::from(vec_cse()) << 12)
+         | (u32::from(weak_mem()) << 13)
+         | (u32::from(uniform_atomics()) << 14)
++        | (u32::from(f16_cvt()) << 15)
+ }
+diff --git a/src/nouveau/compiler/nak/opt_copy_prop.rs b/src/nouveau/compiler/nak/opt_copy_prop.rs
+index f692228..b95a63d 100644
+--- a/src/nouveau/compiler/nak/opt_copy_prop.rs
++++ b/src/nouveau/compiler/nak/opt_copy_prop.rs
+@@ -560,7 +560,8 @@ impl<'a> CopyPropPass<'a> {
+                 assert!(dst.comps() == 1);
+                 let dst = dst[0];
+ 
+-                if !add.saturate {
++                // HADD2.F32 x + -0 converts to f32: not a copy
++                if !add.saturate && !add.f32 {
+                     if add.srcs[0].is_fneg_zero(SrcType::F16v2) {
+                         self.add_copy_float(
+                             bi,
+-- 
+2.43.0
+

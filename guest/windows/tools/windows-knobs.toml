@@ -1344,10 +1344,20 @@ class = "experiment"
 read = "first shader compile (once per process)"
 effect = "Bitmask, default 0: SM120 register dependency pairs that wait the SM100 latency instead of one cycle more: 1 FMA-class chains, 2 FMA/ALU cross pairs, 4 predicate guards, 8 coupled carry predicates, 16 uniform datapath, 64 LOP3/PRMT/SHF chains, 128 every pair (unsafe upper bound). For hardware validation with naktest only. Part of the shader cache key."
 
+[env.NAK_F16_CVT]
+class = "tuning"
+read = "first shader compile (once per process)"
+effect = "On by default (unset or 1); 0 restores F2F. On SM86+ a scalar f32-to-f16 conversion is F2FP.F16.F32.PACK_AB with a zero high half (ALU pipe, unless fp16 denormals are flushed) and an f16-to-f32 conversion is HADD2.F32 with -0 (FMA pipe), instead of F2F on the quarter-rate conversion pipe shared with MUFU. Matters for shaders with native 16-bit types (DXIL 6.2 half) that convert dozens of times per loop iteration. Part of the shader cache key."
+
 [env.NAK_UNIFORM_ATOMICS]
 class = "tuning"
 read = "first shader compile (once per process)"
 effect = "On by default (unset or 1); 0 turns it off. An atomic whose address is the same in every active lane of a subgroup is done once by one lane, with a subgroup reduction of the value and an exclusive scan giving each lane its result (nir_opt_uniform_atomics), instead of one atomic per lane serialized in L2. Part of the shader cache key."
+
+[env.NAK_LOOP_CONT_SYNC]
+class = "tuning"
+read = "first shader compile (once per process)"
+effect = "Off by default (unset or 0); 1 makes every divergent loop sync its lanes at the end of each iteration (BSSY/BSYNC around the body, breaks escape through it). Off, loops with no continue skip that sync and breaks go to the loop's exit sync directly. Part of the shader cache key."
 
 [env.NAK_UNROLL_MAX]
 class = "tuning"
