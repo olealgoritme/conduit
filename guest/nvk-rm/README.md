@@ -99,6 +99,8 @@ Patch numbers are file numbers in the directory named in the patch tables.
 | `NAK_IF_CONVERT`, `NAK_NIR_FLATTEN` | 1, 0 | small then/else blocks predicated after register allocation; NIR flattening of small ifs (common 60) |
 | `NAK_BSSY_RECONVERGENT` | 0 | SM100+ if/else barriers in `.RECONVERGENT` mode without BMOV.CLEAR (common 61) |
 | `NAK_PHI_AVOID` | 1 | new values stay out of the registers the block's phi copies want (common 62) |
+| `NAK_F16_CVT` | 1 | scalar f16 conversions on SM86+ run on the ALU (F2FP) and FMA (HADD2.F32) pipes instead of F2F on the quarter-rate conversion pipe (common 74) |
+| `NAK_LOOP_CONT_SYNC` | 0 | 1 syncs lanes at the end of every divergent loop iteration; off, loops without a continue skip that sync (common 75) |
 | `NAK_UNROLL_MAX` | 32 | most iterations NIR fully unrolls a loop with a known trip count (common 65) |
 | `NAK_VEC_CSE` | 1 | the copies that make a splat a register vector serve its later uses in the block (common 66) |
 | `NAK_WEAK_MEM` | 0 | weak (L1-cacheable) order for non-coherent global, SSBO and image accesses (common 67) |
@@ -385,6 +387,8 @@ backend. Numbers are file numbers (there is no 0016 or 0025).
 | 0071 | `NVK_DISPATCH_PROFILE`: compute-class timestamps behind a WAIT_FOR_IDLE before and after every launch (direct, indirect, device-generated, internal), keyed by `vk_shader::src_hash` (the SPIR-V's `OpString "<hash>.dxil"` from vkd3d-proton, else FNV-1a 64 of the SPIR-V), code hash and local size; indirect arguments copied by I2M for the grid; per-window table of ms/s, share, calls/s, mean/median/max us, GPRs, warps, grids |
 | 0072 | `NVK_DISPATCH_CAPTURE`: `vk_device::compute_spirv_hook` hands the SPIR-V and layout of listed compute shaders to NVK, which scans push constant block, resource variables, descriptor indices of the form push constant + constant and root buffer addresses; at a captured dispatch, descriptors are mapped back to views, samplers and buffer ranges (tables from view and sampler creation, the EDB cache) and copied by the copy engine into GART staging before the launch (and after with `_POST`), a CE semaphore marks completion, files are written when the command buffer is reset |
 | 0073 | RM: `NVK_RM_UPLOAD_VRAM` defaults to `compute` on Windows, so compute root descriptor tables are CPU-mapped VRAM (0052); `0` keeps them in system memory |
+| 0074 | NAK: on SM86+ a scalar f32-to-f16 conversion is F2FP.F16.F32.PACK_AB with a zero high half (ALU pipe) and an f16-to-f32 conversion is HADD2.F32 with -0 (FMA pipe) instead of F2F on the quarter-rate conversion pipe shared with MUFU; copy propagation leaves HADD2.F32 alone (`NAK_F16_CVT`, default on; part of the shader cache key) |
+| 0075 | NAK: a divergent loop with no continue skips the per-iteration lane sync (BSSY/BSYNC around the body) and its breaks go to the loop's exit sync directly (`NAK_LOOP_CONT_SYNC=1` restores the sync; part of the shader cache key) |
 
 ## Per-draw cost (common 0001-0007)
 
