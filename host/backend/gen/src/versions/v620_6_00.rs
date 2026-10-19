@@ -71,6 +71,13 @@ pub fn table() -> &'static [IoctlEntry] {
             also: &[],
             kind: IoctlKind::IdleChannels,
         },
+        // NVOS32_PARAMETERS
+        IoctlEntry {
+            escape: NV_ESC_RM_VID_HEAP_CONTROL,
+            param_size: Some(184),
+            also: &[],
+            kind: IoctlKind::VidHeapControl,
+        },
         // IoctlNVOS33ParametersWithFD
         IoctlEntry {
             escape: NV_ESC_RM_MAP_MEMORY,
