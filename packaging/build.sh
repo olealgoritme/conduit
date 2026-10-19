@@ -20,8 +20,9 @@
 #
 # Environment (all optional):
 #   VERSION            package version (default: git describe, without the leading v)
-#   RUST_TARGET        the CLI's target: x86_64-unknown-linux-musl (default, static) or
-#                      "host" (distro builds). The backend and VMM are always glibc.
+#   RUST_TARGET        the CLI's target: "host" (default, glibc; the dashboard loads
+#                      NVIDIA's NVML with dlopen) or x86_64-unknown-linux-musl (static,
+#                      no NVML). The backend and VMM are always glibc.
 #   BUNDLE_QEMU        1 (default) to ship QEMU in /opt/conduit, 0 to leave it out
 #   STAGE              install tree root (default dist/stage)
 #   LINK_DIR           where the `conduit` command symlink goes (default /usr/bin;
@@ -48,7 +49,7 @@ STAGE=${STAGE:-$DIST/stage}
 OUT=${OUT:-$DIST/out}
 PREFIX=/opt/conduit                 # never configurable: AppArmor/SELinux rules name it
 LINK_DIR=${LINK_DIR:-/usr/bin}
-RUST_TARGET=${RUST_TARGET:-x86_64-unknown-linux-musl}
+RUST_TARGET=${RUST_TARGET:-host}
 BUNDLE_QEMU=${BUNDLE_QEMU:-1}
 QEMU_BUILD_SCRIPT=${QEMU_BUILD_SCRIPT:-$ROOT/host/qemu/build-qemu.sh}
 JOBS=${JOBS:-$(nproc 2>/dev/null || echo 4)}
@@ -191,15 +192,16 @@ cmd_rust() {
     t=$(target_dir "$ROOT/cli")/$TARGET_DIR_SUFFIX
     install -m0755 "$t/$CLI_BIN_SRC" "$bin/conduit"
 
-    if [ "$RUST_TARGET" != host ]; then
-        # The CLI is static; the backend and the VM runner link glibc on
-        # purpose (see above) and must run on the oldest glibc any package
-        # targets (the tarball's Debian 12). Weak references (Rust's std
-        # probing for newer calls such as pidfd_spawnp) do not count.
+    if [ "$RUST_TARGET" != host ] || [ -n "${GLIBC_MAX:-}" ]; then
+        # The binaries shared by every package link glibc and must run on the
+        # oldest glibc any package targets (the tarball's Debian 12). Release
+        # builds set GLIBC_MAX; a musl CLI build checks the rest by default.
+        # Weak references (Rust's std probing for newer calls such as
+        # pidfd_spawnp) do not count.
         local glibc_max=${GLIBC_MAX:-2.36} need
         for f in "$bin"/*; do
             case "$(basename "$f")" in
-            conduit-backend|conduit-userspace|conduit-vmm)
+            conduit|conduit-backend|conduit-userspace|conduit-vmm)
                 need=$(objdump -T "$f" | grep -vE '^[0-9a-f]+ +w ' \
                     | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sed 's/GLIBC_//' | sort -Vu | tail -1)
                 [ "$(printf '%s\n%s\n' "$need" "$glibc_max" | sort -V | tail -1)" = "$glibc_max" ] \
