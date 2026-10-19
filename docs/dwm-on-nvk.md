@@ -271,8 +271,9 @@ the UMD's `CheckDirectFlipSupport`). There is no cap left that would make DXGI u
 In an NVK process under a DWM that imports NVK surfaces (not `dwm.exe`; optionally only the programs
 `FlipUpgradeList` names), the D3D11 UMD hooks DXGI's swap-chain creation in the process
 (`IDXGIFactory::CreateSwapChain`, `IDXGIFactory2::CreateSwapChainForHwnd`). A windowed `DISCARD`
-chain with one sample, an R8G8B8A8 or B8G8R8A8 UNORM buffer and no flag but `ALLOW_MODE_SWITCH` is
-created `FLIP_DISCARD` with `FlipUpgradeBuffers` buffers (default 3). The flip model's documented
+chain with one sample, an R8G8B8A8 or B8G8R8A8 UNORM buffer and no flag but `ALLOW_MODE_SWITCH`,
+whose window has a caption (or is a child window), is created `FLIP_DISCARD` with
+`FlipUpgradeBuffers` buffers (default 3). The flip model's documented
 extra requirements (`direct3ddxgi/for-best-performance--use-dxgi-flip-model.md`, "What do I have
 to do to use the flip model?") are met for the app:
 
@@ -280,7 +281,7 @@ to do to use the flip model?") are met for the app:
 |---|---|
 | at least 2 buffers | `FlipUpgradeBuffers`; `ResizeBuffers` keeps the count |
 | the back buffer is re-bound after `Present` | the hooked `Present` / `Present1` binds the immediate context's render targets and depth view again after the real call, as a blt-model present leaves them |
-| `ResizeBuffers` after `SetFullscreenState` | only windowed chains are upgraded; exclusive fullscreen keeps its scanout path |
+| `ResizeBuffers` after `SetFullscreenState` | an upgraded chain's exclusive fullscreen is emulated (below): DXGI never sees the transition |
 | no MSAA buffers | multisampled chains are not upgraded |
 
 `GetDesc` / `GetDesc1` report what the app asked for. Interval-0 presents stay unthrottled when
@@ -292,6 +293,29 @@ resource ids for the 8-bit formats). The UMD is pinned in memory once the hooks 
 
 Once the chain is flip-model, DWM opens its buffers by resource id at creation (as for any NVK
 flip-model chain) and composes the presented buffer.
+
+**Exclusive fullscreen.** "For the flip presentation model, after you transition the display state
+to full screen, you must call ResizeBuffers to ensure that your call to IDXGISwapChain1::Present1
+succeeds" (`IDXGISwapChain::SetFullscreenState`, Remarks). A blt-model app need not, and
+Counter-Strike 2 does not: it creates its chain windowed at the mode's size, calls
+`SetFullscreenState(TRUE)`, and its buffers and window already have the mode's size, so no
+`WM_SIZE` and no `ResizeBuffers` follow. On an upgraded chain DXGI then refuses every present (no
+present in PresentMon, nothing on screen, the game itself running). The driver cannot resize for
+the app (`ResizeBuffers` fails while the app holds its back buffer and views), so:
+
+* A top-level window without a caption (`WS_POPUP`: the window of an exclusive or borderless
+  fullscreen game) is not upgraded: such a chain keeps DXGI's own fullscreen path
+  (`FlipUpgrade: swap chain left as created: Borderless(..)`). `FlipUpgrade=2` upgrades those
+  windows too.
+* An upgraded chain's `SetFullscreenState` is emulated as DXVK's DXGI does it: the chain stays
+  windowed for DXGI, the display mode switches to the buffer size (with `ALLOW_MODE_SWITCH`; the
+  output's closest mode, `ChangeDisplaySettingsExW` with `CDS_FULLSCREEN`), and the window loses
+  its frame and covers the output, topmost. DWM promotes it to independent flip like any
+  flip-model window at the mode's size; interval-0 presents keep `ALLOW_TEARING`. The app sees
+  exclusive fullscreen (`GetFullscreenState`, `GetDesc` / `GetFullscreenDesc` `Windowed` FALSE,
+  `ResizeTarget` switches the mode). `SetFullscreenState(FALSE)`, the window losing the foreground
+  for more than 100 ms (alt-tab; that present returns `DXGI_STATUS_OCCLUDED`, as DXGI's own
+  exclusive fullscreen does) and the chain's release restore the desktop mode and the window.
 
 **`FlipLedger`** (REG_DWORD, default 1; DWM reads it when it starts; 0 turns it off). The problem
 it solves: DWM on NVK samples an app's buffer from its own RM channel, which neither dxgkrnl's
@@ -338,6 +362,8 @@ service key):
 | where | line / value | reading |
 |---|---|---|
 | app (D3D11) | `FlipUpgrade: swap chain #1 upgraded: swap effect 0 -> 4 (FLIP_DISCARD) ...` | the chain is flip-model |
+| app (D3D11) | `FlipUpgrade: exclusive fullscreen #1 (emulated ...)` / `... left (...)` | the app entered / left exclusive fullscreen on an upgraded chain |
+| app (D3D11) | `FlipUpgrade: N swap chains upgraded ...; P presents (T may tear, F failed) ...` | F must stay 0: a failed present is a frame DXGI refused |
 | app (D3D11) | `FlipLedger: N flip-model presents without a CPU wait; the KMD's frame-done table tracks the buffer ...` | the app does not wait |
 | KMD | `FdSub` (frames recorded), `FdFire` (fences that finished at least one frame; a fence also finishes the earlier frames of its context, so `FdFire` may stay below `FdSub`), `FdPend` (frames pending after the last change), `FdOvf` (frames not tracked) | `FdPend` small (the frames the app is ahead of the GPU, about 1-3), `FdOvf` 0 |
 | KMD | `FdD11` / `FdD12` (presents that named their buffer, per carrier) | a fullscreen app on scanout 0 sends no fence with its present: it adds nothing; with nothing pending a fence fire costs the table one compare |
