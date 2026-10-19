@@ -84,7 +84,7 @@ packaging/
 
 ```sh
 sudo packaging/build.sh deps          # apt, dnf or pacman
-packaging/build.sh rust               # backend + VMM (glibc), CLI (static musl; RUST_TARGET=host for glibc)
+packaging/build.sh rust               # backend, VMM and CLI (glibc; RUST_TARGET=x86_64-unknown-linux-musl for a static CLI without NVML)
 packaging/build.sh viewer
 packaging/build.sh stream
 packaging/build.sh venus              # conduit-venus + virglrenderer (needs the venus submodules; meson, Vulkan and libdrm headers, python3 mako/yaml: `deps` installs them)
@@ -280,7 +280,7 @@ QEMU expression (switched to the 11.1.2 tarball when nixpkgs is older, plus
 |---|---|---|
 | `ci.yml` | push, PR, manual | fmt/clippy/test per Rust project (backend, VMM, `host/venus` without its `renderer` feature, CLI, stream host; GPU tests skipped by name), guest module vs Ubuntu 24.04 (GA and HWE), Debian 13 and Fedora headers plus its plain-C unit tests, viewer `make check`, guest agent unit tests, actionlint, shellcheck, venus submodule pins in `flake.nix` and the RPM spec, DKMS package build |
 | `abi.yml` | Mondays, manual | new open-gpu-kernel-modules tags / gVisor nvproxy ABIs -> `.github/scripts/abi_update.py` runs the `host/backend/gen` generators -> tests -> PR on `abi/auto` (draft if tests fail). Set secret `ABI_BOT_TOKEN` so CI runs on its PRs. |
-| `release.yml` | tag `v*`, manual | Rust binaries once (static musl CLI, glibc backend and VMM); deb/rpm/Arch/tarball in their own containers (viewer, stream host, `conduit-venus` from the venus submodules) with QEMU cached per week; guest .deb/.rpm/.pkg.tar.zst; checksums, PKGBUILD, GitHub Release (tags only) |
+| `release.yml` | tag `v*`, manual | Rust binaries once (CLI, backend and VMM against glibc); deb/rpm/Arch/tarball in their own containers (viewer, stream host, `conduit-venus` from the venus submodules) with QEMU cached per week; guest .deb/.rpm/.pkg.tar.zst; checksums, PKGBUILD, GitHub Release (tags only) |
 | `bios.yml` | changes under `packaging/bios`, called by `release.yml` | the Conduit BIOS on Ubuntu 24.04, cached per `packaging/bios/**` content; conduit-bios .deb and tarball; on main, mirrors the pinned edk2 sources as the `edk2-src-<version>` release |
 | `windows.yml` | `v*` tags (the `release` job waits up to 3 hours for the release.yml release, then attaches the driver zip, the setup package and their checksums as `SHA256SUMS-windows`; `SHA256SUMS` covers release.yml's files) and by hand (about an hour on Windows runners) | the Windows guest stack from `guest/windows` (WDDM driver, D3D11/12 UMDs, Mesa Venus ICD, loaders, installer); the package per configuration as an artifact, and the Release driver folder (`conduit-windows-gpu-driver-<version>.zip`: signed INF/SYS/CAT, UMDs, NVK/Zink files, test certificate, `packaging/windows/install.ps1`) and the Release package (`conduit-windows-gpu-setup-<version>.zip`: `HeliosSetup.exe`) as release assets. The driver alone also builds in a local Windows VM (`guest/windows/ci/vm/README.md`) |
 
