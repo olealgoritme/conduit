@@ -10,10 +10,14 @@ pub mod v565_57_01;
 pub mod v580_178_04;
 pub mod v595_71_05;
 pub mod v610_57_04;
+pub mod v615_62_00;
+pub mod v615_71_09;
 pub mod v620_30_00;
 pub mod v620_32_00;
 pub mod v620_47_00;
 pub mod v620_51_00;
+pub mod v620_51_03;
+pub mod v620_6_00;
 
 use crate::version::DriverVersion;
 
@@ -101,6 +105,18 @@ static PROFILES: &[Profile] = &[
         table: v610_57_04::table,
     },
     Profile {
+        version: DriverVersion::new(615, 62, 0),
+        table: v615_62_00::table,
+    },
+    Profile {
+        version: DriverVersion::new(615, 71, 9),
+        table: v615_71_09::table,
+    },
+    Profile {
+        version: DriverVersion::new(620, 6, 0),
+        table: v620_6_00::table,
+    },
+    Profile {
         version: DriverVersion::new(620, 30, 0),
         table: v620_30_00::table,
     },
@@ -115,6 +131,10 @@ static PROFILES: &[Profile] = &[
     Profile {
         version: DriverVersion::new(620, 51, 0),
         table: v620_51_00::table,
+    },
+    Profile {
+        version: DriverVersion::new(620, 51, 3),
+        table: v620_51_03::table,
     },
 ];
 

@@ -159,21 +159,35 @@ mod tests {
         all_escapes_known(A2000_615, DriverVersion::new(615, 71, 9));
     }
 
-    /// 615.71.09 deliberately has no profile of its own. If someone adds one,
-    /// this test is how they find out that the A2000 capture stopped testing
-    /// range selection and started testing an exact match instead.
+    /// 615.71.09 has a profile of its own, so the A2000 capture is checked
+    /// against its exact table (the two tests above). Range selection is
+    /// exercised by a release with no profile: one past the A2000's driver
+    /// that nothing ships (615.99.00) must resolve to the 615.71.09 table,
+    /// and the sizes the A2000 issued must still hold for it. If a profile is
+    /// ever added for the release used here, pick another gap.
     #[test]
-    fn the_a2000_driver_is_served_by_range_selection() {
-        let v = DriverVersion::new(615, 71, 9);
+    fn a_release_after_the_a2000_driver_is_served_by_range_selection() {
+        let own = DriverVersion::new(615, 71, 9);
+        assert!(
+            crate::versions::supported_versions().any(|p| p == own),
+            "615.71.09 lost its profile, so the A2000 fixture no longer has an exact table"
+        );
+        assert!(
+            std::ptr::eq(table_of(own), crate::versions::v615_71_09::table()),
+            "615.71.09 should resolve to its own table"
+        );
+
+        let v = DriverVersion::new(615, 99, 0);
         assert!(
             !crate::versions::supported_versions().any(|p| p == v),
-            "615.71.09 now has a profile of its own, so the A2000 fixture no longer \
-             exercises range selection -- point it at a version that does, or drop this test"
+            "{v} now has a profile of its own, so this test no longer exercises range \
+             selection -- point it at a version that has none"
         );
         assert!(
-            std::ptr::eq(table_of(v), table_of(DriverVersion::new(610, 57, 4))),
-            "615.71.09 should resolve to the 610.57.04 table"
+            std::ptr::eq(table_of(v), table_of(own)),
+            "{v} should resolve to the 615.71.09 table"
         );
+        sizes_match(A2000_615, v, "the RTX A2000 (served by range)");
     }
 
     /// The strongest claim the two captures support together: a T4 on

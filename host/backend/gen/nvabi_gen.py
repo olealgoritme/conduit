@@ -39,6 +39,7 @@ KIND = {
     "rmFree": "Simple",
     "rmDupObject": "Simple",
     "rmVidHeapControl": "VidHeapControl",
+    "rmVidHeapControlWithOSDescriptor": "VidHeapControl",
     "rmIdleChannels": "IdleChannels",
     "rmNumaInfo": "Bytes",
 }
@@ -165,8 +166,9 @@ def main():
             continue
         kind = KIND.get(fn)
         if kind is None:
-            print(f"warning: unmapped handler {fn} for {esc}", file=sys.stderr)
-            continue
+            # Dropping the escape would emit a table that refuses a call
+            # nvproxy serves, so stop and let a person map the handler.
+            sys.exit(f"unmapped handler {fn} for {esc}: add it to KIND")
         st = tparam or structs_by_esc.get(esc)
         size = None
         if st:
