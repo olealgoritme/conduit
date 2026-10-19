@@ -47,7 +47,7 @@ from GPU memory to your screen: no copying, no video compression.
 <p align="center"><b>Windows 11 VM</b></p>
 
 <p align="center">
-  <img src="docs/assets/conduit-win11.jpg" alt="A Windows 11 guest on Conduit on an RTX 5090: the host terminal shows nvidia-smi with conduit-backend and conduit-venus and virsh list with win11 running; below, the guest runs Unigine Heaven 4.0 in Direct3D 11 at 300 fps, and Task Manager shows the Conduit Helios GPU" width="860">
+  <img src="docs/assets/conduit-win11.jpg" alt="A Windows 11 guest on Conduit on an RTX 5090: Unigine Heaven 4.0 runs windowed in Direct3D 11 at 631 fps, Device Manager lists the Conduit Helios display adapter, and Task Manager shows the Conduit Helios GPU with 32 GB of dedicated memory and driver 22.22.405.126" width="860">
 </p>
 
 <p align="center"><sub>A Windows 11 guest on an RTX 5090: Unigine Heaven in Direct3D 11 at 300 fps, rendered by NVK on the host GPU.</sub></p>
