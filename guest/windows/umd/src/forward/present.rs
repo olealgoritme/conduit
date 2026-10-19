@@ -1971,6 +1971,7 @@ pub(crate) fn maybe_install_flip_upgrade(dev: &HeliosDevice) {
     helios_umd_common::flip_upgrade::install(helios_umd_common::flip_upgrade::Options {
         buffers: crate::knobs::FLIP_UPGRADE_BUFFERS.get(),
         tearing: crate::knobs::FLIP_UPGRADE_TEARING.get(),
+        borderless: crate::knobs::flip_upgrade() >= 2,
     });
 }
 

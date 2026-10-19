@@ -593,10 +593,12 @@ pub(crate) fn nvk_blt_gpu_copy() -> bool {
 
 /// `FlipUpgrade`: 1 (default) = in an NVK process under a DWM that imports NVK surfaces (not
 /// dwm.exe itself), a windowed blt-model D3D11 swap chain (`DISCARD`, one sample, R8G8B8A8 /
-/// B8G8R8A8 UNORM, no flag but `ALLOW_MODE_SWITCH`) is created `FLIP_DISCARD` with
-/// `FlipUpgradeBuffers` buffers: DWM composes the app's own buffers (no copy into the window's
-/// redirection surface), and the app sees its own description
-/// (`helios_umd_common::flip_upgrade`). `FlipUpgradeList` (REG_SZ, `;`-separated executable
+/// B8G8R8A8 UNORM, no flag but `ALLOW_MODE_SWITCH`) of a window with a caption (or a child
+/// window) is created `FLIP_DISCARD` with `FlipUpgradeBuffers` buffers: DWM composes the app's
+/// own buffers (no copy into the window's redirection surface), and the app sees its own
+/// description; its exclusive fullscreen is emulated (`helios_umd_common::flip_upgrade`). A
+/// window without a caption (a fullscreen game's) keeps the app's swap chain. 2 = windows
+/// without a caption are upgraded too. `FlipUpgradeList` (REG_SZ, `;`-separated executable
 /// names) limits it to those programs. 0 = swap chains as the app asks. `HELIOS_FLIP_UPGRADE`
 /// overrides it per process.
 pub(crate) static FLIP_UPGRADE: DwordKnob = DwordKnob::new(c"FlipUpgrade", 1);
