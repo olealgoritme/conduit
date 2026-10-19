@@ -29,6 +29,10 @@ pub mod v535_129_03;
 pub mod v565_77_00;
 pub mod v580_178_04;
 pub mod v595_104_02;
+pub mod v595_44_13;
+pub mod v595_44_14;
+pub mod v595_44_15;
+pub mod v595_45_04;
 pub mod v595_58_03;
 pub mod v595_71_05;
 pub mod v595_80_00;
@@ -205,6 +209,22 @@ static PROFILES: &[Profile] = &[
     Profile {
         version: DriverVersion::new(580, 178, 4),
         layout: || v580_178_04::LAYOUT,
+    },
+    Profile {
+        version: DriverVersion::new(595, 44, 13),
+        layout: || v595_44_13::LAYOUT,
+    },
+    Profile {
+        version: DriverVersion::new(595, 44, 14),
+        layout: || v595_44_14::LAYOUT,
+    },
+    Profile {
+        version: DriverVersion::new(595, 44, 15),
+        layout: || v595_44_15::LAYOUT,
+    },
+    Profile {
+        version: DriverVersion::new(595, 45, 4),
+        layout: || v595_45_04::LAYOUT,
     },
     Profile {
         version: DriverVersion::new(595, 58, 3),

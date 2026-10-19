@@ -32,6 +32,10 @@ pub mod v535_129_03;
 pub mod v565_77_00;
 pub mod v580_178_04;
 pub mod v595_104_02;
+pub mod v595_44_13;
+pub mod v595_44_14;
+pub mod v595_44_15;
+pub mod v595_45_04;
 pub mod v595_58_03;
 pub mod v595_71_05;
 pub mod v595_80_00;
@@ -254,6 +258,38 @@ static PROFILES: &[Profile] = &[
         deprec: || v580_178_04::DEPREC,
         catch_all: || v580_178_04::CATCH_ALL,
         gss: || v580_178_04::GSS,
+    },
+    Profile {
+        version: DriverVersion::new(595, 44, 13),
+        ctrl: || v595_44_13::CTRL,
+        class: || v595_44_13::CLASS,
+        deprec: || v595_44_13::DEPREC,
+        catch_all: || v595_44_13::CATCH_ALL,
+        gss: || v595_44_13::GSS,
+    },
+    Profile {
+        version: DriverVersion::new(595, 44, 14),
+        ctrl: || v595_44_14::CTRL,
+        class: || v595_44_14::CLASS,
+        deprec: || v595_44_14::DEPREC,
+        catch_all: || v595_44_14::CATCH_ALL,
+        gss: || v595_44_14::GSS,
+    },
+    Profile {
+        version: DriverVersion::new(595, 44, 15),
+        ctrl: || v595_44_15::CTRL,
+        class: || v595_44_15::CLASS,
+        deprec: || v595_44_15::DEPREC,
+        catch_all: || v595_44_15::CATCH_ALL,
+        gss: || v595_44_15::GSS,
+    },
+    Profile {
+        version: DriverVersion::new(595, 45, 4),
+        ctrl: || v595_45_04::CTRL,
+        class: || v595_45_04::CLASS,
+        deprec: || v595_45_04::DEPREC,
+        catch_all: || v595_45_04::CATCH_ALL,
+        gss: || v595_45_04::GSS,
     },
     Profile {
         version: DriverVersion::new(595, 58, 3),
