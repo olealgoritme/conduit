@@ -6,6 +6,7 @@ mod buildid;
 mod config;
 mod create;
 mod ctl;
+mod dbus;
 mod display;
 mod doctor;
 mod feed;
@@ -27,6 +28,7 @@ mod run;
 mod scope;
 mod setup;
 mod shares;
+mod sleep;
 mod stages;
 mod stream;
 mod sys;
@@ -497,6 +499,10 @@ enum Cmd {
     /// (internal) conduit-stats@NAME.service: feed GPU readings to the VM
     #[command(name = "_stats", hide = true)]
     Stats { name: String },
+    /// (internal) conduit-sleep.service: pause running VMs while the host
+    /// sleeps (docs/SUSPEND.md)
+    #[command(name = "_sleep", hide = true)]
+    Sleep,
     /// (internal) after the backend stopped with its VM
     #[command(name = "_stopped", hide = true)]
     Stopped { name: String },
@@ -1001,6 +1007,7 @@ fn main() {
         Cmd::Backend { name } => lvrun::backend_exec(&name),
         Cmd::Virtiofsd { name } => lvrun::virtiofsd_exec(&name),
         Cmd::Stats { name } => feed::run(&name),
+        Cmd::Sleep => sleep::run(),
         Cmd::Stopped { name } => lvrun::stopped(&name),
         Cmd::Isolation { action, target } => match action.as_str() {
             "start" => hostiso::start(&target),
@@ -1156,6 +1163,7 @@ mod tests {
             vec!["conduit", "libvirt", "disable", "myvm"],
             vec!["conduit", "view", "myvm", "--keep-running"],
             vec!["conduit", "config", "set", "view.close_stops_vm", "false"],
+            vec!["conduit", "config", "set", "vm.pause_on_suspend", "false"],
             vec!["conduit", "config", "get"],
             vec!["conduit", "create", "myvm", "--no-libvirt"],
         ] {

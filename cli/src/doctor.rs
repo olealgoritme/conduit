@@ -424,6 +424,7 @@ fn gpu_host_lines(r: &mut Report) {
             None => {}
         }
     }
+    suspend_lines(r);
     if std::fs::read_to_string("/proc/driver/nvidia/params").is_ok_and(|p| gpu_firmware_off(&p)) {
         r.line(
             Level::Warn,
@@ -453,6 +454,195 @@ fn gpu_host_lines(r: &mut Report) {
             };
             r.line(lvl, "Driver files", &detail, &fix);
         }
+    }
+}
+
+/// The NVIDIA driver's sleep services (systemd units its packages ship).
+const NVIDIA_SLEEP_UNITS: [&str; 3] = [
+    "nvidia-suspend.service",
+    "nvidia-resume.service",
+    "nvidia-hibernate.service",
+];
+
+/// One value of `/proc/driver/nvidia/params`, quotes dropped.
+fn nv_param<'a>(params: &'a str, key: &str) -> Option<&'a str> {
+    params.lines().find_map(|l| {
+        l.split_once(':')
+            .filter(|(k, _)| k.trim() == key)
+            .map(|(_, v)| v.trim().trim_matches('"'))
+    })
+}
+
+/// Whether video memory survives the host's sleep, so a paused VM's GPU state
+/// does (docs/SUSPEND.md): from the driver's parameters, whether its sleep
+/// services are enabled (`None`: no systemd to ask), and whether the folder
+/// it saves video memory to is in RAM. Level, detail, fix.
+fn gpu_sleep_verdict(
+    params: &str,
+    services: Option<&[(&str, bool)]>,
+    save_dir_in_ram: Option<bool>,
+) -> (Level, String, String) {
+    let on = |k: &str| nv_param(params, k) == Some("1");
+    let preserve = on("PreserveVideoMemoryAllocations");
+    let notifiers = on("UseKernelSuspendNotifiers");
+    let set_it = "Set it in a modprobe file, then rebuild the initramfs if it loads the nvidia module\n\
+                  (update-initramfs -u, dracut -f or mkinitcpio -P) and restart:\n  \
+                  echo 'options nvidia NVreg_PreserveVideoMemoryAllocations=1 NVreg_TemporaryFilePath=/var/tmp' \\\n    \
+                  | sudo tee /etc/modprobe.d/nvidia-sleep.conf";
+    if !preserve {
+        return (
+            Level::Warn,
+            "NVreg_PreserveVideoMemoryAllocations is off: video memory is lost when this computer \
+             sleeps, so a VM's GPU state does not survive it"
+                .into(),
+            format!(
+                "{set_it}\nand enable the driver's sleep services:\n  sudo systemctl enable {}",
+                NVIDIA_SLEEP_UNITS.join(" ")
+            ),
+        );
+    }
+    let ram = if save_dir_in_ram == Some(true) {
+        let dir = nv_param(params, "TemporaryFilePath")
+            .filter(|d| !d.is_empty())
+            .unwrap_or("/tmp");
+        Some(format!(
+            "video memory is saved to {dir}, which is in RAM (tmpfs): with a lot of it in use \
+             the save may not fit"
+        ))
+    } else {
+        None
+    };
+    let ram_fix = "Point NVreg_TemporaryFilePath at a folder on disk, e.g. /var/tmp, in the same \
+                   modprobe file, and restart.";
+    if notifiers {
+        return match ram {
+            Some(r) => (Level::Warn, r, ram_fix.into()),
+            None => (
+                Level::Ok,
+                "video memory is kept (NVreg_PreserveVideoMemoryAllocations=1, kernel suspend \
+                 notifiers)"
+                    .into(),
+                String::new(),
+            ),
+        };
+    }
+    let Some(services) = services else {
+        return (
+            Level::Warn,
+            "NVreg_PreserveVideoMemoryAllocations=1, but without systemd the driver's sleep \
+             services could not be checked"
+                .into(),
+            "The driver saves video memory only when `nvidia-sleep.sh suspend` and `resume` run\n\
+             around the sleep: install them as your login manager's sleep hooks (elogind:\n\
+             /usr/lib/elogind/system-sleep/), or use NVreg_UseKernelSuspendNotifiers=1 on drivers\n\
+             that have it."
+                .into(),
+        );
+    };
+    let off: Vec<&str> = services
+        .iter()
+        .filter(|(u, enabled)| !enabled && *u != "nvidia-hibernate.service")
+        .map(|(u, _)| *u)
+        .collect();
+    if !off.is_empty() {
+        return (
+            Level::Warn,
+            format!(
+                "NVreg_PreserveVideoMemoryAllocations=1, but {} not enabled: video memory is not \
+                 saved when this computer sleeps",
+                off.join(" and ")
+            ),
+            format!(
+                "Enable the driver's sleep services:\n  sudo systemctl enable {}",
+                NVIDIA_SLEEP_UNITS.join(" ")
+            ),
+        );
+    }
+    match ram {
+        Some(r) => (Level::Warn, r, ram_fix.into()),
+        None => (
+            Level::Ok,
+            "video memory is kept (NVreg_PreserveVideoMemoryAllocations=1, nvidia-suspend and \
+             nvidia-resume enabled)"
+                .into(),
+            String::new(),
+        ),
+    }
+}
+
+/// Whether a folder is on a tmpfs.
+fn in_ram(dir: &str) -> Option<bool> {
+    const TMPFS_MAGIC: i64 = 0x0102_1994;
+    let c = std::ffi::CString::new(dir).ok()?;
+    // SAFETY: a zeroed statfs filled in by the call; `c` outlives it.
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statfs(c.as_ptr(), &mut st) } != 0 {
+        return None;
+    }
+    // f_type is not i64 on every architecture.
+    #[allow(clippy::unnecessary_cast)]
+    Some(st.f_type as i64 == TMPFS_MAGIC)
+}
+
+/// The sleep checks: the driver keeps video memory, and the sleep hook runs.
+fn suspend_lines(r: &mut Report) {
+    let params = std::fs::read_to_string("/proc/driver/nvidia/params").unwrap_or_default();
+    let systemd = Path::new("/run/systemd/system").is_dir() && sys::have("systemctl");
+    let services: Option<Vec<(&str, bool)>> = systemd.then(|| {
+        NVIDIA_SLEEP_UNITS
+            .iter()
+            .map(|u| {
+                let enabled = sys::output_timeout(
+                    std::process::Command::new("systemctl").args(["is-enabled", u]),
+                    std::time::Duration::from_secs(3),
+                )
+                .is_some_and(|s| s.trim() == "enabled");
+                (*u, enabled)
+            })
+            .collect()
+    });
+    let dir = nv_param(&params, "TemporaryFilePath")
+        .filter(|d| !d.is_empty())
+        .unwrap_or("/tmp")
+        .to_string();
+    let (lvl, detail, fix) = gpu_sleep_verdict(&params, services.as_deref(), in_ram(&dir));
+    r.line(lvl, "GPU memory across sleep", &detail, &fix);
+
+    let (lvl, detail, fix) = sleep_hook_verdict(
+        crate::config::pause_on_suspend(),
+        crate::units::sleep_hook_installed(),
+        crate::units::sleep_hook_active(),
+    );
+    r.line(lvl, "Sleep", &detail, fix);
+}
+
+fn sleep_hook_verdict(
+    enabled: bool,
+    installed: bool,
+    active: bool,
+) -> (Level, String, &'static str) {
+    match (enabled, installed, active) {
+        (false, _, _) => (
+            Level::Ok,
+            "running VMs are not paused when this computer sleeps (vm.pause_on_suspend false)".into(),
+            "",
+        ),
+        (true, _, true) => (
+            Level::Ok,
+            "running VMs are paused before this computer sleeps and continue after (conduit-sleep.service)".into(),
+            "",
+        ),
+        (true, false, false) => (
+            Level::Warn,
+            "the sleep hook is not installed: VMs are not paused when this computer sleeps".into(),
+            "`conduit up NAME`, `conduit view NAME` or `conduit attach NAME` installs and starts it.",
+        ),
+        (true, true, false) => (
+            Level::Warn,
+            "the sleep hook (conduit-sleep.service) is not running: VMs are not paused when this computer sleeps".into(),
+            "Start it: systemctl --user enable --now conduit-sleep.service\n\
+             (`journalctl --user -u conduit-sleep` says why it stopped)",
+        ),
     }
 }
 
@@ -1071,6 +1261,23 @@ pub fn run_vm(name: &str) -> i32 {
             "sudo apt install virtiofsd",
         ),
     }
+    if crate::run::is_running(name) {
+        match crate::sleep::backend_ask(name, "status", std::time::Duration::from_secs(1)) {
+            Ok(s) => r.line(
+                Level::Ok,
+                "Host sleep",
+                &format!("the GPU backend keeps the guest's GPU state across a pause ({s})"),
+                "",
+            ),
+            Err(_) => r.line(
+                Level::Warn,
+                "Host sleep",
+                "the running GPU backend has no power socket (started by an older conduit): \
+                 this VM is not paused when the host sleeps, and `conduit pause` loses its GPU state",
+                &format!("Restart the VM once: conduit down {name}, then start it again"),
+            ),
+        }
+    }
     let Some(link) = link else {
         r.line(
             Level::Ok,
@@ -1516,6 +1723,70 @@ mod tests {
         assert!(!gpu_firmware_off("EnableGpuFirmware: 18\n"));
         assert!(!gpu_firmware_off("EnableGpuFirmwareLogs: 0\n"));
         assert!(!gpu_firmware_off(""));
+    }
+
+    #[test]
+    fn gpu_memory_across_sleep_needs_preserve_and_the_services_or_notifiers() {
+        let all_on: Vec<(&str, bool)> = NVIDIA_SLEEP_UNITS.iter().map(|u| (*u, true)).collect();
+        let off = "PreserveVideoMemoryAllocations: 0\nTemporaryFilePath: \"\"\n";
+        let (l, d, fix) = gpu_sleep_verdict(off, Some(&all_on), Some(false));
+        assert_eq!(l, Level::Warn);
+        assert!(d.contains("PreserveVideoMemoryAllocations is off"), "{d}");
+        assert!(fix.contains("NVreg_PreserveVideoMemoryAllocations=1"));
+        assert!(fix.contains("sudo systemctl enable nvidia-suspend.service"));
+
+        let on = "PreserveVideoMemoryAllocations: 1\nTemporaryFilePath: \"/var/tmp\"\n";
+        let (l, d, _) = gpu_sleep_verdict(on, Some(&all_on), Some(false));
+        assert_eq!(l, Level::Ok, "{d}");
+
+        // Hibernate's service is not needed for suspend.
+        let mut no_hib = all_on.clone();
+        no_hib[2].1 = false;
+        assert_eq!(
+            gpu_sleep_verdict(on, Some(&no_hib), Some(false)).0,
+            Level::Ok
+        );
+        let mut no_resume = all_on.clone();
+        no_resume[1].1 = false;
+        let (l, d, fix) = gpu_sleep_verdict(on, Some(&no_resume), Some(false));
+        assert_eq!(l, Level::Warn);
+        assert!(d.contains("nvidia-resume.service not enabled"), "{d}");
+        assert!(fix.contains("systemctl enable"));
+
+        // Kernel suspend notifiers need no services.
+        let notif = "PreserveVideoMemoryAllocations: 1\nUseKernelSuspendNotifiers: 1\n";
+        let none: Vec<(&str, bool)> = NVIDIA_SLEEP_UNITS.iter().map(|u| (*u, false)).collect();
+        assert_eq!(
+            gpu_sleep_verdict(notif, Some(&none), Some(false)).0,
+            Level::Ok
+        );
+        assert_eq!(gpu_sleep_verdict(notif, None, Some(false)).0, Level::Ok);
+
+        // No systemd to ask: said so.
+        let (l, d, _) = gpu_sleep_verdict(on, None, Some(false));
+        assert_eq!(l, Level::Warn);
+        assert!(d.contains("without systemd"), "{d}");
+
+        // Saving video memory into RAM.
+        let tmp = "PreserveVideoMemoryAllocations: 1\nTemporaryFilePath: \"\"\n";
+        let (l, d, fix) = gpu_sleep_verdict(tmp, Some(&all_on), Some(true));
+        assert_eq!(l, Level::Warn);
+        assert!(d.contains("saved to /tmp, which is in RAM"), "{d}");
+        assert!(fix.contains("NVreg_TemporaryFilePath"));
+        assert_eq!(nv_param(on, "TemporaryFilePath"), Some("/var/tmp"));
+        assert_eq!(nv_param(on, "Nope"), None);
+    }
+
+    #[test]
+    fn the_sleep_hook_line() {
+        assert_eq!(sleep_hook_verdict(true, true, true).0, Level::Ok);
+        assert_eq!(sleep_hook_verdict(false, false, false).0, Level::Ok);
+        let (l, _, fix) = sleep_hook_verdict(true, false, false);
+        assert_eq!(l, Level::Warn);
+        assert!(fix.contains("conduit up NAME"));
+        let (l, _, fix) = sleep_hook_verdict(true, true, false);
+        assert_eq!(l, Level::Warn);
+        assert!(fix.contains("systemctl --user enable --now conduit-sleep.service"));
     }
 
     #[test]

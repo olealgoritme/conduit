@@ -245,6 +245,11 @@ fn start_backend(c: &VmConfig, rt: &Rt, p: &Parts, mode: Option<Mode>) -> Result
         .args(["--caps", "graphics,video,utility,compute"])
         .arg("--trace-socket")
         .arg(crate::trace::socket(&c.name));
+    // Host suspend (docs/SUSPEND.md), when this backend build has it.
+    if backend_takes(backend, "--power-socket") {
+        cmd.arg("--power-socket")
+            .arg(crate::sleep::power_socket(&c.name));
+    }
     if p.venus.is_some() {
         cmd.arg("--venus")
             .arg("--venus-renderer")
@@ -1016,6 +1021,7 @@ fn preflight(c: &VmConfig, want: Option<VmmKind>) -> Result<Parts> {
 
 /// Backend + VM. `mode` None = no display at all (headless, no KMS).
 fn boot(c: &VmConfig, rt: &Rt, st: &mut State, p: &Parts, mode: Option<Mode>) -> Result<()> {
+    crate::sleep::ensure_hook();
     st.backend_comm = comm_of(&p.backend);
     st.vm_comm = comm_of(&p.vmm);
     st.vmm = p.kind.as_str().into();

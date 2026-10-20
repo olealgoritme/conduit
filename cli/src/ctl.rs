@@ -159,6 +159,12 @@ impl Client {
     /// Connect to `vm`'s channel, or say precisely why that is not possible:
     /// not a libvirt VM, not running, running without the channel.
     pub fn connect(vm: &str) -> Result<Client> {
+        Client::connect_waiting(vm, LOCK_WAIT)
+    }
+
+    /// [`Client::connect`], waiting at most `lock_wait` for another command
+    /// that has the channel.
+    pub fn connect_waiting(vm: &str, lock_wait: Duration) -> Result<Client> {
         let link = Link::load(vm).ok_or_else(|| {
             oops(
                 format!("{vm} is not a libvirt VM of Conduit's"),
@@ -182,7 +188,7 @@ impl Client {
         }
         let dir = paths::run_dir(vm);
         std::fs::create_dir_all(&dir)?;
-        let lock = sys::lock(&dir.join("ctl.lock"), LOCK_WAIT).map_err(|_| {
+        let lock = sys::lock(&dir.join("ctl.lock"), lock_wait).map_err(|_| {
             oops(
                 format!("another conduit command is using {vm}'s control channel"),
                 "Wait for it (a file copy, say) to finish, then try again",
@@ -292,6 +298,19 @@ impl Client {
             downloads: clean(&p.downloads, MAX_TEXT),
             ..p
         })
+    }
+
+    /// Set the guest's clock (`settime`, after the host resumed).
+    pub fn set_time(&mut self, unix_ms: u64, limit: Duration) -> R<()> {
+        let r = self.call(Op::SetTime { unix_ms }, limit)?;
+        if r.ok {
+            Ok(())
+        } else {
+            Err(CtlError::Guest(clean(
+                r.error.as_deref().unwrap_or("the guest refused"),
+                MAX_MSG,
+            )))
+        }
     }
 
     pub fn run(&mut self, a: RunArgs) -> R<Started> {

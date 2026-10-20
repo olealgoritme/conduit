@@ -275,7 +275,8 @@ VMs.
 | `conduit view NAME` | starts the VM if it is off, then opens the window; on a running VM it attaches (the backend re-sends the current frame) |
 | close the window | a VM that `conduit view` started shuts down (unless `--keep-running` or `conduit config set view.close_stops_vm false`); any other keeps running |
 | Pause / `virsh suspend` | vCPUs stop; backend and window stay (the window shows the last frame) |
-| Resume / `virsh resume` | continues |
+| Resume / `virsh resume` | continues; the guest's GPU objects stay when the pause came through `conduit pause` or the sleep hook, which tell the backend to keep them ([SUSPEND.md](SUSPEND.md#why-the-backend-is-asked-first)); after a pause from virt-manager or `virsh suspend` the backend takes the restart for a reboot |
+| this computer sleeps | the sleep hook (`conduit-sleep.service`) pauses the running VM, drains its GPU work and continues it after the wake ([SUSPEND.md](SUSPEND.md)) |
 | Reboot / `virsh reboot` / `reboot` inside | same QEMU, same backend; the GPU works after it |
 | Shut Down / `virsh shutdown` / `conduit down NAME` | ACPI power-off; QEMU exits; backend and virtiofsd exit; host isolation is reverted; boot files refreshed; the window closes |
 | Force Off / `virsh destroy` / `conduit poweroff NAME` | same, without asking the guest |

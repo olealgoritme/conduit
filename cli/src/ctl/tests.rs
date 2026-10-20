@@ -30,6 +30,8 @@ struct Guest {
     files: HashMap<String, Vec<u8>>,
     temp: HashMap<String, Vec<u8>>,
     ran: Vec<RunArgs>,
+    /// What `settime` set the clock to.
+    clock: Option<u64>,
 }
 
 fn apps() -> Vec<App> {
@@ -106,6 +108,12 @@ fn handle(g: &mut Guest, r: Request, f: &Faults) -> Response {
             Response::ok(id, &Started { pid: 4242 })
         }
         Op::Stop { .. } => Response::ok(id, &serde_json::json!({})),
+        // A Linux agent, which cannot set the clock, answers like this.
+        Op::SetTime { .. } if f.hostile => Response::err(id, "unknown op settime"),
+        Op::SetTime { unix_ms } => {
+            g.clock = Some(unix_ms);
+            Response::ok(id, &serde_json::json!({}))
+        }
         Op::Apps if f.hostile => Response::ok(
             id,
             &Apps {
@@ -265,6 +273,22 @@ fn ping_and_apps_and_run_end_to_end() {
     let ran = &g.lock().unwrap().ran[1];
     assert_eq!(ran.args, ["a b.txt"]);
     assert_eq!((ran.cwd.as_str(), ran.env["A"].as_str()), ("C:\\Temp", "1"));
+}
+
+#[test]
+fn settime_sets_the_guest_clock_or_says_why_not() {
+    let (mut c, g) = pair(Faults::default());
+    c.set_time(1_760_000_000_123, Duration::from_secs(1))
+        .unwrap();
+    assert_eq!(g.lock().unwrap().clock, Some(1_760_000_000_123));
+    let (mut c, _) = pair(Faults {
+        hostile: true,
+        ..Faults::default()
+    });
+    assert_eq!(
+        c.set_time(1, Duration::from_secs(1)).unwrap_err(),
+        CtlError::Guest("unknown op settime".into())
+    );
 }
 
 #[test]

@@ -81,15 +81,38 @@ fn libvirt(name: &str, link: &Link, p: Power) -> Result<()> {
         }
         Power::Poweroff => return run::down(name, Stop::Force),
         Power::Pause => {
+            keep_gpu_state(name);
             v.run(&["suspend", d])?;
             ui::info(format!("{name} is paused (`conduit resume {name}`)"));
         }
         Power::Resume => {
             v.run(&["resume", d])?;
+            gpu_state_kept(name);
             ui::info(format!("{name} is running"));
         }
     }
     Ok(())
+}
+
+/// QEMU stops the GPU device while a VM is paused and starts it again when
+/// it continues; the backend takes such a restart for a guest reboot unless
+/// told to keep the guest's GPU objects (`keep` on its power socket,
+/// docs/SUSPEND.md). A backend without the socket (started by an older
+/// conduit) releases them as before.
+fn keep_gpu_state(name: &str) {
+    if let Err(e) = crate::sleep::backend_ask(name, "keep", Duration::from_secs(1)) {
+        ui::warn(format!(
+            "{name}'s GPU backend cannot keep its GPU state across the pause ({e:#}): \
+             programs using the GPU in the VM may fail after `conduit resume`; restart the \
+             VM once to get a backend that can"
+        ));
+    }
+}
+
+/// After the continue: the restart it caused has been kept (or comes soon,
+/// within the backend's grace period); a later one is a reboot again.
+fn gpu_state_kept(name: &str) {
+    let _ = crate::sleep::backend_ask(name, "release", Duration::from_secs(10));
 }
 
 /// A VM `conduit up`/`view` runs directly: QMP for QEMU, ssh for the guest.
@@ -167,11 +190,14 @@ fn direct(name: &str, p: Power) -> Result<()> {
         Power::Poweroff => run::down(name, Stop::Force),
         Power::Pause => {
             need_qemu("pause")?;
+            keep_gpu_state(name);
             qmp_do("stop", &format!("is paused (`conduit resume {name}`)"))
         }
         Power::Resume => {
             need_qemu("resume")?;
-            qmp_do("cont", "is running")
+            let r = qmp_do("cont", "is running");
+            gpu_state_kept(name);
+            r
         }
     }
 }

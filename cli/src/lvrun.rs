@@ -150,6 +150,7 @@ fn is_up(link: &Link) -> bool {
 
 /// Checks and host-side preparation before the domain starts.
 fn before_start(name: &str, link: &Link) -> Result<()> {
+    crate::sleep::ensure_hook();
     let scope = link.scope()?;
     if !units::ensure_listening(&scope, name) {
         return Err(oops(
@@ -651,6 +652,11 @@ pub fn backend_exec(name: &str) -> Result<()> {
         .args(["--caps", "graphics,video,utility,compute"])
         .arg("--trace-socket")
         .arg(crate::trace::socket(name));
+    // Host suspend (docs/SUSPEND.md), when this backend build has it.
+    if run::backend_takes(&backend, "--power-socket") {
+        cmd.arg("--power-socket")
+            .arg(crate::sleep::power_socket(name));
+    }
     if let Some(s) = &venus_sock {
         cmd.arg("--venus").arg("--venus-renderer").arg(s);
         if config::venus_guest_blobs() {
