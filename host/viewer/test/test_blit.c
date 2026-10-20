@@ -27,7 +27,7 @@ int main(void)
 
     /* When the copy may be offered. */
     CHECK(nb_copy_allowed(true, true, false, true, true), "allowed");
-    CHECK(!nb_copy_allowed(false, true, false, true, true), "linear/shm tier");
+    CHECK(!nb_copy_allowed(false, true, false, true, true), "linear");
     CHECK(!nb_copy_allowed(true, false, false, true, true), "--gpu-scale=off");
     CHECK(!nb_copy_allowed(true, true, true, true, true), "scaler failed");
     CHECK(!nb_copy_allowed(true, true, false, false, true), "no viewporter");

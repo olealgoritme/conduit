@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <time.h>
 
 #include "nb_gpuscale.h"
 
@@ -33,6 +34,46 @@ static uint32_t px(struct nb_gs *g, int t, int x, int y)
 
     nb_gs_read(g, t, x, y, &c);
     return c;
+}
+
+/* 500 draws at bw x bh; with `mem`, each read back into it (in the cost). */
+static void bench(struct nb_gs *g, const char *what, unsigned bw, unsigned bh,
+                  uint32_t *mem)
+{
+    unsigned sum = 0, mx = 0, us;
+    static unsigned v[500];
+
+    for (int i = 0; i < 500; i++) {
+        struct nb_gs_draw d = {
+            .src_key = 3, .target = i % NB_GS_TARGETS, .dx = 0, .dy = 0,
+            .dw = (int)bw, .dh = (int)bh, .sx = 0, .sy = 0, .sw = SW, .sh = SH,
+        };
+        struct timespec a, b;
+
+        clock_gettime(CLOCK_MONOTONIC, &a);
+        nb_gs_draw(g, &d, 1000000, &us);
+        if (mem) {
+            nb_gs_readback(g, d.target, mem);
+        }
+        clock_gettime(CLOCK_MONOTONIC, &b);
+        us = (unsigned)((b.tv_sec - a.tv_sec) * 1000000 +
+                        (b.tv_nsec - a.tv_nsec) / 1000);
+        v[i] = us;
+        sum += us;
+        mx = us > mx ? us : mx;
+    }
+    for (int i = 1; i < 500; i++) {         /* p99 by insertion */
+        unsigned k = v[i];
+        int j = i - 1;
+
+        while (j >= 0 && v[j] > k) {
+            v[j + 1] = v[j];
+            j--;
+        }
+        v[j + 1] = k;
+    }
+    printf("test_gpuscale: %ux%u %s: avg %u us, p50 %u us, p99 %u us, max %u "
+           "us\n", bw, bh, what, sum / 500, v[250], v[495], mx);
 }
 
 int main(void)
@@ -106,7 +147,7 @@ int main(void)
         printf("test_gpuscale: SKIP (%s)\n", why);
         return 77;
     }
-    CHECK(nb_gs_targets(g, TW, TH, NULL, NULL, NULL, 0, tg, why, sizeof(why)) ==
+    CHECK(nb_gs_targets(g, TW, TH, NULL, NULL, NULL, NULL, 0, tg, why, sizeof(why)) ==
           NB_GS_TARGETS, "targets: %s", why);
     printf("test_gpuscale: target %ux%u %.4s modifier 0x%016llx on %s, "
            "context priority requested %s, granted %s\n",
@@ -185,44 +226,30 @@ int main(void)
               "bottom-left green %08x", mem[160 * TW + 200]);
         CHECK((mem[90 * TW + 440] & 0xffffff) == 0x0000ff,
               "right blue as XRGB %08x", mem[90 * TW + 440]);
-        CHECK(nb_gs_targets(g, TW, TH, NULL, NULL, NULL, 0, tg, why, sizeof(why)) ==
+        CHECK(nb_gs_targets(g, TW, TH, NULL, NULL, NULL, NULL, 0, tg, why, sizeof(why)) ==
               NB_GS_TARGETS, "back to dma-buf targets");
     }
     /*
      * TEST_GPUSCALE_BENCH=WxH: the per-frame cost at a real output size (a
-     * 1600x900-class source stretched over the output), 500 draws.
+     * 1600x900-class source stretched over the output), 500 draws, of the
+     * gpu-copy level (the pass into dma-buf targets) and of the readback
+     * level (the pass plus the copy into memory).
      */
     if (getenv("TEST_GPUSCALE_BENCH")) {
-        unsigned bw = 0, bh = 0, sum = 0, mx = 0, us;
-        unsigned v[500];
+        unsigned bw = 0, bh = 0;
 
-        if (sscanf(getenv("TEST_GPUSCALE_BENCH"), "%ux%u", &bw, &bh) == 2 &&
-            nb_gs_targets(g, bw, bh, NULL, NULL, NULL, 0, tg, why, sizeof(why)) ==
-                NB_GS_TARGETS) {
-            for (int i = 0; i < 500; i++) {
-                struct nb_gs_draw d = {
-                    .src_key = 3, .target = i % NB_GS_TARGETS, .dx = 0,
-                    .dy = 0, .dw = (int)bw, .dh = (int)bh, .sx = 0, .sy = 0,
-                    .sw = SW, .sh = SH,
-                };
+        if (sscanf(getenv("TEST_GPUSCALE_BENCH"), "%ux%u", &bw, &bh) == 2) {
+            uint32_t *mem = malloc((size_t)bw * bh * 4);
 
-                nb_gs_draw(g, &d, 1000000, &us);
-                v[i] = us;
-                sum += us;
-                mx = us > mx ? us : mx;
+            if (nb_gs_targets(g, bw, bh, NULL, NULL, NULL, NULL, 0, tg, why,
+                              sizeof(why)) == NB_GS_TARGETS) {
+                bench(g, "gpu-copy", bw, bh, NULL);
             }
-            for (int i = 1; i < 500; i++) {         /* p99 by insertion */
-                unsigned k = v[i];
-                int j = i - 1;
-
-                while (j >= 0 && v[j] > k) {
-                    v[j + 1] = v[j];
-                    j--;
-                }
-                v[j + 1] = k;
+            if (mem && nb_gs_targets_readback(g, bw, bh, why, sizeof(why)) ==
+                           NB_GS_TARGETS) {
+                bench(g, "readback", bw, bh, mem);
             }
-            printf("test_gpuscale: %ux%u pass: avg %u us, p50 %u us, p99 %u "
-                   "us, max %u us\n", bw, bh, sum / 500, v[250], v[495], mx);
+            free(mem);
         }
     }
     nb_gs_src_drop(g, 3);

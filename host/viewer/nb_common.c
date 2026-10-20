@@ -155,19 +155,22 @@ const char *nb_fourcc_name(uint32_t fourcc, char buf[8])
  * driver chose", which is exactly the uncertainty this option exists to remove.
  */
 /*
- * Which presentation tier the broker will offer.  ONE ordered option rather
- * than a flag per tier: the tiers are a fallback LADDER, so the only sensible
- * restriction is naming one rung, and six booleans would give sixty-four states
- * of which most are meaningless ("--no-linear --linear-only").
+ * Which presentation path the viewer takes (--present-mode, nb_present.h).
+ * ONE ordered option rather than a flag per path: the paths are a fallback
+ * LADDER, so the only sensible choice is where to start and whether to fall.
  *
- *   NB_TIER_AUTO   walk the ladder: the guest's own modifier, then LINEAR
- *                  dma-buf, then wl_shm.  The default.
- *   NB_TIER_NATIVE advertise only what the display really offers; no LINEAR
- *                  narrowing.  Zero-copy or nothing.
- *   NB_TIER_LINEAR advertise only DRM_FORMAT_MOD_LINEAR, forcing the VMM to
- *                  detile.  Reproduces a cross-vendor host on a single-GPU one.
- *   NB_TIER_SHM    refuse dma-buf outright, so only shared memory is left.
- *                  Slowest and universal; the honest floor.
+ *   NB_TIER_AUTO     zero-copy, then the GPU copy, then read-back: a level
+ *                    is left for the next on a hard failure.
+ *   NB_TIER_NATIVE   zero-copy; a pair the display does not take is copied
+ *                    by the GPU pass frame by frame, the level never changes.
+ *   NB_TIER_LINEAR   advertise only DRM_FORMAT_MOD_LINEAR, forcing the VMM to
+ *                    detile.  Reproduces a cross-vendor host on a single-GPU
+ *                    one.  No copy.
+ *   NB_TIER_SHM      advertise no dma-buf; a shared-memory frame is shown as
+ *                    it is, a dma-buf frame that arrives anyway is read back.
+ *   NB_TIER_COPY     every dma-buf frame through the GPU copy, read-back if
+ *                    the display refuses the copy's buffers.
+ *   NB_TIER_READBACK every dma-buf frame through the GPU pass and memory.
  */
 /*
  * WHAT RESOLUTION DO WE SUGGEST TO THE GUEST?
@@ -204,11 +207,9 @@ unsigned nb_hz_fixed;          /* millihertz, NB_HZ_FIXED only */
 int      nb_res_mode = NB_RES_AUTO;
 unsigned nb_res_w, nb_res_h;   /* NB_RES_FIXED only */
 
-/* virtio-nvgpu: ZERO-COPY OR NOTHING by default.  Upstream defaults to AUTO,
- * whose last rung is wl_shm (a CPU-visible copy).  The scanout contract
- * (virtio-nvgpu docs/SCANOUT.md) forbids any copy, so a refused import must be
- * a loud dropped frame, not a silent downgrade.  --present-mode=auto restores
- * the upstream ladder for debugging. */
+/* NATIVE when nothing is asked for: zero-copy, with the per-frame GPU copy
+ * for a pair the display does not take.  `conduit view` passes auto (or the
+ * user's viewer.present setting). */
 int nb_tier = NB_TIER_NATIVE;
 
 int nb_stats;

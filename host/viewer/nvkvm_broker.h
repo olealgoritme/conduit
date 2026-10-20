@@ -33,7 +33,7 @@
 
 #include "nvkvm_broker_proto.h"
 
-#define NB_MAX_SESSION_FDS   8
+#define NB_MAX_SESSION_FDS   10
 #define NB_MAX_ALLOW_IDS     16
 /*
  * How many imported buffers a backend keeps alive at once.  A guest compositor
@@ -185,6 +185,8 @@ struct nb_config {
     int         sync;           /* --sync: NB_SYNC_*, -1 = the saved one    */
     int         gpu_scale;      /* --gpu-scale: NB_GS_*                     */
     const char *render_node;    /* --render-node: the scaler's GPU          */
+    bool        explicit_sync;  /* --explicit-sync: wp_linux_drm_syncobj_v1
+                                 * when offered (default on)                */
     char        gpu_why[200];   /* what --gpu resolved to, and why          */
     const char *view_state;     /* settings file, rewritten on every change */
     const char *vm_shutdown_cmd;/* menu: run via /bin/sh, not waited for    */
@@ -711,8 +713,10 @@ struct nb_session *nb_session_open(const struct nb_config *cfg);
 /* Bytes per pixel for the single-plane 32-bit formats the nvkvm head can
  * flip, or 0 for anything else.  0 means "reject": a format whose pitch we
  * cannot compute is a format whose bounds we cannot check. */
-/* Presentation tiers, worst-to-best fallback order.  See nb_common.c. */
-enum { NB_TIER_AUTO = 0, NB_TIER_NATIVE, NB_TIER_LINEAR, NB_TIER_SHM };
+/* --present-mode: where presentation starts and how far it may fall back.
+ * The same numbers as nb_present.h NB_PM_*; see there and nb_common.c. */
+enum { NB_TIER_AUTO = 0, NB_TIER_NATIVE, NB_TIER_LINEAR, NB_TIER_SHM,
+       NB_TIER_COPY, NB_TIER_READBACK };
 /* What refresh the broker tells the guest.  See nb_common.c. */
 enum { NB_HZ_AUTO = 0, NB_HZ_NONE, NB_HZ_FIXED };
 extern int      nb_hz_mode;
