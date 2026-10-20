@@ -58,6 +58,8 @@
 #include "nb_latch.h"
 #include "nb_blit.h"
 #include "nb_scanout.h"
+#include "nb_present.h"
+#include "nb_xsync.h"
 #include "nb_vmpause.h"
 #include <sys/timerfd.h>
 
@@ -89,6 +91,13 @@ struct nb_session *nb_session_wayland(const struct nb_config *cfg)
 #include "single-pixel-buffer-v1-client-protocol.h"
 #include "xdg-decoration-unstable-v1-client-protocol.h"
 #include "xdg-shell-client-protocol.h"
+#ifdef NB_HAVE_WL_SYNCOBJ
+#include "linux-drm-syncobj-v1-client-protocol.h"
+#else
+struct wp_linux_drm_syncobj_manager_v1;
+struct wp_linux_drm_syncobj_surface_v1;
+struct wp_linux_drm_syncobj_timeline_v1;
+#endif
 
 /* Defined here rather than pulled from libdrm: with the DRM-lease design gone
  * this backend has no other reason to link libdrm, and one constant is not
@@ -187,6 +196,26 @@ struct nb_wl_buf {
      * wl_buffer (buf NULL) and every frame goes through the GPU pass
      * (nb_blit.h). */
     bool      copy;
+    bool      shm;                  /* a wl_shm buffer (the boot console)    */
+};
+
+/*
+ * EXPLICIT SYNC, one timeline: the viewer's import of it (a DRM syncobj
+ * handle on nb_xs's render node) and the compositor's.
+ */
+struct nb_wl_tl {
+    uint32_t h;
+    struct wp_linux_drm_syncobj_timeline_v1 *tl;
+};
+
+/* What was attached to a surface and still needs its acquire/release points
+ * (set right before the surface's commit, see wl_surf_commit()). */
+enum { NB_XA_NONE = 0, NB_XA_GUEST, NB_XA_GT };
+struct nb_wl_xa {
+    int      kind;                  /* NB_XA_*                               */
+    int      idx;                   /* guest slot or GPU-copy target         */
+    uint64_t acq;                   /* acquire point already on the timeline,
+                                     * 0 = make one at the commit            */
 };
 
 /* Distinct pairs whose importability we remember.  Two occur in practice:
@@ -430,11 +459,9 @@ struct nb_wl {
      * LETTERBOX BACKGROUND.  In aspect mode the viewport destination is
      * smaller than the window in one dimension, and Wayland has no background
      * colour -- something has to actually occupy the remainder or the desktop
-     * shows through.  This is one opaque black pixel stretched by its own
-     * viewport, placed BELOW the parent surface (the protocol allows the
-     * parent as place_below's sibling), so the guest's frame stays exactly
-     * where it was: on w->surf, attached directly, still a direct-scanout
-     * candidate.  Mapped ONLY when there are bars to draw.
+     * shows through.  This was one opaque black pixel stretched by its own
+     * viewport around the main surface; it is no longer mapped (the main
+     * surface is the bars now, see cs_surf).
      */
     struct wl_surface    *bg_surf;
     struct wl_subsurface *bg_sub;
@@ -631,6 +658,18 @@ struct nb_wl {
      *   letterbox  -> the main surface is one black pixel stretched over the
      *                 window, and the guest's buffer goes on cs_surf, a
      *                 desynchronised subsurface at (off_x, off_y)
+     *
+     * SUBSURFACE STACKING: by creation order only, never by
+     * wl_subsurface.place_above/place_below.  The protocol puts a new
+     * subsurface on top of its parent and of every sibling made before it,
+     * which is exactly the order wanted here: cs_surf first, then the
+     * overlay, the UI layers and the close dialog as they are first needed.
+     * Restacking requests are where compositors differ: one in wide use
+     * matches the sibling a placement names against the wrong list, so every
+     * placement lands at the bottom of the stack -- with the resize borders
+     * placed below the parent first, the picture and the overlay ended up
+     * under the opaque black main surface and the window was black.  Creation
+     * order needs no request at all, so there is nothing to get wrong.
      */
     struct wl_surface    *cs_surf;
     struct wl_subsurface *cs_sub;
@@ -719,6 +758,38 @@ struct nb_wl {
     bool            copy_told;
     /* Which path a fullscreen frame takes, measured (nb_scanout.h). */
     struct nb_so    so;
+    /*
+     * THE PRESENT LEVEL (nb_present.h): zero-copy, gpu-copy or readback, and
+     * how far --present-mode lets a hard failure take it.
+     */
+    struct nb_pc    pc;
+    bool            pc_noimport_told;
+    /*
+     * EXPLICIT SYNC (wp_linux_drm_syncobj_v1, nb_xsync.h).  A surface that
+     * carries a dma-buf gets a syncobj extension; one about to carry
+     * anything else (the letterbox's black pixel, shared memory) loses it
+     * first, because only dma-bufs are guaranteed to take explicit sync.
+     * Acquire points share one timeline; each buffer the compositor may hold
+     * has its own release timeline (nb_present.h nb_rel).  While a surface
+     * has the extension, wl_buffer.release is undefined for it: a buffer is
+     * free when its release point is signalled.
+     */
+    struct wp_linux_drm_syncobj_manager_v1 *xs_mgr;
+    struct nb_xs   *xs;
+    bool            xs_off;         /* not offered, turned off, or failed  */
+    struct wp_linux_drm_syncobj_surface_v1 *xs_surf[2];  /* main, picture */
+    struct nb_wl_xa xs_pend[2];
+    struct nb_wl_tl xs_acq;
+    uint64_t        xs_acq_pt;
+    struct nb_wl_tl xs_buf_tl[NB_MAX_BUFS];
+    struct nb_wl_tl xs_gt_tl[NB_GS_TARGETS];
+    struct nb_rel   rel[NB_MAX_BUFS];       /* per guest slot, never reset */
+    struct nb_rel   gt_rel[NB_GS_TARGETS];
+    uint64_t        buf_acq[NB_MAX_BUFS];   /* acquire point of its content */
+    uint64_t        gt_acq[NB_GS_TARGETS];
+    int             xs_pfd;         /* index in the pollfds, -1 none       */
+    unsigned        st_xs;          /* commits explicitly synced, per second */
+    bool            xs_dmabuf_fence;/* the acquire uses the dma-buf's fence */
 
     /*
      * DMA-BUF FEEDBACK (zwp_linux_dmabuf_v1 v4) for the main surface: the
@@ -734,11 +805,22 @@ struct nb_wl {
     size_t          fb_tab_sz;
     struct nb_so_fmts fb_tr_fmts;   /* the tranche being received      */
     uint32_t        fb_tr_flags;
+    dev_t           fb_tr_dev;      /* this tranche's target device, 0 unknown */
     struct nb_so_fmts fb_pend_scan; /* scanout tranches of this batch  */
     bool            fb_pend_has;
     unsigned        fb_pend_tr;
     struct nb_so_fmts fb_scan;      /* the last complete batch         */
     bool            fb_has_scan, fb_got;
+    /* The other tranches (the compositor's main device: what it imports to
+     * render with), where the GPU copy allocates (nb_pc_targets). */
+    struct nb_so_fmts fb_pend_render, fb_render;
+    bool            fb_pend_has_render, fb_has_render;
+    dev_t           fb_main_dev;    /* the compositor's main device, 0 unknown */
+    bool            gt_fs;          /* targets were made for fullscreen    */
+    /* Every pair the compositor advertised, before the guest-format and
+     * --present-mode filters: tells "advertised nothing" from "nothing we
+     * can use". */
+    unsigned        n_adv_raw;
     unsigned        fb_tr;
     unsigned        fb_gen;         /* bumped when the scanout set changes */
     /* WLR_NO_HARDWARE_CURSORS=1 in our environment: the session draws
@@ -866,6 +948,7 @@ static int  wl_tick_ui(struct nb_wl *w, int next);
 static void wl_menu_set(struct nb_wl *w, bool open);
 static void wl_rehint(struct nb_wl *w);
 static void wl_ed_show(struct nb_wl *w, bool on);
+static void wl_ed_build(struct nb_wl *w);
 static void wl_hypr_sync(struct nb_wl *w);
 static bool wl_async_wanted(const struct nb_wl *w);
 static void wl_sync_changed(struct nb_wl *w, const char *why);
@@ -1183,7 +1266,13 @@ static void buf_release(void *data, struct wl_buffer *b)
      * With NVKVM_BROKER_CAP_RELEASE_SEQ it is exact: `seq` is the newest
      * ATTACH of this buffer, which this release covers (attach and commit
      * happen back to back, so the newest ATTACH is the newest commit).
+     *
+     * Not for an explicitly synced commit: then the event is undefined and
+     * the release point says when (wl_xs_scan).
      */
+    if (!nb_rel_event(&slot->owner->rel[slot - slot->owner->bufs])) {
+        return;
+    }
     slot->held = false;
     if (slot->owner->sink) {
         nb_sink_release(slot->owner->sink, slot->id, slot->seq);
@@ -1206,6 +1295,10 @@ static void wl_buf_destroy(struct nb_wl *w, int i)
         close(w->bufs[i].fd);
     }
     memset(&w->bufs[i], 0, sizeof(w->bufs[i]));
+    /* No release comes for a destroyed wl_buffer; the slot's timeline and
+     * its point counter stay for the next buffer. */
+    nb_rel_forget(&w->rel[i]);
+    w->buf_acq[i] = 0;
 }
 
 /*
@@ -1251,6 +1344,367 @@ static void wl_drop_attach(struct nb_session *s, const struct nb_buf_desc *d)
     }
 }
 
+/* ── explicit sync (wp_linux_drm_syncobj_v1, nb_xsync.h) ─────────────────── */
+/*
+ * WHAT A COMMIT CARRIES.  A dma-buf attached to a surface with the syncobj
+ * extension needs an acquire point (the compositor waits for it before it
+ * reads) and a release point (it signals that when it is done), set in the
+ * same commit cycle.  They are set right before the commit, in
+ * wl_surf_commit(), from what wl_attach_sf() recorded: setting them at the
+ * attach would leave a release point nobody commits when a relayout attaches
+ * again before the commit, and that buffer would never be released.
+ *
+ *   acquire  a guest frame: the dma-buf's pending writes (nb_xs_from_dmabuf);
+ *            the frame is also complete at handover for a Linux guest, whose
+ *            KMS head waits for its plane fences before the flip.  A GPU-copy
+ *            frame: the pass's fence when the driver exports one, else the
+ *            pass was waited for and the point is signalled from the CPU.
+ *            Committing the same content again (a relayout, a cursor nudge)
+ *            reuses its point.
+ *   release  one timeline per buffer; wl_xs_scan() reads them when the
+ *            eventfd fires (or from the tick), and that is when a guest
+ *            buffer goes back to the guest and a copy target is free.
+ */
+
+/* Explicit sync for new commits: offered, wanted, and not given up. */
+static bool wl_xs_on(const struct nb_wl *w)
+{
+    return w->xs_mgr && !w->xs_off && w->cfg && w->cfg->explicit_sync;
+}
+
+static struct wl_surface *wl_xs_sf(const struct nb_wl *w, int k)
+{
+    return k ? w->cs_surf : w->surf;
+}
+
+/* Something is waiting on a point: the watcher must keep looking. */
+static bool wl_xs_waiting(const struct nb_wl *w)
+{
+    if (!w->xs) {
+        return false;
+    }
+    for (int i = 0; i < NB_MAX_BUFS; i++) {
+        if (nb_rel_waiting(&w->rel[i])) {
+            return true;
+        }
+    }
+    for (int i = 0; i < NB_GS_TARGETS; i++) {
+        if (nb_rel_waiting(&w->gt_rel[i])) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
+ * Points that have been reached: guest buffers back to the guest, copy
+ * targets free again.  One SYNCOBJ_QUERY for everything that waits.
+ */
+static void wl_xs_scan(struct nb_wl *w)
+{
+    uint32_t h[NB_MAX_BUFS + NB_GS_TARGETS];
+    uint64_t v[NB_MAX_BUFS + NB_GS_TARGETS];
+    int who[NB_MAX_BUFS + NB_GS_TARGETS];
+    unsigned n = 0;
+
+    if (!w->xs) {
+        return;
+    }
+    nb_xs_drain(w->xs);
+    for (int i = 0; i < NB_MAX_BUFS; i++) {
+        if (nb_rel_waiting(&w->rel[i]) && w->xs_buf_tl[i].h) {
+            h[n] = w->xs_buf_tl[i].h;
+            who[n++] = i;
+        }
+    }
+    for (int i = 0; i < NB_GS_TARGETS; i++) {
+        if (nb_rel_waiting(&w->gt_rel[i]) && w->xs_gt_tl[i].h) {
+            h[n] = w->xs_gt_tl[i].h;
+            who[n++] = 100 + i;
+        }
+    }
+    if (!n || nb_xs_query(w->xs, h, v, n) < 0) {
+        return;
+    }
+    for (unsigned k = 0; k < n; k++) {
+        if (who[k] < 100) {
+            int i = who[k];
+
+            if (nb_rel_signaled(&w->rel[i], v[k]) && w->bufs[i].valid) {
+                w->bufs[i].held = false;
+                if (w->sink) {
+                    nb_sink_release(w->sink, w->bufs[i].id, w->bufs[i].seq);
+                }
+            }
+        } else if (nb_rel_signaled(&w->gt_rel[who[k] - 100], v[k])) {
+            w->gt[who[k] - 100].busy = false;
+        }
+    }
+}
+
+#ifdef NB_HAVE_WL_SYNCOBJ
+/*
+ * Give up explicit sync for new commits (an ioctl or an import failed).  The
+ * surfaces lose their extension now, so their next commit is implicitly
+ * synced; points already committed are still watched (w->xs stays open).
+ */
+static void wl_xs_fail(struct nb_wl *w, const char *why)
+{
+    if (!w->xs_off) {
+        nb_err("explicit sync: off for this session: %s; the compositor "
+               "syncs implicitly from now", why);
+    }
+    w->xs_off = true;
+    for (int k = 0; k < 2; k++) {
+        if (w->xs_surf[k]) {
+            wp_linux_drm_syncobj_surface_v1_destroy(w->xs_surf[k]);
+            w->xs_surf[k] = NULL;
+        }
+    }
+}
+
+/* A timeline the compositor knows too.  0, or -1. */
+static int wl_xs_tl(struct nb_wl *w, struct nb_wl_tl *t)
+{
+    int fd = -1;
+
+    if (t->tl) {
+        return 0;
+    }
+    if (nb_xs_timeline(w->xs, &t->h, &fd) < 0) {
+        t->h = 0;
+        return -1;
+    }
+    /* libwayland duplicates the fd when it marshals the request. */
+    t->tl = wp_linux_drm_syncobj_manager_v1_import_timeline(w->xs_mgr, fd);
+    close(fd);
+    if (!t->tl) {
+        nb_xs_destroy(w->xs, t->h);
+        t->h = 0;
+        return -1;
+    }
+    return 0;
+}
+
+/* The render node and the acquire timeline, made on first use. */
+static bool wl_xs_ready(struct nb_wl *w)
+{
+    char why[200] = "";
+
+    if (!wl_xs_on(w)) {
+        return false;
+    }
+    if (w->xs && w->xs_acq.tl) {
+        return true;
+    }
+    if (!w->xs) {
+        w->xs = nb_xs_open(NULL, w->fb_main_dev, why, sizeof(why));
+        if (!w->xs) {
+            nb_log("explicit sync: not used (%s); the compositor syncs "
+                   "implicitly", why[0] ? why : "no render node");
+            w->xs_off = true;
+            return false;
+        }
+    }
+    if (wl_xs_tl(w, &w->xs_acq) < 0) {
+        wl_xs_fail(w, "cannot create the acquire timeline");
+        return false;
+    }
+    nb_log("explicit sync: on (wp_linux_drm_syncobj_v1), timelines on %s, "
+           "release points %s", nb_xs_node(w->xs),
+           nb_xs_eventfd(w->xs) >= 0 ? "watched with an eventfd"
+                                     : "polled every millisecond (no "
+                                       "DRM_IOCTL_SYNCOBJ_EVENTFD)");
+    return true;
+}
+
+/* Give surface k the syncobj extension (a dma-buf goes on it) or take it
+ * away (anything else does). */
+static void wl_xs_surface(struct nb_wl *w, int k, bool want)
+{
+    if (want && wl_xs_ready(w) && wl_xs_sf(w, k)) {
+        if (!w->xs_surf[k]) {
+            w->xs_surf[k] = wp_linux_drm_syncobj_manager_v1_get_surface(
+                                w->xs_mgr, wl_xs_sf(w, k));
+        }
+    } else if (w->xs_surf[k]) {
+        wp_linux_drm_syncobj_surface_v1_destroy(w->xs_surf[k]);
+        w->xs_surf[k] = NULL;
+    }
+}
+/* Everything explicit sync made, at the end of the session. */
+static void wl_xs_tl_drop(struct nb_wl *w, struct nb_wl_tl *t)
+{
+    if (t->tl) {
+        wp_linux_drm_syncobj_timeline_v1_destroy(t->tl);
+    }
+    nb_xs_destroy(w->xs, t->h);
+    memset(t, 0, sizeof(*t));
+}
+
+static void wl_xs_close(struct nb_wl *w)
+{
+    for (int k = 0; k < 2; k++) {
+        if (w->xs_surf[k]) {
+            wp_linux_drm_syncobj_surface_v1_destroy(w->xs_surf[k]);
+            w->xs_surf[k] = NULL;
+        }
+    }
+    wl_xs_tl_drop(w, &w->xs_acq);
+    for (int i = 0; i < NB_MAX_BUFS; i++) {
+        wl_xs_tl_drop(w, &w->xs_buf_tl[i]);
+    }
+    for (int i = 0; i < NB_GS_TARGETS; i++) {
+        wl_xs_tl_drop(w, &w->xs_gt_tl[i]);
+    }
+    if (w->xs_mgr) {
+        wp_linux_drm_syncobj_manager_v1_destroy(w->xs_mgr);
+        w->xs_mgr = NULL;
+    }
+    nb_xs_close(w->xs);
+    w->xs = NULL;
+}
+#else
+static void wl_xs_close(struct nb_wl *w)
+{
+    (void)w;
+}
+static void wl_xs_surface(struct nb_wl *w, int k, bool want)
+{
+    (void)w; (void)k; (void)want;
+}
+static bool wl_xs_ready(struct nb_wl *w)
+{
+    (void)w;
+    return false;
+}
+#endif
+
+/*
+ * Attach `b` to surface k (0 the main surface, 1 the picture's) and record
+ * what it is, for the points wl_surf_commit() sets.  `dma`: the buffer is a
+ * dma-buf (only those take explicit sync).  `acq`: the content's acquire
+ * point when it already has one (0: made at the commit).
+ */
+static void wl_attach_sf(struct nb_wl *w, int k, struct wl_buffer *b,
+                         int kind, int idx, bool dma, uint64_t acq)
+{
+    struct wl_surface *sf = wl_xs_sf(w, k);
+
+    if (!sf) {
+        return;
+    }
+    wl_xs_surface(w, k, b && dma && kind != NB_XA_NONE);
+    wl_surface_attach(sf, b, 0, 0);
+    w->xs_pend[k] = (struct nb_wl_xa){
+        .kind = b ? kind : NB_XA_NONE, .idx = idx, .acq = acq,
+    };
+}
+
+/* Right before a commit of `sf`: the points for what was attached to it. */
+static void wl_xs_flush(struct nb_wl *w, struct wl_surface *sf)
+{
+    int k = sf && sf == w->surf ? 0 : sf && sf == w->cs_surf ? 1 : -1;
+    struct nb_wl_xa a;
+    struct nb_rel *rel;
+    uint64_t *acqp;
+    struct nb_wl_tl *tl;
+    int dmabuf = -1;
+
+    if (k < 0 || w->xs_pend[k].kind == NB_XA_NONE) {
+        return;
+    }
+    a = w->xs_pend[k];
+    w->xs_pend[k].kind = NB_XA_NONE;
+    if (a.kind == NB_XA_GUEST) {
+        rel = &w->rel[a.idx];
+        acqp = &w->buf_acq[a.idx];
+        tl = &w->xs_buf_tl[a.idx];
+        dmabuf = w->bufs[a.idx].valid ? w->bufs[a.idx].fd : -1;
+    } else {
+        rel = &w->gt_rel[a.idx];
+        acqp = &w->gt_acq[a.idx];
+        tl = &w->xs_gt_tl[a.idx];
+    }
+#ifdef NB_HAVE_WL_SYNCOBJ
+    if (w->xs_surf[k]) {
+        uint64_t acq = a.acq, rp;
+        int r = 0;
+
+        if (!acq) {
+            acq = ++w->xs_acq_pt;
+            r = dmabuf >= 0
+                    ? nb_xs_from_dmabuf(w->xs, w->xs_acq.h, acq, dmabuf)
+                    : nb_xs_signal(w->xs, w->xs_acq.h, acq);
+            if (r == 1 && !w->xs_dmabuf_fence) {
+                w->xs_dmabuf_fence = true;
+                nb_log("explicit sync: a guest frame's acquire point carries "
+                       "the dma-buf's own fence");
+            }
+        }
+        if (r >= 0 && wl_xs_tl(w, tl) == 0) {
+            *acqp = acq;
+            rp = nb_rel_commit(rel, true);
+            wp_linux_drm_syncobj_surface_v1_set_acquire_point(
+                w->xs_surf[k], w->xs_acq.tl, (uint32_t)(acq >> 32),
+                (uint32_t)acq);
+            wp_linux_drm_syncobj_surface_v1_set_release_point(
+                w->xs_surf[k], tl->tl, (uint32_t)(rp >> 32), (uint32_t)rp);
+            (void)nb_xs_watch(w->xs, tl->h, rp);
+            w->st_xs++;
+            return;
+        }
+        wl_xs_fail(w, r < 0 ? "the acquire point could not be set"
+                            : "cannot create a release timeline");
+        /* Committed without points now: content the GPU may still be
+         * writing (the copy's unwaited pass) must be done first. */
+        if (a.acq) {
+            (void)nb_xs_wait(w->xs, w->xs_acq.h, a.acq, 50000);
+        }
+    }
+#else
+    (void)tl;
+    (void)dmabuf;
+#endif
+    *acqp = 0;
+    nb_rel_commit(rel, false);
+}
+
+/* Every commit of the main surface or the picture's goes through here. */
+static void wl_surf_commit(struct nb_wl *w, struct wl_surface *sf)
+{
+    wl_xs_flush(w, sf);
+    wl_surface_commit(sf);
+}
+
+/* ── the present level (nb_present.h) ─────────────────────────────────────── */
+
+/* Say where frames go now, once per change (the one log line --present-mode
+ * promises). */
+static void wl_pc_report(struct nb_wl *w)
+{
+    if (!nb_pc_take_change(&w->pc)) {
+        return;
+    }
+    nb_log("present: %s (--present-mode=%s): %s", nb_pl_name(w->pc.level),
+           nb_pm_name(w->pc.mode), w->pc.why);
+}
+
+/* A hard failure at `at`: one level down when the mode allows it. */
+static void wl_pc_fail(struct nb_wl *w, enum nb_pl at, const char *why)
+{
+    if (nb_pc_fail(&w->pc, at, "%s", why)) {
+        if (nb_pc_forces_readback(&w->pc)) {
+            w->gt_want_rb = true;
+            w->gt_w = 0;            /* reallocate at the next frame */
+        }
+        wl_pc_report(w);
+        if (w->sink) {
+            nb_sink_refresh(w->sink);   /* the current frame, at the new level */
+        }
+    }
+}
+
 /* ── ops: format policy ──────────────────────────────────────────────────── */
 
 static bool wl_format_ok(struct nb_session *s, uint32_t fourcc, uint64_t mod)
@@ -1282,10 +1736,16 @@ static bool wl_copy_ok(struct nb_session *s, uint32_t fourcc, uint64_t mod)
     char why[200] = "";
     bool ok;
 
-    if (!nb_copy_allowed((nb_tier == NB_TIER_AUTO || nb_tier == NB_TIER_NATIVE)
-                             && !nb_linear_only,
-                         w->gs_mode != NB_GS_OFF, w->gs_dead,
-                         w->viewport != NULL, w->dmabuf != NULL)) {
+    /*
+     * --gpu-scale=off turns off the fullscreen SCALER (a choice between two
+     * ways of showing a frame the compositor takes); a frame it does not
+     * take, or a level that copies everything, has no other way to the
+     * screen, so it is not asked here.  The read-back level needs no
+     * dma-buf protocol at all.
+     */
+    if (!nb_copy_allowed(nb_pc_copy_allowed(&w->pc) && !nb_linear_only,
+                         true, w->gs_dead, w->viewport != NULL,
+                         w->dmabuf != NULL || nb_pc_forces_readback(&w->pc))) {
         return false;
     }
     for (unsigned i = 0; i < w->copy_n; i++) {
@@ -1325,6 +1785,30 @@ static bool wl_copy_ok(struct nb_session *s, uint32_t fourcc, uint64_t mod)
         w->copy_n++;
     }
     return ok;
+}
+
+/*
+ * At the gpu-copy and readback levels every dma-buf frame goes through the
+ * GPU pass -- when the viewer's GPU can import it.  When it cannot there is
+ * no copy to make, and the frame is shown zero-copy if the compositor takes
+ * it (said once).
+ */
+static bool wl_force_copy(struct nb_wl *w, const struct nb_buf_desc *d)
+{
+    if (!nb_pc_forces_copy(&w->pc) || d->is_shm) {
+        return false;
+    }
+    if (wl_copy_ok(w->sess, d->fourcc, d->modifier)) {
+        return true;
+    }
+    if (!w->pc_noimport_told) {
+        w->pc_noimport_told = true;
+        nb_err("present: level %s, but the viewer's GPU cannot import %.4s "
+               "modifier 0x%016llx; showing those frames zero-copy",
+               nb_pl_name(w->pc.level), (const char *)&d->fourcc,
+               (unsigned long long)d->modifier);
+    }
+    return false;
 }
 
 /* ── ops: attach / commit ────────────────────────────────────────────────── */
@@ -1407,6 +1891,8 @@ static void probe_failed(void *data, struct zwp_linux_buffer_params_v1 *params)
         w->probe_bad_pending = true;
         w->probe_bad_fourcc  = w->proven[i].fourcc;
         w->probe_bad_mod     = w->proven[i].mod;
+        wl_pc_fail(w, NB_PL_ZC, "the compositor refused to import the "
+                   "guest's buffer");
     }
     zwp_linux_buffer_params_v1_destroy(params);
 }
@@ -1451,7 +1937,10 @@ static int wl_attach(struct nb_session *s, const struct nb_buf_desc *d)
         if (sl->valid && sl->id == d->id && sl->w == d->width &&
             sl->h == d->height && sl->stride == d->stride &&
             sl->offset == d->offset && sl->fourcc == d->fourcc &&
-            sl->modifier == d->modifier) {
+            sl->modifier == d->modifier &&
+            /* Imported for zero-copy before the level dropped: made again
+             * as a copy (the old slot ages out of the cache). */
+            (sl->shm || (sl->copy ? !w->gs_dead : !wl_force_copy(w, d)))) {
             sl->used = w->tick;
             sl->seq  = d->seq;
             sl->recv_ns = d->recv_ns;
@@ -1534,6 +2023,7 @@ static int wl_attach(struct nb_session *s, const struct nb_buf_desc *d)
             .w = d->width, .h = d->height, .stride = d->stride,
             .offset = d->offset, .fourcc = d->fourcc, .modifier = d->modifier,
             .used = w->tick, .owner = w, .seq = d->seq, .fd = -1,
+            .shm = true,
         };
         wl_buffer_add_listener(sb, &buf_listener, &w->bufs[victim]);
         w->pending = victim;
@@ -1551,8 +2041,8 @@ static int wl_attach(struct nb_session *s, const struct nb_buf_desc *d)
         int proven = ps0 >= 0 ? w->proven[ps0].state : 0;
         enum nb_att how = nb_att_decide(adv, proven, false);
 
-        if (how != NB_ATT_DIRECT) {
-            how = nb_att_decide(adv, proven,
+        if (how != NB_ATT_DIRECT || wl_force_copy(w, d)) {
+            how = nb_att_decide(adv && !wl_force_copy(w, d), proven,
                                 wl_copy_ok(s, d->fourcc, d->modifier));
         }
         if (how == NB_ATT_REJECT) {
@@ -1567,10 +2057,15 @@ static int wl_attach(struct nb_session *s, const struct nb_buf_desc *d)
             if (!w->copy_told) {
                 w->copy_told = true;
                 nb_log("picture: %.4s modifier 0x%016llx frames are copied by "
-                       "the GPU pass (the compositor %s this layout), in "
-                       "every window mode", (const char *)&d->fourcc,
+                       "the GPU pass (%s), in every window mode",
+                       (const char *)&d->fourcc,
                        (unsigned long long)d->modifier,
-                       adv ? "refused" : "does not advertise");
+                       wl_force_copy(w, d)
+                           ? nb_pc_forces_readback(&w->pc)
+                                 ? "present level readback"
+                                 : "present level gpu-copy"
+                       : adv ? "the compositor refused this layout"
+                             : "the compositor does not advertise this layout");
             }
             wl_buf_evict(w, victim);
             w->bufs[victim] = (struct nb_wl_buf){
@@ -1686,9 +2181,10 @@ static int wl_attach(struct nb_session *s, const struct nb_buf_desc *d)
         .offset = d->offset, .fourcc = d->fourcc, .modifier = d->modifier,
         .used = w->tick, .owner = w, .seq = d->seq, .recv_ns = d->recv_ns,
         /* Kept for the fullscreen scaler, which imports it on the GPU when
-         * the picture is not 1:1.  A dup of an fd we hold anyway. */
-        .fd = w->gs_mode == NB_GS_OFF ? -1
-                                      : fcntl(d->fd, F_DUPFD_CLOEXEC, 3),
+         * the picture is not 1:1, and for explicit sync, which takes the
+         * acquire point from its fence.  A dup of an fd we hold anyway. */
+        .fd = w->gs_mode == NB_GS_OFF && !wl_xs_on(w)
+                  ? -1 : fcntl(d->fd, F_DUPFD_CLOEXEC, 3),
     };
     wl_buffer_add_listener(b, &buf_listener, &w->bufs[victim]);
     w->pending = victim;
@@ -1858,8 +2354,8 @@ static void wl_leave_sub(struct nb_wl *w)
         return;
     }
     w->in_sub = false;
-    wl_surface_attach(w->cs_surf, NULL, 0, 0);
-    wl_surface_commit(w->cs_surf);
+    wl_attach_sf(w, 1, NULL, NB_XA_NONE, -1, false, 0);
+    wl_surf_commit(w, w->cs_surf);
     w->cs_at_x = w->cs_at_y = INT32_MIN;
     w->main_vw = w->main_vh = 0;
     w->tgt_ow = w->tgt_oh = 0;
@@ -1873,7 +2369,10 @@ static void gt_release(void *data, struct wl_buffer *b)
     struct nb_wl_gt *t = data;
 
     (void)b;
-    t->busy = false;
+    /* Undefined under explicit sync: then the release point frees it. */
+    if (nb_rel_event(&t->owner->gt_rel[t - t->owner->gt])) {
+        t->busy = false;
+    }
 }
 static const struct wl_buffer_listener gt_listener = { .release = gt_release };
 
@@ -1913,18 +2412,23 @@ static void gt_failed(void *data, struct zwp_linux_buffer_params_v1 *params)
         return;
     }
     t->failed = true;
-    if (t->owner && !t->owner->gt_want_rb) {
-        /* Not the end: the same pass, read back into shared memory, which
-         * every compositor takes. */
-        nb_err("gpu-scale: the compositor refused the scaler's dma-buf; "
-               "reading the pass back into shared memory instead");
-        t->owner->gt_want_rb = true;
-        t->owner->gt_w = 0;     /* reallocate at the next frame */
-    } else if (t->owner) {
-        nb_err("gpu-scale: the compositor refused the scaler's buffer; the "
-               "compositor scales the picture instead");
-        t->owner->gs_dead = true;
+    if (!t->owner) {
+        return;
     }
+    /*
+     * Not the end: the same pass, read back into shared memory, which every
+     * compositor takes.  Every target of the batch answers; only the first
+     * says so.  Read-back targets are wl_shm and never come here, so this
+     * never turns the pass off.
+     */
+    if (!t->owner->gt_want_rb) {
+        nb_err("GPU copy: the compositor refused the copy's dma-buf; reading "
+               "the pass back into shared memory instead");
+    }
+    t->owner->gt_want_rb = true;
+    t->owner->gt_w = 0;         /* reallocate at the next frame */
+    wl_pc_fail(t->owner, NB_PL_COPY, "the compositor refused the GPU copy's "
+               "buffers");
 }
 static const struct zwp_linux_buffer_params_v1_listener gt_params_listener = {
     .created = gt_created,
@@ -1938,6 +2442,8 @@ static void gt_drop(struct nb_wl *w)
             wl_buffer_destroy(w->gt[i].buf);
         }
         w->gt[i] = (struct nb_wl_gt){ .owner = w, .gen = w->gt[i].gen + 1 };
+        nb_rel_forget(&w->gt_rel[i]);
+        w->gt_acq[i] = 0;
     }
     if (w->gt_shm) {
         munmap(w->gt_shm, w->gt_shm_sz);
@@ -2008,7 +2514,8 @@ static bool gs_fmt_ok(void *ctx, uint32_t fourcc, uint64_t mod)
 {
     struct nb_wl *w = ctx;
 
-    return nb_formats_has(&w->formats, fourcc, mod);
+    return nb_formats_has(&w->formats, fourcc, mod) ||
+           (w->fb_has_render && nb_so_fmts_has(&w->fb_render, fourcc, mod));
 }
 
 static void wl_gs_disable(struct nb_wl *w, const char *why)
@@ -2017,6 +2524,14 @@ static void wl_gs_disable(struct nb_wl *w, const char *why)
     nb_err("gpu-scale: off for this session: %s.  The compositor scales the "
            "picture, which on some compositors (Hyprland) means vsync in "
            "fullscreen; a 1:1 guest mode is unaffected", why);
+    if (nb_pc_forces_copy(&w->pc)) {
+        nb_err("present: %s needs the GPU pass, which failed; frames the "
+               "compositor takes as they are are shown zero-copy now",
+               nb_pl_name(w->pc.level));
+    }
+    if (w->sink) {
+        nb_sink_refresh(w->sink);
+    }
 }
 
 /*
@@ -2150,20 +2665,29 @@ static bool wl_gs_ready(struct nb_wl *w, const struct nb_wl_buf *sl, int pw,
                nb_gs_prio_name(nb_gs_prio_granted(w->gs)));
     }
     if (w->gt_w != (uint32_t)pw || w->gt_h != (uint32_t)ph ||
-        w->gt_fb_gen != w->fb_gen) {
-        uint64_t sm[32];
-        unsigned ns = w->fb_has_scan
-                          ? nb_so_fmts_mods(&w->fb_scan, NB_FOURCC_XR24_LOCAL,
-                                            sm, 32)
-                          : 0;
+        w->gt_fb_gen != w->fb_gen || w->gt_fs != w->fullscreen) {
+        struct nb_so_fmts v3;
+        struct nb_pc_cand cand;
         int k;
 
+        /* The layouts to allocate in, best first (nb_pc_targets): the
+         * compositor's render tranche, the scanout one first in fullscreen;
+         * the plain modifier list without feedback. */
+        memset(&v3, 0, sizeof(v3));
+        for (unsigned i = 0; i < w->formats.n; i++) {
+            nb_so_fmts_add(&v3, w->formats.e[i].fourcc,
+                           w->formats.e[i].modifier);
+        }
+        nb_pc_targets(w->fb_has_scan ? &w->fb_scan : NULL, w->fullscreen,
+                      &w->fb_render, w->fb_has_render, &v3, &cand);
         gt_drop(w);
         w->gt_fb_gen = w->fb_gen;
-        k = w->gt_want_rb ? 0
-                          : nb_gs_targets(w->gs, (uint32_t)pw, (uint32_t)ph,
-                                          gs_fmt_ok, w, sm, ns, tg, why,
-                                          sizeof(why));
+        w->gt_fs = w->fullscreen;
+        k = w->gt_want_rb || !w->dmabuf
+                ? 0
+                : nb_gs_targets(w->gs, (uint32_t)pw, (uint32_t)ph,
+                                gs_fmt_ok, w, cand.fourcc, cand.mod, cand.n,
+                                tg, why, sizeof(why));
         if (k != NB_GS_TARGETS) {
             /*
              * No dma-buf layout this GPU renders to that the compositor
@@ -2311,7 +2835,9 @@ static int wl_gs_present(struct nb_wl *w, int slot, int pw, int ph)
     } else {
         wp_viewport_set_destination(w->viewport, w->win_w, w->win_h);
     }
-    wl_surface_attach(w->surf, w->gt[t].buf, 0, 0);
+    /* The pass was waited for: the acquire point is signalled at the
+     * commit (acq 0). */
+    wl_attach_sf(w, 0, w->gt[t].buf, NB_XA_GT, t, !w->gt_rb, 0);
     w->gt[t].busy = true;
     if (!w->gs_shown || w->tgt_ow != w->win_w || w->tgt_oh != w->win_h) {
         w->tgt_ow = w->win_w;
@@ -2390,7 +2916,9 @@ static struct wl_surface *wl_viewport_apply(struct nb_wl *w, int bw, int bh,
          * every window mode; any other only when the decision says so. */
         bool copy_only = slot >= 0 && slot < NB_MAX_BUFS &&
                          w->bufs[slot].valid && w->bufs[slot].copy;
-        bool usable = w->gs_mode != NB_GS_OFF && !w->gs_dead && w->viewport;
+        /* --gpu-scale=off turns off the scaler, not the copy: a copy-only
+         * frame has no other way to the screen. */
+        bool usable = !w->gs_dead && w->viewport;
 
         w->gs_frame = false;
         w->gs_dropped = false;
@@ -2446,7 +2974,7 @@ static struct wl_surface *wl_viewport_apply(struct nb_wl *w, int bw, int bh,
                                        wl_fixed_from_int(-1));
                 w->vp_src[0] = false;
             }
-            wl_surface_attach(w->surf, w->blk_buf, 0, 0);
+            wl_attach_sf(w, 0, w->blk_buf, NB_XA_NONE, -1, false, 0);
             wl_surface_damage_buffer(w->surf, 0, 0, 1, 1);
             w->main_vw = w->main_vh = 0;
             w->tgt_ow = w->tgt_oh = 0;
@@ -2457,7 +2985,12 @@ static struct wl_surface *wl_viewport_apply(struct nb_wl *w, int bw, int bh,
         target = w->in_sub ? w->cs_surf : w->surf;
         vp = w->in_sub ? w->cs_vp : w->viewport;
         if (show && (buf || switched)) {
-            wl_surface_attach(target, show, 0, 0);
+            int si = buf ? w->pending : w->current;
+
+            /* A new frame gets a new acquire point; the same content
+             * attached again (a switch of surface) keeps its own. */
+            wl_attach_sf(w, w->in_sub ? 1 : 0, show, NB_XA_GUEST, si,
+                         !w->bufs[si].shm, buf ? 0 : w->buf_acq[si]);
         }
         if (w->in_sub) {
             if (w->main_vw != w->win_w || w->main_vh != w->win_h) {
@@ -2528,7 +3061,7 @@ static void wl_main_settle(struct nb_wl *w)
     if (w->main_dirty) {
         w->main_dirty = false;
         if (w->in_sub) {
-            wl_surface_commit(w->surf);
+            wl_surf_commit(w, w->surf);
         }
     }
 }
@@ -2699,7 +3232,7 @@ static int wl_commit(struct nb_session *s, struct nb_sink *sink)
             cur_apply(w, w->last_serial);
         }
     } else {
-        wl_surface_attach(w->surf, sl->buf, 0, 0);
+        wl_attach_sf(w, 0, sl->buf, NB_XA_GUEST, w->pending, !sl->shm, 0);
         new_w = (int)sl->w;
         new_h = (int)sl->h;
         /* No viewporter: the surface is the buffer.  An opaque region is a
@@ -2760,7 +3293,7 @@ static int wl_commit(struct nb_session *s, struct nb_sink *sink)
      * the compare.
      */
     bd_layout(w);
-    wl_surface_commit(target);
+    wl_surf_commit(w, target);
     wl_main_settle(w);          /* the letterbox's parent state, if it moved */
     if (!w->has_content) {
         w->has_content = true;  /* mapped now: a window property can stick */
@@ -2941,7 +3474,13 @@ static void wl_nudge(struct nb_wl *w)
         w->nudge_pending = false;
         return;
     }
-    wl_surface_attach(sf, b, 0, 0);
+    if (w->gs_shown) {
+        wl_attach_sf(w, 0, b, NB_XA_GT, w->gt_last, !w->gt_rb,
+                     w->gt_acq[w->gt_last]);
+    } else {
+        wl_attach_sf(w, sf == w->cs_surf ? 1 : 0, b, NB_XA_GUEST, w->current,
+                     !w->bufs[w->current].shm, w->buf_acq[w->current]);
+    }
     wl_surface_damage_buffer(sf, 0, 0, 1, 1);
     if (!w->frame_inflight) {
         struct wl_callback *cb = wl_surface_frame(sf);
@@ -2952,7 +3491,7 @@ static void wl_nudge(struct nb_wl *w)
             armed = true;
         }
     }
-    wl_surface_commit(sf);
+    wl_surf_commit(w, sf);
     nb_pace_committed(&w->pace, now, armed);
     nb_pace_flushed(&w->pace, wl_display_flush(w->dpy) < 0 && errno == EAGAIN);
     w->nudge_pending = false;
@@ -3181,7 +3720,7 @@ static void tb_update(struct nb_wl *w, int width)
             wl_surface_commit(w->tb_surf);
             w->tb_mapped = false;
             wl_geom_apply(w);
-            wl_surface_commit(w->surf);
+            wl_surf_commit(w, w->surf);
             wl_display_flush(w->dpy);
         }
         return;
@@ -3241,7 +3780,7 @@ static void tb_update(struct nb_wl *w, int width)
     /* The window is the content PLUS the bar sitting above it, and PLUS any
      * letterbox bars around it. */
     wl_geom_apply(w);
-    wl_surface_commit(w->surf);
+    wl_surf_commit(w, w->surf);
     wl_display_flush(w->dpy);
 }
 
@@ -3993,8 +4532,7 @@ __attribute__((unused)) static void bg_build(struct nb_wl *w)
     if (!w->bg_sub) {
         return;
     }
-    /* Below the parent, so the guest's frame stays the topmost thing. */
-    wl_subsurface_place_below(w->bg_sub, w->surf);
+    /* No restacking request (see SUBSURFACE STACKING). */
     wl_subsurface_set_desync(w->bg_sub);
     w->bg_vp = wp_viewporter_get_viewport(w->viewporter, w->bg_surf);
 }
@@ -4137,7 +4675,7 @@ static void dlg_hide(struct nb_wl *w)
     if (w->dlg_surf) {
         wl_surface_attach(w->dlg_surf, NULL, 0, 0);
         wl_surface_commit(w->dlg_surf);
-        wl_surface_commit(w->surf);
+        wl_surf_commit(w, w->surf);
         wl_display_flush(w->dpy);
     }
     nb_log("close: dismissed");
@@ -4160,7 +4698,7 @@ static void dlg_commit(struct nb_wl *w)
     wl_surface_attach(w->dlg_surf, w->dlg_buf, 0, 0);
     wl_surface_damage_buffer(w->dlg_surf, 0, 0, NB_DLG_W, NB_DLG_H);
     wl_surface_commit(w->dlg_surf);
-    wl_surface_commit(w->surf);
+    wl_surf_commit(w, w->surf);
     wl_display_flush(w->dpy);
 }
 
@@ -4214,9 +4752,7 @@ static void dlg_show(struct nb_wl *w)
             w->quit = true;
             return;
         }
-        wl_subsurface_place_above(w->dlg_sub,
-                                  w->ov_surf ? w->ov_surf
-                                  : w->cs_surf ? w->cs_surf : w->surf);
+        /* Made last, so it is on top (see SUBSURFACE STACKING). */
         wl_subsurface_set_desync(w->dlg_sub);
     }
     if (!w->dlg_buf) {
@@ -4461,6 +4997,17 @@ static int wl_tick(struct nb_session *s)
     int r = wl_tick_fetch(w, wl_tick_clip(s));
 
     r = wl_tick_viewer(w, r);
+    /*
+     * Release points without an eventfd to watch them (a kernel before
+     * DRM_IOCTL_SYNCOBJ_EVENTFD): looked at every millisecond while one is
+     * outstanding.
+     */
+    if (wl_xs_waiting(w) && nb_xs_eventfd(w->xs) < 0) {
+        wl_xs_scan(w);
+        if (wl_xs_waiting(w) && (r < 0 || r > 1)) {
+            r = 1;
+        }
+    }
     /* A staged frame held by an overdue frame callback: look again then. */
     wl_commit_staged(w);
     if ((w->commit_staged && w->pending >= 0) || w->nudge_pending) {
@@ -4571,7 +5118,7 @@ static int wl_show_idle(struct nb_session *s)
         }
     }
     wl_leave_sub(w);            /* the placeholder is the main surface */
-    wl_surface_attach(w->surf, w->idle_buf, 0, 0);
+    wl_attach_sf(w, 0, w->idle_buf, NB_XA_NONE, -1, false, 0);
     if (w->viewport) {
         wp_viewport_set_destination(w->viewport, wd, ht);
     }
@@ -4582,7 +5129,7 @@ static int wl_show_idle(struct nb_session *s)
     bg_layout(w, w->win_w > 0 ? w->win_w : wd, w->win_h > 0 ? w->win_h : ht);
     wl_geom_apply(w);
     wl_surface_damage_buffer(w->surf, 0, 0, wd, ht);
-    wl_surface_commit(w->surf);
+    wl_surf_commit(w, w->surf);
     wl_display_flush(w->dpy);
     w->current = -1;
     cur_apply(w, w->last_serial);   /* placeholder now: give the cursor back */
@@ -5169,10 +5716,25 @@ static void fb_table(void *d, struct zwp_linux_dmabuf_feedback_v1 *f,
 }
 static void fb_main_device(void *d, struct zwp_linux_dmabuf_feedback_v1 *f,
                            struct wl_array *dev)
-{ (void)d; (void)f; (void)dev; }
+{
+    struct nb_wl *w = d;
+
+    (void)f;
+    /* A dev_t: where explicit sync makes its timelines. */
+    if (dev && dev->size == sizeof(dev_t)) {
+        memcpy(&w->fb_main_dev, dev->data, sizeof(dev_t));
+    }
+}
 static void fb_tr_device(void *d, struct zwp_linux_dmabuf_feedback_v1 *f,
                          struct wl_array *dev)
-{ (void)d; (void)f; (void)dev; }
+{
+    struct nb_wl *w = d;
+
+    (void)f;
+    if (dev && dev->size == sizeof(dev_t)) {
+        memcpy(&w->fb_tr_dev, dev->data, sizeof(dev_t));
+    }
+}
 static void fb_tr_formats(void *d, struct zwp_linux_dmabuf_feedback_v1 *f,
                           struct wl_array *idx)
 {
@@ -5221,9 +5783,20 @@ static void fb_tr_done(void *d, struct zwp_linux_dmabuf_feedback_v1 *f)
             nb_so_fmts_add(&w->fb_pend_scan, w->fb_tr_fmts.e[k].fourcc,
                            w->fb_tr_fmts.e[k].mod);
         }
+    } else if (!w->fb_tr_dev || !w->fb_main_dev ||
+               w->fb_tr_dev == w->fb_main_dev) {
+        /* What the compositor imports to render with, on its main device
+         * (another device's tranche lists what only that GPU takes): where
+         * the GPU copy allocates its buffers (nb_present.h nb_pc_targets). */
+        w->fb_pend_has_render = true;
+        for (unsigned k = 0; k < w->fb_tr_fmts.n; k++) {
+            nb_so_fmts_add(&w->fb_pend_render, w->fb_tr_fmts.e[k].fourcc,
+                           w->fb_tr_fmts.e[k].mod);
+        }
     }
     memset(&w->fb_tr_fmts, 0, sizeof(w->fb_tr_fmts));
     w->fb_tr_flags = 0;
+    w->fb_tr_dev = 0;
 }
 static void fb_done(void *d, struct zwp_linux_dmabuf_feedback_v1 *f)
 {
@@ -5232,15 +5805,26 @@ static void fb_done(void *d, struct zwp_linux_dmabuf_feedback_v1 *f)
                    w->fb_scan.n != w->fb_pend_scan.n ||
                    memcmp(w->fb_scan.e, w->fb_pend_scan.e,
                           w->fb_scan.n * sizeof(w->fb_scan.e[0]));
+    bool rchanged = w->fb_has_render != w->fb_pend_has_render ||
+                    w->fb_render.n != w->fb_pend_render.n ||
+                    memcmp(w->fb_render.e, w->fb_pend_render.e,
+                           w->fb_render.n * sizeof(w->fb_render.e[0]));
 
     (void)f;
     w->fb_got = true;
     w->fb_has_scan = w->fb_pend_has;
     w->fb_scan = w->fb_pend_scan;
+    w->fb_has_render = w->fb_pend_has_render;
+    w->fb_render = w->fb_pend_render;
     w->fb_tr = w->fb_pend_tr;
     memset(&w->fb_pend_scan, 0, sizeof(w->fb_pend_scan));
+    memset(&w->fb_pend_render, 0, sizeof(w->fb_pend_render));
     w->fb_pend_has = false;
+    w->fb_pend_has_render = false;
     w->fb_pend_tr = 0;
+    if (rchanged && !changed) {
+        w->fb_gen++;            /* the copy's targets follow the render set */
+    }
     if (changed) {
         uint64_t m[4];
 
@@ -5283,6 +5867,7 @@ static void dmabuf_format(void *d, struct zwp_linux_dmabuf_v1 *z, uint32_t fmt)
 {
     struct nb_wl *w = d;
     (void)z;
+    w->n_adv_raw++;
     /* Version 1/2 only ever say "this format, implicit layout". */
     nb_formats_add(&w->formats, fmt, NB_DRM_FORMAT_MOD_INVALID);
 }
@@ -5291,6 +5876,7 @@ static void dmabuf_modifier(void *d, struct zwp_linux_dmabuf_v1 *z,
 {
     struct nb_wl *w = d;
     (void)z;
+    w->n_adv_raw++;
     nb_formats_add(&w->formats, fmt, ((uint64_t)hi << 32) | lo);
 }
 static const struct zwp_linux_dmabuf_v1_listener dmabuf_listener = {
@@ -5327,7 +5913,7 @@ static void xdg_configure(void *d, struct xdg_surface *s, uint32_t serial)
     if (w->idle_wanted && w->current < 0) {
         wl_show_idle(w->sess);
     } else {
-        wl_surface_commit(w->surf);
+        wl_surf_commit(w, w->surf);
     }
     ov_sync(w);                 /* first configure maps it */
 }
@@ -5539,7 +6125,7 @@ static void top_apply(struct nb_wl *w)
         wl_surface_damage_buffer(pic, 0, 0,
                                  w->gs_frame ? INT32_MAX : w->buf_w,
                                  w->gs_frame ? INT32_MAX : w->buf_h);
-        wl_surface_commit(pic);
+        wl_surf_commit(w, pic);
         wl_main_settle(w);
         if (w->gc_on && gc_layout(w, false)) {
             cur_apply(w, w->last_serial);
@@ -5808,7 +6394,7 @@ static void bd_layout(struct nb_wl *w)
                 wl_surface_commit(w->bd_surf[i]);
             }
         }
-        wl_surface_commit(w->surf);
+        wl_surf_commit(w, w->surf);
         wl_display_flush(w->dpy);
         return;
     }
@@ -5828,7 +6414,7 @@ static void bd_layout(struct nb_wl *w)
         wl_surface_damage_buffer(w->bd_surf[i], 0, 0, 1, 1);
         wl_surface_commit(w->bd_surf[i]);
     }
-    wl_surface_commit(w->surf);
+    wl_surf_commit(w, w->surf);
     wl_display_flush(w->dpy);
 }
 
@@ -5879,7 +6465,7 @@ static void bd_build(struct nb_wl *w)
                                                        w->bd_surf[i], w->surf);
         w->bd_vp[i] = wp_viewporter_get_viewport(w->viewporter, w->bd_surf[i]);
         if (w->bd_sub[i]) {
-            wl_subsurface_place_below(w->bd_sub[i], w->surf);
+            /* Outside the main surface, so stacking does not matter. */
             wl_subsurface_set_desync(w->bd_sub[i]);
         }
         none = wl_compositor_create_region(w->comp);
@@ -6198,6 +6784,11 @@ static void reg_global(void *data, struct wl_registry *r, uint32_t name,
     } else if (!strcmp(iface,
                zwp_relative_pointer_manager_v1_interface.name)) {
         w->relptr_mgr = BIND(zwp_relative_pointer_manager_v1_interface, 1);
+#ifdef NB_HAVE_WL_SYNCOBJ
+    } else if (!strcmp(iface,
+               wp_linux_drm_syncobj_manager_v1_interface.name)) {
+        w->xs_mgr = BIND(wp_linux_drm_syncobj_manager_v1_interface, 1);
+#endif
     }
 #undef BIND
 }
@@ -6442,8 +7033,8 @@ static bool ov_build(struct nb_wl *w, unsigned sc)
         if (!w->ov_sub) {
             return false;
         }
-        /* Above the picture's own subsurface, or it would be drawn over. */
-        wl_subsurface_place_above(w->ov_sub, w->cs_surf ? w->cs_surf : w->surf);
+        /* Above the picture's own subsurface because it is made after it
+         * (see SUBSURFACE STACKING). */
         wl_subsurface_set_desync(w->ov_sub);
         none = wl_compositor_create_region(w->comp);
         if (none) {
@@ -6571,7 +7162,7 @@ static void ov_sync(struct nb_wl *w)
         ov_paint_commit(w);
         /* The subsurface's position is parent state: commit the parent so a
          * first map or a move does not wait for the next guest frame. */
-        wl_surface_commit(w->surf);
+        wl_surf_commit(w, w->surf);
     } else if (w->ov_mapped) {
         w->ov_mapped = false;
         if (w->ov_surf) {
@@ -6873,9 +7464,9 @@ static void wl_sync_changed(struct nb_wl *w, const char *why)
     wl_tearing_apply(w);
     if (w->configured) {
         if (w->in_sub && w->cs_surf) {
-            wl_surface_commit(w->cs_surf);
+            wl_surf_commit(w, w->cs_surf);
         }
-        wl_surface_commit(w->surf);
+        wl_surf_commit(w, w->surf);
         wl_display_flush(w->dpy);
     }
     if (was != w->tearing_async || why) {
@@ -7013,19 +7604,6 @@ static const struct wl_buffer_listener ly_buf_listener = {
     .release = ly_release,
 };
 
-/* The topmost of our UI subsurfaces, so each new one goes above the last. */
-static struct wl_surface *wl_ui_top;
-
-static void wl_place_top(struct nb_wl *w, struct wl_subsurface *sub,
-                         struct wl_surface *sf)
-{
-    struct wl_surface *ref = wl_ui_top ? wl_ui_top
-                           : w->cs_surf ? w->cs_surf : w->surf;
-
-    wl_subsurface_place_above(sub, ref);
-    wl_ui_top = sf;
-}
-
 static struct nb_wl_layer *wl_layer_new(struct nb_wl *w, bool input)
 {
     struct nb_wl_layer *L;
@@ -7048,8 +7626,7 @@ static struct nb_wl_layer *wl_layer_new(struct nb_wl *w, bool input)
         free(L);
         return NULL;
     }
-    wl_place_top(w, L->sub, L->surf);
-    wl_subsurface_set_desync(L->sub);
+    wl_subsurface_set_desync(L->sub);   /* on top: made last */
     if (w->viewporter) {
         L->vp = wp_viewporter_get_viewport(w->viewporter, L->surf);
     }
@@ -7170,7 +7747,7 @@ static void wl_layer_show(struct nb_wl *w, struct nb_wl_layer *L, int idx,
         L->x = x;
         L->y = y;
         wl_subsurface_set_position(L->sub, x, y);
-        wl_surface_commit(w->surf);     /* position is the parent's state */
+        wl_surf_commit(w, w->surf);     /* position is the parent's state */
     }
     L->mapped = true;
 }
@@ -7230,6 +7807,7 @@ static void wl_menu_paint(struct nb_wl *w)
         return;
     }
     if (!w->ly_menu) {
+        wl_ed_build(w);             /* below the menu: made first */
         w->ly_menu = wl_layer_new(w, true);
         if (!w->ly_menu) {
             return;
@@ -7247,16 +7825,18 @@ static void wl_menu_paint(struct nb_wl *w)
     wl_layer_show(w, w->ly_menu, idx, r.x, r.y, r.w, r.h);
 }
 
-/* The output area's outline while the menu is open. */
-static void wl_ed_show(struct nb_wl *w, bool on)
+/*
+ * The outline's eight surfaces, made once.  Before the menu's layer, which
+ * must stack above them (SUBSURFACE STACKING: creation order).
+ */
+static void wl_ed_build(struct nb_wl *w)
 {
-    struct nb_rect a;
     int i;
 
     if (!w->viewporter || !w->comp || !w->subcomp || !w->shm) {
         return;
     }
-    if (on && !w->ed_buf) {
+    if (!w->ed_buf) {
         struct wl_shm_pool *pool;
         uint32_t *px;
         int fd = memfd_create("conduit-viewer-edge", MFD_CLOEXEC);
@@ -7290,7 +7870,6 @@ static void wl_ed_show(struct nb_wl *w, bool on)
             w->ed_sub[i] = wl_subcompositor_get_subsurface(w->subcomp,
                                                            w->ed_surf[i],
                                                            w->surf);
-            wl_place_top(w, w->ed_sub[i], w->ed_surf[i]);
             wl_subsurface_set_desync(w->ed_sub[i]);
             w->ed_vp[i] = wp_viewporter_get_viewport(w->viewporter,
                                                      w->ed_surf[i]);
@@ -7300,10 +7879,17 @@ static void wl_ed_show(struct nb_wl *w, bool on)
                 wl_region_destroy(none);
             }
         }
-        /* The menu goes above the outline. */
-        if (w->ly_menu) {
-            wl_place_top(w, w->ly_menu->sub, w->ly_menu->surf);
-        }
+    }
+}
+
+/* The output area's outline while the menu is open. */
+static void wl_ed_show(struct nb_wl *w, bool on)
+{
+    struct nb_rect a;
+    int i;
+
+    if (on) {
+        wl_ed_build(w);
     }
     if (!w->ed_buf) {
         return;
@@ -7343,7 +7929,7 @@ static void wl_ed_show(struct nb_wl *w, bool on)
     }
     w->ed_at = a;
     w->ed_mapped = true;
-    wl_surface_commit(w->surf);
+    wl_surf_commit(w, w->surf);
 }
 
 /* ── the top-edge button ── */
@@ -7555,7 +8141,7 @@ static void wl_relayout(struct nb_wl *w)
         wl_surface_damage_buffer(pic, 0, 0,
                                  w->gs_frame ? INT32_MAX : w->buf_w,
                                  w->gs_frame ? INT32_MAX : w->buf_h);
-        wl_surface_commit(pic);
+        wl_surf_commit(w, pic);
         wl_main_settle(w);
         if (w->gc_on && gc_layout(w, false)) {
             cur_apply(w, w->last_serial);
@@ -7971,6 +8557,14 @@ static int wl_pollfds(struct nb_session *s, struct pollfd *out, int max)
         out[n].revents = 0;
         w->latch_pfd = n++;
     }
+    /* Explicit sync: a release point reached (nb_xsync.h). */
+    w->xs_pfd = -1;
+    if (nb_xs_eventfd(w->xs) >= 0 && wl_xs_waiting(w) && n < max) {
+        out[n].fd = nb_xs_eventfd(w->xs);
+        out[n].events = POLLIN;
+        out[n].revents = 0;
+        w->xs_pfd = n++;
+    }
     return n;
 }
 
@@ -8020,6 +8614,9 @@ static int wl_dispatch_session(struct nb_session *s, struct nb_sink *sink)
         }
         w->latch_armed = false;
         wl_commit_staged(w);    /* the latch window opened */
+    }
+    if (w->pfd && w->xs_pfd >= 0 && (w->pfd[w->xs_pfd].revents & POLLIN)) {
+        wl_xs_scan(w);          /* buffers back to the guest, targets free */
     }
     if (wl_display_prepare_read(w->dpy) != 0) {
         /* Another queue already has events buffered; drain those first. */
@@ -8225,6 +8822,7 @@ static void wl_close_session(struct nb_session *s)
         wl_buf_destroy(w, i);
     }
     wl_gs_close(w);
+    wl_xs_close(w);
     if (w->dfb) {
         zwp_linux_dmabuf_feedback_v1_destroy(w->dfb);
         w->dfb = NULL;
@@ -8359,35 +8957,19 @@ static void wl_close_session(struct nb_session *s)
 }
 
 /*
- * AUTO must still reach the shm rung when this compositor cannot do dma-buf
- * at all, matching the ladder documented in nb_common.c (NB_TIER_AUTO: the
- * guest's own modifier, then LINEAR, then wl_shm -- the default).  This is
- * the identical bug fixed in nb_session_x11.c for a DRI3-less Xvfb: a missing
- * capability sent every tier to `goto fail` unconditionally, so AUTO never
- * reached the one rung that needs neither DRI3 nor a compositor dma-buf
- * extension.  MEASURED there: AUTO crash-looped on Xvfb (8 DRI3 errors)
- * while --present-mode=shm on the same server came up with zero.
- *
- * The caller only reaches here when nb_tier != NB_TIER_SHM already (that tier
- * has its own check just above), so this only ever *degrades* AUTO -- an
- * EXPLICIT --present-mode=native or =linear still fails at the call site,
- * because the user asked for dma-buf specifically and cannot have it swapped
- * for a copy path silently.
- *
- * Returns true (and switches nb_tier to NB_TIER_SHM) if AUTO could descend;
- * false if this compositor's wl_shm is unavailable too, in which case the
- * caller must still fail loudly -- there is nothing left to fall back to.
+ * The compositor cannot take a dma-buf at all (no zwp_linux_dmabuf_v1, a
+ * version without create_immed, or no pair a guest frame can use).  The
+ * read-back level needs none of that -- only wl_shm, which is core -- so a
+ * mode that may fall that far (auto, copy, readback, shm) goes there; an
+ * explicit native or linear asked for dma-buf and fails loudly instead.
+ * Returns true when presentation can go on.
  */
-static bool wl_dmabuf_unusable_auto_fallback(struct nb_wl *w, const char *why)
+static bool wl_dmabuf_unusable(struct nb_wl *w, const char *why)
 {
-    if (nb_tier != NB_TIER_AUTO || !w->shm) {
+    if (!w->shm || !nb_pc_floor(&w->pc, why)) {
         return false;
     }
-    nb_log("AUTO: %s -- descending to the shm tier (wl_shm). Expect lower "
-           "performance than a dma-buf path; pass --present-mode=native or "
-           "=linear to require dma-buf and fail instead of falling back.",
-           why);
-    nb_tier = NB_TIER_SHM;
+    w->gt_want_rb = true;
     return true;
 }
 
@@ -8403,6 +8985,9 @@ static int wl_open(struct nb_session *s, const struct nb_config *cfg)
     w->current = -1;
     w->last_scanout = -1;
     nb_so_init(&w->so);
+    nb_pc_init(&w->pc, nb_tier);
+    /* The read-back level reads every copy back from the start. */
+    w->gt_want_rb = nb_pc_forces_readback(&w->pc);
     /* 0 is a valid button index, so "none" has to be spelled -1 explicitly:
      * a calloc'd struct would otherwise open with the close button drawn as
      * hovered AND held. */
@@ -8474,60 +9059,50 @@ static int wl_open(struct nb_session *s, const struct nb_config *cfg)
                "keyboard, NO pointer and NO grab. Display only.");
     }
     /*
-     * THE SHM TIER NEEDS NONE OF THIS, and demanding it broke the tier
-     * outright.  --present-mode shm refuses dma-buf on purpose so that shared
-     * memory is the only thing left; the format list is then empty BY DESIGN.
-     * These three checks read that deliberate state as a broken compositor and
-     * killed the broker on startup -- MEASURED: "the compositor advertised no
-     * dma-buf formats at all", on a compositor advertising plenty.
-     *
-     * What shm actually requires is wl_shm, which is a core global no
-     * compositor may omit -- that being the whole reason it is the last rung.
+     * WHAT THE COMPOSITOR TAKES.  The read-back level (and --present-mode
+     * shm, which advertises no dma-buf on purpose) needs only wl_shm; every
+     * other level needs zwp_linux_dmabuf_v1 version 2+ and at least one pair
+     * a guest frame can have.  "Advertised nothing" and "advertised nothing
+     * this mode can use" are told apart: the first is the compositor, the
+     * second is the format filter or --present-mode=linear.
      */
-    if (nb_tier == NB_TIER_SHM) {
-        if (!w->shm) {
-            nb_err("--present-mode shm needs wl_shm, and this compositor "
-                   "offers none.  wl_shm is core Wayland; a compositor without "
-                   "it has no tier left to fall back to.");
-            goto fail;
-        }
-    } else {
-        /*
-         * else-if, not three independent ifs: once one of these has decided
-         * to DESCEND (rather than fail), nb_tier is already NB_TIER_SHM and
-         * w->dmabuf/w->dmabuf_ver/w->formats describe a dma-buf path we are
-         * no longer taking -- falling through into the next check would read
-         * them anyway and could bounce a second, spurious failure off
-         * wl_dmabuf_unusable_auto_fallback() now that nb_tier is no longer
-         * NB_TIER_AUTO.
-         */
+    if (!w->shm && nb_pc_forces_readback(&w->pc)) {
+        nb_err("--present-mode=%s needs wl_shm, and this compositor offers "
+               "none.  wl_shm is core Wayland; without it nothing can be "
+               "shown.", nb_pm_name(w->pc.mode));
+        goto fail;
+    }
+    if (!nb_pc_forces_readback(&w->pc)) {
+        char why[200] = "";
+
         if (!w->dmabuf) {
-            if (!wl_dmabuf_unusable_auto_fallback(w,
-                    "this compositor does not implement zwp_linux_dmabuf_v1")) {
-                nb_err("this compositor does not implement zwp_linux_dmabuf_v1, so "
-                       "it cannot take the guest's buffer without a copy.  Retry "
-                       "with --present-mode shm, which needs no dma-buf at all.");
-                goto fail;
-            }
+            snprintf(why, sizeof(why), "this compositor does not implement "
+                     "zwp_linux_dmabuf_v1");
         } else if (w->dmabuf_ver < 2) {
-            if (!wl_dmabuf_unusable_auto_fallback(w,
-                    "zwp_linux_dmabuf_v1 is present but below version 2, "
-                    "which has no create_immed")) {
-                nb_err("zwp_linux_dmabuf_v1 version %u has no create_immed; version "
-                       "2 or later is required (universally available since 2016)",
-                       w->dmabuf_ver);
-                goto fail;
-            }
+            snprintf(why, sizeof(why), "zwp_linux_dmabuf_v1 version %u has "
+                     "no create_immed (version 2+ is needed)", w->dmabuf_ver);
+        } else if (w->formats.n == 0 && w->n_adv_raw == 0) {
+            snprintf(why, sizeof(why), "the compositor advertised no dma-buf "
+                     "formats");
         } else if (w->formats.n == 0) {
-            if (!wl_dmabuf_unusable_auto_fallback(w,
-                    "the compositor advertised no dma-buf formats at all")) {
-                nb_err("the compositor advertised no dma-buf formats at all — "
-                       "nothing could be validated against, so every frame would "
-                       "be rejected");
+            snprintf(why, sizeof(why), "the compositor advertised %u dma-buf "
+                     "(format, modifier) pairs, none of them XRGB/ARGB 8888%s",
+                     w->n_adv_raw,
+                     nb_tier == NB_TIER_LINEAR || nb_linear_only
+                         ? " with the LINEAR modifier (--present-mode=linear)"
+                         : "");
+        }
+        if (why[0]) {
+            if (!wl_dmabuf_unusable(w, why)) {
+                nb_err("%s, so the guest's buffer cannot be shown as it is "
+                       "(--present-mode=%s).  --present-mode=auto or readback "
+                       "reads frames back into shared memory instead.", why,
+                       nb_pm_name(w->pc.mode));
                 goto fail;
             }
         }
     }
+    wl_pc_report(w);
 
     /* The window. */
     w->scale_120 = 120;         /* until the compositor says otherwise */
@@ -8607,7 +9182,6 @@ static int wl_open(struct nb_session *s, const struct nb_config *cfg)
                  * windowed.  An overlay bar would forfeit that for chrome.
                  */
                 wl_subsurface_set_position(w->tb_sub, 0, -NB_TB_H);
-                wl_subsurface_place_above(w->tb_sub, w->surf);
                 wl_subsurface_set_desync(w->tb_sub);
                 nb_log("drawing a client-side title bar (%d px): this "
                        "compositor offers no server-side decorations",
@@ -8670,7 +9244,8 @@ static int wl_open(struct nb_session *s, const struct nb_config *cfg)
                                                       w->cs_surf);
             }
             if (w->cs_sub) {
-                wl_subsurface_place_above(w->cs_sub, w->surf);
+                /* The first subsurface that overlaps the picture area:
+                 * everything made later is stacked above it. */
                 wl_subsurface_set_desync(w->cs_sub);
             }
             w->cs_at_x = w->cs_at_y = INT32_MIN;
@@ -8703,7 +9278,7 @@ static int wl_open(struct nb_session *s, const struct nb_config *cfg)
     w->wnd_w = w->win_w;            /* what unfullscreen returns to, until a
                                      * windowed configure says otherwise */
     w->wnd_h = w->win_h;
-    wl_surface_commit(w->surf);
+    wl_surf_commit(w, w->surf);
     wl_display_roundtrip(w->dpy);   /* configure, and the decoration mode */
 
     s->width = (uint32_t)w->surf_w;
@@ -8846,6 +9421,7 @@ struct nb_session *nb_session_wayland(const struct nb_config *cfg)
     w->fetch_pfd = -1;
     w->latch_tfd = -1;
     w->latch_pfd = -1;
+    w->xs_pfd = -1;
     nb_latch_init(&w->latch);
     {
         const char *fl = getenv("CONDUIT_VIEWER_FRAMELOG");

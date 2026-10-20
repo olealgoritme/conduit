@@ -39,10 +39,11 @@ static inline enum nb_att nb_att_decide(bool advertised, int proven,
 }
 
 /*
- * Whether the GPU copy may be offered at all: a dma-buf path that is not
- * deliberately restricted (--present-mode=linear makes the VMM detile;
- * shm advertises no dma-buf), a scaler that is enabled and has not failed,
- * and a viewport to place its output with.
+ * Whether the GPU copy may be offered at all: a mode that copies
+ * (--present-mode=linear makes the VMM detile instead), a GPU pass that is
+ * enabled and has not failed, a viewport to place its output with, and a way
+ * to hand the copy over (zwp_linux_dmabuf_v1, or wl_shm at the read-back
+ * level).
  */
 static inline bool nb_copy_allowed(bool tier_native_or_auto, bool gs_enabled,
                                    bool gs_dead, bool have_viewport,

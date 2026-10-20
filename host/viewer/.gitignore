@@ -21,3 +21,4 @@ test-gpusel
 test-scanout
 test-vmpause
 build_id.h
+test-present

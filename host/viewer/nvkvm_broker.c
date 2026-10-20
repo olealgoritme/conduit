@@ -67,6 +67,7 @@
 
 #include "nvkvm_broker.h"
 #include "nb_gpusel.h"
+#include "nb_present.h"
 
 /*
  * The filesystem magic of the anonymous inode every dma-buf lives on.  This is
@@ -3276,17 +3277,29 @@ static void usage(void)
 "                                own size and the viewer scales it\n"
 "                         WxH    always suggest this size\n"
 "                       Use --scale to choose how a mismatch is fitted.\n"
-"  --present-mode=MODE  which presentation tier to offer.  The tiers are a\n"
-"                       fallback ladder, cheapest first:\n"
-"                         auto    the guest's own modifier if the\n"
-"                                 display takes it, else a LINEAR dma-buf, else\n"
-"                                 shared memory\n"
-"                         native  (default here) zero-copy or nothing\n"
-"                         linear  advertise only LINEAR, forcing the VMM to\n"
-"                                 detile.  Reproduces a cross-vendor host on a\n"
-"                                 single-GPU one.  Costs one GPU transfer\n"
-"                         shm     no dma-buf at all: plain shared memory, which\n"
-"                                 no compositor can refuse.  Slowest, universal\n"
+"  --present-mode=MODE  how a guest frame reaches the display (also\n"
+"                       CONDUIT_VIEWER_PRESENT, which overrides this flag).\n"
+"                       Three levels, cheapest first: zero-copy (the guest's\n"
+"                       buffer itself), gpu-copy (the viewer's GPU pass draws\n"
+"                       it into a buffer of its own in a layout the display\n"
+"                       lists), readback (the same pass read back into shared\n"
+"                       memory, which every display takes):\n"
+"                         auto      zero-copy, then gpu-copy, then readback;\n"
+"                                   a level is left on a hard failure (an\n"
+"                                   import or buffer refused, no dma-buf\n"
+"                                   protocol, no layout fits), with one log line\n"
+"                         native    (default here; `conduit view` passes auto)\n"
+"                                   zero-copy; a format the display does not\n"
+"                                   take is copied frame by frame\n"
+"                         copy      gpu-copy, then readback\n"
+"                         readback  readback only\n"
+"                         linear    advertise only LINEAR, forcing the VMM to\n"
+"                                   detile; no copy\n"
+"                         shm       advertise no dma-buf: shared-memory frames\n"
+"                                   as they are, dma-buf frames read back\n"
+"  --explicit-sync=on|off  wp_linux_drm_syncobj_v1 on the window's dma-buf\n"
+"                       commits when the compositor offers it (default on;\n"
+"                       also CONDUIT_VIEWER_EXPLICIT_SYNC=0)\n"
 "  --linear-only        deprecated alias for --present-mode=linear\n"
 "Conduit display options (Wayland backend):\n"
 "  --sync=MODE          when a frame reaches the screen (saved per VM with\n"
@@ -3562,6 +3575,11 @@ int main(int argc, char **argv)
     cfg.overlay_mode = NB_OVERLAY_WINDOWED;
     cfg.sync = -1;
     {
+        const char *e = getenv("CONDUIT_VIEWER_EXPLICIT_SYNC");
+
+        cfg.explicit_sync = !(e && (!strcmp(e, "0") || !strcmp(e, "off")));
+    }
+    {
         /* CONDUIT_VIEWER_SYNC: the --sync mode, for a viewer started by
          * `conduit view` or a unit; a --sync flag still wins. */
         const char *e = getenv("CONDUIT_VIEWER_SYNC");
@@ -3655,17 +3673,15 @@ int main(int argc, char **argv)
         }
         else if (!strcmp(a, "--linear-only")) { nb_linear_only = 1; }
         else if (!strncmp(a, "--present-mode=", 15)) {
-            const char *mode = a + 15;
-            if      (!strcmp(mode, "auto"))   { nb_tier = NB_TIER_AUTO;   }
-            else if (!strcmp(mode, "native")) { nb_tier = NB_TIER_NATIVE; }
-            else if (!strcmp(mode, "linear")) { nb_tier = NB_TIER_LINEAR; }
-            else if (!strcmp(mode, "shm"))    { nb_tier = NB_TIER_SHM;    }
-            else {
-                nb_err("--present-mode must be auto, native, linear or shm");
+            if (nb_pm_parse(a + 15, &nb_tier) != 0) {
+                nb_err("--present-mode must be auto, native, copy, readback, "
+                       "linear or shm");
                 return 2;
             }
         }
         else if (!strcmp(a, "--trace-frames")) { nb_trace_frames = 1; }
+        else if (!strcmp(a, "--explicit-sync=on"))  { cfg.explicit_sync = true; }
+        else if (!strcmp(a, "--explicit-sync=off")) { cfg.explicit_sync = false; }
         else if (!strncmp(a, "--gpu-scale=", 12)) {
             if (!strcmp(a + 12, "auto"))     { cfg.gpu_scale = NB_GS_AUTO; }
             else if (!strcmp(a + 12, "off")) { cfg.gpu_scale = NB_GS_OFF; }
@@ -3864,6 +3880,29 @@ int main(int argc, char **argv)
         }
         cfg.render_node = gpu_path[0] ? gpu_path : NULL;
         nb_log("viewer GPU: %s", cfg.gpu_why);
+    }
+    /*
+     * CONDUIT_VIEWER_PRESENT: the present mode, over --present-mode.  The
+     * environment wins here (unlike CONDUIT_VIEWER_SYNC) because it is the
+     * user's override for one viewer -- a compositor that takes the guest's
+     * buffers and shows nothing needs `copy` whatever the launcher passed.
+     */
+    {
+        const char *e = getenv("CONDUIT_VIEWER_PRESENT");
+        int pm;
+
+        if (e && *e) {
+            if (nb_pm_parse(e, &pm) != 0) {
+                nb_err("CONDUIT_VIEWER_PRESENT=%s: not auto, native, copy, "
+                       "readback, linear or shm (ignored)", e);
+            } else {
+                if (pm != nb_tier) {
+                    nb_log("present: CONDUIT_VIEWER_PRESENT=%s overrides "
+                           "--present-mode=%s", e, nb_pm_name(nb_tier));
+                }
+                nb_tier = pm;
+            }
+        }
     }
     /* --socket is no longer the only way to get a listening socket; the check
      * that matters happens once activation has had its say, below. */

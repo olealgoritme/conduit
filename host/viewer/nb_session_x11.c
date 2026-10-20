@@ -72,8 +72,13 @@ struct nb_session *nb_session_x11(const struct nb_config *cfg)
 #ifdef NB_HAVE_XCB_XINPUT
 #include <xcb/xinput.h>
 #endif
+#ifdef NB_HAVE_XCB_SHM
+#include <xcb/shm.h>
+#endif
 #include "nb_ui.h"
 #include "nb_relacc.h"
+#include "nb_gpuscale.h"
+#include "nb_present.h"
 #include "nb_vmpause.h"
 
 #define NB_DRM_FORMAT_MOD_INVALID  0x00ffffffffffffffULL
@@ -94,6 +99,10 @@ struct nb_x11_buf {
     /* SHM tier: no pixmap at all, just a mapping we blit from. */
     void        *map;
     size_t       map_len;
+    /* GPU copy (nb_present.h): no pixmap either; the GPU pass reads the
+     * dma-buf (fd, a dup we own) into a buffer of the viewer's own. */
+    bool         copy;
+    int          fd;
 };
 
 struct nb_x11 {
@@ -149,6 +158,49 @@ struct nb_x11 {
 
     struct nb_formats formats;
     struct nb_x11_buf bufs[NB_MAX_BUFS];
+
+    /*
+     * THE PRESENT LEVEL (nb_present.h), the same cascade as on Wayland:
+     *   zero-copy  the guest's dma-buf as a DRI3 pixmap, Present 1:1 or one
+     *              XRender composite when scaled;
+     *   gpu-copy   the GPU pass (nb_gpuscale.h) draws the picture at the
+     *              content window's size into a buffer of the viewer's own,
+     *              in a modifier DRI3 lists, presented as a pixmap;
+     *   readback   the same pass read back and put with MIT-SHM (PutImage
+     *              without it) -- no DRI3 or Present needed.
+     * dri3: DRI3 and Present are in use (false on a server without them).
+     */
+    struct nb_pc      pc;
+    bool              dri3;
+    struct nb_gs     *gs;
+    bool              gs_dead;
+    struct { uint32_t fourcc; uint64_t mod; bool ok; } copy_v[8];
+    unsigned          copy_n;
+    bool              copy_told, noimport_told;
+    struct {
+        xcb_pixmap_t  pix;
+        bool          busy;             /* Present still reads it        */
+    } gt[NB_GS_TARGETS];
+    uint32_t          gt_w, gt_h;
+    bool              gt_rb;            /* targets are read back          */
+    bool              gt_want_rb;       /* the server refused the copy's
+                                         * pixmaps: read back from now   */
+    int               gt_last;
+    bool              copy_owed;        /* a frame was skipped: ask for it
+                                         * again when a buffer frees up   */
+    xcb_gcontext_t    copy_gc;
+    /* Read-back: two frames of w*h*4, in a MIT-SHM segment when it works. */
+    uint8_t          *rb_mem;
+    size_t            rb_one;
+    bool              rb_busy[2];       /* the server has not read it yet */
+    int               rb_next;
+#ifdef NB_HAVE_XCB_SHM
+    xcb_shm_seg_t     rb_seg;
+    uint8_t           shm_event;        /* first event of MIT-SHM, 0 none */
+    bool              shm_tried, shm_ok;
+#endif
+    unsigned          st_gpu_n, st_gpu_max;
+    uint64_t          st_gpu_sum;
     uint64_t tick;
     int      pending, current;
     uint32_t serial;
@@ -391,7 +443,107 @@ static void x11_buf_free(struct nb_x11 *x, int i)
     if (x->bufs[i].map) {
         munmap(x->bufs[i].map, x->bufs[i].map_len);
     }
+    if (x->bufs[i].copy) {
+        nb_gs_src_drop(x->gs, i);   /* the GPU's import of it */
+        close(x->bufs[i].fd);
+    }
     memset(&x->bufs[i], 0, sizeof(x->bufs[i]));
+}
+
+/* ── the present level (nb_present.h) ───────────────────────────────────── */
+
+static void x11_pc_report(struct nb_x11 *x)
+{
+    if (nb_pc_take_change(&x->pc)) {
+        nb_log("present: %s (--present-mode=%s): %s", nb_pl_name(x->pc.level),
+               nb_pm_name(x->pc.mode), x->pc.why);
+    }
+}
+
+/* A hard failure at `at`: one level down when the mode allows it, and the
+ * current frame again, at the new level. */
+static void x11_pc_fail(struct nb_x11 *x, enum nb_pl at, const char *why)
+{
+    if (nb_pc_fail(&x->pc, at, "%s", why)) {
+        x->gt_w = 0;                /* new targets at the next frame */
+        x11_pc_report(x);
+        if (x->sink) {
+            nb_sink_refresh(x->sink);
+        }
+    }
+}
+
+/*
+ * ops->copy_ok: can the GPU pass show this pair?  The pass is opened on the
+ * first question (it dlopen()s EGL/GBM), on --gpu's render node or the first
+ * one that imports the pair; the verdict is cached per pair.
+ */
+static bool x11_copy_ok(struct nb_session *s, uint32_t fourcc, uint64_t mod)
+{
+    struct nb_x11 *x = s->priv;
+    char why[200] = "";
+    bool ok;
+
+    if (!nb_pc_copy_allowed(&x->pc) || nb_linear_only || x->gs_dead) {
+        return false;
+    }
+    for (unsigned i = 0; i < x->copy_n; i++) {
+        if (x->copy_v[i].fourcc == fourcc && x->copy_v[i].mod == mod) {
+            return x->copy_v[i].ok;
+        }
+    }
+    if (!x->gs) {
+        const char *node = x->cfg ? x->cfg->render_node : NULL;
+
+        x->gs = nb_gs_open(node, 0, fourcc, mod, why, sizeof(why));
+        if (!x->gs && node) {
+            nb_err("viewer GPU: %s (--gpu / viewer.gpu); trying the others",
+                   why);
+            x->gs = nb_gs_open(NULL, 0, fourcc, mod, why, sizeof(why));
+        }
+        if (x->gs) {
+            nb_log("GPU copy: ready on %s", nb_gs_node(x->gs));
+        }
+    }
+    ok = x->gs && nb_gs_can_import(x->gs, fourcc, mod);
+    nb_log("GPU copy: %.4s modifier 0x%016llx %s", (const char *)&fourcc,
+           (unsigned long long)mod,
+           ok ? "can be copied by the viewer's GPU pass"
+              : why[0] ? why : "cannot be imported by the viewer's GPU");
+    if (x->copy_n < sizeof(x->copy_v) / sizeof(x->copy_v[0])) {
+        x->copy_v[x->copy_n].fourcc = fourcc;
+        x->copy_v[x->copy_n].mod = mod;
+        x->copy_v[x->copy_n].ok = ok;
+        x->copy_n++;
+    }
+    return ok;
+}
+
+/*
+ * Whether this dma-buf frame goes through the GPU pass: always at the
+ * gpu-copy and readback levels (when the GPU imports it), and at zero-copy
+ * for a pair the X server does not take (the ATTACH validator let it in only
+ * because the copy can show it).
+ */
+static bool x11_wants_copy(struct nb_x11 *x, const struct nb_buf_desc *d)
+{
+    if (d->is_shm) {
+        return false;
+    }
+    if (nb_pc_forces_copy(&x->pc)) {
+        if (x11_copy_ok(x->sess, d->fourcc, d->modifier)) {
+            return true;
+        }
+        if (!x->noimport_told) {
+            x->noimport_told = true;
+            nb_err("present: level %s, but the viewer's GPU cannot import "
+                   "%.4s modifier 0x%016llx; showing those frames zero-copy",
+                   nb_pl_name(x->pc.level), (const char *)&d->fourcc,
+                   (unsigned long long)d->modifier);
+        }
+        return false;
+    }
+    return !x11_format_ok(x->sess, d->fourcc, d->modifier);
 }
 
 static int x11_attach(struct nb_session *s, const struct nb_buf_desc *d)
@@ -402,6 +554,7 @@ static int x11_attach(struct nb_session *s, const struct nb_buf_desc *d)
     xcb_generic_error_t *err;
     int i, victim = -1, dupfd;
     uint64_t oldest = UINT64_MAX;
+    bool copy;
 
     x->tick++;
     /*
@@ -453,13 +606,14 @@ static int x11_attach(struct nb_session *s, const struct nb_buf_desc *d)
         x->pending = i;
         return 0;
     }
+    copy = x11_wants_copy(x, d);
     for (i = 0; i < NB_MAX_BUFS; i++) {
         struct nb_x11_buf *sl = &x->bufs[i];
 
         if (sl->valid && sl->id == d->id && sl->w == d->width &&
             sl->h == d->height && sl->stride == d->stride &&
             sl->offset == d->offset && sl->fourcc == d->fourcc &&
-            sl->modifier == d->modifier) {
+            sl->modifier == d->modifier && sl->copy == copy && !sl->map) {
             sl->used = x->tick;
             x->pending = i;
             return 0;
@@ -480,6 +634,39 @@ static int x11_attach(struct nb_session *s, const struct nb_buf_desc *d)
     }
     if (victim < 0) {
         return -ENOSPC;
+    }
+    if (!copy && !x->dri3) {
+        /* Never a DRI3 request to a server without it: xcb closes the whole
+         * connection over one.  (The validator lets no such frame in.) */
+        return -EINVAL;
+    }
+    /* A copy needs nothing from the X server: the GPU pass reads the
+     * dma-buf at the commit. */
+    if (copy) {
+        dupfd = fcntl(d->fd, F_DUPFD_CLOEXEC, 3);
+        if (dupfd < 0) {
+            return -errno;
+        }
+        if (!x->copy_told) {
+            x->copy_told = true;
+            nb_log("picture: %.4s modifier 0x%016llx frames are copied by the "
+                   "GPU pass (%s)", (const char *)&d->fourcc,
+                   (unsigned long long)d->modifier,
+                   nb_pc_forces_copy(&x->pc)
+                       ? (nb_pc_forces_readback(&x->pc)
+                              ? "present level readback"
+                              : "present level gpu-copy")
+                       : "the X server does not take this layout");
+        }
+        x11_buf_free(x, victim);
+        x->bufs[victim] = (struct nb_x11_buf){
+            .valid = true, .id = d->id, .w = d->width, .h = d->height,
+            .stride = d->stride, .offset = d->offset, .fourcc = d->fourcc,
+            .modifier = d->modifier, .used = x->tick, .copy = true,
+            .fd = dupfd,
+        };
+        x->pending = victim;
+        return 0;
     }
 
     /*
@@ -601,6 +788,8 @@ static int x11_attach(struct nb_session *s, const struct nb_buf_desc *d)
         nb_err("DRI3 pixmap import refused: X error %u (major %u minor %u)",
                err->error_code, err->major_code, err->minor_code);
         free(err);
+        x11_pc_fail(x, NB_PL_ZC, "the X server refused to import the guest's "
+                    "buffer");
         return -EINVAL;
     }
 
@@ -807,7 +996,7 @@ static void x11_stats_flush(struct nb_x11 *x)
     if (now - x->st_t0 < 1000) {
         return;
     }
-    if (x->st_commits || x->st_flip || x->st_copy) {
+    if (x->st_commits || x->st_flip || x->st_copy || x->st_gpu_n) {
         double secs = (double)(now - x->st_t0) / 1e3;
         unsigned shown = x->st_flip + x->st_copy + x->st_comp;
         char blk[300] = "";
@@ -818,16 +1007,25 @@ static void x11_stats_flush(struct nb_x11 *x)
             x11_scanout_blockers(x, why, sizeof(why));
             snprintf(blk, sizeof(blk), " | composited, blockers: %s", why);
         }
+        char gpu[96] = "";
+
+        if (x->st_gpu_n) {
+            snprintf(gpu, sizeof(gpu), " | GPU pass avg %.0fus max %uus",
+                     (double)x->st_gpu_sum / x->st_gpu_n, x->st_gpu_max);
+        }
         nb_log("stats: commit %.1f fps (%u direct scanout, %.0f%%) | Present "
-               "FLIP %u, COPY %u, XRender composites %u | path: %s, %s%s",
+               "FLIP %u, COPY %u, XRender composites %u | path: %s, %s%s%s",
                x->st_commits / secs, x->st_flip,
                shown ? 100.0 * x->st_flip / shown : 0.0, x->st_flip,
                x->st_copy, x->st_comp,
-               x->st_comp ? "scaled by XRender" : "Present 1:1, zero-copy",
-               x->imm ? "immediate" : "vsync", blk);
+               x->st_gpu_n ? (x->gt_rb ? "readback" : "gpu-copy")
+               : x->st_comp ? "scaled by XRender" : "Present 1:1, zero-copy",
+               x->imm ? "immediate" : "vsync", gpu, blk);
     }
     x->st_t0 = now;
     x->st_commits = x->st_flip = x->st_copy = x->st_comp = 0;
+    x->st_gpu_n = x->st_gpu_max = 0;
+    x->st_gpu_sum = 0;
 }
 
 /*
@@ -864,6 +1062,341 @@ static int x11_draw(struct nb_x11 *x, struct nb_x11_buf *sl)
     return 0;
 }
 
+/* ── the GPU copy and the read-back (nb_present.h) ───────────────────────── */
+
+static bool x11_fmt_ok(void *ctx, uint32_t fourcc, uint64_t mod)
+{
+    struct nb_x11 *x = ctx;
+
+    return nb_formats_has(&x->formats, fourcc, mod);
+}
+
+static void x11_gt_drop(struct nb_x11 *x)
+{
+    for (int i = 0; i < NB_GS_TARGETS; i++) {
+        if (x->gt[i].pix) {
+            xcb_free_pixmap(x->c, x->gt[i].pix);
+        }
+        x->gt[i].pix = 0;
+        x->gt[i].busy = false;
+    }
+#ifdef NB_HAVE_XCB_SHM
+    if (x->rb_seg) {
+        xcb_shm_detach(x->c, x->rb_seg);
+        x->rb_seg = 0;
+    }
+    x->shm_ok = false;
+#endif
+    if (x->rb_mem) {
+        munmap(x->rb_mem, x->rb_one * 2);
+        x->rb_mem = NULL;
+    }
+    x->rb_one = 0;
+    x->rb_busy[0] = x->rb_busy[1] = false;
+    x->gt_w = x->gt_h = 0;
+    x->gt_rb = false;
+}
+
+static void x11_gs_disable(struct nb_x11 *x, const char *why)
+{
+    x->gs_dead = true;
+    nb_err("GPU copy: off for this session: %s; frames the X server takes as "
+           "they are are shown zero-copy now", why);
+    if (x->sink) {
+        nb_sink_refresh(x->sink);
+    }
+}
+
+/*
+ * Two frames of read-back memory in one memfd, handed to the X server as a
+ * MIT-SHM segment when it takes one (then PutImage carries no pixels, the
+ * server reads them from the segment), else plain memory for core PutImage.
+ */
+static bool x11_rb_make(struct nb_x11 *x, uint32_t w, uint32_t h)
+{
+    size_t one = (size_t)w * h * 4;
+    int fd = memfd_create("conduit-viewer-readback", MFD_CLOEXEC);
+    void *m;
+
+    if (fd < 0) {
+        return false;
+    }
+    if (ftruncate(fd, (off_t)(one * 2)) < 0) {
+        close(fd);
+        return false;
+    }
+    m = mmap(NULL, one * 2, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (m == MAP_FAILED) {
+        close(fd);
+        return false;
+    }
+    x->rb_mem = m;
+    x->rb_one = one;
+#ifdef NB_HAVE_XCB_SHM
+    if (x->shm_event) {
+        int fd2 = fcntl(fd, F_DUPFD_CLOEXEC, 3);   /* xcb owns what it sends */
+        xcb_generic_error_t *err = NULL;
+
+        if (fd2 >= 0) {
+            x->rb_seg = xcb_generate_id(x->c);
+            err = xcb_request_check(x->c, xcb_shm_attach_fd_checked(
+                                              x->c, x->rb_seg, fd2, 1));
+            x->shm_ok = !err;
+            if (err) {
+                x->rb_seg = 0;
+                free(err);
+            }
+        }
+        if (!x->shm_ok && !x->shm_tried) {
+            nb_log("read-back: the X server refused the MIT-SHM segment; the "
+                   "pixels go in PutImage requests");
+        }
+        x->shm_tried = true;
+    }
+#endif
+    close(fd);
+    return true;
+}
+
+/* A pixmap of one of the GPU copy's buffers.  0 when the server refuses. */
+static xcb_pixmap_t x11_gt_pixmap(struct nb_x11 *x,
+                                  const struct nb_gs_target *t)
+{
+    xcb_pixmap_t pix = xcb_generate_id(x->c);
+    int fd = fcntl(t->fd, F_DUPFD_CLOEXEC, 3);     /* xcb owns what it sends */
+    xcb_void_cookie_t ck;
+    xcb_generic_error_t *err;
+
+    if (fd < 0) {
+        return 0;
+    }
+    if (t->modifier == NB_DRM_FORMAT_MOD_INVALID) {
+        ck = xcb_dri3_pixmap_from_buffer_checked(
+                 x->c, pix, x->content, t->stride * t->h, (uint16_t)t->w,
+                 (uint16_t)t->h, (uint16_t)t->stride, 24, 32, fd);
+    } else {
+        int32_t fds[1] = { fd };
+
+        ck = xcb_dri3_pixmap_from_buffers_checked(
+                 x->c, pix, x->content, 1, (uint16_t)t->w, (uint16_t)t->h,
+                 t->stride, t->offset, 0, 0, 0, 0, 0, 0, 24, 32, t->modifier,
+                 fds);
+    }
+    err = xcb_request_check(x->c, ck);
+    if (err) {
+        free(err);
+        return 0;
+    }
+    return pix;
+}
+
+/*
+ * The targets at w x h: pixmaps of the GPU copy's own buffers (gpu-copy), or
+ * read-back renderbuffers and memory (readback, or when the X server takes
+ * none of the copy's buffers).  false: the GPU pass is unusable.
+ */
+static bool x11_gt_ready(struct nb_x11 *x, uint32_t w, uint32_t h)
+{
+    bool want_rb = nb_pc_forces_readback(&x->pc) || !x->dri3 ||
+                   x->gt_want_rb;
+    struct nb_gs_target tg[NB_GS_TARGETS];
+    char why[200] = "";
+
+    if (x->gt_w == w && x->gt_h == h && (x->gt_rb || !want_rb)) {
+        return true;
+    }
+    x11_gt_drop(x);
+    if (!want_rb) {
+        struct nb_so_fmts v3;
+        struct nb_pc_cand cand;
+        int i;
+
+        memset(&v3, 0, sizeof(v3));
+        for (unsigned k = 0; k < x->formats.n; k++) {
+            nb_so_fmts_add(&v3, x->formats.e[k].fourcc,
+                           x->formats.e[k].modifier);
+        }
+        nb_pc_targets(NULL, false, NULL, false, &v3, &cand);
+        if (nb_gs_targets(x->gs, w, h, x11_fmt_ok, x, cand.fourcc, cand.mod,
+                          cand.n, tg, why, sizeof(why)) == NB_GS_TARGETS) {
+            for (i = 0; i < NB_GS_TARGETS; i++) {
+                x->gt[i].pix = x11_gt_pixmap(x, &tg[i]);
+                if (!x->gt[i].pix) {
+                    break;
+                }
+            }
+            if (i == NB_GS_TARGETS) {
+                x->gt_w = w;
+                x->gt_h = h;
+                nb_log("GPU copy: %ux%u %.4s modifier 0x%016llx pixmaps on %s",
+                       w, h, (const char *)&tg[0].fourcc,
+                       (unsigned long long)tg[0].modifier, nb_gs_node(x->gs));
+                return true;
+            }
+            x11_gt_drop(x);
+            snprintf(why, sizeof(why), "the X server refused the GPU copy's "
+                     "buffers");
+            x->gt_want_rb = true;
+            x11_pc_fail(x, NB_PL_COPY, why);
+        }
+    }
+    {
+        char why2[200] = "";
+
+        if (nb_gs_targets_readback(x->gs, w, h, why2, sizeof(why2)) !=
+                NB_GS_TARGETS || !x11_rb_make(x, w, h)) {
+            x11_gt_drop(x);
+            x11_gs_disable(x, why2[0] ? why2 : "no read-back buffers");
+            return false;
+        }
+        x->gt_w = w;
+        x->gt_h = h;
+        x->gt_rb = true;
+        nb_log("read-back: %ux%u on %s, put with %s%s%s%s", w, h,
+               nb_gs_node(x->gs),
+#ifdef NB_HAVE_XCB_SHM
+               x->shm_ok ? "MIT-SHM" : "PutImage",
+#else
+               "PutImage",
+#endif
+               why[0] ? " (" : "", why, why[0] ? ")" : "");
+    }
+    return true;
+}
+
+/*
+ * One copied frame: the GPU pass draws the visible picture at the content
+ * window's size, then it is presented (gpu-copy) or read back and put
+ * (readback).  The pass is waited for, so the guest's buffer is free again
+ * as soon as this returns.
+ */
+static int x11_copy_present(struct nb_x11 *x, struct nb_sink *sink)
+{
+    int slot = x->pending;
+    struct nb_x11_buf *sl = &x->bufs[slot];
+    const struct nb_place *p = &x->place;
+    struct nb_gs_draw d;
+    unsigned gpu_us = 0;
+    uint32_t tw, th;
+    int t = -1;
+
+    x11_place(x, (int)sl->w, (int)sl->h);
+    tw = (uint32_t)(p->vis.w > 0 ? p->vis.w : 1);
+    th = (uint32_t)(p->vis.h > 0 ? p->vis.h : 1);
+    x->pending = -1;
+    if (!x->gs || x->gs_dead || !x11_gt_ready(x, tw, th)) {
+        nb_sink_release(sink, sl->id, 0);
+        nb_sink_frame(sink);
+        return 0;
+    }
+    if (x->gt_rb) {
+        t = (x->gt_last + 1) % NB_GS_TARGETS;
+    } else {
+        for (int k = 1; k <= NB_GS_TARGETS; k++) {
+            int i = (x->gt_last + k) % NB_GS_TARGETS;
+
+            if (!x->gt[i].busy) {
+                t = i;
+                break;
+            }
+        }
+    }
+    if (t < 0 || (x->gt_rb && x->rb_busy[0] && x->rb_busy[1])) {
+        /*
+         * Everything is still on screen or queued: skip this frame.  The
+         * buffer that frees up asks for it again (copy_owed), so an idle
+         * guest's last frame is not lost; without Present nothing else
+         * paces the guest, so the next frame is allowed now.
+         */
+        nb_sink_release(sink, sl->id, 0);
+        x->copy_owed = true;
+        if (!x->dri3) {
+            nb_sink_frame(sink);
+        }
+        return 0;
+    }
+    if (nb_gs_src(x->gs, slot, sl->fd, sl->w, sl->h, sl->stride, sl->offset,
+                  sl->fourcc, sl->modifier) < 0) {
+        x11_gs_disable(x, "the GPU cannot import the guest's frame");
+        nb_sink_release(sink, sl->id, 0);
+        nb_sink_frame(sink);
+        return 0;
+    }
+    d = (struct nb_gs_draw){
+        .src_key = slot, .target = t,
+        .dx = 0, .dy = 0, .dw = (int)tw, .dh = (int)th,
+        .sx = p->sw > 0 ? p->sx : 0, .sy = p->sh > 0 ? p->sy : 0,
+        .sw = p->sw > 0 ? p->sw : sl->w, .sh = p->sh > 0 ? p->sh : sl->h,
+        .nearest = x->vst.cur.filter == NB_FILTER_NEAREST,
+    };
+    if (nb_gs_draw(x->gs, &d, 50000, &gpu_us) < 0) {
+        x11_gs_disable(x, "the GPU pass failed or took over 50 ms");
+        nb_sink_release(sink, sl->id, 0);
+        nb_sink_frame(sink);
+        return 0;
+    }
+    nb_sink_release(sink, sl->id, 0);       /* the pass has read it */
+    x->gt_last = t;
+    if (!x->copy_gc) {
+        x->copy_gc = xcb_generate_id(x->c);
+        xcb_create_gc(x->c, x->copy_gc, x->content, 0, NULL);
+    }
+    if (!x->gt_rb) {
+        xcb_present_pixmap(x->c, x->content, x->gt[t].pix, ++x->serial,
+                           XCB_NONE, XCB_NONE, 0, 0, XCB_NONE, XCB_NONE,
+                           XCB_NONE, x->imm ? XCB_PRESENT_OPTION_ASYNC : 0,
+                           0, 0, 0, 0, NULL);
+        x->gt[t].busy = true;           /* until its IdleNotify */
+    } else {
+        int half = x->rb_busy[x->rb_next] ? x->rb_next ^ 1 : x->rb_next;
+        uint8_t *dst = x->rb_mem + (size_t)half * x->rb_one;
+        uint64_t r0 = nb_mono_ns();
+
+        if (nb_gs_readback(x->gs, t, dst) < 0) {
+            x11_gs_disable(x, "the read-back failed");
+            nb_sink_frame(sink);
+            return 0;
+        }
+        gpu_us += (unsigned)((nb_mono_ns() - r0) / 1000u);
+#ifdef NB_HAVE_XCB_SHM
+        if (x->shm_ok) {
+            xcb_shm_put_image(x->c, x->content, x->copy_gc, (uint16_t)tw,
+                              (uint16_t)th, 0, 0, (uint16_t)tw, (uint16_t)th,
+                              0, 0, 24, XCB_IMAGE_FORMAT_Z_PIXMAP,
+                              1 /* send ShmCompletion */, x->rb_seg,
+                              (uint32_t)((size_t)half * x->rb_one));
+            x->rb_busy[half] = true;
+        } else
+#endif
+        {
+            x11_blit(x, x->content, x->copy_gc, (const uint32_t *)dst,
+                     (int)tw, (int)th);
+            nb_sink_charge_work(sink, (uint64_t)tw * th * 4u);
+        }
+        x->rb_next = half ^ 1;
+        /* Paced on vblank when Present is there (no pixmap is presented,
+         * so ask for the next MSC); at once without it. */
+        if (x->dri3) {
+            xcb_present_notify_msc(x->c, x->content, ++x->serial, 0, 1, 0);
+        } else {
+            nb_sink_frame(sink);
+            x->last_frame_ms = x11_now_ms();
+        }
+    }
+    xcb_flush(x->c);
+    x->st_commits++;
+    x->st_gpu_n++;
+    x->st_gpu_sum += gpu_us;
+    if (gpu_us > x->st_gpu_max) {
+        x->st_gpu_max = gpu_us;
+    }
+    x11_stats_flush(x);
+    x->current = slot;
+    x->idle_shown = false;
+    x11_cursor_policy(x);
+    return 0;
+}
+
 static int x11_commit(struct nb_session *s, struct nb_sink *sink)
 {
     struct nb_x11 *x = s->priv;
@@ -890,6 +1423,12 @@ static int x11_commit(struct nb_session *s, struct nb_sink *sink)
             x->mode_ui_due = NB_UI_REDRAW |
                              (x->ui.notice[0] ? NB_UI_NOTICE : 0);
         }
+    }
+
+    /* A copied frame (nb_present.h): the GPU pass, then the pixmap or the
+     * read-back. */
+    if (sl->copy) {
+        return x11_copy_present(x, sink);
     }
 
     /*
@@ -1116,6 +1655,15 @@ static void x11_present_event(struct nb_x11 *x, struct nb_sink *sink,
                 break;
             }
         }
+        for (i = 0; i < NB_GS_TARGETS; i++) {
+            if (x->gt[i].pix && x->gt[i].pix == ie->pixmap) {
+                x->gt[i].busy = false;      /* the GPU copy may draw it */
+                if (x->copy_owed) {
+                    x->copy_owed = false;
+                    nb_sink_refresh(sink);  /* the skipped frame, again */
+                }
+            }
+        }
         break;
     }
     default:
@@ -1134,6 +1682,23 @@ static int x11_dispatch(struct nb_session *s, struct nb_sink *sink)
         return -EIO;
     }
     while ((ev = xcb_poll_for_event(x->c)) != NULL) {
+#ifdef NB_HAVE_XCB_SHM
+        /* The server has read a read-back frame from the segment. */
+        if (x->shm_event &&
+            (ev->response_type & 0x7f) == x->shm_event + XCB_SHM_COMPLETION) {
+            xcb_shm_completion_event_t *ce = (void *)ev;
+
+            if (x->rb_one && ce->shmseg == x->rb_seg) {
+                x->rb_busy[ce->offset >= x->rb_one ? 1 : 0] = false;
+                if (x->copy_owed) {
+                    x->copy_owed = false;
+                    nb_sink_refresh(sink);  /* the skipped frame, again */
+                }
+            }
+            free(ev);
+            continue;
+        }
+#endif
         switch (ev->response_type & 0x7f) {
         case XCB_FOCUS_IN:
         case XCB_FOCUS_OUT: {
@@ -2002,7 +2567,11 @@ static void x11_close(struct nb_session *s)
         for (i = 0; i < NB_MAX_BUFS; i++) {
             x11_buf_free(x, i);
         }
+        x11_gt_drop(x);
         xcb_flush(x->c);
+    }
+    if (x->gs) {
+        nb_gs_close(x->gs);
     }
     if (x->c) {
         xcb_disconnect(x->c);
@@ -2010,6 +2579,16 @@ static void x11_close(struct nb_session *s)
     free(x);
     s->priv = NULL;
     free(s);
+}
+
+/*
+ * The X server cannot take a dma-buf (no DRI3, or no Present to show one).
+ * The read-back level needs neither, so a mode that may fall that far
+ * (auto, copy, readback, shm) goes there.  true: presentation can go on.
+ */
+static bool x11_no_dmabuf(struct nb_x11 *x, const char *why)
+{
+    return nb_pc_floor(&x->pc, why);
 }
 
 static int x11_open(struct nb_session *s, const struct nb_config *cfg)
@@ -2026,6 +2605,7 @@ static int x11_open(struct nb_session *s, const struct nb_config *cfg)
     x->pending = -1;
     x->current = -1;
     x->last_mode = -1;
+    nb_pc_init(&x->pc, nb_tier);
     x->win_w = (int)cfg->win_w;
     x->win_h = (int)cfg->win_h;
 
@@ -2110,33 +2690,20 @@ static int x11_open(struct nb_session *s, const struct nb_config *cfg)
     ext = xcb_get_extension_data(x->c, &xcb_dri3_id);
     if (!ext || !ext->present) {
         /*
-         * AUTO is documented (nb_common.c) as walking guest-modifier -> LINEAR
-         * -> shm until one works, but this check used to `goto fail` no matter
-         * which tier asked -- so on a DRI3-less server AUTO never reached its
-         * own lowest, always-available rung.
-         *
-         * MEASURED on Xvfb :1 -screen 0 1920x1080x24 (headless, no DRI3):
-         *   auto (default)      -> crash-loop, 8 "no DRI3 extension" errors
-         *   --present-mode=shm  -> up, 0 DRI3 errors
-         * Same server, same missing extension; only AUTO's path to the rung
-         * that already works was missing.  An EXPLICIT --present-mode=native
-         * or =linear must still fail here -- the user asked for dma-buf
-         * specifically and cannot have it silently swapped for a copy path.
+         * No DRI3: no dma-buf reaches this server, so neither zero-copy nor
+         * the GPU copy's pixmaps.  The read-back level needs neither (the
+         * pass reads the guest's buffer on the viewer's GPU and PutImage
+         * carries the pixels), so a mode that may fall that far goes there.
+         * MEASURED on Xvfb (no DRI3): auto used to crash-loop here.  An
+         * explicit native or linear asked for dma-buf and still fails.
          */
-        if (nb_tier == NB_TIER_AUTO) {
-            nb_log("AUTO: this X server has no DRI3 extension, so it cannot "
-                   "take a dma-buf at all -- descending to the shm tier "
-                   "(shared memory + core PutImage). Expect lower performance "
-                   "than a dma-buf path; pass --present-mode=native or "
-                   "=linear to require dma-buf and fail instead of falling "
-                   "back.");
-            nb_tier = NB_TIER_SHM;
+        if (x11_no_dmabuf(x, "this X server has no DRI3 extension")) {
             goto skip_dmabuf_extensions;
         }
         nb_err("the X server has no DRI3 extension, so it cannot take a "
-               "dma-buf at all.  There is no fallback here on purpose: a copy "
-               "path would need a GL context in the privileged process, which "
-               "is what this design removes.");
+               "dma-buf at all (--present-mode=%s).  --present-mode=auto or "
+               "readback reads frames back and puts them instead.",
+               nb_pm_name(x->pc.mode));
         goto fail;
     }
     dv = xcb_dri3_query_version_reply(x->c, xcb_dri3_query_version(x->c, 1, 2),
@@ -2159,6 +2726,9 @@ static int x11_open(struct nb_session *s, const struct nb_config *cfg)
 
     ext = xcb_get_extension_data(x->c, &xcb_present_id);
     if (!ext || !ext->present) {
+        if (x11_no_dmabuf(x, "the X server has no Present extension")) {
+            goto skip_dmabuf_extensions;
+        }
         nb_err("the X server has no Present extension");
         goto fail;
     }
@@ -2171,8 +2741,23 @@ static int x11_open(struct nb_session *s, const struct nb_config *cfg)
     }
     nb_log("Present %u.%u", pv->major_version, pv->minor_version);
     free(pv);
+    x->dri3 = true;
 
 skip_dmabuf_extensions:
+#ifdef NB_HAVE_XCB_SHM
+    /* MIT-SHM 1.2 (an fd-passed segment) for the read-back level. */
+    ext = xcb_get_extension_data(x->c, &xcb_shm_id);
+    if (ext && ext->present) {
+        xcb_shm_query_version_reply_t *sv = xcb_shm_query_version_reply(
+            x->c, xcb_shm_query_version(x->c), NULL);
+
+        if (sv && (sv->major_version > 1 ||
+                   (sv->major_version == 1 && sv->minor_version >= 2))) {
+            x->shm_event = ext->first_event;
+        }
+        free(sv);
+    }
+#endif
 
     /* The toplevel: input, focus, grab, fullscreen. */
     x->win = xcb_generate_id(x->c);
@@ -2290,7 +2875,7 @@ skip_dmabuf_extensions:
      * not fail the one call.  Skipping the version *check* while still making
      * the call is therefore not a fallback, it is a delayed crash.
      */
-    if (nb_tier != NB_TIER_SHM) {
+    if (x->dri3) {
         x->present_eid = xcb_generate_id(x->c);
         xcb_present_select_input(x->c, x->present_eid, x->content,
                                  XCB_PRESENT_EVENT_MASK_COMPLETE_NOTIFY |
@@ -2326,9 +2911,9 @@ skip_dmabuf_extensions:
      * server with no DRI3 that request alone closes the connection.  The shm
      * tier advertises nothing and imports nothing, so there is nothing to ask.
      */
-    if (nb_tier == NB_TIER_SHM) {
-        nb_log("shm tier: advertising no dma-buf format (frames are shared "
-               "memory), so no modifier query is made");
+    if (!x->dri3) {
+        nb_log("no DRI3: advertising no dma-buf format, so no modifier query "
+               "is made (frames are read back, or arrive as shared memory)");
         have_mods = false;
         goto formats_done;
     }
@@ -2409,9 +2994,10 @@ formats_done:
      * accept_memfd -- which this backend never sets -- says "a memfd may stand
      * in for a dma-buf on the ordinary path", which is a test-only relaxation.
      */
-    if (nb_tier == NB_TIER_SHM) {
+    if (x->pc.bottom == NB_PL_READBACK) {
         s->accept_shm = true;
     }
+    x11_pc_report(x);
     return 0;
 
 fail:
@@ -3226,6 +3812,13 @@ static void x11_relayout(struct nb_x11 *x)
 
         if (sl->map) {
             x11_size_content(x, (int)sl->w, (int)sl->h);
+        } else if (sl->copy) {
+            /* Already given back to the guest: placed again, and the guest
+             * asked for its frame again to draw there. */
+            x11_place(x, (int)sl->w, (int)sl->h);
+            if (x->sink) {
+                nb_sink_refresh(x->sink);
+            }
         } else {
             /*
              * Re-place it.  A composite is redrawn from the pixmap (it was
@@ -3525,6 +4118,7 @@ static const struct nb_session_ops x11_ops = {
     .set_grab = x11_set_grab,
     .set_fullscreen = x11_set_fullscreen,
     .format_ok = x11_format_ok,
+    .copy_ok = x11_copy_ok,
     .attach = x11_attach,
     .commit = x11_commit,
     .resize = x11_resize,
