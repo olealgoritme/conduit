@@ -379,8 +379,11 @@ Only core mechanisms are used, so the viewer runs on any desktop:
 - **Wayland** (GNOME/Mutter, KDE/KWin, Hyprland, Sway and other wlroots
   compositors): the layers are `wl_subsurface`s (core `wl_subcompositor`) with
   `wl_shm` buffers, translucent. `wp_viewporter`, which scaling needs anyway,
-  gives them physical-pixel buffers at fractional scales. Nothing uses
-  layer-shell or a compositor-specific protocol.
+  gives them physical-pixel buffers at fractional scales. They stack in the
+  order they are created (the picture's own subsurface first, then the
+  overlay, the menu layers and the close dialog); the viewer sends no
+  `place_above`/`place_below` requests, which some compositors resolve
+  wrongly. Nothing uses layer-shell or a compositor-specific protocol.
 - **X11** (any window manager, with or without a compositor): the layers are
   child windows painted opaque with `PutImage`, so they need no ARGB visual and
   no compositor. X11 has no per-window scale, so they are drawn at 1x.

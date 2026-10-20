@@ -429,11 +429,9 @@ struct nb_wl {
      * LETTERBOX BACKGROUND.  In aspect mode the viewport destination is
      * smaller than the window in one dimension, and Wayland has no background
      * colour -- something has to actually occupy the remainder or the desktop
-     * shows through.  This is one opaque black pixel stretched by its own
-     * viewport, placed BELOW the parent surface (the protocol allows the
-     * parent as place_below's sibling), so the guest's frame stays exactly
-     * where it was: on w->surf, attached directly, still a direct-scanout
-     * candidate.  Mapped ONLY when there are bars to draw.
+     * shows through.  This was one opaque black pixel stretched by its own
+     * viewport around the main surface; it is no longer mapped (the main
+     * surface is the bars now, see cs_surf).
      */
     struct wl_surface    *bg_surf;
     struct wl_subsurface *bg_sub;
@@ -630,6 +628,18 @@ struct nb_wl {
      *   letterbox  -> the main surface is one black pixel stretched over the
      *                 window, and the guest's buffer goes on cs_surf, a
      *                 desynchronised subsurface at (off_x, off_y)
+     *
+     * SUBSURFACE STACKING: by creation order only, never by
+     * wl_subsurface.place_above/place_below.  The protocol puts a new
+     * subsurface on top of its parent and of every sibling made before it,
+     * which is exactly the order wanted here: cs_surf first, then the
+     * overlay, the UI layers and the close dialog as they are first needed.
+     * Restacking requests are where compositors differ: one in wide use
+     * matches the sibling a placement names against the wrong list, so every
+     * placement lands at the bottom of the stack -- with the resize borders
+     * placed below the parent first, the picture and the overlay ended up
+     * under the opaque black main surface and the window was black.  Creation
+     * order needs no request at all, so there is nothing to get wrong.
      */
     struct wl_surface    *cs_surf;
     struct wl_subsurface *cs_sub;
@@ -864,6 +874,7 @@ static int  wl_tick_ui(struct nb_wl *w, int next);
 static void wl_menu_set(struct nb_wl *w, bool open);
 static void wl_rehint(struct nb_wl *w);
 static void wl_ed_show(struct nb_wl *w, bool on);
+static void wl_ed_build(struct nb_wl *w);
 static void wl_hypr_sync(struct nb_wl *w);
 static bool wl_async_wanted(const struct nb_wl *w);
 static void wl_sync_changed(struct nb_wl *w, const char *why);
@@ -3989,8 +4000,7 @@ __attribute__((unused)) static void bg_build(struct nb_wl *w)
     if (!w->bg_sub) {
         return;
     }
-    /* Below the parent, so the guest's frame stays the topmost thing. */
-    wl_subsurface_place_below(w->bg_sub, w->surf);
+    /* No restacking request (see SUBSURFACE STACKING). */
     wl_subsurface_set_desync(w->bg_sub);
     w->bg_vp = wp_viewporter_get_viewport(w->viewporter, w->bg_surf);
 }
@@ -4210,9 +4220,7 @@ static void dlg_show(struct nb_wl *w)
             w->quit = true;
             return;
         }
-        wl_subsurface_place_above(w->dlg_sub,
-                                  w->ov_surf ? w->ov_surf
-                                  : w->cs_surf ? w->cs_surf : w->surf);
+        /* Made last, so it is on top (see SUBSURFACE STACKING). */
         wl_subsurface_set_desync(w->dlg_sub);
     }
     if (!w->dlg_buf) {
@@ -5875,7 +5883,7 @@ static void bd_build(struct nb_wl *w)
                                                        w->bd_surf[i], w->surf);
         w->bd_vp[i] = wp_viewporter_get_viewport(w->viewporter, w->bd_surf[i]);
         if (w->bd_sub[i]) {
-            wl_subsurface_place_below(w->bd_sub[i], w->surf);
+            /* Outside the main surface, so stacking does not matter. */
             wl_subsurface_set_desync(w->bd_sub[i]);
         }
         none = wl_compositor_create_region(w->comp);
@@ -6434,8 +6442,8 @@ static bool ov_build(struct nb_wl *w, unsigned sc)
         if (!w->ov_sub) {
             return false;
         }
-        /* Above the picture's own subsurface, or it would be drawn over. */
-        wl_subsurface_place_above(w->ov_sub, w->cs_surf ? w->cs_surf : w->surf);
+        /* Above the picture's own subsurface because it is made after it
+         * (see SUBSURFACE STACKING). */
         wl_subsurface_set_desync(w->ov_sub);
         none = wl_compositor_create_region(w->comp);
         if (none) {
@@ -7002,19 +7010,6 @@ static const struct wl_buffer_listener ly_buf_listener = {
     .release = ly_release,
 };
 
-/* The topmost of our UI subsurfaces, so each new one goes above the last. */
-static struct wl_surface *wl_ui_top;
-
-static void wl_place_top(struct nb_wl *w, struct wl_subsurface *sub,
-                         struct wl_surface *sf)
-{
-    struct wl_surface *ref = wl_ui_top ? wl_ui_top
-                           : w->cs_surf ? w->cs_surf : w->surf;
-
-    wl_subsurface_place_above(sub, ref);
-    wl_ui_top = sf;
-}
-
 static struct nb_wl_layer *wl_layer_new(struct nb_wl *w, bool input)
 {
     struct nb_wl_layer *L;
@@ -7037,8 +7032,7 @@ static struct nb_wl_layer *wl_layer_new(struct nb_wl *w, bool input)
         free(L);
         return NULL;
     }
-    wl_place_top(w, L->sub, L->surf);
-    wl_subsurface_set_desync(L->sub);
+    wl_subsurface_set_desync(L->sub);   /* on top: made last */
     if (w->viewporter) {
         L->vp = wp_viewporter_get_viewport(w->viewporter, L->surf);
     }
@@ -7219,6 +7213,7 @@ static void wl_menu_paint(struct nb_wl *w)
         return;
     }
     if (!w->ly_menu) {
+        wl_ed_build(w);             /* below the menu: made first */
         w->ly_menu = wl_layer_new(w, true);
         if (!w->ly_menu) {
             return;
@@ -7236,16 +7231,18 @@ static void wl_menu_paint(struct nb_wl *w)
     wl_layer_show(w, w->ly_menu, idx, r.x, r.y, r.w, r.h);
 }
 
-/* The output area's outline while the menu is open. */
-static void wl_ed_show(struct nb_wl *w, bool on)
+/*
+ * The outline's eight surfaces, made once.  Before the menu's layer, which
+ * must stack above them (SUBSURFACE STACKING: creation order).
+ */
+static void wl_ed_build(struct nb_wl *w)
 {
-    struct nb_rect a;
     int i;
 
     if (!w->viewporter || !w->comp || !w->subcomp || !w->shm) {
         return;
     }
-    if (on && !w->ed_buf) {
+    if (!w->ed_buf) {
         struct wl_shm_pool *pool;
         uint32_t *px;
         int fd = memfd_create("conduit-viewer-edge", MFD_CLOEXEC);
@@ -7279,7 +7276,6 @@ static void wl_ed_show(struct nb_wl *w, bool on)
             w->ed_sub[i] = wl_subcompositor_get_subsurface(w->subcomp,
                                                            w->ed_surf[i],
                                                            w->surf);
-            wl_place_top(w, w->ed_sub[i], w->ed_surf[i]);
             wl_subsurface_set_desync(w->ed_sub[i]);
             w->ed_vp[i] = wp_viewporter_get_viewport(w->viewporter,
                                                      w->ed_surf[i]);
@@ -7289,10 +7285,17 @@ static void wl_ed_show(struct nb_wl *w, bool on)
                 wl_region_destroy(none);
             }
         }
-        /* The menu goes above the outline. */
-        if (w->ly_menu) {
-            wl_place_top(w, w->ly_menu->sub, w->ly_menu->surf);
-        }
+    }
+}
+
+/* The output area's outline while the menu is open. */
+static void wl_ed_show(struct nb_wl *w, bool on)
+{
+    struct nb_rect a;
+    int i;
+
+    if (on) {
+        wl_ed_build(w);
     }
     if (!w->ed_buf) {
         return;
@@ -8575,7 +8578,6 @@ static int wl_open(struct nb_session *s, const struct nb_config *cfg)
                  * windowed.  An overlay bar would forfeit that for chrome.
                  */
                 wl_subsurface_set_position(w->tb_sub, 0, -NB_TB_H);
-                wl_subsurface_place_above(w->tb_sub, w->surf);
                 wl_subsurface_set_desync(w->tb_sub);
                 nb_log("drawing a client-side title bar (%d px): this "
                        "compositor offers no server-side decorations",
@@ -8638,7 +8640,8 @@ static int wl_open(struct nb_session *s, const struct nb_config *cfg)
                                                       w->cs_surf);
             }
             if (w->cs_sub) {
-                wl_subsurface_place_above(w->cs_sub, w->surf);
+                /* The first subsurface that overlaps the picture area:
+                 * everything made later is stacked above it. */
                 wl_subsurface_set_desync(w->cs_sub);
             }
             w->cs_at_x = w->cs_at_y = INT32_MIN;

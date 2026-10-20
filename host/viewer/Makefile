@@ -279,6 +279,8 @@ check: all test-utf8 test-overlay test-relacc test-view test-ui test-pace test-l
 	python3 test/test_clipboard.py ./$(BIN)
 	python3 test/test_clipboard_push.py ./$(BIN)
 	python3 test/test_lifecycle.py ./$(BIN)
+	@if grep -n 'wl_subsurface_place_\(above\|below\)' nb_session_wl.c; then \
+	  echo 'nb_session_wl.c: subsurfaces stack by creation order, no restacking requests (see SUBSURFACE STACKING)'; exit 1; fi
 
 # Keep the sanitizer invocation reproducible locally and in CI.  A clean
 # rebuild matters here: mixing instrumented and ordinary objects links fine
