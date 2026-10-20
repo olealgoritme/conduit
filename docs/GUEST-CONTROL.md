@@ -39,7 +39,9 @@ The protocol is the `conduit-ctl` crate (`host/ctl`): requests
 `{"v":1,"id":N,"op":"run",...}`, responses `{"id":N,"ok":true,...}` or
 `{"id":N,"ok":false,"error":"..."}`. Ops: `ping` (agent version, OS, user,
 whether a desktop session exists), `run`, `stop`, `apps`, `icon`, `put`, `get`,
-`ls`. Request ids grow across commands, so a late answer to an abandoned
+`ls`, `settime` (set the guest's clock after the host slept,
+[SUSPEND.md](SUSPEND.md); the Windows tray sets it, the Linux agent answers
+that it cannot). Request ids grow across commands, so a late answer to an abandoned
 request is never taken for the current one. Lines over 4 MiB are dropped, an
 unknown op or a malformed line gets an error response, and each agent handles
 every request separately, so one bad request cannot stop it.

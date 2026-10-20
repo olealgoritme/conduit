@@ -18,7 +18,7 @@
 use crate::apps::{self, ComGuard};
 use crate::launch;
 use conduit_ctl::{LineReader, Request, Response, RunArgs, CHANNEL};
-use gpu_tray::ctl_logic::{Agent, Backend};
+use gpu_tray::ctl_logic::{Agent, Backend, UtcTime};
 use std::path::PathBuf;
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
@@ -87,6 +87,56 @@ impl Backend for WinBackend {
     fn as_user<R>(&self, f: impl FnOnce() -> R) -> Result<R, String> {
         launch::as_user(f)
     }
+
+    fn set_time(&self, t: &UtcTime) -> Result<(), String> {
+        set_system_time(t)
+    }
+}
+
+/// `SetSystemTime` needs `SeSystemtimePrivilege` enabled, not just held (an
+/// elevated administrator holds it, disabled).
+fn set_system_time(t: &UtcTime) -> Result<(), String> {
+    use windows_sys::Win32::Security::{
+        AdjustTokenPrivileges, LookupPrivilegeValueW, SE_PRIVILEGE_ENABLED,
+        TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
+    };
+    use windows_sys::Win32::System::SystemInformation::SetSystemTime;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    unsafe {
+        let mut tok: HANDLE = null_mut();
+        if OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+            &mut tok,
+        ) != 0
+        {
+            let name = crate::gfx::wide("SeSystemtimePrivilege");
+            let mut tp: TOKEN_PRIVILEGES = std::mem::zeroed();
+            tp.PrivilegeCount = 1;
+            tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+            if LookupPrivilegeValueW(null(), name.as_ptr(), &mut tp.Privileges[0].Luid) != 0 {
+                AdjustTokenPrivileges(tok, 0, &tp, 0, null_mut(), null_mut());
+            }
+            CloseHandle(tok);
+        }
+        let st = SYSTEMTIME {
+            wYear: t.year,
+            wMonth: t.month,
+            wDayOfWeek: t.weekday,
+            wDay: t.day,
+            wHour: t.hour,
+            wMinute: t.minute,
+            wSecond: t.second,
+            wMilliseconds: t.millis,
+        };
+        if SetSystemTime(&st) == 0 {
+            return Err(format!(
+                "SetSystemTime failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// A manual-reset event.

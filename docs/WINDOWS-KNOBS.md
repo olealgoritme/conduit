@@ -490,6 +490,7 @@ Set on the host with `conduit config set KEY VALUE` ([CLI.md](CLI.md)); stored i
 | Key | Named values | What it does (default) |
 |---|---|---|
 | `view.close_stops_vm` | true, false | closing the window of a VM that `conduit view` started shuts it down (default true) |
+| `vm.pause_on_suspend` | true, false | pause running VMs before the host sleeps and continue them after it wakes, GPU state kept (default true) |
 | `venus.guest_blobs` | true, false | serve guest-memory blobs to Venus guests (the Windows KMD's windowed Present writes guest pages directly), from the next backend start (default false) |
 | `backend.latency` | off, all | round-trip latency options for the backend and conduit-venus, from the next backend start (default all: quiet-held, fused-submit, direct-fences, event-batch; a comma-separated list sets exactly those, fence-spin included only when named) |
 | `backend.cpus` | see text | keep the backend and conduit-venus on these host CPUs, from the next backend start (unset: any CPU; a list such as 0-7,16-23) |

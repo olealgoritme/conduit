@@ -620,6 +620,14 @@ void nb_sink_release_keys(struct nb_sink *s)
     s->shift_down = sh;
 }
 
+void nb_sink_hold_input(struct nb_sink *s, bool on)
+{
+    if (on && !s->input_held) {
+        nb_sink_release_keys(s);
+    }
+    s->input_held = on;
+}
+
 void nb_sink_toggle_fullscreen(struct nb_sink *s)
 {
     if (s->sess->ops->dismiss_dialog && !s->fullscreen) {
@@ -697,6 +705,10 @@ void nb_sink_key(struct nb_sink *s, unsigned code, bool down)
      * the key is HELD and replayed by nb_sink_clip_finish() once the content
      * is queued -- or immediately, if nothing is going to be sent.
      */
+    if (s->input_held) {
+        bit_set(s->consumed, code, down);
+        return;             /* the VM is paused */
+    }
     trigger = down && s->focused ? nb_clip_trigger(s, code) : NULL;
     if (trigger) {
         /* Auto-repeat while an asynchronous fetch is pending is still the same
@@ -731,7 +743,7 @@ void nb_sink_key(struct nb_sink *s, unsigned code, bool down)
 
 void nb_sink_btn(struct nb_sink *s, unsigned code, bool down)
 {
-    if (code >= 768 || !s->focused) {
+    if (code >= 768 || !s->focused || s->input_held) {
         return;
     }
     /* Without a grab, a click outside the window is not ours to forward. */
@@ -748,7 +760,7 @@ void nb_sink_btn(struct nb_sink *s, unsigned code, bool down)
 void nb_sink_abs(struct nb_sink *s, int x, int y, unsigned w, unsigned h)
 {
     /* Under grab the client must never learn where the host pointer is. */
-    if (s->grabbed || !s->focused || !s->pointer_in) {
+    if (s->grabbed || !s->focused || !s->pointer_in || s->input_held) {
         return;
     }
     nb_emit(s, NVKVM_BROKER_EV_ABS, x, y, w, h);
@@ -757,7 +769,7 @@ void nb_sink_abs(struct nb_sink *s, int x, int y, unsigned w, unsigned h)
 void nb_sink_abs_resync(struct nb_sink *s, int x, int y, unsigned w,
                         unsigned h)
 {
-    if (s->grabbed || !s->focused || !s->pointer_in) {
+    if (s->grabbed || !s->focused || !s->pointer_in || s->input_held) {
         return;
     }
     /*
@@ -775,7 +787,7 @@ void nb_sink_abs_resync(struct nb_sink *s, int x, int y, unsigned w,
 
 void nb_sink_rel(struct nb_sink *s, int dx, int dy)
 {
-    if (!s->grabbed || !s->focused) {
+    if (!s->grabbed || !s->focused || s->input_held) {
         return;
     }
     if (dx == 0 && dy == 0) {
@@ -786,7 +798,7 @@ void nb_sink_rel(struct nb_sink *s, int dx, int dy)
 
 void nb_sink_wheel(struct nb_sink *s, int v, int h)
 {
-    if (!s->focused || (!s->grabbed && !s->pointer_in)) {
+    if (!s->focused || (!s->grabbed && !s->pointer_in) || s->input_held) {
         return;
     }
     nb_emit(s, NVKVM_BROKER_EV_WHEEL, v, h, 0, 0);
@@ -3216,6 +3228,9 @@ static void usage(void)
 "                       start; --res/--area/--scale/--filter override it\n"
 "  --vm-shutdown-cmd CMD, --vm-reboot-cmd CMD\n"
 "                       commands the menu's Shut down / Restart run (/bin/sh)\n"
+"  --vm-pause-cmd CMD, --vm-resume-cmd CMD\n"
+"                       commands the menu's Pause / Resume run (/bin/sh); the\n"
+"                       menu shows the VM paused once the command exits 0\n"
 "  --open-menu          start with the menu open (CTRL+ALT+M toggles)\n"
 "\n"
 "  Display hotkeys (CTRL+ALT+...): M menu, S scale, A area, R guest\n"
@@ -3822,6 +3837,10 @@ int main(int argc, char **argv)
             cfg.vm_shutdown_cmd = v; }
         else if (!strcmp(a, "--vm-reboot-cmd")) { NEEDVAL();
             cfg.vm_reboot_cmd = v; }
+        else if (!strcmp(a, "--vm-pause-cmd")) { NEEDVAL();
+            cfg.vm_pause_cmd = v; }
+        else if (!strcmp(a, "--vm-resume-cmd")) { NEEDVAL();
+            cfg.vm_resume_cmd = v; }
         else if (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage(); return 0; }
         else if (!strcmp(a, "-V") || !strcmp(a, "--version")) {
             printf("conduit-viewer %s\n", CONDUIT_BUILD_ID); return 0; }

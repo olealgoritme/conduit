@@ -158,6 +158,12 @@ impl Virsh {
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     }
 
+    /// Run with a deadline (killed at it): stdout when it succeeded in time.
+    /// For callers that must never hang, like the sleep hook.
+    pub fn run_within(&self, args: &[&str], limit: std::time::Duration) -> Option<String> {
+        sys::output_timeout(&mut self.cmd(args), limit)
+    }
+
     /// Can we talk to this libvirt at all? Explains how to fix it if not.
     pub fn reachable(&self) -> Result<()> {
         if !sys::have("virsh") {

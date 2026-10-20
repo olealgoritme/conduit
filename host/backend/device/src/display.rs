@@ -1297,6 +1297,21 @@ impl GuestInputClaims {
         self.other_first.store(false, Ordering::Release);
     }
 
+    /// The device restarted for the same driver, which carries on (the VM
+    /// was paused with its GPU objects kept: a host suspend, `conduit
+    /// pause`). What it said stays true, and the start is not a new one:
+    /// the mode list it has is not sent again, which would be a hotplug for
+    /// a driver that did not have it yet (its compositor re-probes and may
+    /// turn the output off).
+    pub fn device_continued(&self, acked_features: u64) {
+        let bit = u64::from(protocol::messages::NVGPU_CFG_TAKES_INPUT);
+        self.acked
+            .store(acked_features & bit != 0, Ordering::Release);
+        let ml = u64::from(protocol::messages::NVGPU_F_MODE_LIST);
+        self.mode_list
+            .store(acked_features & ml != 0, Ordering::Release);
+    }
+
     /// The device was reset: nothing is known about the next driver.
     pub fn reset(&self) {
         self.device_started(0);
@@ -3844,6 +3859,41 @@ fn connect_unix(path: &Path) -> io::Result<OwnedFd> {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicBool;
+
+    /// A restart after a kept pause (host suspend, `conduit pause`) is the
+    /// same driver carrying on: the mode list is not owed again (it would be
+    /// a hotplug in the guest), and what the driver said about itself stays.
+    #[test]
+    fn a_kept_restart_keeps_the_drivers_claims_and_its_mode_list() {
+        use protocol::messages::{MsgType, NVGPU_CFG_TAKES_INPUT, NVGPU_F_MODE_LIST};
+        const VERSION_1: u64 = 1 << 32;
+        let claims = GuestInputClaims::default();
+        let f = VERSION_1 | u64::from(NVGPU_CFG_TAKES_INPUT) | u64::from(NVGPU_F_MODE_LIST);
+        claims.device_started(f);
+        let epoch = claims.mode_list_epoch().expect("acked the mode list");
+        claims.device_continued(f);
+        assert_eq!(claims.mode_list_epoch(), Some(epoch), "no list owed");
+        assert!(claims.takes_input(true));
+        // A real restart (reboot, driver reload) owes it again.
+        claims.device_started(f);
+        assert_ne!(claims.mode_list_epoch(), Some(epoch));
+
+        // A Linux module from before the input bit is known only by its
+        // first requests, which a paused guest does not send again.
+        claims.device_started(VERSION_1);
+        claims.saw_request(MsgType::GetSysFiles as u32);
+        assert!(claims.takes_input(true));
+        claims.device_continued(VERSION_1);
+        assert!(claims.takes_input(true), "still the Linux module");
+        assert_eq!(claims.mode_list_epoch(), None);
+
+        // Windows stays Windows.
+        claims.device_started(VERSION_1);
+        claims.saw_request(MsgType::Open as u32);
+        claims.device_continued(VERSION_1);
+        claims.saw_request(MsgType::GetSysFiles as u32);
+        assert!(!claims.takes_input(true));
+    }
 
     /// The routing rule for the three guests there are: a Linux guest whose
     /// module acks `NVGPU_CFG_TAKES_INPUT`, a Linux guest whose module

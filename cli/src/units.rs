@@ -109,6 +109,53 @@ pub fn stats_template(scope: &Scope, conduit: &Path) -> String {
     )
 }
 
+/// `conduit-sleep.service`: the sleep hook (sleep.rs), one per user. A user
+/// unit whatever the VMs' libvirt connection: it runs as you and reaches
+/// every VM the way `conduit pause` does.
+pub const SLEEP_UNIT: &str = "conduit-sleep.service";
+
+pub fn sleep_template(conduit: &Path) -> String {
+    format!(
+        "# Installed by `conduit`. Regenerated when a VM is attached or started.\n\
+         [Unit]\n\
+         Description=Conduit: pause running VMs while this computer sleeps\n\
+         \n\
+         [Service]\n\
+         Type=simple\n\
+         ExecStart={exe} _sleep\n\
+         Restart=always\n\
+         RestartSec=5\n\
+         \n\
+         [Install]\n\
+         WantedBy=default.target\n",
+        exe = conduit.display(),
+    )
+}
+
+/// Install the sleep hook and keep it running. The unit is rewritten (and
+/// the hook restarted) only when it changed, e.g. after `conduit` moved.
+pub fn ensure_sleep_hook(conduit: &Path) -> Result<()> {
+    let body = sleep_template(conduit);
+    let same = std::fs::read_to_string(user_unit_dir().join(SLEEP_UNIT)).is_ok_and(|s| s == body);
+    if !same {
+        put(&Scope::User, SLEEP_UNIT, &body)?;
+        systemctl(&Scope::User, &["daemon-reload"])?;
+        systemctl(&Scope::User, &["enable", "--now", SLEEP_UNIT])?;
+        let _ = systemctl(&Scope::User, &["try-restart", SLEEP_UNIT]);
+    } else if !sleep_hook_active() {
+        systemctl(&Scope::User, &["enable", "--now", SLEEP_UNIT])?;
+    }
+    Ok(())
+}
+
+pub fn sleep_hook_installed() -> bool {
+    user_unit_dir().join(SLEEP_UNIT).is_file()
+}
+
+pub fn sleep_hook_active() -> bool {
+    systemctl_ok(&Scope::User, &["is-active", "--quiet", SLEEP_UNIT])
+}
+
 /// Where the domain's QEMU listens with its VNC server (the boot console:
 /// firmware, boot menu, disk-unlock prompt). QEMU creates this socket and the
 /// backend connects to it (`--console-vnc`), the other way round from the
@@ -673,6 +720,10 @@ pub fn install(scope: &Scope, vm: &str, conduit: &Path) -> Result<()> {
     if let Err(e) = systemctl(scope, &["enable", "--now", &stats_unit(vm)]) {
         eprintln!("conduit: could not start the GPU stats feed: {e:#}");
     }
+    // So is the sleep hook (docs/SUSPEND.md).
+    if let Err(e) = ensure_sleep_hook(conduit) {
+        eprintln!("conduit: could not start the sleep hook: {e:#}");
+    }
     // Shared folders: the default one on first attach, then every configured one.
     let names: Vec<String> = crate::shares::load_or_init(vm)?
         .into_iter()
@@ -866,6 +917,15 @@ mod tests {
         assert!(v.contains("ExecStart=/usr/bin/conduit _stats %i"));
         assert!(v.contains("WantedBy=default.target"));
         assert!(stats_path(&Scope::User, "w").ends_with("conduit/w/stats.sock"));
+    }
+
+    #[test]
+    fn sleep_hook_unit() {
+        let v = sleep_template(Path::new("/usr/bin/conduit"));
+        assert!(v.contains("\nExecStart=/usr/bin/conduit _sleep\n"));
+        assert!(v.contains("\nRestart=always\n"));
+        assert!(v.contains("\nWantedBy=default.target\n"));
+        assert_eq!(SLEEP_UNIT, "conduit-sleep.service");
     }
 
     #[test]

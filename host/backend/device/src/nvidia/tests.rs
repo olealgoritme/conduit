@@ -3308,6 +3308,56 @@ mod tests {
         assert!(host.0.lock().unwrap().is_empty());
     }
 
+    /// A fake RM whose controls all answer with one status (NVOS54's word).
+    #[derive(Clone, Default)]
+    struct ProbeHost(std::sync::Arc<std::sync::atomic::AtomicU32>);
+
+    impl HostDriver for ProbeHost {
+        fn ioctl(&self, _fd: RawFd, request: u64, arg: &mut [u8]) -> std::result::Result<(), i32> {
+            if request & 0xff == 0x2a && arg.len() >= NVOS54_STATUS + 4 {
+                let s = self.0.load(std::sync::atomic::Ordering::Relaxed);
+                arg[NVOS54_STATUS..NVOS54_STATUS + 4].copy_from_slice(&s.to_le_bytes());
+            }
+            Ok(())
+        }
+    }
+
+    /// Every guest TSG is remembered, policy or not, and asked about after a
+    /// host resume (crate::power): a lost GPU says so on all of them; ones
+    /// the guest freed are forgotten.
+    #[test]
+    fn guest_tsgs_are_probed_after_a_host_resume() {
+        use crate::power::Health;
+        let host = ProbeHost::default();
+        let mut be = NvidiaBackend::for_test();
+        be.set_host_driver_version(abi::version::DriverVersion::new(615, 71, 9))
+            .expect("615.71.09 has tables");
+        be.set_host(Box::new(host.clone()));
+        be.set_guest_sched(crate::gpu_sched::GuestSched::NONE);
+        let null = std::fs::File::open("/dev/null").expect("/dev/null");
+        let h = be.handles.insert(OwnedFd::from(null));
+        for tsg in [0x5c00_0010, 0x5c00_0011, 0x5c00_0010] {
+            send_nested(&mut be, h, abi::ioctl::NV_ESC_RM_ALLOC, &tsg_alloc(tsg), 28);
+        }
+        assert_eq!(be.guest_tsg_count(), 2, "each TSG once");
+        assert_eq!(be.probe_gpu(), Health::Healthy { checked: 2 });
+
+        host.0.store(0x0F, std::sync::atomic::Ordering::Relaxed); // NV_ERR_GPU_IS_LOST
+        assert_eq!(
+            be.probe_gpu(),
+            Health::Lost {
+                checked: 2,
+                lost: 2,
+                status: 0x0F
+            }
+        );
+        assert_eq!(be.guest_tsg_count(), 2, "lost ones are kept");
+
+        host.0.store(0x57, std::sync::atomic::Ordering::Relaxed); // NV_ERR_OBJECT_NOT_FOUND
+        assert_eq!(be.probe_gpu(), Health::Healthy { checked: 0 });
+        assert_eq!(be.guest_tsg_count(), 0, "freed ones are forgotten");
+    }
+
     /// A guest SET_TIMESLICE longer than the policy reaches RM clamped; a
     /// shorter one, and any one without a policy, as sent.
     #[test]

@@ -421,6 +421,61 @@ check "focus loss releases the held key" 'KEY[[:space:]]+.*x=30 y=0'         "$C
 check "focus loss drops the grab"        'grab dropped: the window lost focus' "$CASE_LOG"
 check "the client is told the grab ended" 'GRAB[[:space:]]+flags=--'         "$CASE_OUT"
 
+# The menu's Pause holds input: what is down is released first, nothing
+# reaches the paused guest, the hotkeys still work, and input flows again
+# once it runs.  30=A 48=B 31=S 272=BTN_LEFT
+run_case 'f 1
+p 1
+k 30 1
+h 1
+k 48 1
+k 48 0
+b 272 1
+b 272 0
+a 10 20
+w 1 0
+k 29 1
+k 56 1
+k 34 1
+k 34 0
+r 5 -3
+k 34 1
+k 34 0
+k 56 0
+k 29 0
+k 30 0
+h 0
+k 31 1
+k 31 0
+'
+check   "holding releases the key that was down" 'KEY[[:space:]]+.*x=30 y=0' "$CASE_OUT"
+nocheck "no KEY while held"                       'KEY[[:space:]]+.*x=48'     "$CASE_OUT"
+nocheck "no BTN while held"                       'BTN[[:space:]]'            "$CASE_OUT"
+nocheck "no ABS while held"                       'ABS[[:space:]]'            "$CASE_OUT"
+nocheck "no WHEEL while held"                     'WHEEL[[:space:]]'          "$CASE_OUT"
+nocheck "no REL while held, even grabbed"         'REL[[:space:]]'            "$CASE_OUT"
+check   "CTRL+ALT+G still works while held"       'GRAB[[:space:]]+flags=G'   "$CASE_OUT"
+check   "KEY flows again after the hold"          'KEY[[:space:]]+.*x=31 y=1' "$CASE_OUT"
+
+# --vm-pause-cmd / --vm-resume-cmd: listed, need a value, accepted.
+"$BROKER" --help > "$TMP/help.log" 2>&1
+check "--help lists --vm-pause-cmd and --vm-resume-cmd" \
+      'vm-pause-cmd CMD, --vm-resume-cmd CMD' "$TMP/help.log"
+"$BROKER" --socket "$TMP/v.sock" --backend test --vm-pause-cmd \
+    > "$TMP/novalue.log" 2>&1 < /dev/null
+if [ $? -eq 2 ]; then ok "--vm-pause-cmd without a value is refused"
+else bad "--vm-pause-cmd without a value was accepted"; fi
+"$BROKER" --socket "$TMP/v.sock" --backend test --vm-resume-cmd \
+    > "$TMP/novalue.log" 2>&1 < /dev/null
+if [ $? -eq 2 ]; then ok "--vm-resume-cmd without a value is refused"
+else bad "--vm-resume-cmd without a value was accepted"; fi
+BROKER_EXTRA="--vm-pause-cmd true --vm-resume-cmd true" run_case 'f 1
+k 30 1
+k 30 0
+'
+nocheck "both are accepted"                 'unknown argument' "$CASE_LOG"
+check   "and the viewer runs with them"     'KEY[[:space:]]+.*x=30 y=1' "$CASE_OUT"
+
 # ── virtio-nvgpu: CMD_CURSOR ─────────────────────────────────────────────────
 echo
 echo "-- guest cursor (CMD_CURSOR)"

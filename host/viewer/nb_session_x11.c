@@ -79,6 +79,7 @@ struct nb_session *nb_session_x11(const struct nb_config *cfg)
 #include "nb_relacc.h"
 #include "nb_gpuscale.h"
 #include "nb_present.h"
+#include "nb_vmpause.h"
 
 #define NB_DRM_FORMAT_MOD_INVALID  0x00ffffffffffffffULL
 
@@ -261,6 +262,7 @@ struct nb_x11 {
     /* The viewer's own UI (nb_ui.h) on child windows: opaque, so it needs
      * no compositor and no ARGB visual. */
     struct nb_ui ui;
+    struct nb_vmpause vmp;      /* the menu's Pause / Resume                */
     struct nb_x11_layer {
         xcb_window_t win;
         uint32_t    *px;
@@ -2148,6 +2150,10 @@ static void x11_set_status(struct nb_x11 *x, const char *status)
     char buf[256];
     const char *txt = x->title;
 
+    /* Paused (the menu's Pause) is the status whenever nothing else is. */
+    if (!status && x->vmp.paused) {
+        status = NB_VM_PAUSED_STATUS;
+    }
     if (status && x->title[0]) {
         snprintf(buf, sizeof buf, "%s - %s", status, x->title);
         txt = buf;
@@ -3513,6 +3519,9 @@ static const struct nb_ui_env *x11_ui_env(struct nb_x11 *x)
     e.nearest_ok = false;
 #endif
     e.vm_actions = x->cfg && (x->cfg->vm_shutdown_cmd || x->cfg->vm_reboot_cmd);
+    e.vm_pause = x->cfg && x->cfg->vm_pause_cmd && x->cfg->vm_resume_cmd;
+    e.vm_paused = x->vmp.paused;
+    e.vm_pause_busy = nb_vmpause_busy(&x->vmp);
     e.translucent = false;
     return &e;
 }
@@ -3898,6 +3907,11 @@ static void x11_ui_do(struct nb_x11 *x, unsigned bits)
     if ((bits & NB_UI_VM_REBOOT) && x->cfg) {
         nb_run_detached(x->cfg->vm_reboot_cmd);
     }
+    if ((bits & (NB_UI_VM_PAUSE | NB_UI_VM_RESUME)) &&
+        !nb_vm_pause_ask(&x->vmp, x->sink, x->cfg, (bits & NB_UI_VM_PAUSE) != 0,
+                         x->ui.notice, sizeof(x->ui.notice))) {
+        bits |= NB_UI_NOTICE;
+    }
     if ((bits & NB_UI_CLOSE) || !x->ui.open) {
         x11_layer_hide(x, &x->ly_menu);
         x11_ed_show(x, false);
@@ -4034,6 +4048,17 @@ static int x11_tick_ui(struct nb_x11 *x, int next)
         due = (t) > now ? (int)((t) - now) : 0; \
         next = next < 0 || due < next ? due : next; \
     } while (0)
+    /* The menu's Pause / Resume command, reaped when it ends. */
+    if (nb_vmpause_busy(&x->vmp)) {
+        if (nb_vm_pause_reap(&x->vmp, x->sink, x->ui.notice,
+                             sizeof(x->ui.notice))) {
+            x11_ui_do(x, NB_UI_REDRAW | NB_UI_NOTICE);
+            x11_set_status(x, x->grabbed ? "GRABBED - CTRL+ALT+G TO RELEASE"
+                                         : NULL);
+        } else {
+            X11_DUE(now + NB_VMPAUSE_POLL_MS);
+        }
+    }
     if (x->rehint_due_ms) {
         if (now >= x->rehint_due_ms) {
             x->rehint_due_ms = 0;

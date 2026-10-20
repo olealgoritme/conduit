@@ -785,12 +785,31 @@ area:
     flow_break(&b);
 
     /* VM */
+    if (env->vm_pause || env->vm_actions) {
+        section(&b, env->vm_pause && env->vm_paused ? "Virtual machine (paused)"
+                                                    : "Virtual machine");
+    }
+    /*
+     * Pause / Resume, one toggle on its own row: no confirming click (it is
+     * undone by the next one), disabled while its command runs.  Lit while
+     * paused, so the way back is the first thing seen.
+     */
+    if (env->vm_pause) {
+        const char *label = nb_ui_vm_pause_label(env);
+
+        idx = add_item(&b, UI_PAD, b.y, b.lw - 2 * UI_PAD, UI_CHIP_H,
+                       NB_UI_ID_VM_PAUSE, 0, env->vm_pause_busy);
+        if (idx >= 0 && p) {
+            chip_paint(&b, idx, label, env->vm_paused && !env->vm_pause_busy,
+                       C_GREEN);
+        }
+        b.y += UI_CHIP_H + UI_GAP;
+    }
     if (env->vm_actions) {
         int half = (b.lw - 2 * UI_PAD - UI_GAP) / 2;
         static const int ids[2] = { NB_UI_ID_VM_REBOOT, NB_UI_ID_VM_SHUTDOWN };
         static const char *const names[2] = { "Restart", "Shut down" };
 
-        section(&b, "Virtual machine");
         for (i = 0; i < 2; i++) {
             bool armed = ui->confirm == (ids[i] << 8);
 
@@ -818,6 +837,14 @@ area:
 }
 
 /* ── public: lifecycle, layout ──────────────────────────────────────────── */
+
+const char *nb_ui_vm_pause_label(const struct nb_ui_env *env)
+{
+    if (env->vm_pause_busy) {
+        return env->vm_paused ? "Resuming..." : "Pausing...";
+    }
+    return env->vm_paused ? "Resume" : "Pause";
+}
 
 void nb_ui_init(struct nb_ui *ui, struct nb_vstore *st)
 {
@@ -972,7 +999,6 @@ static unsigned act(struct nb_ui *ui, const struct nb_ui_env *env,
     unsigned bits = 0;
     char s[48];
 
-    (void)env;
     /* any click elsewhere cancels a pending confirmation */
     if (ui->confirm && ui->confirm != code) {
         ui->confirm = 0;
@@ -1119,6 +1145,17 @@ static unsigned act(struct nb_ui *ui, const struct nb_ui_env *env,
         return bits | NB_UI_REDRAW |
                (it->id == NB_UI_ID_VM_REBOOT ? NB_UI_VM_REBOOT
                                               : NB_UI_VM_SHUTDOWN);
+    case NB_UI_ID_VM_PAUSE:
+        if (!env->vm_pause || env->vm_pause_busy) {
+            return bits;
+        }
+        if (env->vm_paused) {
+            /* Back to the VM: the menu closes, so the pointer and keys are
+             * the guest's again (a guest whose screen went dark while it
+             * was paused wakes on them); the outcome comes as a notice. */
+            return bits | nb_ui_set_open(ui, env, false) | NB_UI_VM_RESUME;
+        }
+        return bits | NB_UI_REDRAW | NB_UI_VM_PAUSE;
     default:
         return bits;
     }

@@ -246,9 +246,16 @@ pub struct Qmp {
 
 impl Qmp {
     pub fn connect(sock: &Path) -> Result<Qmp> {
+        Qmp::connect_within(sock, Duration::from_secs(5))
+    }
+
+    /// Connect, with every read bounded by `limit` (the sleep hook must
+    /// never wait long on a QEMU that does not answer).
+    pub fn connect_within(sock: &Path, limit: Duration) -> Result<Qmp> {
         let s = UnixStream::connect(sock)
             .with_context(|| format!("connecting to {}", sock.display()))?;
-        s.set_read_timeout(Some(Duration::from_secs(5)))?;
+        s.set_read_timeout(Some(limit))?;
+        s.set_write_timeout(Some(limit))?;
         let w = s.try_clone()?;
         let mut q = Qmp {
             r: BufReader::new(s),
@@ -279,6 +286,17 @@ impl Qmp {
                 return Ok(r.clone());
             }
         }
+    }
+}
+
+impl Qmp {
+    /// `query-status`: whether the vCPUs run (false when paused, for
+    /// whatever reason: `stop`, an I/O error, a full disk).
+    pub fn running(&mut self) -> Result<bool> {
+        let r = self.exec("query-status")?;
+        r.get("running")
+            .and_then(serde_json::Value::as_bool)
+            .context("query-status: no \"running\" in the answer")
     }
 }
 

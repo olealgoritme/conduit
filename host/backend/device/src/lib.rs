@@ -22,6 +22,7 @@ pub mod host;
 pub mod mmap;
 pub mod nvidia;
 pub mod posture;
+pub mod power;
 pub mod replay;
 pub mod sandbox;
 pub mod scanout_presented;

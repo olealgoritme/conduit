@@ -28,6 +28,7 @@ from GPU memory to your screen: no copying, no video compression.
 | Clipboard both ways, sound (speakers + mic) | ✅ |
 | Streaming to Moonlight (AV1/HEVC/H.264, up to 240 fps) | ✅ |
 | virt-manager / virsh (start, pause, reboot, stop; attach to existing VMs) | ✅ |
+| Host sleep: running VMs pause before the computer suspends and continue after, GPU state kept ([SUSPEND.md](docs/SUSPEND.md); needs the NVIDIA driver to keep video memory, `conduit doctor` checks) | implemented, being tested |
 | Host isolation: host work and device interrupts kept off a running VM's CPUs (per CCD, P/E cores or NUMA node; on by default, [HOST-TUNING.md](docs/HOST-TUNING.md#cpu-host-isolation)) | ✅ |
 | Windows 11 VMs: desktop/DWM, D3D11, D3D12, Vulkan, OpenGL (Zink) on NVK-on-RM, up to 240 Hz | experimental, opt-in (`--venus`, guest driver 22.22.405.84 attached to every release: [Windows guests](#windows-guests)) |
 | NVK (Mesa's open Vulkan driver) on NVIDIA's Resource Manager (the host's NVIDIA driver), in a Linux VM | experimental, opt-in (`NVK_RM=1`: [guest/nvk-rm](guest/nvk-rm/README.md), [librmclient](guest/rmclient/README.md)) |

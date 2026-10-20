@@ -329,6 +329,9 @@ pub struct NvidiaBackend {
     allow_refused: std::collections::BTreeMap<String, u64>,
     /// What the guest-TSG timeslice policy did (sched.rs).
     tsg_sched: sched::TsgSchedStats,
+    /// The guest's channel groups (owner file handle, client, TSG), for the
+    /// health probe after a host resume (`crate::power`, sched.rs).
+    guest_tsgs: Vec<(u64, u32, u32)>,
     /// Where device memory is placed so the guest can address it. `None` until
     /// the transport supplies one, and without it a mapping can be made on the
     /// host but never reached from the guest.
@@ -502,6 +505,7 @@ impl NvidiaBackend {
             os_events: std::collections::HashMap::new(),
             allow_refused: std::collections::BTreeMap::new(),
             tsg_sched: sched::TsgSchedStats::default(),
+            guest_tsgs: Vec::new(),
             abi_refused: std::collections::BTreeMap::new(),
             rm_classes: std::collections::BTreeMap::new(),
             rm_controls: std::collections::BTreeMap::new(),

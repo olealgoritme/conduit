@@ -40,6 +40,8 @@
 #define NB_UI_MODE_ADD  (1u << 11)  /* add ui->mode_w x mode_h to the VM's modes */
 #define NB_UI_MODE_DEL  (1u << 12)  /* remove it from the VM's custom modes  */
 #define NB_UI_SYNC      (1u << 13)  /* st->sync changed: re-apply presentation */
+#define NB_UI_VM_PAUSE  (1u << 14)  /* run the VM pause command              */
+#define NB_UI_VM_RESUME (1u << 15)  /* run the VM resume command             */
 
 /* Pointer shapes the area editor asks for. */
 enum {
@@ -60,6 +62,9 @@ struct nb_ui_env {
     bool     fullscreen;
     bool     nearest_ok;        /* this backend can honour the sharp filter */
     bool     vm_actions;        /* shutdown/restart commands are available  */
+    bool     vm_pause;          /* pause/resume commands are available      */
+    bool     vm_paused;         /* the VM is paused (the viewer paused it)  */
+    bool     vm_pause_busy;     /* a pause/resume command is still running  */
     bool     translucent;       /* the panel layer can blend (Wayland: yes) */
     bool     no_stats;          /* this backend has no stats overlay (X11)  */
     bool     immediate;         /* frames are presented immediately now     */
@@ -96,6 +101,7 @@ enum {
     NB_UI_ID_RULE_DEL,          /* arg: index into st->rule: forget it       */
     NB_UI_ID_RULE_DEFAULT,      /* the current layout becomes the default    */
     NB_UI_ID_SYNC,              /* arg: NB_SYNC_*                            */
+    NB_UI_ID_VM_PAUSE,          /* Pause, or Resume while paused             */
 };
 
 /* One clickable thing on the panel, panel CONTENT coordinates (logical; the
@@ -143,6 +149,9 @@ unsigned nb_ui_set_open(struct nb_ui *ui, const struct nb_ui_env *env,
  * changed).  Logical size in lw, lh. */
 void nb_ui_layout(struct nb_ui *ui, const struct nb_ui_env *env, int *lw,
                   int *lh);
+/* The Pause / Resume chip's text: Pause, Resume, or Pausing... / Resuming...
+ * while the command runs (env->vm_paused, env->vm_pause_busy). */
+const char *nb_ui_vm_pause_label(const struct nb_ui_env *env);
 /* Index of the item with this id/arg after the last layout, or -1. */
 int nb_ui_find(const struct nb_ui *ui, int id, int arg);
 /* Tests: draw text with the built-in bitmap font even when FreeType is

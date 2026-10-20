@@ -191,6 +191,8 @@ struct nb_config {
     const char *view_state;     /* settings file, rewritten on every change */
     const char *vm_shutdown_cmd;/* menu: run via /bin/sh, not waited for    */
     const char *vm_reboot_cmd;
+    const char *vm_pause_cmd;   /* menu: Pause / Resume, waited for without */
+    const char *vm_resume_cmd;  /* blocking; the label flips on exit 0      */
     bool        open_menu;      /* --open-menu: start with the menu open    */
 };
 
@@ -356,6 +358,7 @@ struct nb_sink {
     bool     pointer_in;
     bool     grabbed;
     bool     fullscreen;
+    bool     input_held;        /* the VM is paused: forward no input        */
 
     /* Modifier latch for the broker-owned hotkeys.  Tracked from the same key
      * stream the client sees, so the two cannot disagree about reality. */
@@ -426,6 +429,11 @@ void nb_sink_key_latch(struct nb_sink *s, unsigned code, bool down);
 /* Release every key and button the guest believes is down (the menu is
  * taking input); the modifier latch is kept. */
 void nb_sink_release_keys(struct nb_sink *s);
+/* While the VM is paused (the menu's Pause): keys, buttons, pointer and
+ * wheel stop reaching the guest, and what it believes is down is released
+ * first, so nothing is stuck when it runs again.  The viewer's own hotkeys
+ * (the menu, grab, fullscreen) keep working. */
+void nb_sink_hold_input(struct nb_sink *s, bool on);
 void nb_sink_toggle_fullscreen(struct nb_sink *s);
 void nb_sink_btn(struct nb_sink *s, unsigned code, bool down);
 void nb_sink_abs(struct nb_sink *s, int x, int y, unsigned w, unsigned h);
@@ -796,6 +804,22 @@ unsigned nb_guest_mode_changed(struct nb_vstore *st, unsigned w, unsigned h,
                                char *label, size_t n);
 /* Run a configured command via /bin/sh, detached. */
 void nb_run_detached(const char *cmd);
+/*
+ * The menu's Pause / Resume (nb_vmpause.h), shared by the sessions.  _ask
+ * starts --vm-pause-cmd or --vm-resume-cmd; input stops reaching the guest
+ * from the moment a pause is asked.  false when nothing could start, with a
+ * notice in `note`.  _reap, from the UI tick while one runs: true when it
+ * ended, with the outcome in `note`; input comes back only once a resume
+ * succeeded.
+ */
+struct nb_vmpause;
+bool nb_vm_pause_ask(struct nb_vmpause *vp, struct nb_sink *sink,
+                     const struct nb_config *cfg, bool pause, char *note,
+                     size_t n);
+bool nb_vm_pause_reap(struct nb_vmpause *vp, struct nb_sink *sink, char *note,
+                      size_t n);
+/* The status line while paused (title bar / window name). */
+#define NB_VM_PAUSED_STATUS "PAUSED - CTRL+ALT+M TO RESUME"
 
 /* The same 5x7 font, for the client-side title bar.  Uppercase-only. */
 unsigned nb_placeholder_text_w(const char *s, unsigned scale);

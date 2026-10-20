@@ -3,6 +3,7 @@
 //! | key | values | default |
 //! |---|---|---|
 //! | `view.close_stops_vm` | true, false | true: closing the window of a VM that `conduit view` started shuts it down. A VM started any other way (`conduit up`, virt-manager, virsh) always keeps running. |
+//! | `vm.pause_on_suspend` | true, false | true: before the host sleeps, running VMs are paused and their GPU work drained, and after it wakes they continue where they were (docs/SUSPEND.md). false: the sleep hook does nothing. Read at each sleep. |
 //! | `venus.guest_blobs` | true, false | false: the backend serves guest-memory blobs (docs/VENUS.md "Guest-memory blobs"), Venus copy destinations over the guest's own pages, for the Windows KMD's windowed Present. Opt-in while new. Applies when a VM's backend next starts. |
 //! | `backend.latency` | off, all, or a comma-separated list of quiet-held, fused-submit, direct-fences, event-batch, fence-spin | unset: the backend's and conduit-venus's defaults (`all`: the first four); a list is exactly those options (`all,fence-spin` adds the polling fence wait). Round-trip latency options, docs/research/host-roundtrip-latency.md. Applies when a VM's backend next starts. |
 //! | `backend.cpus` | a CPU list such as 0-7,16-23 | unset: the backend and conduit-venus run on any CPU; set: every thread of both stays on these (docs/HOST-TUNING.md). Applies when a VM's backend next starts. |
@@ -27,6 +28,11 @@ const KEYS: &[(&str, &[&str], &str)] = &[
         "view.close_stops_vm",
         &["true", "false"],
         "closing the window of a VM that `conduit view` started shuts it down (default true)",
+    ),
+    (
+        "vm.pause_on_suspend",
+        &["true", "false"],
+        "pause running VMs before the host sleeps and continue them after it wakes, GPU state kept (default true)",
     ),
     (
         "venus.guest_blobs",
@@ -276,6 +282,18 @@ pub fn close_stops_vm() -> bool {
         .unwrap_or(true)
 }
 
+/// `vm.pause_on_suspend` (default true): the sleep hook pauses running VMs
+/// before the host sleeps (sleep.rs).
+pub fn pause_on_suspend() -> bool {
+    pause_on_suspend_of(&load())
+}
+
+fn pause_on_suspend_of(m: &Map<String, Value>) -> bool {
+    m.get("vm.pause_on_suspend")
+        .and_then(Value::as_bool)
+        .unwrap_or(true)
+}
+
 /// `venus.guest_blobs` (default false): the backend gets `--venus-guest-blobs`.
 pub fn venus_guest_blobs() -> bool {
     load()
@@ -520,6 +538,22 @@ mod tests {
         assert!(key("view.close_stops_vm").is_ok());
         assert!(key("view.nope").is_err());
         assert!(key("gpu.window_mib").is_ok());
+    }
+
+    #[test]
+    fn pause_on_suspend_defaults_on() {
+        let mut m = Map::new();
+        assert!(pause_on_suspend_of(&m));
+        m.insert("vm.pause_on_suspend".into(), Value::Bool(false));
+        assert!(!pause_on_suspend_of(&m));
+        m.insert("vm.pause_on_suspend".into(), Value::Bool(true));
+        assert!(pause_on_suspend_of(&m));
+        // A hand-edited string is not a value: the default.
+        m.insert("vm.pause_on_suspend".into(), Value::String("no".into()));
+        assert!(pause_on_suspend_of(&m));
+        let (name, values, _) = key("vm.pause_on_suspend").unwrap();
+        assert_eq!(*name, "vm.pause_on_suspend");
+        assert_eq!(*values, ["true", "false"]);
     }
 
     #[test]
