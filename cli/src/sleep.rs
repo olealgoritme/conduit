@@ -492,20 +492,27 @@ impl Host for Real {
     }
 }
 
-/// After the wake, the guest's clock is behind by the time it slept. Windows
-/// guests: the Conduit tray sets it (`settime` on the control channel).
-/// Other libvirt guests: the QEMU guest agent, when installed (`virsh domtime
-/// --sync`). VMs `conduit up` runs: `hwclock --hctosys` over ssh (the
-/// emulated RTC follows the host). All best effort, each bounded.
 fn sync_clock(p: &Paused) {
+    if let Some(done) = set_guest_clock(&p.name, &p.runner) {
+        eprintln!("conduit: sleep: {}: clock {done}", p.name);
+    }
+}
+
+/// After a wake or a `conduit resume`, the guest's clock is behind by the
+/// time it was paused. Windows guests: the Conduit tray sets it (`settime` on
+/// the control channel). Other libvirt guests: the QEMU guest agent, when
+/// installed (`virsh domtime --sync`). VMs `conduit up` runs: `hwclock
+/// --hctosys` over ssh (the emulated RTC follows the host). All best effort,
+/// each bounded. What was done, for the log; None for the built-in runner.
+pub fn set_guest_clock(name: &str, runner: &Runner) -> Option<String> {
     let now_ms = || {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_millis() as u64)
     };
-    let done = match &p.runner {
+    let done = match runner {
         Runner::Libvirt { uri, domain } => {
-            let agent = crate::ctl::Client::connect_waiting(&p.name, Duration::from_secs(2))
+            let agent = crate::ctl::Client::connect_waiting(name, Duration::from_secs(2))
                 .map_err(|e| format!("{e:#}"))
                 .and_then(|mut c| {
                     c.set_time(now_ms(), Duration::from_secs(3))
@@ -524,7 +531,7 @@ fn sync_clock(p: &Paused) {
                 },
             }
         }
-        Runner::Qemu => match VmConfig::load(&p.name) {
+        Runner::Qemu => match VmConfig::load(name) {
             Ok(c) => {
                 let mut cmd = crate::run::ssh_cmd(&c, "root");
                 cmd.args([
@@ -541,9 +548,9 @@ fn sync_clock(p: &Paused) {
             }
             Err(e) => format!("not set: {e:#}"),
         },
-        Runner::Builtin => return,
+        Runner::Builtin => return None,
     };
-    eprintln!("conduit: sleep: {}: clock {done}", p.name);
+    Some(done)
 }
 
 /// Continue what a previous run of the hook paused and never saw wake (it

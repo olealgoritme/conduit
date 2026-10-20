@@ -4,6 +4,7 @@
 
 use crate::qemu;
 use crate::run::{self, Rt, Stop};
+use crate::sleep::Runner;
 use crate::sys;
 use crate::ui::{self, oops};
 use crate::virt::{self, Link};
@@ -100,6 +101,13 @@ fn libvirt(name: &str, link: &Link, p: Power) -> Result<()> {
             v.run(&["resume", d])?;
             gpu_state_kept(name);
             ui::info(format!("{name} is running"));
+            set_clock(
+                name,
+                &Runner::Libvirt {
+                    uri: link.uri.clone(),
+                    domain: link.domain.clone(),
+                },
+            );
         }
     }
     Ok(())
@@ -124,6 +132,13 @@ fn keep_gpu_state(name: &str) {
 /// within the backend's grace period); a later one is a reboot again.
 fn gpu_state_kept(name: &str) {
     let _ = crate::sleep::backend_ask(name, "release", Duration::from_secs(10));
+}
+
+/// The guest's clock stood still while it was paused.
+fn set_clock(name: &str, runner: &Runner) {
+    if let Some(done) = crate::sleep::set_guest_clock(name, runner) {
+        ui::info(format!("{name}: clock {done}"));
+    }
 }
 
 /// A VM `conduit up`/`view` runs directly: QMP for QEMU, ssh for the guest.
@@ -206,9 +221,10 @@ fn direct(name: &str, p: Power) -> Result<()> {
         }
         Power::Resume => {
             need_qemu("resume")?;
-            let r = qmp_do("cont", "is running");
+            qmp_do("cont", "is running")?;
             gpu_state_kept(name);
-            r
+            set_clock(name, &Runner::Qemu);
+            Ok(())
         }
     }
 }

@@ -73,7 +73,8 @@ served requests for a guest reboot and releases the guest's GPU objects. `keep`
 `release` that lasts 60 s more, then a restart is a reboot again. `conduit
 pause` and `conduit resume`, and the Pause / Resume button in the viewer's
 menu (which runs them), use the same `keep` and `release`, so a paused VM
-keeps its GPU state there too.
+keeps its GPU state there too. `conduit resume` then sets the guest's clock
+the same way as after a wake.
 
 A kept restart keeps the display as well. The viewer goes on showing the
 guest's last frame while the VM is paused and after it continues, until the
