@@ -108,6 +108,12 @@ pub enum Op {
     Get(GetArgs),
     /// List a directory. Answers [`Listing`].
     Ls { path: String },
+    /// Set the guest's clock to this UTC time, in milliseconds since the Unix
+    /// epoch: after the host resumed from sleep, a paused VM's clock is behind
+    /// by the time it slept. Answers no fields; an agent that cannot set the
+    /// clock answers an error (an older one, "unknown op").
+    #[serde(rename = "settime")]
+    SetTime { unix_ms: u64 },
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -376,6 +382,9 @@ mod tests {
                 len: 2,
             }),
             Op::Ls { path: "/".into() },
+            Op::SetTime {
+                unix_ms: 1_760_000_000_123,
+            },
         ];
         for (i, op) in ops.into_iter().enumerate() {
             let r = Request::new(i as u64, op);
@@ -508,5 +517,14 @@ mod tests {
         r.push(b"half");
         r.reset();
         assert_eq!(r.push(b"x\n"), ["x"]);
+    }
+
+    #[test]
+    fn settime_is_spelled_for_the_agents() {
+        let line = Request::new(9, Op::SetTime { unix_ms: 42 }).to_line();
+        assert_eq!(
+            line,
+            "{\"v\":1,\"id\":9,\"op\":\"settime\",\"unix_ms\":42}\n"
+        );
     }
 }

@@ -47,6 +47,62 @@ pub trait Backend: Send + Sync {
     fn as_user<R>(&self, f: impl FnOnce() -> R) -> Result<R, String>
     where
         Self: Sized;
+    /// Set the system clock to this UTC time (`settime`, after the host
+    /// resumed from sleep). A backend that cannot says so.
+    fn set_time(&self, _t: &UtcTime) -> Result<(), String> {
+        Err("this agent cannot set the clock".into())
+    }
+}
+
+/// A UTC calendar time, the fields Windows' `SYSTEMTIME` has.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UtcTime {
+    pub year: u16,
+    pub month: u16,
+    /// 0 = Sunday.
+    pub weekday: u16,
+    pub day: u16,
+    pub hour: u16,
+    pub minute: u16,
+    pub second: u16,
+    pub millis: u16,
+}
+
+/// The earliest and latest clock `settime` accepts: anything outside is a
+/// broken host clock, not a time to set (2020-01-01 to 2200-01-01).
+const SETTIME_MIN_MS: u64 = 1_577_836_800_000;
+const SETTIME_MAX_MS: u64 = 7_258_118_400_000;
+
+/// Milliseconds since the Unix epoch as a UTC calendar time; `None` outside
+/// the plausible range.
+pub fn utc_time(unix_ms: u64) -> Option<UtcTime> {
+    if !(SETTIME_MIN_MS..SETTIME_MAX_MS).contains(&unix_ms) {
+        return None;
+    }
+    let secs = unix_ms / 1000;
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    // Howard Hinnant's civil_from_days.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    Some(UtcTime {
+        year: year as u16,
+        month: month as u16,
+        // 1970-01-01 was a Thursday.
+        weekday: ((days + 4) % 7) as u16,
+        day: day as u16,
+        hour: (rem / 3600) as u16,
+        minute: (rem / 60 % 60) as u16,
+        second: (rem % 60) as u16,
+        millis: (unix_ms % 1000) as u16,
+    })
 }
 
 pub struct Agent<B> {
@@ -140,6 +196,10 @@ impl<B: Backend> Agent<B> {
                     .and_then(|r| r)
                     .map(|l| Response::ok(id, &l))
             }
+            Op::SetTime { unix_ms } => utc_time(unix_ms)
+                .ok_or_else(|| format!("{unix_ms} ms is not a plausible time"))
+                .and_then(|t| self.backend.set_time(&t))
+                .map(|()| Response::ok(id, &())),
         };
         r.unwrap_or_else(|e| Response::err(id, e))
     }
@@ -585,9 +645,15 @@ mod tests {
         /// File ops run through `as_user`, and how many.
         as_user: AtomicU32,
         refuse_user: bool,
+        /// What `settime` set.
+        clock: Mutex<Option<UtcTime>>,
     }
 
     impl Backend for Fake {
+        fn set_time(&self, t: &UtcTime) -> Result<(), String> {
+            *lock(&self.clock) = Some(*t);
+            Ok(())
+        }
         fn user(&self) -> String {
             "tester".into()
         }
@@ -680,6 +746,56 @@ mod tests {
 
     fn err_of(r: Result<Written, String>) -> String {
         r.expect_err("should fail")
+    }
+
+    #[test]
+    fn utc_time_is_the_calendar_time() {
+        // 2025-10-09 08:53:20.123 UTC, a Thursday.
+        assert_eq!(
+            utc_time(1_760_000_000_123),
+            Some(UtcTime {
+                year: 2025,
+                month: 10,
+                weekday: 4,
+                day: 9,
+                hour: 8,
+                minute: 53,
+                second: 20,
+                millis: 123,
+            })
+        );
+        // A leap day, and the last millisecond of a year (a Sunday).
+        let t = utc_time(1_709_164_800_000).unwrap();
+        assert_eq!((t.year, t.month, t.day, t.weekday), (2024, 2, 29, 4));
+        let t = utc_time(1_735_689_599_999).unwrap();
+        assert_eq!(
+            (t.year, t.month, t.day, t.hour, t.minute, t.second, t.millis),
+            (2024, 12, 31, 23, 59, 59, 999)
+        );
+        assert_eq!(t.weekday, 2);
+        assert_eq!(utc_time(0), None, "a broken host clock is not set");
+        assert_eq!(utc_time(u64::MAX), None);
+    }
+
+    #[test]
+    fn settime_sets_the_clock_once_plausible() {
+        let a = agent(None);
+        assert!(
+            call(
+                &a,
+                Op::SetTime {
+                    unix_ms: 1_760_000_000_123
+                }
+            )
+            .ok
+        );
+        assert_eq!(
+            lock(&a.backend.clock).map(|t| (t.year, t.month, t.day)),
+            Some((2025, 10, 9))
+        );
+        let r = call(&a, Op::SetTime { unix_ms: 5 });
+        assert!(!r.ok);
+        assert!(r.error.unwrap().contains("not a plausible time"));
     }
 
     #[test]
