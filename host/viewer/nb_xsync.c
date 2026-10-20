@@ -10,6 +10,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdarg.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -149,7 +150,7 @@ static bool node_of_dev(dev_t dev, char *out, size_t n)
     DIR *d = opendir("/dev/dri");
     struct dirent *e;
     bool found = false;
-    char b[96], rb[256];
+    char b[96], rb[PATH_MAX];   /* realpath() writes up to PATH_MAX bytes */
 
     if (!d) {
         return false;
@@ -161,7 +162,7 @@ static bool node_of_dev(dev_t dev, char *out, size_t n)
         return false;
     }
     while (!found && (e = readdir(d))) {
-        char path[300], a[96], ra[256];
+        char path[300], a[96], ra[PATH_MAX];
         struct stat st;
 
         if (strncmp(e->d_name, "renderD", 7)) {

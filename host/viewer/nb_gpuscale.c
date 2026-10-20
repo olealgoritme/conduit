@@ -17,6 +17,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdarg.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -695,7 +696,7 @@ struct nb_gs *nb_gs_open(const char *node, dev_t dev, uint32_t fourcc,
             snprintf(path, sizeof(path), "/dev/dri/%s", e->d_name);
             /* Same device as the card node `dev`: compare the sysfs device. */
             if (stat(path, &st) == 0) {
-                char a[96], b[96], ra[256], rb[256];
+                char a[96], b[96], ra[PATH_MAX], rb[PATH_MAX];   /* realpath() writes up to PATH_MAX bytes */
 
                 snprintf(a, sizeof(a), "/sys/dev/char/%u:%u/device",
                          major(st.st_rdev), minor(st.st_rdev));
