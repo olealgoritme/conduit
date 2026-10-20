@@ -17,6 +17,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdarg.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -599,7 +600,9 @@ static void gs_down(struct nb_gs *g)
             }
             f->DeleteFramebuffers(1, &g->t[i].fbo);
             f->DeleteRenderbuffers(1, &g->t[i].rb);
-            f->DestroyImageKHR(g->dpy, g->t[i].img);
+            if (g->t[i].img) {      /* read-back targets have none */
+                f->DestroyImageKHR(g->dpy, g->t[i].img);
+            }
         }
         if (g->prog) {
             f->DeleteProgram(g->prog);
@@ -609,8 +612,13 @@ static void gs_down(struct nb_gs *g)
     }
     for (int i = 0; i < NB_GS_TARGETS; i++) {
         if (g->t[i].valid) {
-            close(g->t[i].fd);
-            f->gbm_bo_destroy(g->t[i].bo);
+            /* Read-back targets are plain renderbuffers: no dma-buf, no bo. */
+            if (g->t[i].fd >= 0) {
+                close(g->t[i].fd);
+            }
+            if (g->t[i].bo) {
+                f->gbm_bo_destroy(g->t[i].bo);
+            }
             g->t[i].valid = false;
         }
     }
@@ -688,7 +696,7 @@ struct nb_gs *nb_gs_open(const char *node, dev_t dev, uint32_t fourcc,
             snprintf(path, sizeof(path), "/dev/dri/%s", e->d_name);
             /* Same device as the card node `dev`: compare the sysfs device. */
             if (stat(path, &st) == 0) {
-                char a[96], b[96], ra[256], rb[256];
+                char a[96], b[96], ra[PATH_MAX], rb[PATH_MAX];   /* realpath() writes up to PATH_MAX bytes */
 
                 snprintf(a, sizeof(a), "/sys/dev/char/%u:%u/device",
                          major(st.st_rdev), minor(st.st_rdev));
@@ -851,8 +859,35 @@ int nb_gs_readback(struct nb_gs *g, int target, void *dst)
     return 0;
 }
 
+/* One buffer in `fmt`, GBM choosing among `m` (scanout-capable first). */
+static struct gbm_bo *bo_with_mods(struct nb_gs *g, uint32_t w, uint32_t h,
+                                   uint32_t fmt, const uint64_t *m, unsigned k)
+{
+    struct fns *f = &g->f;
+    struct gbm_bo *bo = NULL;
+
+    if (!k) {
+        return NULL;
+    }
+    if (f->gbm_bo_create_with_modifiers2) {
+        bo = f->gbm_bo_create_with_modifiers2(g->gbm, w, h, fmt, m, k,
+                                              GBM_BO_USE_SCANOUT |
+                                              GBM_BO_USE_RENDERING);
+        if (!bo) {
+            /* A layout the display engine cannot scan out is still one the
+             * compositor composites. */
+            bo = f->gbm_bo_create_with_modifiers2(g->gbm, w, h, fmt, m, k,
+                                                  GBM_BO_USE_RENDERING);
+        }
+    } else if (f->gbm_bo_create_with_modifiers) {
+        bo = f->gbm_bo_create_with_modifiers(g->gbm, w, h, fmt, m, k);
+    }
+    return bo;
+}
+
 int nb_gs_targets(struct nb_gs *g, uint32_t w, uint32_t h, nb_gs_fmt_ok ok,
-                  void *ctx, const uint64_t *scan_mods, unsigned n_scan,
+                  void *ctx, const uint32_t *cand_fourcc,
+                  const uint64_t *cand_mod, unsigned n_cand,
                   struct nb_gs_target out[NB_GS_TARGETS],
                   char *why, size_t n)
 {
@@ -867,29 +902,23 @@ int nb_gs_targets(struct nb_gs *g, uint32_t w, uint32_t h, nb_gs_fmt_ok ok,
         uint64_t mod;
 
         /*
-         * The compositor's scanout tranche first, when it named one: GBM
-         * picks among exactly the XRGB modifiers a plane takes, so the
-         * output buffer is not only importable but scannable.
+         * The candidates first (nb_present.h nb_pc_targets: the layouts the
+         * compositor lists, scanout-capable ones first in fullscreen), one
+         * format at a time in the order given: GBM picks among exactly the
+         * modifiers of that format the compositor takes.
          */
-        if (n_scan && (f->gbm_bo_create_with_modifiers2 ||
-                       f->gbm_bo_create_with_modifiers)) {
-            uint64_t m[32];
-            unsigned k = 0;
+        for (unsigned j = 0; j < n_cand && !bo; ) {
+            uint64_t m[48];
+            unsigned k = 0, e = j;
 
-            for (unsigned j = 0; j < n_scan && k < 32; j++) {
-                if (!ok || ok(ctx, FMT_XRGB8888, scan_mods[j])) {
-                    m[k++] = scan_mods[j];
+            fmt = cand_fourcc[j];
+            for (; e < n_cand && cand_fourcc[e] == fmt; e++) {
+                if (k < 48 && (!ok || ok(ctx, fmt, cand_mod[e]))) {
+                    m[k++] = cand_mod[e];
                 }
             }
-            if (k) {
-                fmt = FMT_XRGB8888;
-                bo = f->gbm_bo_create_with_modifiers2
-                         ? f->gbm_bo_create_with_modifiers2(
-                               g->gbm, w, h, fmt, m, k,
-                               GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING)
-                         : f->gbm_bo_create_with_modifiers(g->gbm, w, h, fmt,
-                                                           m, k);
-            }
+            bo = bo_with_mods(g, w, h, fmt, m, k);
+            j = e;
         }
         /* Opaque XRGB first (a plane takes it without blending), and only
          * a layout the compositor said it takes. */

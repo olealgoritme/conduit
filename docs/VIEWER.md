@@ -299,37 +299,97 @@ windows only) in the config, or for the running session only
 Display Configuration, Adaptive sync: Automatic. Sway:
 `output * adaptive_sync on`. The viewer does not change these settings.
 
-## Direct attach or GPU copy
+## Present levels
 
-The guest's frame is attached to the window as it is (zero-copy) whenever
-the compositor takes its (format, modifier) pair: it advertises the pair (or
-its opaque twin, XRGB for ARGB) on `zwp_linux_dmabuf_v1` and imports it.
-A guest frame is always shown opaque, because a guest primary's alpha is
-undefined (a Windows desktop composed by DWM leaves it at zero): an ARGB
-frame is attached as its XRGB twin whenever the compositor advertises the
-twin for that modifier, the picture surface carries an opaque region, shared
-memory frames go out as `WL_SHM_FORMAT_XRGB8888`, the GPU pass writes alpha
-1, and on X11 the picture is a depth-24 window.
-When it does not (the compositor runs on another GPU than the guest's, and
-the guest's layout is NVIDIA block-linear while the compositor lists only
-its own GPU's modifiers and LINEAR, or the compositor refuses a pair it
-advertised), the viewer copies each frame with its GPU pass
-(`host/viewer/nb_gpuscale.c`) into a buffer the compositor does take
-(XRGB8888, a modifier it lists, LINEAR as the last choice), scaled and
-letterboxed to the window, in every window mode. When the GPU pass cannot
-render into any layout the compositor takes (an NVIDIA GPU renders to no
-LINEAR buffer, and a compositor on an integrated GPU takes no NVIDIA
-modifier), it renders into its own memory and reads each frame back into a
-`wl_shm` buffer, which every compositor takes: one copy through system
-memory, about 1.3 ms per frame at 2560x1440. The viewer answers the
-backend's format query yes for such a pair, so no frame is dropped.
-`--gpu-scale=off` turns the GPU pass off, the copy included;
-`--present-mode=linear` and `shm` leave it off (the backend converts
-instead). The log says `GPU copy: ... is not taken by the compositor` once
-per pair, the `--stats` line says `path: direct attach` or `path: GPU copy
-(...) on /dev/dri/renderD...`, and the overlay's last line reads `DIRECT`,
-`GPU COPY` or `GPU SCALE` with the GPU. The decision is
-`host/viewer/nb_blit.h`.
+A guest frame reaches the window in one of three ways, cheapest first
+(`host/viewer/nb_present.h`):
+
+| Level | What happens | Cost |
+|---|---|---|
+| zero-copy | The guest's dma-buf is the window's buffer (`wl_buffer`, or a DRI3 pixmap on X11). | None in the viewer. |
+| gpu-copy | The viewer's GPU pass (`host/viewer/nb_gpuscale.c`) draws the frame, scaled and letterboxed, into a buffer of its own in a layout the display server lists. | One GPU pass per frame. |
+| readback | The same pass, read back into shared memory: `wl_shm` on Wayland, MIT-SHM (else `PutImage`) on X11. Needs nothing from the display server but its core protocol. | One pass plus a copy through system memory. |
+
+`--present-mode` (`viewer.present` and `viewer.present.NAME` in
+`conduit config`, `CONDUIT_VIEWER_PRESENT` in the viewer's environment,
+which wins) picks where to start and how far to fall:
+
+- `auto` (what `conduit view` passes): zero-copy, then gpu-copy, then
+  readback. A level is left only on a hard failure: the display refused to
+  import the guest's buffer, refused the copy's buffers, offers no dma-buf
+  protocol (no `zwp_linux_dmabuf_v1`, no DRI3 or Present), or lists no
+  layout a guest frame can have. The log says it once:
+  `present: gpu-copy (--present-mode=auto): the compositor refused to import
+  the guest's buffer`. Nothing softer moves it. A client cannot see the
+  screen, and what it is told (presentation feedback, buffer releases) is
+  the same for a hidden window as for a buffer the display failed to draw,
+  so guessing from it would give up zero-copy, and its latency, where it
+  works. For a display that takes the guest's buffers and draws them wrong,
+  set `copy`.
+- `copy`: gpu-copy, then readback.
+- `readback`: readback only.
+- `native` (the viewer's own default): zero-copy, never falling. A pair the
+  display does not take is still copied frame by frame (below).
+- `linear`: only LINEAR is advertised, so the backend detiles; no copy.
+- `shm`: no dma-buf is advertised. Shared-memory frames are shown as they
+  are, dma-buf frames are read back.
+
+Nothing depends on the output's bit depth: the guest's frame is 8-bit and
+the copy's buffers are XRGB8888, which the compositor converts to a 10-bit
+output in its own pass.
+
+**A pair the display does not take.** At the zero-copy level the guest's
+frame is attached as it is whenever the compositor takes its (format,
+modifier) pair: it advertises the pair (or its opaque twin, XRGB for ARGB)
+on `zwp_linux_dmabuf_v1` and imports it. A guest frame is always shown
+opaque, because a guest primary's alpha is undefined (a Windows desktop
+composed by DWM leaves it at zero): an ARGB frame is attached as its XRGB
+twin whenever the compositor advertises the twin for that modifier, the
+picture surface carries an opaque region, shared memory frames go out as
+`WL_SHM_FORMAT_XRGB8888`, the GPU pass writes alpha 1, and on X11 the
+picture is a depth-24 window. When it does not (the compositor runs on
+another GPU than the guest's, and the guest's layout is NVIDIA block-linear
+while the compositor lists only its own GPU's modifiers and LINEAR), the
+viewer copies that pair's frames with the GPU pass, in every window mode,
+and the backend's format query is answered yes for it, so no frame is
+dropped. The decision is `host/viewer/nb_blit.h`. `--gpu-scale=off` turns
+off the fullscreen scaler only; a frame that has no other way to the screen
+is still copied.
+
+**The copy's buffers.** On Wayland they are allocated in a pair from the
+compositor's dma-buf feedback: its render tranche (what it imports to
+composite with), the scanout tranche first in fullscreen; the plain
+`zwp_linux_dmabuf_v1` modifier list when there is no feedback. On X11 the
+modifiers come from `DRI3GetSupportedModifiers`. The buffer is the window's
+size, with the letterbox drawn into it. When the GPU renders into no layout
+the display takes (an NVIDIA GPU renders to no LINEAR buffer, and a
+compositor on an integrated GPU takes no NVIDIA modifier), the pass reads
+back instead: `glReadPixels` straight into the shared memory the display
+reads, one copy through system memory (about 2.6 ms per 5120x1440 frame and
+0.6 ms per 1920x1080 frame on an RTX 5090; the pass itself is about 50 µs).
+`TEST_GPUSCALE_BENCH=WxH host/viewer/test-gpuscale` measures both.
+
+**Explicit sync.** On a compositor that offers `wp_linux_drm_syncobj_v1`,
+every dma-buf commit carries an acquire and a release point
+(`host/viewer/nb_xsync.c`, plain DRM ioctls on the compositor's render
+node). A guest frame's acquire point is the dma-buf's own pending writes
+(`DMA_BUF_IOCTL_EXPORT_SYNC_FILE`), or signalled at once on a kernel
+without that ioctl (the guest's frame is complete when it is handed over,
+[SYNC.md](SYNC.md)). A copied frame's acquire point is signalled once the
+pass is done. Each buffer has its own release timeline, watched with one
+eventfd (`DRM_IOCTL_SYNCOBJ_EVENTFD`; polled every millisecond on a kernel
+without it), and a buffer goes back to the guest, or a copy buffer is reused,
+only when its release point is signalled. Anything that is not a dma-buf
+(the letterbox's black pixel, shared memory) is committed with the surface's
+syncobj object destroyed first. `--explicit-sync=off`
+(`CONDUIT_VIEWER_EXPLICIT_SYNC=0`) keeps implicit sync.
+
+**What the log and the stats say.** `present: LEVEL (--present-mode=MODE):
+why` at start and on every drop, `GPU copy: ... is not taken by the
+compositor` once per pair, and the `--stats` line `path: direct attach` or
+`path: GPU copy (...) on /dev/dri/renderD...` (on X11 `path: gpu-copy` or
+`readback` with the pass's time). The overlay's last line reads `DIRECT`,
+`GPU COPY` or `GPU SCALE` with the GPU.
 
 ## The viewer's GPU
 

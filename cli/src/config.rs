@@ -11,6 +11,8 @@
 //! | `host.isolation.NAME` | auto, off, or a CPU list | unset: `host.isolation`. The same for one VM. |
 //! | `viewer.gpu` | auto, dgpu, igpu, or a render node such as /dev/dri/renderD128 | auto: the GPU the viewer copies or scales frames on when the compositor does not take them as they are (docs/VIEWER.md "The viewer's GPU"): the GPU that imports the guest's frames, the one that made them first. dgpu and igpu are found from PCI facts, not card numbers. Applies when the viewer next opens. |
 //! | `viewer.gpu.NAME` | auto, dgpu, igpu, or a render node | unset: `viewer.gpu`. The same for one VM. |
+//! | `viewer.present` | auto, native, copy, readback, linear, shm | auto: how the viewer puts a guest frame on screen (docs/VIEWER.md "Present levels"): the guest's buffer itself (zero-copy), dropping to the viewer's GPU copy and then to a read-back into shared memory only when the display refuses a level. copy and readback force those levels. Applies when the viewer next opens; CONDUIT_VIEWER_PRESENT in the viewer's environment overrides it. |
+//! | `viewer.present.NAME` | auto, native, copy, readback, linear, shm | unset: `viewer.present`. The same for one VM. |
 //! | `gpu.window_mib` | auto, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144 | auto: the host GPU's BAR1 (as Resizable BAR on bare metal), clamped to what the guest's 64-bit MMIO window holds, 4096 without a GPU. The shared window every guest CPU mapping of GPU memory goes through, in MiB. Address space, not memory. Applies when a VM's backend next starts. |
 
 use crate::paths;
@@ -67,6 +69,16 @@ const KEYS: &[(&str, &[&str], &str)] = &[
         "viewer.gpu for the VM called VM (e.g. viewer.gpu.win11) (unset: viewer.gpu)",
     ),
     (
+        "viewer.present",
+        &["auto", "native", "copy", "readback", "linear", "shm"],
+        "how the viewer puts a guest frame on screen, from the viewer's next start (default auto: zero-copy, falling back to the GPU copy and then to read-back only when the display refuses a level; copy or readback force those levels)",
+    ),
+    (
+        "viewer.present.VM",
+        &["auto", "native", "copy", "readback", "linear", "shm"],
+        "viewer.present for the VM called VM (e.g. viewer.present.win11) (unset: viewer.present)",
+    ),
+    (
         "gpu.vram_limit_mib",
         &["auto", "off"],
         "MiB of video memory a guest may hold, or off, from the next backend start (unset: a cap when safe mode is on and the NVIDIA card drives a monitor; auto: that cap whatever the driver; off: none; also any number of MiB)",
@@ -105,8 +117,11 @@ fn save(m: &Map<String, Value>) -> Result<()> {
     std::fs::rename(&tmp, &f).with_context(|| format!("saving {}", f.display()))
 }
 
+/// The viewer's --present-mode values (host/viewer/nb_present.h).
+const PRESENT_MODES: &[&str] = &["auto", "native", "copy", "readback", "linear", "shm"];
+
 /// Settings that also take a per-VM override, `BASE.NAME`.
-const PER_VM: &[&str] = &["host.isolation", "viewer.gpu"];
+const PER_VM: &[&str] = &["host.isolation", "viewer.gpu", "viewer.present"];
 
 /// `BASE.NAME` for a per-VM base and a valid VM name: (the generic key
 /// `BASE.VM`, the VM's name).
@@ -117,6 +132,7 @@ fn vm_key(k: &str) -> Option<(&'static str, &str)> {
             .filter(|n| *n != "VM" && crate::vm::check_name(n).is_ok())
             .map(|n| match *base {
                 "host.isolation" => ("host.isolation.VM", n),
+                "viewer.present" => ("viewer.present.VM", n),
                 _ => ("viewer.gpu.VM", n),
             })
     })
@@ -205,6 +221,9 @@ pub fn set(k: &str, v: &str) -> Result<()> {
     }
     if name.starts_with("viewer.gpu") {
         println!("Applies when the viewer next opens; `conduit doctor` shows the GPU it picks.");
+    }
+    if name.starts_with("viewer.present") {
+        println!("Applies when the viewer next opens; its log says which level it uses.");
     }
     Ok(())
 }
@@ -375,6 +394,26 @@ fn viewer_gpu_of(m: &Map<String, Value>, vm: &str) -> (String, String) {
     let own = format!("viewer.gpu.{vm}");
     for k in [own.as_str(), "viewer.gpu"] {
         if let Some(v) = m.get(k).and_then(Value::as_str).filter(|v| gpu_value(v)) {
+            return (v.to_string(), k.to_string());
+        }
+    }
+    ("auto".into(), "default".into())
+}
+
+/// The `viewer.present` setting for a VM and where it came from: its own
+/// `viewer.present.NAME`, else `viewer.present`, else the default `auto`.
+pub fn viewer_present(vm: &str) -> (String, String) {
+    viewer_present_of(&load(), vm)
+}
+
+fn viewer_present_of(m: &Map<String, Value>, vm: &str) -> (String, String) {
+    let own = format!("viewer.present.{vm}");
+    for k in [own.as_str(), "viewer.present"] {
+        if let Some(v) = m
+            .get(k)
+            .and_then(Value::as_str)
+            .filter(|v| PRESENT_MODES.contains(v))
+        {
             return (v.to_string(), k.to_string());
         }
     }
@@ -579,6 +618,40 @@ mod tests {
             assert!(isolation_value(ok), "{ok}");
         }
         assert!(!isolation_value("on"));
+    }
+
+    #[test]
+    fn viewer_present_setting_and_per_vm_override() {
+        let mut m = Map::new();
+        assert_eq!(
+            viewer_present_of(&m, "desk"),
+            ("auto".into(), "default".into())
+        );
+        m.insert("viewer.present".into(), Value::String("copy".into()));
+        assert_eq!(
+            viewer_present_of(&m, "desk"),
+            ("copy".into(), "viewer.present".into())
+        );
+        m.insert(
+            "viewer.present.desk".into(),
+            Value::String("readback".into()),
+        );
+        assert_eq!(
+            viewer_present_of(&m, "desk"),
+            ("readback".into(), "viewer.present.desk".into())
+        );
+        assert_eq!(viewer_present_of(&m, "other").0, "copy");
+        // A value the viewer would not take is skipped, not passed on.
+        m.insert("viewer.present.desk".into(), Value::String("fast".into()));
+        assert_eq!(viewer_present_of(&m, "desk").0, "copy");
+        // The keys list the same values the lookup accepts.
+        assert_eq!(key("viewer.present").unwrap().1, PRESENT_MODES);
+        assert_eq!(key("viewer.present.desk").unwrap().1, PRESENT_MODES);
+        assert!(key("viewer.present.desk").is_ok());
+        assert_eq!(
+            vm_key("viewer.present.desk"),
+            Some(("viewer.present.VM", "desk"))
+        );
     }
 
     #[test]

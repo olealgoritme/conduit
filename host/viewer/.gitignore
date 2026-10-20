@@ -20,3 +20,4 @@ test-blit
 test-gpusel
 test-scanout
 build_id.h
+test-present

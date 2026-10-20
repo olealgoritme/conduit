@@ -56,13 +56,15 @@ typedef bool (*nb_gs_fmt_ok)(void *ctx, uint32_t fourcc, uint64_t mod);
 
 /*
  * (Re)allocate the NB_GS_TARGETS output buffers at w x h (physical pixels).
- * scan_mods/n_scan: the XRGB8888 modifiers of the compositor's scanout
- * tranche (dma-buf feedback), tried first; none: GBM's own choice for
- * scanout.  Returns the number made (0 on failure, with why).  out[]
- * describes them.
+ * cand_fourcc/cand_mod/n_cand: the (format, modifier) pairs to allocate in,
+ * best first and grouped by format (nb_present.h nb_pc_targets); GBM picks
+ * among the modifiers of one format at a time.  None fits, or none given:
+ * GBM's own choice, kept when ok() takes it, else LINEAR.  Returns the
+ * number made (0 on failure, with why).  out[] describes them.
  */
 int nb_gs_targets(struct nb_gs *g, uint32_t w, uint32_t h, nb_gs_fmt_ok ok,
-                  void *ctx, const uint64_t *scan_mods, unsigned n_scan,
+                  void *ctx, const uint32_t *cand_fourcc,
+                  const uint64_t *cand_mod, unsigned n_cand,
                   struct nb_gs_target out[NB_GS_TARGETS],
                   char *why, size_t n);
 

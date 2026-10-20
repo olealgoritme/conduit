@@ -13,14 +13,16 @@
 # Note what is NOT linked here: no libdrm, no EGL, no GL, no libgbm.  The broker turns
 # a dma-buf into a wl_buffer or an X pixmap with protocol requests; the import
 # happens in the compositor or the X server.  That is the same property the
-# VMM gains, one process in.  The one GPU pass there is (nb_gpuscale.c, the
-# fullscreen scaler for a picture that is not 1:1) dlopen()s libEGL, libGLESv2
-# and libgbm at runtime, only when it is first needed.
+# VMM gains, one process in.  The one GPU pass there is (nb_gpuscale.c: the
+# fullscreen scaler, and the gpu-copy and readback present levels) dlopen()s
+# libEGL, libGLESv2 and libgbm at runtime, only when it is first needed.
+# Explicit sync (nb_xsync.c) is plain DRM ioctls.
 #
 # Debian/Ubuntu build deps:
 #   Wayland backend : libwayland-dev wayland-protocols
 #   X11 backend     : libxcb1-dev libxcb-dri3-dev libxcb-present-dev
 #   X11 scaling     : libxcb-render0-dev     (optional; without it, 1:1 only)
+#   X11 read-back   : libxcb-shm0-dev        (optional; else PutImage)
 #   X11 rel. motion : libxcb-xinput-dev      (optional; see the report below)
 
 PKG_CONFIG ?= pkg-config
@@ -37,7 +39,7 @@ CFLAGS  += -std=gnu11 -Wall -Wextra -Wno-unused-parameter \
            -D_GNU_SOURCE -I. -Icommon
 LDFLAGS += -Wl,-z,relro,-z,now
 
-OBJS = nvkvm_broker.o nb_common.o nb_placeholder.o nb_overlay.o nb_view.o nb_ui.o nb_gpuscale.o \
+OBJS = nvkvm_broker.o nb_common.o nb_placeholder.o nb_overlay.o nb_view.o nb_ui.o nb_gpuscale.o nb_xsync.o \
        nb_session_x11.o nb_session_wl.o nb_session_test.o
 
 # ── X11 backend: xcb + DRI3 + Present ─────────────────────────────────────
@@ -58,6 +60,13 @@ ifeq ($(shell $(PKG_CONFIG) --exists xcb-render && echo yes),yes)
 HAVE_XRENDER = 1
 CFLAGS  += -DNB_HAVE_XCB_RENDER $(shell $(PKG_CONFIG) --cflags xcb-render)
 LIBS    += $(shell $(PKG_CONFIG) --libs xcb-render)
+endif
+# MIT-SHM: the read-back level hands its pixels over through shared memory.
+# Optional -- without it they go in PutImage requests.
+ifeq ($(shell $(PKG_CONFIG) --exists xcb-shm && echo yes),yes)
+HAVE_XSHM = 1
+CFLAGS  += -DNB_HAVE_XCB_SHM $(shell $(PKG_CONFIG) --cflags xcb-shm)
+LIBS    += $(shell $(PKG_CONFIG) --libs xcb-shm)
 endif
 ifeq ($(shell $(PKG_CONFIG) --exists xcb-xinput && echo yes),yes)
 HAVE_XI  = 1
@@ -87,6 +96,16 @@ WL_XML = \
   $(WL_PROTO_DIR)/staging/single-pixel-buffer/single-pixel-buffer-v1.xml \
   $(WL_PROTO_DIR)/staging/content-type/content-type-v1.xml
 
+# Explicit sync (wayland-protocols 1.34+).  Optional: without the XML the
+# viewer commits with implicit sync, as on a compositor that does not offer it.
+WL_SYNCOBJ_XML := $(WL_PROTO_DIR)/staging/linux-drm-syncobj/linux-drm-syncobj-v1.xml
+ifneq ($(WL_PROTO_DIR),)
+ifeq ($(shell test -f $(WL_SYNCOBJ_XML) && echo yes),yes)
+WL_XML  += $(WL_SYNCOBJ_XML)
+HAVE_WL_SYNCOBJ = 1
+endif
+endif
+
 WL_HDRS = $(notdir $(WL_XML:.xml=-client-protocol.h))
 WL_SRCS = $(notdir $(WL_XML:.xml=-protocol.c))
 WL_OBJS = $(WL_SRCS:.c=.o)
@@ -97,6 +116,9 @@ ifeq ($(shell $(PKG_CONFIG) --exists wayland-client && echo yes),yes)
 ifeq ($(shell test -f $(WL_PROTO_DIR)/stable/linux-dmabuf/linux-dmabuf-v1.xml && echo yes),yes)
 HAVE_WL  = 1
 CFLAGS  += -DNB_HAVE_WAYLAND $(shell $(PKG_CONFIG) --cflags wayland-client)
+ifeq ($(HAVE_WL_SYNCOBJ),1)
+CFLAGS  += -DNB_HAVE_WL_SYNCOBJ
+endif
 LIBS    += $(shell $(PKG_CONFIG) --libs wayland-client)
 OBJS    += $(WL_OBJS)
 endif
@@ -152,8 +174,8 @@ report:
 	@echo "conduit-viewer backends:"
 	@echo "  scanout test source : $(if $(HAVE_SCANTEST),yes (gbm+egl+glesv2),NO - apt install libgbm-dev libegl-dev libgles-dev)"
 	@echo "  dma-buf test source : $(if $(HAVE_GBM),yes (libgbm),NO - apt install libgbm-dev)"
-	@echo "  wayland : $(if $(HAVE_WL),yes,NO - install libwayland-dev wayland-protocols)"
-	@echo "  x11     : $(if $(HAVE_X11),yes (dri3+present$(if $(HAVE_XRENDER), +xrender scaling, NO SCALING: install libxcb-render0-dev)),NO - install libxcb1-dev libxcb-dri3-dev libxcb-present-dev)$(if $(HAVE_X11),$(if $(HAVE_XI), + xi2 raw motion, - NO relative motion under grab: install libxcb-xinput-dev),)"
+	@echo "  wayland : $(if $(HAVE_WL),yes$(if $(HAVE_WL_SYNCOBJ), +explicit sync, - no explicit sync: wayland-protocols 1.34+ needed),NO - install libwayland-dev wayland-protocols)"
+	@echo "  x11     : $(if $(HAVE_X11),yes (dri3+present$(if $(HAVE_XRENDER), +xrender scaling, NO SCALING: install libxcb-render0-dev)$(if $(HAVE_XSHM), +mit-shm read-back, - read-back through PutImage: install libxcb-shm0-dev)),NO - install libxcb1-dev libxcb-dri3-dev libxcb-present-dev)$(if $(HAVE_X11),$(if $(HAVE_XI), + xi2 raw motion, - NO relative motion under grab: install libxcb-xinput-dev),)"
 	@echo "  test    : yes (always)"
 	@echo "  ui text : $(if $(HAVE_FT),freetype + fontconfig,bitmap font only - apt install libfreetype-dev libfontconfig-dev)"
 
@@ -262,8 +284,12 @@ test-scanout: test/test_scanout.c nb_scanout.h
 test-relacc: test/test_relacc.c nb_relacc.h
 	$(CC) $(CFLAGS) -I . -o $@ test/test_relacc.c
 
-check: all test-utf8 test-overlay test-relacc test-view test-ui test-pace test-latch test-blit test-gpusel test-scanout $(if $(HAVE_GBM),test-gpuscale,)
+test-present: test/test_present.c nb_present.h nb_scanout.h
+	$(CC) $(CFLAGS) -I . -o $@ test/test_present.c
+
+check: all test-utf8 test-overlay test-relacc test-view test-ui test-pace test-latch test-blit test-gpusel test-scanout test-present $(if $(HAVE_GBM),test-gpuscale,)
 	./test-utf8
+	./test-present
 	./test-pace
 	./test-latch
 	./test-blit
@@ -296,4 +322,4 @@ install: $(BIN)
 
 clean:
 	rm -f $(BIN) $(TESTCLIENT) $(RELAY) $(DMASRC) $(SCANTEST) *.o *.d build_id.h \
-	      *-client-protocol.h *-protocol.c test-utf8 test-overlay test-gpuscale test-pace test-latch test-blit test-gpusel test-scanout test/utf8_extracted.inc
+	      *-client-protocol.h *-protocol.c test-utf8 test-overlay test-gpuscale test-pace test-latch test-blit test-gpusel test-scanout test-present test/utf8_extracted.inc
