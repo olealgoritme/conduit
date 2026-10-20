@@ -22,6 +22,7 @@
 #   Wayland backend : libwayland-dev wayland-protocols
 #   X11 backend     : libxcb1-dev libxcb-dri3-dev libxcb-present-dev
 #   X11 scaling     : libxcb-render0-dev     (optional; without it, 1:1 only)
+#   X11 read-back   : libxcb-shm0-dev        (optional; else PutImage)
 #   X11 rel. motion : libxcb-xinput-dev      (optional; see the report below)
 
 PKG_CONFIG ?= pkg-config
@@ -59,6 +60,13 @@ ifeq ($(shell $(PKG_CONFIG) --exists xcb-render && echo yes),yes)
 HAVE_XRENDER = 1
 CFLAGS  += -DNB_HAVE_XCB_RENDER $(shell $(PKG_CONFIG) --cflags xcb-render)
 LIBS    += $(shell $(PKG_CONFIG) --libs xcb-render)
+endif
+# MIT-SHM: the read-back level hands its pixels over through shared memory.
+# Optional -- without it they go in PutImage requests.
+ifeq ($(shell $(PKG_CONFIG) --exists xcb-shm && echo yes),yes)
+HAVE_XSHM = 1
+CFLAGS  += -DNB_HAVE_XCB_SHM $(shell $(PKG_CONFIG) --cflags xcb-shm)
+LIBS    += $(shell $(PKG_CONFIG) --libs xcb-shm)
 endif
 ifeq ($(shell $(PKG_CONFIG) --exists xcb-xinput && echo yes),yes)
 HAVE_XI  = 1
@@ -167,7 +175,7 @@ report:
 	@echo "  scanout test source : $(if $(HAVE_SCANTEST),yes (gbm+egl+glesv2),NO - apt install libgbm-dev libegl-dev libgles-dev)"
 	@echo "  dma-buf test source : $(if $(HAVE_GBM),yes (libgbm),NO - apt install libgbm-dev)"
 	@echo "  wayland : $(if $(HAVE_WL),yes$(if $(HAVE_WL_SYNCOBJ), +explicit sync, - no explicit sync: wayland-protocols 1.34+ needed),NO - install libwayland-dev wayland-protocols)"
-	@echo "  x11     : $(if $(HAVE_X11),yes (dri3+present$(if $(HAVE_XRENDER), +xrender scaling, NO SCALING: install libxcb-render0-dev)),NO - install libxcb1-dev libxcb-dri3-dev libxcb-present-dev)$(if $(HAVE_X11),$(if $(HAVE_XI), + xi2 raw motion, - NO relative motion under grab: install libxcb-xinput-dev),)"
+	@echo "  x11     : $(if $(HAVE_X11),yes (dri3+present$(if $(HAVE_XRENDER), +xrender scaling, NO SCALING: install libxcb-render0-dev)$(if $(HAVE_XSHM), +mit-shm read-back, - read-back through PutImage: install libxcb-shm0-dev)),NO - install libxcb1-dev libxcb-dri3-dev libxcb-present-dev)$(if $(HAVE_X11),$(if $(HAVE_XI), + xi2 raw motion, - NO relative motion under grab: install libxcb-xinput-dev),)"
 	@echo "  test    : yes (always)"
 	@echo "  ui text : $(if $(HAVE_FT),freetype + fontconfig,bitmap font only - apt install libfreetype-dev libfontconfig-dev)"
 
