@@ -83,8 +83,20 @@ that fades in when the pointer touches the window's top edge. The menu has:
   VSync, or Latest per refresh. See
   [Presentation](#presentation-immediate-vsync-or-latest-per-refresh).
 - **View**: the stats overlay and fullscreen.
-- **Virtual machine**: Restart and Shut down, which run `conduit reboot` and
-  `conduit shutdown` for the VM. Both ask for a second click to confirm.
+- **Virtual machine**: Pause / Resume, Restart and Shut down, which run
+  `conduit pause`, `conduit resume`, `conduit reboot` and `conduit shutdown`
+  for the VM. Restart and Shut down ask for a second click to confirm.
+  Pause needs no confirmation: the same button then reads Resume. It reads
+  Pausing... or Resuming... until the command finishes, and changes only
+  when the command succeeds; a failure shows a notice with its exit code.
+  While the VM is paused, the section is headed "Virtual machine (paused)",
+  the window title starts with "Paused -", and the title bar says
+  `PAUSED - CTRL+ALT+M TO RESUME`. Keyboard, mouse and wheel input is not
+  sent to a paused guest; keys and buttons it held are released before it
+  pauses. The viewer's own shortcuts still work. The viewer only knows what
+  its own button did. If you pause or resume the VM in another way (the
+  command line, virt-manager), the label may be wrong, and one click puts it
+  right: pausing a paused VM or resuming a running one succeeds.
 
 While the menu is open, keyboard and pointer go to the menu and the area
 editor, never to the guest. Keys the guest held are released when it opens,

@@ -31,6 +31,7 @@
  *     w <v> <h>                   wheel
  *     f <0|1>                     focus out/in
  *     p <0|1>                     pointer leave/enter
+ *     h <0|1>                     input held (the VM paused) / forwarded
  *     c                           complete the current clipboard fetch
  *     s                           attempt a cancelled client's stale fetch
  */
@@ -137,6 +138,7 @@ static void test_line(struct nb_session *s, struct nb_sink *sink,
     case 'w': nb_sink_wheel(sink, a, b); break;
     case 'f': nb_sink_focus(sink, a != 0); break;
     case 'p': nb_sink_pointer(sink, a != 0); break;
+    case 'h': nb_sink_hold_input(sink, a != 0); break;
     case 'c': test_finish_fetch(s->priv, sink, (unsigned)a); break;
     case 's': test_finish_stale_fetch(s->priv, sink); break;
     default: break;

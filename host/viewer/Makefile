@@ -262,7 +262,10 @@ test-scanout: test/test_scanout.c nb_scanout.h
 test-relacc: test/test_relacc.c nb_relacc.h
 	$(CC) $(CFLAGS) -I . -o $@ test/test_relacc.c
 
-check: all test-utf8 test-overlay test-relacc test-view test-ui test-pace test-latch test-blit test-gpusel test-scanout $(if $(HAVE_GBM),test-gpuscale,)
+test-vmpause: test/test_vmpause.c nb_vmpause.h
+	$(CC) $(CFLAGS) -I . -o $@ test/test_vmpause.c
+
+check: all test-utf8 test-overlay test-relacc test-vmpause test-view test-ui test-pace test-latch test-blit test-gpusel test-scanout $(if $(HAVE_GBM),test-gpuscale,)
 	./test-utf8
 	./test-pace
 	./test-latch
@@ -273,6 +276,7 @@ check: all test-utf8 test-overlay test-relacc test-view test-ui test-pace test-l
 	./test-view
 	./test-ui
 	./test-relacc
+	./test-vmpause
 	./test-overlay
 	bash selftest.sh
 	python3 test/test_adopted_socket.py ./$(BIN)
@@ -294,4 +298,4 @@ install: $(BIN)
 
 clean:
 	rm -f $(BIN) $(TESTCLIENT) $(RELAY) $(DMASRC) $(SCANTEST) *.o *.d build_id.h \
-	      *-client-protocol.h *-protocol.c test-utf8 test-overlay test-gpuscale test-pace test-latch test-blit test-gpusel test-scanout test/utf8_extracted.inc
+	      *-client-protocol.h *-protocol.c test-utf8 test-overlay test-gpuscale test-pace test-latch test-blit test-gpusel test-scanout test-vmpause test/utf8_extracted.inc

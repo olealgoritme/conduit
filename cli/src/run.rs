@@ -691,6 +691,28 @@ fn viewer_help(viewer: &Path) -> String {
         .unwrap_or_default()
 }
 
+/// The menu's VM actions: Shut down / Restart always (every viewer with
+/// `--view-state` has them), Pause / Resume when this viewer lists them.
+fn vm_action_args(me: &str, name: &str, help: &str) -> Vec<String> {
+    let me = shell_quote(me);
+    let vm = shell_quote(name);
+    let mut args = vec![
+        "--vm-shutdown-cmd".to_string(),
+        format!("{me} shutdown {vm}"),
+        "--vm-reboot-cmd".to_string(),
+        format!("{me} reboot {vm}"),
+    ];
+    if help.contains("--vm-pause-cmd") && help.contains("--vm-resume-cmd") {
+        args.extend([
+            "--vm-pause-cmd".to_string(),
+            format!("{me} pause {vm}"),
+            "--vm-resume-cmd".to_string(),
+            format!("{me} resume {vm}"),
+        ]);
+    }
+    args
+}
+
 /// Returns true if Hyprland must be tuned for the whole run (old viewer without hook support).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn start_viewer(
@@ -750,12 +772,7 @@ pub(crate) fn start_viewer(
         }
         cmd.arg("--view-state").arg(&state).args(opts.viewer_args());
         if let Ok(me) = std::env::current_exe() {
-            let me = shell_quote(&me.to_string_lossy());
-            let vm = shell_quote(name);
-            cmd.arg("--vm-shutdown-cmd")
-                .arg(format!("{me} shutdown {vm}"))
-                .arg("--vm-reboot-cmd")
-                .arg(format!("{me} reboot {vm}"));
+            cmd.args(vm_action_args(&me.to_string_lossy(), name, &help));
         }
     } else {
         if !opts.is_empty() {
@@ -1703,6 +1720,37 @@ mod clipboard_tests {
             ["--res", "1280x960", "--area", "4:3", "--scale", "stretch", "--sync", "vsync"]
         );
         assert!(ViewOpts::default().viewer_args().is_empty());
+    }
+
+    #[test]
+    fn the_menu_gets_pause_and_resume_when_the_viewer_has_them() {
+        let old = vm_action_args("/usr/bin/conduit", "win11", "--view-state FILE");
+        assert_eq!(
+            old,
+            [
+                "--vm-shutdown-cmd",
+                "/usr/bin/conduit shutdown win11",
+                "--vm-reboot-cmd",
+                "/usr/bin/conduit reboot win11",
+            ]
+        );
+        let help = "  --vm-shutdown-cmd CMD, --vm-reboot-cmd CMD\n  \
+                    --vm-pause-cmd CMD, --vm-resume-cmd CMD\n";
+        let new = vm_action_args("/usr/bin/conduit", "win11", help);
+        assert_eq!(new[..4], old[..]);
+        assert_eq!(
+            new[4..],
+            [
+                "--vm-pause-cmd",
+                "/usr/bin/conduit pause win11",
+                "--vm-resume-cmd",
+                "/usr/bin/conduit resume win11",
+            ]
+        );
+        // Quoted for /bin/sh like the others.
+        let q = vm_action_args("/opt/my conduit/conduit", "my vm", help);
+        assert_eq!(q[5], "'/opt/my conduit/conduit' pause 'my vm'");
+        assert_eq!(q[7], "'/opt/my conduit/conduit' resume 'my vm'");
     }
 
     #[test]

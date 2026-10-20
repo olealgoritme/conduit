@@ -58,6 +58,7 @@
 #include "nb_latch.h"
 #include "nb_blit.h"
 #include "nb_scanout.h"
+#include "nb_vmpause.h"
 #include <sys/timerfd.h>
 
 #ifndef NB_HAVE_WAYLAND
@@ -775,6 +776,7 @@ struct nb_wl {
 
     /* The viewer's own UI layers (nb_ui.h): subsurfaces with shm buffers. */
     struct nb_ui     ui;
+    struct nb_vmpause vmp;          /* the menu's Pause / Resume       */
     struct nb_wl_layer *ly_menu, *ly_note, *ly_btn;
     uint64_t note_until_ms;         /* notice visible until, 0 = hidden    */
     char     note_txt[64];
@@ -3060,6 +3062,8 @@ static void tb_paint(struct nb_wl *w, int width)
             w->clip_notice_until = 0;
             if (w->grabbed) {
                 status = "GRABBED - CTRL+ALT+G TO RELEASE";
+            } else if (w->vmp.paused) {
+                status = NB_VM_PAUSED_STATUS;
             }
         }
         hot_txt = status != NULL;
@@ -6326,11 +6330,15 @@ static void wl_mode_hint(struct nb_wl *w, bool immediate)
 static void wl_title_update(struct nb_wl *w, bool force)
 {
     char t[sizeof(w->title_cur)];
+    char base[sizeof(w->title) + 16];
     bool flip = nb_sink_seq_usec(w->sink);
 
     if (!w->toplevel) {
         return;
     }
+    /* Paused (the menu's Pause): said in the name too, for task bars. */
+    snprintf(base, sizeof(base), "%s%s", w->vmp.paused ? "Paused - " : "",
+             w->title);
     /*
      * No live numbers in the title while fullscreen: nobody sees it there, and
      * every title change makes the compositor re-run its window rules for us
@@ -6338,7 +6346,7 @@ static void wl_title_update(struct nb_wl *w, bool force)
      * path's thread of a compositor that is meant to be scanning us out.
      */
     if (w->stats_active && !w->fullscreen) {
-        nb_fs_title(t, sizeof(t), w->title, (unsigned)w->buf_w,
+        nb_fs_title(t, sizeof(t), base, (unsigned)w->buf_w,
                     (unsigned)w->buf_h, w->refresh_mhz, &w->snap, flip);
         if (w->snap.frames) {
             snprintf(w->tb_stats, sizeof(w->tb_stats), "%.0f FPS %.1f MS %s",
@@ -6349,7 +6357,7 @@ static void wl_title_update(struct nb_wl *w, bool force)
             w->tb_stats[0] = '\0';
         }
     } else {
-        snprintf(t, sizeof(t), "%s", w->title);
+        snprintf(t, sizeof(t), "%s", base);
     }
     if (!force && !strcmp(t, w->title_cur)) {
         return;
@@ -6983,6 +6991,9 @@ static const struct nb_ui_env *wl_ui_env(struct nb_wl *w)
     /* A compositor chooses its own filter; the fullscreen scaler is ours. */
     e.nearest_ok = w->gs_shown;
     e.vm_actions = w->cfg && (w->cfg->vm_shutdown_cmd || w->cfg->vm_reboot_cmd);
+    e.vm_pause = w->cfg && w->cfg->vm_pause_cmd && w->cfg->vm_resume_cmd;
+    e.vm_paused = w->vmp.paused;
+    e.vm_pause_busy = nb_vmpause_busy(&w->vmp);
     e.translucent = true;
     e.modes = &nb_mode_rx.cur;
     return &e;
@@ -7413,6 +7424,22 @@ static int wl_tick_ui(struct nb_wl *w, int next)
         }
     }
 
+    /* The menu's Pause / Resume command, reaped when it ends. */
+    if (nb_vmpause_busy(&w->vmp)) {
+        if (nb_vm_pause_reap(&w->vmp, w->sink, w->ui.notice,
+                             sizeof(w->ui.notice))) {
+            if (w->ui.open) {
+                wl_ui_do(w, NB_UI_REDRAW | NB_UI_NOTICE);
+            } else {
+                wl_note_show(w, w->ui.notice);
+            }
+            wl_title_update(w, true);
+            flush = true;
+        } else {
+            next = wl_tick_min(next, now + NB_VMPAUSE_POLL_MS, now);
+        }
+    }
+
     if (w->rehint_due_ms) {
         if (now >= w->rehint_due_ms) {
             w->rehint_due_ms = 0;
@@ -7631,6 +7658,11 @@ static void wl_ui_do(struct nb_wl *w, unsigned bits)
     }
     if ((bits & NB_UI_VM_REBOOT) && w->cfg) {
         nb_run_detached(w->cfg->vm_reboot_cmd);
+    }
+    if ((bits & (NB_UI_VM_PAUSE | NB_UI_VM_RESUME)) &&
+        !nb_vm_pause_ask(&w->vmp, w->sink, w->cfg, (bits & NB_UI_VM_PAUSE) != 0,
+                         w->ui.notice, sizeof(w->ui.notice))) {
+        bits |= NB_UI_NOTICE;
     }
     if (bits & NB_UI_CLOSE || !w->ui.open) {
         wl_layer_hide(w, w->ly_menu);

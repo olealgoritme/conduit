@@ -71,7 +71,8 @@ continue. Without being told, the backend takes a restart that comes after
 served requests for a guest reboot and releases the guest's GPU objects. `keep`
 (and `hold`) arm the backend to keep them for the next restart. After
 `release` that lasts 60 s more, then a restart is a reboot again. `conduit
-pause` and `conduit resume` use the same `keep` and `release`, so a paused VM
+pause` and `conduit resume`, and the Pause / Resume button in the viewer's
+menu (which runs them), use the same `keep` and `release`, so a paused VM
 keeps its GPU state there too.
 
 ### The backend's power socket

@@ -15,6 +15,7 @@
 #include <linux/input-event-codes.h>
 
 #include "nvkvm_broker.h"
+#include "nb_vmpause.h"
 
 /*
  * Bytes per pixel, for the single-plane 32-bit formats the nvkvm guest head
@@ -500,4 +501,53 @@ void nb_run_detached(const char *cmd)
     while (waitpid(p, NULL, 0) < 0 && errno == EINTR) {
     }
     nb_log("ran `%s`", cmd);
+}
+
+bool nb_vm_pause_ask(struct nb_vmpause *vp, struct nb_sink *sink,
+                     const struct nb_config *cfg, bool pause, char *note,
+                     size_t n)
+{
+    const char *cmd = !cfg ? NULL
+                      : pause ? cfg->vm_pause_cmd : cfg->vm_resume_cmd;
+
+    if (nb_vmpause_busy(vp)) {
+        return true;            /* the one in flight decides */
+    }
+    if (nb_vmpause_start(vp, cmd, pause) != 0) {
+        nb_err("menu: cannot %s the VM: %s", pause ? "pause" : "resume",
+               cmd && *cmd ? strerror(errno) : "no command");
+        snprintf(note, n, "%s", pause ? "Cannot pause the VM"
+                                      : "Cannot resume the VM");
+        return false;
+    }
+    nb_log("menu: %s the VM: `%s`", pause ? "pausing" : "resuming", cmd);
+    /* Released while the guest still runs, so no key stays down in it. */
+    if (pause && sink) {
+        nb_sink_hold_input(sink, true);
+    }
+    return true;
+}
+
+bool nb_vm_pause_reap(struct nb_vmpause *vp, struct nb_sink *sink, char *note,
+                      size_t n)
+{
+    switch (nb_vmpause_poll(vp)) {
+    case NB_VMPAUSE_DONE:
+        nb_log("menu: the VM is %s", vp->paused ? "paused" : "running");
+        snprintf(note, n, "%s", vp->paused ? "VM paused" : "VM running");
+        break;
+    case NB_VMPAUSE_FAILED:
+        nb_err("menu: %s failed (exit %d); the VM is still %s",
+               vp->pausing ? "pause" : "resume", vp->status,
+               vp->paused ? "paused" : "running");
+        snprintf(note, n, "%s failed (exit %d)",
+                 vp->pausing ? "Pause" : "Resume", vp->status);
+        break;
+    default:
+        return false;
+    }
+    if (sink) {
+        nb_sink_hold_input(sink, vp->paused);
+    }
+    return true;
 }

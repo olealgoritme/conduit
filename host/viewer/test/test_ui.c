@@ -27,6 +27,7 @@ static struct nb_ui_env env_of(int w, int h, unsigned s120)
     e.buf_h = 1080;
     e.nearest_ok = true;
     e.vm_actions = true;
+    e.vm_pause = true;
     e.translucent = true;
     return e;
 }
@@ -162,7 +163,7 @@ static void test_layout(void)
                 static const int seq[] = {
                     NB_UI_ID_RES_FIELD, NB_UI_ID_AREA, NB_UI_ID_SCALE,
                     NB_UI_ID_FILTER, NB_UI_ID_PROF_LOAD, NB_UI_ID_STATS,
-                    NB_UI_ID_VM_REBOOT,
+                    NB_UI_ID_VM_PAUSE,
                 };
                 size_t q;
 
@@ -194,8 +195,11 @@ static void test_layout(void)
         struct nb_ui_env e = env_of(1920, 1080, 120);
 
         e.vm_actions = false;
+        e.vm_pause = false;
         nb_ui_layout(&ui, &e, NULL, NULL);
         CHECK(nb_ui_find(&ui, NB_UI_ID_VM_SHUTDOWN, 0) < 0, "no vm items");
+        CHECK(nb_ui_find(&ui, NB_UI_ID_VM_PAUSE, 0) < 0, "no pause item");
+        e.vm_pause = true;
         e.vm_actions = true;
         nb_ui_layout(&ui, &e, NULL, NULL);
         CHECK(nb_ui_find(&ui, NB_UI_ID_VM_SHUTDOWN, 0) >= 0, "vm items");
@@ -424,6 +428,86 @@ static void test_vm(void)
     CHECK(bits & NB_UI_VM_REBOOT, "reboot after its own confirm");
     nb_ui_set_open(&ui, &e, false);
     CHECK(!ui.confirm && ui.drag < 0 && ui.hover < 0, "close resets");
+}
+
+/* Pause / Resume: one toggle, no confirming click, idle while it runs. */
+static void test_vm_pause(void)
+{
+    struct nb_vstore st;
+    struct nb_ui ui;
+    struct nb_ui_env e = env_of(2560, 1440, 120);
+    unsigned bits;
+    int pi, ri, si;
+
+    nb_vstore_init(&st);
+    nb_ui_init(&ui, &st);
+    nb_ui_set_open(&ui, &e, true);
+
+    /* its own full-width row, above Restart / Shut down */
+    nb_ui_layout(&ui, &e, NULL, NULL);
+    pi = nb_ui_find(&ui, NB_UI_ID_VM_PAUSE, 0);
+    ri = nb_ui_find(&ui, NB_UI_ID_VM_REBOOT, 0);
+    si = nb_ui_find(&ui, NB_UI_ID_VM_SHUTDOWN, 0);
+    CHECK(pi >= 0 && ri >= 0 && si >= 0, "three vm items");
+    if (pi >= 0 && ri >= 0 && si >= 0) {
+        const struct nb_rect *p = &ui.item[pi].r, *r = &ui.item[ri].r,
+                             *s = &ui.item[si].r;
+
+        CHECK(p->x == r->x && p->x + p->w == s->x + s->w,
+              "pause spans the restart/shut down row");
+        CHECK(r->y >= p->y + p->h, "restart below pause");
+        CHECK(r->y == s->y, "restart and shut down share a row");
+    }
+
+    CHECK(!strcmp(nb_ui_vm_pause_label(&e), "Pause"), "label: Pause");
+    bits = click(&ui, &e, NB_UI_ID_VM_PAUSE, 0);
+    CHECK((bits & NB_UI_VM_PAUSE) && !(bits & NB_UI_VM_RESUME),
+          "one click pauses: %#x", bits);
+    CHECK(!ui.confirm, "no confirmation for pause");
+
+    /* the command runs: the chip is disabled and says so */
+    e.vm_pause_busy = true;
+    CHECK(!strcmp(nb_ui_vm_pause_label(&e), "Pausing..."), "label: Pausing");
+    bits = click(&ui, &e, NB_UI_ID_VM_PAUSE, 0);
+    CHECK(!(bits & (NB_UI_VM_PAUSE | NB_UI_VM_RESUME)),
+          "busy: a click does nothing");
+    pi = nb_ui_find(&ui, NB_UI_ID_VM_PAUSE, 0);
+    CHECK(pi >= 0 && ui.item[pi].disabled, "busy: disabled");
+
+    /* it exited 0: paused, the same chip resumes */
+    e.vm_pause_busy = false;
+    e.vm_paused = true;
+    CHECK(!strcmp(nb_ui_vm_pause_label(&e), "Resume"), "label: Resume");
+    bits = click(&ui, &e, NB_UI_ID_VM_PAUSE, 0);
+    CHECK((bits & NB_UI_VM_RESUME) && !(bits & NB_UI_VM_PAUSE),
+          "one click resumes: %#x", bits);
+    e.vm_pause_busy = true;
+    CHECK(!strcmp(nb_ui_vm_pause_label(&e), "Resuming..."), "label: Resuming");
+    e.vm_pause_busy = false;
+    e.vm_paused = false;
+    CHECK(!strcmp(nb_ui_vm_pause_label(&e), "Pause"), "label: Pause again");
+
+    /* a pending Shut down confirmation is cancelled by Pause, and Pause
+     * never confirms it */
+    bits = click(&ui, &e, NB_UI_ID_VM_SHUTDOWN, 0);
+    CHECK(ui.confirm, "shut down armed");
+    bits = click(&ui, &e, NB_UI_ID_VM_PAUSE, 0);
+    CHECK(!ui.confirm && !(bits & NB_UI_VM_SHUTDOWN) &&
+          (bits & NB_UI_VM_PAUSE), "pause disarms shut down");
+
+    /* pause only, no shutdown/restart commands */
+    e.vm_actions = false;
+    nb_ui_layout(&ui, &e, NULL, NULL);
+    CHECK(nb_ui_find(&ui, NB_UI_ID_VM_PAUSE, 0) >= 0 &&
+          nb_ui_find(&ui, NB_UI_ID_VM_REBOOT, 0) < 0, "pause alone");
+    /* shutdown/restart only (older CLI): no pause chip */
+    e.vm_actions = true;
+    e.vm_pause = false;
+    e.vm_paused = true;     /* ignored without the commands */
+    nb_ui_layout(&ui, &e, NULL, NULL);
+    CHECK(nb_ui_find(&ui, NB_UI_ID_VM_PAUSE, 0) < 0 &&
+          nb_ui_find(&ui, NB_UI_ID_VM_REBOOT, 0) >= 0, "no pause chip");
+    nb_ui_set_open(&ui, &e, false);
 }
 
 static void test_drag(void)
@@ -718,6 +802,7 @@ int main(void)
     test_clicks();
     test_text();
     test_vm();
+    test_vm_pause();
     test_drag();
     test_paint();
     test_mode_list();

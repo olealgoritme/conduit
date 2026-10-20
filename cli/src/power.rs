@@ -80,10 +80,21 @@ fn libvirt(name: &str, link: &Link, p: Power) -> Result<()> {
             ui::info(format!("{name} was reset"));
         }
         Power::Poweroff => return run::down(name, Stop::Force),
+        // Idempotent, like QMP's stop/cont: pausing a paused VM or resuming
+        // a running one succeeds, so the viewer's Pause / Resume toggle (which
+        // only knows what its own commands did) puts itself right.
+        Power::Pause if state == "paused" => {
+            ui::info(format!(
+                "{name} is already paused (`conduit resume {name}`)"
+            ));
+        }
         Power::Pause => {
             keep_gpu_state(name);
             v.run(&["suspend", d])?;
             ui::info(format!("{name} is paused (`conduit resume {name}`)"));
+        }
+        Power::Resume if !state.is_empty() && state != "paused" => {
+            ui::info(format!("{name} is already running"));
         }
         Power::Resume => {
             v.run(&["resume", d])?;
