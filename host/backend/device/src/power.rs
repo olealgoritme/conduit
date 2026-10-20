@@ -128,6 +128,9 @@ impl Command {
 pub struct Keep {
     armed: bool,
     until: Option<Instant>,
+    /// Restarts kept so far, never reset: how [`QueueWatch`] tells a kept
+    /// restart that came and went between two looks from a reboot.
+    kept: u64,
 }
 
 impl Keep {
@@ -151,8 +154,55 @@ impl Keep {
     /// the keep is spent.
     pub fn consume(&mut self, now: Instant) -> bool {
         let keep = self.is_armed(now);
-        *self = Keep::default();
+        self.cancel();
+        if keep {
+            self.kept += 1;
+        }
         keep
+    }
+
+    /// The guest reset the device: whatever a pause asked to keep is gone.
+    pub fn cancel(&mut self) {
+        self.armed = false;
+        self.until = None;
+    }
+
+    /// How many restarts have been kept.
+    pub fn kept(&self) -> u64 {
+        self.kept
+    }
+}
+
+/// The boot console's look at the guest's event queue (`--console-vnc`):
+/// a queue that was running and is not any more is the guest gone (a reboot:
+/// the firmware screen comes next, and the console shows it) -- unless the
+/// VM was paused with its GPU objects kept (a host suspend, `conduit pause`).
+/// QEMU stops the device's rings for that pause as for a reset, but the same
+/// guest carries on after it, with the same picture: the console must not
+/// take it over, or the viewer shows the console (black, for a guest whose
+/// fbcon is not on the firmware framebuffer) until the guest happens to flip
+/// again, which an idle desktop never does.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct QueueWatch {
+    was_ready: bool,
+    /// [`Keep::kept`] when the queue was last seen running.
+    kept_seen: u64,
+}
+
+impl QueueWatch {
+    /// One look at the queue (`ready`: started by the guest's driver). True
+    /// when it stopped for a reason other than a kept pause.
+    pub fn stopped(&mut self, ready: bool, keep: &Keep, now: Instant) -> bool {
+        let stop = self.was_ready && !ready;
+        // Armed: the pause is on (or about to be). A kept count that moved:
+        // the restart came between this look and the last, and the rings are
+        // still being set up again.
+        let paused = keep.is_armed(now) || keep.kept() != self.kept_seen;
+        self.was_ready = ready;
+        if ready {
+            self.kept_seen = keep.kept();
+        }
+        stop && !paused
     }
 }
 
@@ -521,6 +571,63 @@ mod tests {
         let mut k = Keep::default();
         k.released(t);
         assert!(!k.is_armed(t));
+    }
+
+    #[test]
+    fn kept_restarts_are_counted_and_a_reset_cancels_the_keep() {
+        let t = Instant::now();
+        let mut k = Keep::default();
+        assert_eq!(k.kept(), 0);
+        assert!(!k.consume(t));
+        assert_eq!(k.kept(), 0, "a reboot is not counted");
+        k.arm();
+        assert!(k.consume(t));
+        assert_eq!(k.kept(), 1);
+        k.arm();
+        k.cancel();
+        assert!(!k.is_armed(t), "the guest reset the device");
+        assert!(!k.consume(t));
+        assert_eq!(k.kept(), 1, "the count survives both");
+    }
+
+    #[test]
+    fn the_console_takes_over_when_the_guest_stops_its_queues() {
+        let t = Instant::now();
+        let k = Keep::default();
+        let mut w = QueueWatch::default();
+        assert!(!w.stopped(false, &k, t), "never started: nothing to judge");
+        assert!(!w.stopped(true, &k, t));
+        assert!(!w.stopped(true, &k, t));
+        assert!(w.stopped(false, &k, t), "running, then stopped: a reboot");
+        assert!(!w.stopped(false, &k, t), "said once");
+        assert!(!w.stopped(true, &k, t), "the next boot's driver");
+        assert!(w.stopped(false, &k, t), "and its reboot");
+    }
+
+    #[test]
+    fn a_kept_pause_is_not_a_reboot_however_the_looks_fall() {
+        let t = Instant::now();
+        let mut k = Keep::default();
+        let mut w = QueueWatch::default();
+        assert!(!w.stopped(true, &k, t));
+
+        // `conduit pause`: keep, then QEMU stops the rings, and restarts them
+        // on `cont` (the restart spends the keep).
+        k.arm();
+        assert!(!w.stopped(false, &k, t), "stopped while the keep is armed");
+        assert!(k.consume(t));
+        assert!(!w.stopped(false, &k, t), "still being set up again");
+        assert!(!w.stopped(true, &k, t), "running again");
+
+        // A pause shorter than one look: the rings are seen stopped only
+        // after the restart spent the keep.
+        k.arm();
+        assert!(k.consume(t));
+        assert!(!w.stopped(false, &k, t), "the restart came between looks");
+        assert!(!w.stopped(true, &k, t));
+
+        // After it, a reboot is a reboot again.
+        assert!(w.stopped(false, &k, t));
     }
 
     #[test]

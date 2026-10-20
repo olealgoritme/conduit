@@ -75,6 +75,12 @@ pause` and `conduit resume`, and the Pause / Resume button in the viewer's
 menu (which runs them), use the same `keep` and `release`, so a paused VM
 keeps its GPU state there too.
 
+A kept restart keeps the display as well. The viewer goes on showing the
+guest's last frame while the VM is paused and after it continues, until the
+guest flips again; the boot console does not take over, as it does when a
+guest stops the device's queues to reboot. The mode list is not sent to the
+guest again, so its compositor sees no hotplug.
+
 ### The backend's power socket
 
 One line per connection, one line of answer:

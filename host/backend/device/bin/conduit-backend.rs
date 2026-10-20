@@ -2393,6 +2393,7 @@ impl NvGpuBackend {
         display: Option<(DisplayMode, Arc<DisplayLink>, bool)>,
         input_target: EventTarget,
         input_claims: Arc<GuestInputClaims>,
+        keep: Arc<Mutex<device::power::Keep>>,
         safe_mode: bool,
         guest_sched: device::gpu_sched::GuestSched,
     ) -> anyhow::Result<Self> {
@@ -2489,7 +2490,7 @@ impl NvGpuBackend {
             gpu_cmd_seen: false,
             flips_used: Vec::new(),
             latency: Latency::default(),
-            keep: Arc::new(Mutex::new(device::power::Keep::default())),
+            keep,
             signal_after_restart: false,
             #[cfg(feature = "venus")]
             venus: VenusChains::default(),
@@ -2930,7 +2931,7 @@ impl VhostUserBackendMut for NvGpuBackend {
 
     fn reset_device(&mut self) {
         // The guest reset the device: whatever a pause asked to keep is gone.
-        *self.keep.lock().expect("keep") = device::power::Keep::default();
+        self.keep.lock().expect("keep").cancel();
         self.reset("RESET_DEVICE");
     }
 
@@ -2953,13 +2954,17 @@ impl VhostUserBackendMut for NvGpuBackend {
         if self.served && keep {
             log::info!(
                 "device restarted after a pause (host suspend or `conduit pause`): keeping the \
-                 guest's GPU objects"
+                 guest's GPU objects and its display"
             );
             self.signal_after_restart = true;
-        } else if self.served {
-            self.reset("device restarted (guest reboot or driver reload)");
+            // The same driver: no mode list again (a hotplug in the guest).
+            self.input_claims.device_continued(features);
+        } else {
+            if self.served {
+                self.reset("device restarted (guest reboot or driver reload)");
+            }
+            self.input_claims.device_started(features);
         }
-        self.input_claims.device_started(features);
         let release = features & u64::from(NVGPU_F_SCANOUT_RELEASE) != 0;
         let presented = features & u64::from(NVGPU_F_SCANOUT_PRESENTED) != 0;
         let packed = features & u64::from(NVGPU_F_EVENT_PACKED) != 0;
@@ -3317,16 +3322,22 @@ fn venus_renderer(args: &Args) -> anyhow::Result<Box<dyn conduit_venus::Renderer
 /// device's rings on a guest reset, but (for its generic vhost-user device)
 /// says nothing else until the next boot's driver starts it again -- and the
 /// firmware screen in between is what the console is for.
-fn guest_queues_probe(target: EventTarget) -> device::console::GuestProbe {
-    let mut was_ready = false;
+///
+/// A pause that keeps the guest's GPU objects (host suspend, `conduit pause`)
+/// stops the rings too, and is not the guest going: its picture stays
+/// (`device::power::QueueWatch`).
+fn guest_queues_probe(
+    target: EventTarget,
+    keep: Arc<Mutex<device::power::Keep>>,
+) -> device::console::GuestProbe {
+    let mut watch = device::power::QueueWatch::default();
     Box::new(move || {
         let Some((vring, _)) = target.lock().expect("event target").clone() else {
             return true; // no guest queues yet: nothing to judge by
         };
         let ready = vring.get_ref().get_queue().ready();
-        let stopped = was_ready && !ready;
-        was_ready = ready;
-        !stopped
+        let keep = *keep.lock().unwrap_or_else(|p| p.into_inner());
+        !watch.stopped(ready, &keep, Instant::now())
     })
 }
 
@@ -3546,6 +3557,9 @@ fn main() -> anyhow::Result<()> {
     // after the sandbox, which must go on while this process is one thread.
     let input_target: EventTarget = Arc::new(Mutex::new(None));
     let input_claims = Arc::new(GuestInputClaims::default());
+    // Whether the next device restart keeps the guest (device::power): the
+    // power socket arms it, the restart spends it, the console looks at it.
+    let keep = Arc::new(Mutex::new(device::power::Keep::default()));
     let display = if args.display.is_some() || !args.display_socket.is_empty() {
         let mode = args.display.unwrap_or(DisplayMode::DEFAULT);
         let link = DisplayLink::with_paths(args.display_socket.clone(), mode);
@@ -3602,7 +3616,7 @@ fn main() -> anyhow::Result<()> {
             let console = device::console::Console::start(
                 link.clone(),
                 path.clone(),
-                Some(guest_queues_probe(input_target.clone())),
+                Some(guest_queues_probe(input_target.clone(), keep.clone())),
             )
             .map_err(|e| anyhow::anyhow!("console thread: {e}"))?;
             log::info!("console: the VM's screen from {}", path.display());
@@ -3646,6 +3660,7 @@ fn main() -> anyhow::Result<()> {
         display,
         input_target,
         input_claims,
+        keep,
         safe_mode,
         device::gpu_sched::GuestSched::effective(args.gpu_timeslice_us),
     )?;
