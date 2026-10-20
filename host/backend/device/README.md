@@ -24,6 +24,7 @@ it refuses to run as root. See `docs/ARCHITECTURE.md` and `docs/SECURITY.md`.
 | `src/vram.rs`, `src/nvidia/vidmem.rs` | `--vram-limit-mib` |
 | `src/sandbox.rs`, `src/posture.rs` | seccomp, Landlock, privilege drop |
 | `src/trace.rs` | request tracing: `--trace`, `--trace-socket` (docs/TRACING.md) |
+| `src/power.rs` | host suspend: `--power-socket` (hold guest requests, drain, check the GPU after the wake; docs/SUSPEND.md) |
 | `src/shm_regions.rs` | the window, UVM aperture and (`--venus`) Venus blob regions |
 | `src/chain.rs` | descriptor chains: requests read from every readable descriptor, replies scattered across every writable one |
 | `src/nvidia/os_event.rs` | RM OS events: `NV_ESC_RM_GET_EVENT_DATA` served only on a file holding one (docs/SECURITY.md) |

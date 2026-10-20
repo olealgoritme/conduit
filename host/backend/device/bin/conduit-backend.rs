@@ -190,6 +190,13 @@ struct Args {
     #[arg(long, value_name = "PATH")]
     trace_socket: Option<PathBuf>,
 
+    /// The power socket for host suspend (docs/SUSPEND.md): `conduit _sleep`
+    /// asks the backend to hold guest requests and drain in-flight GPU work
+    /// before the host sleeps, and to check the GPU and serve again after.
+    /// Must be in a directory the backend can create sockets in.
+    #[arg(long, value_name = "PATH")]
+    power_socket: Option<PathBuf>,
+
     /// Size of the window (shared memory region 1), where every guest CPU
     /// mapping of RM memory is placed, in MiB: a power of two from 32 to
     /// 4194304, or `auto`, the host GPU's BAR1 (as Resizable BAR on bare
@@ -1782,6 +1789,37 @@ fn event_pump(
     };
 
     loop {
+        // The GPU did not come back from a host suspend (device::power): every
+        // fence the guest waits on ends now, in an error, instead of never.
+        if device::power::take_fail_fences() && !once.is_empty() {
+            let mut retry = false;
+            let fences: Vec<u64> = once.iter().copied().collect();
+            let n = fences.len();
+            for h in fences {
+                match reports.report(
+                    h as u32,
+                    true,
+                    device::power::LOST_STATUS,
+                    batch.then_some(&mut pass),
+                ) {
+                    Sent::Pushed => {
+                        once.remove(&h);
+                        if let Some(fd) = watched.remove(&h) {
+                            ctl(libc::EPOLL_CTL_DEL, fd.as_raw_fd(), h as u32);
+                        }
+                    }
+                    // The backlog sends it; `settle` drops the watch.
+                    Sent::Queued => {
+                        once.remove(&h);
+                    }
+                    Sent::Coalesced | Sent::Dropped => retry = true,
+                }
+            }
+            log::warn!("event pump: GPU lost: {n} pending fence(s) reported failed");
+            if retry {
+                device::power::request_fail_fences();
+            }
+        }
         // Drain the control channel first: a descriptor closed on the other
         // thread must leave the set before it can be reported again.
         loop {
@@ -2062,6 +2100,8 @@ fn event_pump(
                 ctl(libc::EPOLL_CTL_DEL, fd.as_raw_fd(), handle as u32);
             }
         }
+        // What a host-suspend `hold` waits for (device::power).
+        device::power::set_pending_fences(once.len());
     }
 }
 
@@ -2303,6 +2343,12 @@ struct NvGpuBackend {
     flips_used: Vec<u64>,
     /// `--latency`.
     latency: Latency,
+    /// Whether the next device restart keeps the guest's GPU objects (host
+    /// suspend, `conduit pause`): shared with the power socket's thread.
+    keep: Arc<Mutex<device::power::Keep>>,
+    /// A restart kept the guest's objects: signal every queue at the next
+    /// event, for what was put on a used ring while the rings were stopped.
+    signal_after_restart: bool,
     /// Venus, with `--venus`: the size of region 3 (0 without), and the
     /// fenced chains waiting for their fences.
     #[cfg(feature = "venus")]
@@ -2443,6 +2489,8 @@ impl NvGpuBackend {
             gpu_cmd_seen: false,
             flips_used: Vec::new(),
             latency: Latency::default(),
+            keep: Arc::new(Mutex::new(device::power::Keep::default())),
+            signal_after_restart: false,
             #[cfg(feature = "venus")]
             venus: VenusChains::default(),
         })
@@ -2881,6 +2929,8 @@ impl VhostUserBackendMut for NvGpuBackend {
     }
 
     fn reset_device(&mut self) {
+        // The guest reset the device: whatever a pause asked to keep is gone.
+        *self.keep.lock().expect("keep") = device::power::Keep::default();
         self.reset("RESET_DEVICE");
     }
 
@@ -2894,8 +2944,19 @@ impl VhostUserBackendMut for NvGpuBackend {
     ///
     /// The acked features also say whether this guest's driver takes display
     /// input (`NVGPU_CFG_TAKES_INPUT`).
+    ///
+    /// A restart the power socket asked to keep (`hold` or `keep`: the VM was
+    /// paused, for a host suspend or `conduit pause`, and is continuing) is
+    /// the same guest carrying on, and keeps everything.
     fn acked_features(&mut self, features: u64) {
-        if self.served {
+        let keep = self.keep.lock().expect("keep").consume(Instant::now());
+        if self.served && keep {
+            log::info!(
+                "device restarted after a pause (host suspend or `conduit pause`): keeping the \
+                 guest's GPU objects"
+            );
+            self.signal_after_restart = true;
+        } else if self.served {
             self.reset("device restarted (guest reboot or driver reload)");
         }
         self.input_claims.device_started(features);
@@ -3001,6 +3062,14 @@ impl VhostUserBackendMut for NvGpuBackend {
             return Err(std::io::Error::other(format!(
                 "event for unknown queue {device_event}"
             )));
+        }
+        // The first event after a restart that kept the guest's objects (QEMU
+        // starts every queue with a kick pending): whatever reached a used
+        // ring while the rings were stopped went without an interrupt.
+        if std::mem::take(&mut self.signal_after_restart) {
+            for v in vrings {
+                let _ = v.signal_used_queue();
+            }
         }
         // The event queue carries buffers the guest posted for *us* to fill, not
         // requests. Serving them as requests is a loop with no bottom: each one
@@ -3312,6 +3381,61 @@ fn disconnect_is_ok(e: vhost_user_backend::Error) -> Result<(), vhost_user_backe
     }
 }
 
+/// What the power socket's thread works on (`device::power::serve`): the
+/// request gate is the backend's lock, which every request is served under.
+struct Power {
+    backend: Arc<RwLock<NvGpuBackend>>,
+    keep: Arc<Mutex<device::power::Keep>>,
+    nvidia: Arc<Mutex<NvidiaBackend>>,
+    #[cfg(feature = "venus")]
+    held: HeldChains,
+}
+
+impl Power {
+    fn of(backend: &Arc<RwLock<NvGpuBackend>>) -> Power {
+        let b = backend.read().expect("backend lock");
+        Power {
+            backend: backend.clone(),
+            keep: b.keep.clone(),
+            nvidia: b.nvidia.clone(),
+            #[cfg(feature = "venus")]
+            held: b.venus.held.clone(),
+        }
+    }
+}
+
+impl device::power::Target for Power {
+    type Gate<'a> = std::sync::RwLockWriteGuard<'a, NvGpuBackend>;
+
+    fn try_gate(&self) -> Option<Self::Gate<'_>> {
+        match self.backend.try_write() {
+            Ok(g) => Some(g),
+            Err(std::sync::TryLockError::Poisoned(p)) => Some(p.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        }
+    }
+
+    fn in_flight(&self) -> (usize, usize) {
+        #[cfg(feature = "venus")]
+        let chains = self.held.lock().map_or(0, |h| h.len());
+        #[cfg(not(feature = "venus"))]
+        let chains = 0;
+        (device::power::pending_fences(), chains)
+    }
+
+    fn probe(&self) -> device::power::Health {
+        self.nvidia.lock().expect("nvidia lock").probe_gpu()
+    }
+
+    fn tsgs(&self) -> usize {
+        self.nvidia.lock().map_or(0, |n| n.guest_tsg_count())
+    }
+
+    fn keep(&self) -> &Mutex<device::power::Keep> {
+        &self.keep
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let args = Args::parse();
@@ -3358,6 +3482,12 @@ fn main() -> anyhow::Result<()> {
     let trace_file = open_trace_file(&args)?;
     #[cfg(feature = "trace")]
     if let Some(p) = &args.trace_socket {
+        let d = dir_of(p);
+        if !socket_dirs.contains(&d) {
+            socket_dirs.push(d);
+        }
+    }
+    if let Some(p) = &args.power_socket {
         let d = dir_of(p);
         if !socket_dirs.contains(&d) {
             socket_dirs.push(d);
@@ -3555,6 +3685,26 @@ fn main() -> anyhow::Result<()> {
             socket: args.trace_socket.clone(),
         })
         .map_err(|e| anyhow::anyhow!("tracing: {e}"))?;
+    }
+
+    // Host suspend (docs/SUSPEND.md): bound in the socket directory the
+    // sandbox allows, like the trace socket.
+    if let Some(path) = &args.power_socket {
+        let _ = std::fs::remove_file(path);
+        match std::os::unix::net::UnixListener::bind(path) {
+            Ok(listener) => {
+                let power = Power::of(&backend);
+                std::thread::Builder::new()
+                    .name("power-control".into())
+                    .spawn(move || device::power::serve(listener, power))
+                    .map_err(|e| anyhow::anyhow!("power thread: {e}"))?;
+                log::info!("power: control socket {}", path.display());
+            }
+            Err(e) => log::warn!(
+                "power: socket {}: {e}; a host suspend cannot keep this VM's GPU objects",
+                path.display()
+            ),
+        }
     }
 
     // vhost_user_backend::Error does not implement std::error::Error, so it

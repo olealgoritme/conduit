@@ -8,6 +8,11 @@
 
 use super::*;
 use crate::gpu_sched::{CMD_GET_TIMESLICE, CMD_SET_TIMESLICE, GuestSched, TSG_CLASS};
+use crate::power::{Health, Probe};
+
+/// Most guest channel groups remembered for the health probe; past it the
+/// oldest are forgotten (a guest makes a few per GPU process).
+const MAX_PROBED_TSGS: usize = 4096;
 
 /// What the policy did, for the log.
 #[derive(Default, Debug)]
@@ -70,11 +75,9 @@ impl NvidiaBackend {
     }
 
     /// After a forwarded ioctl: a TSG allocation that succeeded gets the
-    /// policy's timeslice.
+    /// policy's timeslice, and is remembered for the health probe
+    /// ([`Self::probe_gpu`]).
     pub(super) fn note_tsg(&mut self, payload: &[u8], resp: &[u8]) {
-        let Some(us) = self.start.sched.timeslice_us else {
-            return;
-        };
         if payload.len() < size_of::<IoctlReq>() {
             return;
         }
@@ -101,6 +104,10 @@ impl NvidiaBackend {
         }
         let (client, tsg) = (word(0), word(8));
         let Ok(fd) = self.handles.get_raw(self.current_handle as u64) else {
+            return;
+        };
+        self.remember_tsg(self.current_handle as u64, client, tsg);
+        let Some(us) = self.start.sched.timeslice_us else {
             return;
         };
         self.tsg_sched.tsgs += 1;
@@ -151,5 +158,51 @@ impl NvidiaBackend {
         let mut v = param_in.to_vec();
         v[at..at + 8].copy_from_slice(&allowed.to_le_bytes());
         Some(v)
+    }
+
+    fn remember_tsg(&mut self, handle: u64, client: u32, tsg: u32) {
+        let entry = (handle, client, tsg);
+        if self.guest_tsgs.contains(&entry) {
+            return;
+        }
+        if self.guest_tsgs.len() >= MAX_PROBED_TSGS {
+            self.guest_tsgs.remove(0);
+        }
+        self.guest_tsgs.push(entry);
+    }
+
+    /// Guest channel groups the health probe would ask about.
+    pub fn guest_tsg_count(&self) -> usize {
+        self.guest_tsgs.len()
+    }
+
+    /// After a host resume: ask RM about every guest channel group with a
+    /// harmless control (GET_TIMESLICE). Ones the guest freed answer "not
+    /// found" and are forgotten; a GPU that did not come back answers "lost"
+    /// on all of them instead of hanging the guest's next wait.
+    pub fn probe_gpu(&mut self) -> Health {
+        let mut probes = Vec::with_capacity(self.guest_tsgs.len());
+        let mut keep = Vec::with_capacity(self.guest_tsgs.len());
+        for &(handle, client, tsg) in &self.guest_tsgs {
+            let probe = match self.handles.get_raw(handle) {
+                Err(_) => Probe::Stale,
+                Ok(fd) => {
+                    let mut got = [0u8; 8];
+                    crate::power::classify(self.own_rm_control(
+                        fd,
+                        client,
+                        tsg,
+                        CMD_GET_TIMESLICE,
+                        &mut got,
+                    ))
+                }
+            };
+            if probe != Probe::Stale {
+                keep.push((handle, client, tsg));
+            }
+            probes.push(probe);
+        }
+        self.guest_tsgs = keep;
+        crate::power::judge(&probes)
     }
 }
