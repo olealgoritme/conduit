@@ -728,8 +728,24 @@ pub(crate) fn start_viewer(
                 }
             ),
         ])
-        .args(["--present-mode=native", "--persist", "--stats"]);
+        .args(["--persist", "--stats"]);
     let help = viewer_help(viewer);
+    // How a frame reaches the screen (`viewer.present`, docs/VIEWER.md
+    // "Present levels"): auto unless the user chose a level. A viewer without
+    // the present levels (its --help names no `readback`) keeps native: its
+    // auto is an older ladder that gives up zero-copy for LINEAR.
+    let (present, _) = crate::config::viewer_present(name);
+    let present = if help.contains("readback") {
+        present
+    } else {
+        if present != "auto" && present != "native" {
+            ui::warn(format!(
+                "this conduit-viewer is too old for viewer.present={present}; using native"
+            ));
+        }
+        "native".into()
+    };
+    cmd.arg(format!("--present-mode={present}"));
     let opts = view_opts();
     if help.contains("--view-state") {
         // Settings live with the VM and are restored next time; the flags
