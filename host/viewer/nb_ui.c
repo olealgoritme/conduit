@@ -1149,8 +1149,13 @@ static unsigned act(struct nb_ui *ui, const struct nb_ui_env *env,
         if (!env->vm_pause || env->vm_pause_busy) {
             return bits;
         }
-        return bits | NB_UI_REDRAW |
-               (env->vm_paused ? NB_UI_VM_RESUME : NB_UI_VM_PAUSE);
+        if (env->vm_paused) {
+            /* Back to the VM: the menu closes, so the pointer and keys are
+             * the guest's again (a guest whose screen went dark while it
+             * was paused wakes on them); the outcome comes as a notice. */
+            return bits | nb_ui_set_open(ui, env, false) | NB_UI_VM_RESUME;
+        }
+        return bits | NB_UI_REDRAW | NB_UI_VM_PAUSE;
     default:
         return bits;
     }

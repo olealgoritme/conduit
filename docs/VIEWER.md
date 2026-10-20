@@ -89,6 +89,7 @@ that fades in when the pointer touches the window's top edge. The menu has:
   Pause needs no confirmation: the same button then reads Resume. It reads
   Pausing... or Resuming... until the command finishes, and changes only
   when the command succeeds; a failure shows a notice with its exit code.
+  Resume also closes the menu, so keyboard and pointer go to the guest again.
   While the VM is paused, the section is headed "Virtual machine (paused)",
   the window title starts with "Paused -", and the title bar says
   `PAUSED - CTRL+ALT+M TO RESUME`. Keyboard, mouse and wheel input is not

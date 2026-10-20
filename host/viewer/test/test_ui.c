@@ -481,6 +481,9 @@ static void test_vm_pause(void)
     bits = click(&ui, &e, NB_UI_ID_VM_PAUSE, 0);
     CHECK((bits & NB_UI_VM_RESUME) && !(bits & NB_UI_VM_PAUSE),
           "one click resumes: %#x", bits);
+    CHECK((bits & NB_UI_CLOSE) && !ui.open,
+          "resume closes the menu: input is the guest's again");
+    nb_ui_set_open(&ui, &e, true);
     e.vm_pause_busy = true;
     CHECK(!strcmp(nb_ui_vm_pause_label(&e), "Resuming..."), "label: Resuming");
     e.vm_pause_busy = false;
