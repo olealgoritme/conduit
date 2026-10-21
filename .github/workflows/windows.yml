@@ -255,12 +255,22 @@ jobs:
             mingw-w64-i686-python
             mingw-w64-i686-python-mako
             mingw-w64-i686-python-packaging
-            mingw-w64-i686-python-yaml
+            mingw-w64-i686-python-pip
+            mingw-w64-i686-python-setuptools
             mingw-w64-i686-pkgconf
             mingw-w64-i686-vulkan-headers
             mingw-w64-i686-vulkan-loader
             bison
             flex
+      # Mesa needs PyYAML at build time; MSYS2's 32-bit repository no longer
+      # has it. The pinned sdist, built against the runner's own setuptools.
+      - name: PyYAML for the WoW64 Mesa build
+        shell: msys2 {0}
+        run: |
+          printf '%s\n' 'pyyaml==6.0.3 --hash=sha256:d76623373421df22fb4cf8817020cbb7ef15c725b9d5e45f17e189bfc384190f' > pyyaml-req.txt
+          python -m pip install --break-system-packages --no-build-isolation --require-hashes -r pyyaml-req.txt
+          rm pyyaml-req.txt
+          python -c 'import yaml; print("PyYAML", yaml.__version__)'
       - name: Build WoW64 Mesa runtime
         shell: msys2 {0}
         run: bash ./guest/windows/ci/windows/build-mesa.sh "$GITHUB_WORKSPACE/guest/windows" "$RUNNER_TEMP/helios-mesa-x86"
