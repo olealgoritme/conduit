@@ -851,6 +851,7 @@ struct nb_wl {
     struct nb_gs *gc_gs;
     uint32_t  gc_gs_w, gc_gs_h;     /* its read-back targets' size         */
     bool      gc_gs_failed;         /* no GPU here imports the cursor      */
+    bool      ptr_on_pic;           /* last cur_apply: over the picture    */
 
     /*
      * Display settings (nb_view.h) and where they last put the picture.
@@ -4427,11 +4428,44 @@ static const struct wp_fractional_scale_v1_listener frac_listener = {
  * appearing or the guest's first frame arriving sends no enter event, so
  * without this the cursor keeps whatever state it had.
  */
+/*
+ * wl_pointer.set_cursor, then the cursor surface committed again with its
+ * buffer and full damage.  A compositor may take a cursor's pixels only from
+ * a commit made while the surface HAS the cursor role -- Hyprland copies them
+ * then (Compositor.cpp updateCursorShm) and on NVIDIA draws the cursor from
+ * that copy -- so an image committed before its first set_cursor is shown
+ * transparent there.  The extra commit of an unchanged shm buffer is harmless
+ * everywhere else.
+ */
+static void ptr_cursor(struct nb_wl *w, struct wl_pointer *p, uint32_t serial,
+                       struct wl_surface *sf, struct wl_buffer *buf,
+                       int32_t hx, int32_t hy)
+{
+    wl_pointer_set_cursor(p, serial, sf, hx, hy);
+    if (sf && buf) {
+        (void)w;
+        wl_surface_attach(sf, buf, 0, 0);
+        wl_surface_damage_buffer(sf, 0, 0, INT32_MAX, INT32_MAX);
+        wl_surface_commit(sf);
+    }
+}
+
+/* The pointer (window coordinates) is over the drawn guest picture, not
+ * over the bars around it. */
+static bool wl_ptr_on_pic(const struct nb_wl *w)
+{
+    const struct nb_rect *v = &w->place.vis;
+
+    return w->current >= 0 && w->ptr_wx >= v->x && w->ptr_wx < v->x + v->w &&
+           w->ptr_wy >= v->y && w->ptr_wy < v->y + v->h;
+}
+
 static void cur_apply(struct nb_wl *w, uint32_t serial)
 {
     if (!w->ptr || !w->ptr_on_content) {
         return;
     }
+    w->ptr_on_pic = wl_ptr_on_pic(w);
     cur_build(w);
     if (w->ui.open && !w->dlg_open) {
         /* The menu is open: the area editor's handles. */
@@ -4447,8 +4481,8 @@ static void cur_apply(struct nb_wl *w, uint32_t serial)
         int k = c >= 0 && c < NB_UI_CUR_COUNT ? map[c] : NB_CUR_ARROW;
 
         w->ui_cur = c;
-        wl_pointer_set_cursor(w->ptr, serial, w->cur_surf[k], w->cur_hx[k],
-                              w->cur_hy[k]);
+        ptr_cursor(w, w->ptr, serial, w->cur_surf[k], w->cur_buf[k],
+                   w->cur_hx[k], w->cur_hy[k]);
         w->cur_img_on = true;
         return;
     }
@@ -4460,7 +4494,14 @@ static void cur_apply(struct nb_wl *w, uint32_t serial)
          * the user is asked a question with four buttons and given no cursor
          * to answer it with.
          */
-        wl_pointer_set_cursor(w->ptr, serial, w->cur_surf[NB_CUR_ARROW], 0, 0);
+        ptr_cursor(w, w->ptr, serial, w->cur_surf[NB_CUR_ARROW],
+                   w->cur_buf[NB_CUR_ARROW], 0, 0);
+        w->cur_img_on = true;
+    } else if (w->current >= 0 && !w->ptr_on_pic && !w->grabbed) {
+        /* The bars around the picture: nothing of the guest's is drawn
+         * there, so the host pointer is. */
+        ptr_cursor(w, w->ptr, serial, w->cur_surf[NB_CUR_ARROW],
+                   w->cur_buf[NB_CUR_ARROW], 0, 0);
         w->cur_img_on = true;
     } else if (w->current >= 0) {
         /*
@@ -4478,7 +4519,8 @@ static void cur_apply(struct nb_wl *w, uint32_t serial)
          * software cursor is visible).  Under grab it is always NULL.
          */
         if (w->gc_on && !w->grabbed && w->gc_cur >= 0 && w->gc_surf) {
-            wl_pointer_set_cursor(w->ptr, serial, w->gc_surf, w->gc_lhx,
+            ptr_cursor(w, w->ptr, serial, w->gc_surf, w->gc[w->gc_cur].buf,
+                       w->gc_lhx,
                                   w->gc_lhy);
             w->cur_img_on = true;
         } else {
@@ -4487,7 +4529,8 @@ static void cur_apply(struct nb_wl *w, uint32_t serial)
         }
     } else {
         /* The placeholder.  Nothing is drawing a cursor into it. */
-        wl_pointer_set_cursor(w->ptr, serial, w->cur_surf[NB_CUR_ARROW], 0, 0);
+        ptr_cursor(w, w->ptr, serial, w->cur_surf[NB_CUR_ARROW],
+                   w->cur_buf[NB_CUR_ARROW], 0, 0);
         w->cur_img_on = true;
     }
 }
@@ -5310,8 +5353,8 @@ static void ptr_enter(void *d, struct wl_pointer *p, uint32_t serial,
         {
             const int c = nb_bd_cursor[w->bd_hot];
 
-            wl_pointer_set_cursor(p, serial, w->cur_surf[c],
-                                  w->cur_hx[c], w->cur_hy[c]);
+            ptr_cursor(w, p, serial, w->cur_surf[c], w->cur_buf[c],
+                       w->cur_hx[c], w->cur_hy[c]);
         }
         return;
     }
@@ -5323,7 +5366,8 @@ static void ptr_enter(void *d, struct wl_pointer *p, uint32_t serial,
         w->ptr_on_tb = false;
         w->ptr_on_content = false;
         w->ui_cur = -1;
-        wl_pointer_set_cursor(p, serial, w->cur_surf[NB_CUR_ARROW], 0, 0);
+        ptr_cursor(w, p, serial, w->cur_surf[NB_CUR_ARROW],
+                   w->cur_buf[NB_CUR_ARROW], 0, 0);
         if (w->sink) {
             nb_sink_pointer(w->sink, false);
         }
@@ -5337,14 +5381,16 @@ static void ptr_enter(void *d, struct wl_pointer *p, uint32_t serial,
         w->ptr_on_dlg = true;
         w->ptr_on_tb = false;
         w->ptr_on_content = false;
-        wl_pointer_set_cursor(p, serial, w->cur_surf[NB_CUR_ARROW], 0, 0);
+        ptr_cursor(w, p, serial, w->cur_surf[NB_CUR_ARROW],
+                   w->cur_buf[NB_CUR_ARROW], 0, 0);
         return;
     }
     w->ptr_on_dlg = false;
     if (s && s == w->tb_surf) {
         w->ptr_on_tb = true;
         w->ptr_on_content = false;
-        wl_pointer_set_cursor(p, serial, w->cur_surf[NB_CUR_ARROW], 0, 0);
+        ptr_cursor(w, p, serial, w->cur_surf[NB_CUR_ARROW],
+                   w->cur_buf[NB_CUR_ARROW], 0, 0);
         return;
     }
     w->ptr_on_tb = false;
@@ -5367,22 +5413,22 @@ static void ptr_enter(void *d, struct wl_pointer *p, uint32_t serial,
      * the arrow returns on its own at the window chrome.
      */
     w->ptr_on_content = true;
-    cur_apply(w, serial);
-    if (w->sink) {
-        nb_sink_pointer(w->sink, true);
-    }
     /*
      * Where it entered is a position like any motion's.  A compositor sends
      * enter alone when the pointer crosses from the bars onto the picture's
      * subsurface, or when the picture appears under a still pointer; until
      * the next motion the guest pointer would stay where it was, and a click
-     * land there.
+     * land there.  Known before cur_apply: over the bars it is an arrow.
      */
     w->ptr_wx = wl_fixed_to_double(x);
     w->ptr_wy = wl_fixed_to_double(y);
     if (w->in_sub && s == w->cs_surf) {
         w->ptr_wx += w->off_x;
         w->ptr_wy += w->off_y;
+    }
+    cur_apply(w, serial);
+    if (w->sink) {
+        nb_sink_pointer(w->sink, true);
     }
     if (!w->ui.open) {
         wl_ptr_to_guest(w);
@@ -5472,6 +5518,9 @@ static void ptr_motion(void *d, struct wl_pointer *p, uint32_t t,
         w->ptr_wx = wx;
         w->ptr_wy = wy;
         wl_btn_track(w, wy);
+        if (!w->ui.open && wl_ptr_on_pic(w) != w->ptr_on_pic) {
+            cur_apply(w, w->last_serial);       /* picture <-> bars */
+        }
         if (w->ui.open) {
             wl_ui_do(w, nb_ui_area_motion(&w->ui, wl_ui_env(w), wx, wy));
             return;
@@ -8196,6 +8245,11 @@ static void wl_menu_set(struct nb_wl *w, bool open)
         nb_log("menu: closed");
     }
     wl_ui_do(w, nb_ui_set_open(&w->ui, wl_ui_env(w), open));
+    if (open) {
+        /* The host pointer, at once and wherever it is: the menu is used
+         * with it, and a still pointer gets no motion to bring it back. */
+        cur_apply(w, w->last_serial);
+    }
 }
 
 static void wl_ui_do(struct nb_wl *w, unsigned bits)
