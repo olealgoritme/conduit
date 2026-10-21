@@ -91,6 +91,8 @@ struct nb_gs_draw {
     int    dx, dy, dw, dh;      /* destination, target pixels, y down        */
     double sx, sy, sw, sh;      /* source rectangle, buffer pixels           */
     bool   nearest;
+    bool   alpha;               /* keep the source's alpha (a cursor image);
+                                 * otherwise the target is opaque            */
 };
 
 /*

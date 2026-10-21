@@ -199,7 +199,7 @@ struct nb_gs {
     EGLContext ctx;
     enum nb_gs_prio prio_req, prio_got;
     GLuint prog;
-    GLint u_tex, u_rect, u_swap;
+    GLint u_tex, u_rect, u_swap, u_alpha;
     bool readback;              /* targets are plain renderbuffers, read back */
     struct {
         bool     valid;
@@ -526,10 +526,11 @@ static bool prog_up(struct nb_gs *g, char *why, size_t n)
         "precision mediump float;\n"
         "uniform samplerExternalOES u_tex;\n"
         "uniform float u_swap;\n"
+        "uniform float u_alpha;\n"
         "varying vec2 v_tc;\n"
         "void main() {\n"
-        "  vec3 c = texture2D(u_tex, v_tc).rgb;\n"
-        "  gl_FragColor = vec4(mix(c, c.bgr, u_swap), 1.0);\n"
+        "  vec4 t = texture2D(u_tex, v_tc);\n"
+        "  gl_FragColor = vec4(mix(t.rgb, t.bgr, u_swap), mix(1.0, t.a, u_alpha));\n"
         "}\n";
     static const GLfloat quad[] = { 0, 0, 1, 0, 0, 1, 1, 1 };
     GLuint v = shader(g, GL_VERTEX_SHADER, vs);
@@ -556,6 +557,7 @@ static bool prog_up(struct nb_gs *g, char *why, size_t n)
     g->u_tex = f->GetUniformLocation(g->prog, "u_tex");
     g->u_rect = f->GetUniformLocation(g->prog, "u_rect");
     g->u_swap = f->GetUniformLocation(g->prog, "u_swap");
+    g->u_alpha = f->GetUniformLocation(g->prog, "u_alpha");
     f->Uniform1i(g->u_tex, 0);
     /* Client-side vertex array: GLES2 allows it, and it is 32 bytes. */
     f->VertexAttribPointer(0, 2, GL_FLOAT, 0, 0, quad);
@@ -853,7 +855,8 @@ int nb_gs_readback(struct nb_gs *g, int target, void *dst)
     }
     g->f.BindFramebuffer(GL_FRAMEBUFFER, g->t[target].fbo);
     /* R and B were swapped by the shader, so GL_RGBA bytes are XRGB8888's
-     * B, G, R, X in memory; rows top-down as everywhere here. */
+     * B, G, R, X in memory (ARGB8888's B, G, R, A for an alpha draw); rows
+     * top-down as everywhere here. */
     g->f.ReadPixels(0, 0, (GLsizei)g->tw, (GLsizei)g->th, 0x1908 /* RGBA */,
                     0x1401 /* UNSIGNED_BYTE */, dst);
     return 0;
@@ -1088,6 +1091,7 @@ int nb_gs_draw(struct nb_gs *g, const struct nb_gs_draw *d,
                  (GLfloat)(d->sy / g->s[si].h), (GLfloat)(d->sw / g->s[si].w),
                  (GLfloat)(d->sh / g->s[si].h));
     f->Uniform1f(g->u_swap, g->readback ? 1.0f : 0.0f);
+    f->Uniform1f(g->u_alpha, d->alpha ? 1.0f : 0.0f);
     f->DrawArrays(GL_TRIANGLE_STRIP, 0, 4);
     t0 = now_ns();
     sync = f->CreateSyncKHR(g->dpy, EGL_SYNC_FENCE_KHR, NULL);

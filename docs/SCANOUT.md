@@ -198,6 +198,11 @@ guest cursor plane commit ──CursorUpdate{owner,handle,hot}──► backend 
   `CAP_CURSOR` never gets `CMD_CURSOR` (it would be a protocol violation).
 - The viewer draws it at the picture's scale (guest pixel → window pixel)
   through a viewport, so it keeps its size relative to the guest desktop.
+- On a display that does not list LINEAR ARGB8888 dma-bufs (Hyprland on
+  NVIDIA, where LINEAR is external-only and an imported LINEAR buffer is drawn
+  as nothing), or that refuses the import, the viewer's GPU draws each new
+  image 1:1 with its alpha and reads it back into a `wl_shm` buffer. Only a
+  shape change is copied; moves stay the host pointer's.
 
 ### Hardware cursor, Windows guests
 

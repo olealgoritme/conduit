@@ -845,6 +845,13 @@ struct nb_wl {
     uint32_t  gc_gen;
     uint64_t  gc_tick;
     bool      gc_told_fail;
+    /* A display that does not take the cursor's LINEAR ARGB8888 dma-buf
+     * (Hyprland 0.47 on NVIDIA lists only tiled layouts): the viewer's GPU
+     * copies each new image into shared memory.  Opened when first needed. */
+    struct nb_gs *gc_gs;
+    uint32_t  gc_gs_w, gc_gs_h;     /* its read-back targets' size         */
+    bool      gc_gs_failed;         /* no GPU here imports the cursor      */
+    bool      ptr_on_pic;           /* last cur_apply: over the picture    */
 
     /*
      * Display settings (nb_view.h) and where they last put the picture.
@@ -4421,11 +4428,44 @@ static const struct wp_fractional_scale_v1_listener frac_listener = {
  * appearing or the guest's first frame arriving sends no enter event, so
  * without this the cursor keeps whatever state it had.
  */
+/*
+ * wl_pointer.set_cursor, then the cursor surface committed again with its
+ * buffer and full damage.  A compositor may take a cursor's pixels only from
+ * a commit made while the surface HAS the cursor role -- Hyprland copies them
+ * then (Compositor.cpp updateCursorShm) and on NVIDIA draws the cursor from
+ * that copy -- so an image committed before its first set_cursor is shown
+ * transparent there.  The extra commit of an unchanged shm buffer is harmless
+ * everywhere else.
+ */
+static void ptr_cursor(struct nb_wl *w, struct wl_pointer *p, uint32_t serial,
+                       struct wl_surface *sf, struct wl_buffer *buf,
+                       int32_t hx, int32_t hy)
+{
+    wl_pointer_set_cursor(p, serial, sf, hx, hy);
+    if (sf && buf) {
+        (void)w;
+        wl_surface_attach(sf, buf, 0, 0);
+        wl_surface_damage_buffer(sf, 0, 0, INT32_MAX, INT32_MAX);
+        wl_surface_commit(sf);
+    }
+}
+
+/* The pointer (window coordinates) is over the drawn guest picture, not
+ * over the bars around it. */
+static bool wl_ptr_on_pic(const struct nb_wl *w)
+{
+    const struct nb_rect *v = &w->place.vis;
+
+    return w->current >= 0 && w->ptr_wx >= v->x && w->ptr_wx < v->x + v->w &&
+           w->ptr_wy >= v->y && w->ptr_wy < v->y + v->h;
+}
+
 static void cur_apply(struct nb_wl *w, uint32_t serial)
 {
     if (!w->ptr || !w->ptr_on_content) {
         return;
     }
+    w->ptr_on_pic = wl_ptr_on_pic(w);
     cur_build(w);
     if (w->ui.open && !w->dlg_open) {
         /* The menu is open: the area editor's handles. */
@@ -4441,8 +4481,8 @@ static void cur_apply(struct nb_wl *w, uint32_t serial)
         int k = c >= 0 && c < NB_UI_CUR_COUNT ? map[c] : NB_CUR_ARROW;
 
         w->ui_cur = c;
-        wl_pointer_set_cursor(w->ptr, serial, w->cur_surf[k], w->cur_hx[k],
-                              w->cur_hy[k]);
+        ptr_cursor(w, w->ptr, serial, w->cur_surf[k], w->cur_buf[k],
+                   w->cur_hx[k], w->cur_hy[k]);
         w->cur_img_on = true;
         return;
     }
@@ -4454,7 +4494,14 @@ static void cur_apply(struct nb_wl *w, uint32_t serial)
          * the user is asked a question with four buttons and given no cursor
          * to answer it with.
          */
-        wl_pointer_set_cursor(w->ptr, serial, w->cur_surf[NB_CUR_ARROW], 0, 0);
+        ptr_cursor(w, w->ptr, serial, w->cur_surf[NB_CUR_ARROW],
+                   w->cur_buf[NB_CUR_ARROW], 0, 0);
+        w->cur_img_on = true;
+    } else if (w->current >= 0 && !w->ptr_on_pic && !w->grabbed) {
+        /* The bars around the picture: nothing of the guest's is drawn
+         * there, so the host pointer is. */
+        ptr_cursor(w, w->ptr, serial, w->cur_surf[NB_CUR_ARROW],
+                   w->cur_buf[NB_CUR_ARROW], 0, 0);
         w->cur_img_on = true;
     } else if (w->current >= 0) {
         /*
@@ -4472,7 +4519,8 @@ static void cur_apply(struct nb_wl *w, uint32_t serial)
          * software cursor is visible).  Under grab it is always NULL.
          */
         if (w->gc_on && !w->grabbed && w->gc_cur >= 0 && w->gc_surf) {
-            wl_pointer_set_cursor(w->ptr, serial, w->gc_surf, w->gc_lhx,
+            ptr_cursor(w, w->ptr, serial, w->gc_surf, w->gc[w->gc_cur].buf,
+                       w->gc_lhx,
                                   w->gc_lhy);
             w->cur_img_on = true;
         } else {
@@ -4481,7 +4529,8 @@ static void cur_apply(struct nb_wl *w, uint32_t serial)
         }
     } else {
         /* The placeholder.  Nothing is drawing a cursor into it. */
-        wl_pointer_set_cursor(w->ptr, serial, w->cur_surf[NB_CUR_ARROW], 0, 0);
+        ptr_cursor(w, w->ptr, serial, w->cur_surf[NB_CUR_ARROW],
+                   w->cur_buf[NB_CUR_ARROW], 0, 0);
         w->cur_img_on = true;
     }
 }
@@ -5304,8 +5353,8 @@ static void ptr_enter(void *d, struct wl_pointer *p, uint32_t serial,
         {
             const int c = nb_bd_cursor[w->bd_hot];
 
-            wl_pointer_set_cursor(p, serial, w->cur_surf[c],
-                                  w->cur_hx[c], w->cur_hy[c]);
+            ptr_cursor(w, p, serial, w->cur_surf[c], w->cur_buf[c],
+                       w->cur_hx[c], w->cur_hy[c]);
         }
         return;
     }
@@ -5317,7 +5366,8 @@ static void ptr_enter(void *d, struct wl_pointer *p, uint32_t serial,
         w->ptr_on_tb = false;
         w->ptr_on_content = false;
         w->ui_cur = -1;
-        wl_pointer_set_cursor(p, serial, w->cur_surf[NB_CUR_ARROW], 0, 0);
+        ptr_cursor(w, p, serial, w->cur_surf[NB_CUR_ARROW],
+                   w->cur_buf[NB_CUR_ARROW], 0, 0);
         if (w->sink) {
             nb_sink_pointer(w->sink, false);
         }
@@ -5331,14 +5381,16 @@ static void ptr_enter(void *d, struct wl_pointer *p, uint32_t serial,
         w->ptr_on_dlg = true;
         w->ptr_on_tb = false;
         w->ptr_on_content = false;
-        wl_pointer_set_cursor(p, serial, w->cur_surf[NB_CUR_ARROW], 0, 0);
+        ptr_cursor(w, p, serial, w->cur_surf[NB_CUR_ARROW],
+                   w->cur_buf[NB_CUR_ARROW], 0, 0);
         return;
     }
     w->ptr_on_dlg = false;
     if (s && s == w->tb_surf) {
         w->ptr_on_tb = true;
         w->ptr_on_content = false;
-        wl_pointer_set_cursor(p, serial, w->cur_surf[NB_CUR_ARROW], 0, 0);
+        ptr_cursor(w, p, serial, w->cur_surf[NB_CUR_ARROW],
+                   w->cur_buf[NB_CUR_ARROW], 0, 0);
         return;
     }
     w->ptr_on_tb = false;
@@ -5361,22 +5413,22 @@ static void ptr_enter(void *d, struct wl_pointer *p, uint32_t serial,
      * the arrow returns on its own at the window chrome.
      */
     w->ptr_on_content = true;
-    cur_apply(w, serial);
-    if (w->sink) {
-        nb_sink_pointer(w->sink, true);
-    }
     /*
      * Where it entered is a position like any motion's.  A compositor sends
      * enter alone when the pointer crosses from the bars onto the picture's
      * subsurface, or when the picture appears under a still pointer; until
      * the next motion the guest pointer would stay where it was, and a click
-     * land there.
+     * land there.  Known before cur_apply: over the bars it is an arrow.
      */
     w->ptr_wx = wl_fixed_to_double(x);
     w->ptr_wy = wl_fixed_to_double(y);
     if (w->in_sub && s == w->cs_surf) {
         w->ptr_wx += w->off_x;
         w->ptr_wy += w->off_y;
+    }
+    cur_apply(w, serial);
+    if (w->sink) {
+        nb_sink_pointer(w->sink, true);
     }
     if (!w->ui.open) {
         wl_ptr_to_guest(w);
@@ -5466,6 +5518,9 @@ static void ptr_motion(void *d, struct wl_pointer *p, uint32_t t,
         w->ptr_wx = wx;
         w->ptr_wy = wy;
         wl_btn_track(w, wy);
+        if (!w->ui.open && wl_ptr_on_pic(w) != w->ptr_on_pic) {
+            cur_apply(w, w->last_serial);       /* picture <-> bars */
+        }
         if (w->ui.open) {
             wl_ui_do(w, nb_ui_area_motion(&w->ui, wl_ui_env(w), wx, wy));
             return;
@@ -8190,6 +8245,11 @@ static void wl_menu_set(struct nb_wl *w, bool open)
         nb_log("menu: closed");
     }
     wl_ui_do(w, nb_ui_set_open(&w->ui, wl_ui_env(w), open));
+    if (open) {
+        /* The host pointer, at once and wherever it is: the menu is used
+         * with it, and a still pointer gets no motion to bring it back. */
+        cur_apply(w, w->last_serial);
+    }
 }
 
 static void wl_ui_do(struct nb_wl *w, unsigned bits)
@@ -8317,9 +8377,10 @@ struct nb_gc_req {
     struct nb_wl *w;
     uint32_t gen;
     uint64_t id;
-    uint32_t cw, ch, stride, offset;
+    uint32_t cw, ch, stride, offset, fourcc;
     uint64_t mod;
     unsigned hx, hy;
+    int fd;                     /* our dup, for the copy if the import fails */
 };
 
 /* Lay the current image out at the picture's scale.  Returns true when the
@@ -8380,28 +8441,162 @@ static void gc_show(struct nb_wl *w, int slot, unsigned hx, unsigned hy)
     wl_nudge(w);                /* a new cursor image needs a repaint too */
 }
 
-static void gc_created(void *data, struct zwp_linux_buffer_params_v1 *params,
-                       struct wl_buffer *buf)
+/* The cache slot a new image goes to: a free one, else the one shown
+ * longest ago, never the one on screen.  -1: none. */
+static int gc_slot(struct nb_wl *w)
 {
-    struct nb_gc_req *r = data;
-    struct nb_wl *w = r->w;
     int i, victim = -1;
     uint64_t oldest = UINT64_MAX;
 
-    zwp_linux_buffer_params_v1_destroy(params);
     for (i = 0; i < 4; i++) {
         if (i == w->gc_cur) {
             continue;           /* never the one on screen */
         }
         if (!w->gc[i].valid) {
-            victim = i;
-            break;
+            return i;
         }
         if (w->gc[i].used < oldest) {
             oldest = w->gc[i].used;
             victim = i;
         }
     }
+    return victim;
+}
+
+/* The GPU that copies cursor images, opened the first time one is needed. */
+static bool gc_gs_ready(struct nb_wl *w)
+{
+    const char *node = w->cfg ? w->cfg->render_node : NULL;
+    char why[200] = "";
+
+    if (w->gc_gs || w->gc_gs_failed) {
+        return w->gc_gs != NULL;
+    }
+    w->gc_gs = nb_gs_open(node, 0, NB_FOURCC_AR24_LOCAL, 0, why, sizeof(why));
+    if (!w->gc_gs && node) {
+        w->gc_gs = nb_gs_open(NULL, 0, NB_FOURCC_AR24_LOCAL, 0, why,
+                              sizeof(why));
+    }
+    if (w->gc_gs && !nb_gs_can_import(w->gc_gs, NB_FOURCC_AR24_LOCAL, 0)) {
+        snprintf(why, sizeof(why), "%s imports no LINEAR ARGB8888",
+                 nb_gs_node(w->gc_gs));
+        nb_gs_close(w->gc_gs);
+        w->gc_gs = NULL;
+    }
+    if (!w->gc_gs) {
+        w->gc_gs_failed = true;
+        nb_err("guest cursor: no GPU here copies the guest's cursor image "
+               "(%s)", why[0] ? why : "no render node");
+        return false;
+    }
+    nb_log("guest cursor: copied by %s into shared memory when its shape "
+           "changes (the display takes no LINEAR ARGB8888 dma-buf); moves "
+           "are the host pointer's", nb_gs_node(w->gc_gs));
+    return true;
+}
+
+/*
+ * The display does not take the cursor's dma-buf: draw it 1:1, alpha kept,
+ * with the viewer's GPU and read it back into a wl_shm buffer -- the one
+ * kind every compositor takes.  Only a new shape comes here (a cursor is at
+ * most 256x256); a move is the host pointer's and copies nothing.  The image
+ * is copied every time, never matched in the cache: a guest may redraw a
+ * cursor in place.
+ */
+static int gc_copy(struct nb_wl *w, int fd, uint32_t cw, uint32_t ch,
+                   uint32_t stride, uint32_t offset, uint32_t fourcc,
+                   uint64_t mod, unsigned hx, unsigned hy)
+{
+    struct nb_gs_draw dr = {
+        .src_key = 0, .target = 0, .dw = (int)cw, .dh = (int)ch,
+        .sw = cw, .sh = ch, .nearest = true, .alpha = true,
+    };
+    struct wl_shm_pool *pool;
+    struct wl_buffer *buf;
+    char why[200] = "";
+    size_t size = (size_t)cw * ch * 4;
+    void *px;
+    int mfd, slot, r;
+
+    if (!w->shm || !gc_gs_ready(w)) {
+        return -ENOTSUP;
+    }
+    if (cw != w->gc_gs_w || ch != w->gc_gs_h) {
+        w->gc_gs_w = w->gc_gs_h = 0;
+        if (nb_gs_targets_readback(w->gc_gs, cw, ch, why, sizeof(why)) <= 0) {
+            nb_err("guest cursor: %ux%u copy target: %s", cw, ch, why);
+            return -EIO;
+        }
+        w->gc_gs_w = cw;
+        w->gc_gs_h = ch;
+    }
+    nb_gs_src_drop(w->gc_gs, 0);
+    r = nb_gs_src(w->gc_gs, 0, fd, cw, ch, stride, offset, fourcc, mod);
+    if (r == 0) {
+        r = nb_gs_draw(w->gc_gs, &dr, 50000, NULL);
+    }
+    nb_gs_src_drop(w->gc_gs, 0);
+    if (r != 0) {
+        nb_err("guest cursor: GPU copy of the %ux%u image failed (%d)", cw, ch,
+               r);
+        return r;
+    }
+    slot = gc_slot(w);
+    if (slot < 0) {
+        return -EBUSY;
+    }
+    mfd = memfd_create("conduit-viewer-cursor", MFD_CLOEXEC);
+    if (mfd < 0) {
+        return -errno;
+    }
+    if (ftruncate(mfd, (off_t)size) < 0) {
+        close(mfd);
+        return -EIO;
+    }
+    px = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, mfd, 0);
+    if (px == MAP_FAILED) {
+        close(mfd);
+        return -ENOMEM;
+    }
+    r = nb_gs_readback(w->gc_gs, 0, px);
+    munmap(px, size);
+    if (r != 0) {
+        close(mfd);
+        return r;
+    }
+    pool = wl_shm_create_pool(w->shm, mfd, (int32_t)size);
+    close(mfd);
+    if (!pool) {
+        return -ENOMEM;
+    }
+    buf = wl_shm_pool_create_buffer(pool, 0, (int32_t)cw, (int32_t)ch,
+                                    (int32_t)(cw * 4), WL_SHM_FORMAT_ARGB8888);
+    wl_shm_pool_destroy(pool);
+    if (!buf) {
+        return -ENOMEM;
+    }
+    if (w->gc[slot].buf) {
+        wl_buffer_destroy(w->gc[slot].buf);
+    }
+    /* id 0: never a cache hit (a dma-buf's id is its inode). */
+    w->gc[slot] = (typeof(w->gc[slot])){
+        .valid = true, .used = ++w->gc_tick, .w = cw, .h = ch,
+        .stride = cw * 4, .mod = 0, .buf = buf,
+    };
+    gc_show(w, slot, hx, hy);
+    return 0;
+}
+
+static void gc_created(void *data, struct zwp_linux_buffer_params_v1 *params,
+                       struct wl_buffer *buf)
+{
+    struct nb_gc_req *r = data;
+    struct nb_wl *w = r->w;
+    int victim;
+
+    zwp_linux_buffer_params_v1_destroy(params);
+    close(r->fd);
+    victim = gc_slot(w);
     if (victim < 0) {
         wl_buffer_destroy(buf);
         free(r);
@@ -8426,15 +8621,24 @@ static void gc_created(void *data, struct zwp_linux_buffer_params_v1 *params,
 static void gc_failed(void *data, struct zwp_linux_buffer_params_v1 *params)
 {
     struct nb_gc_req *r = data;
+    struct nb_wl *w = r->w;
 
-    if (!r->w->gc_told_fail) {
-        r->w->gc_told_fail = true;
-        nb_err("cursor: the compositor refused to import the guest's cursor "
-               "image (%ux%u AR24 modifier 0x%016llx); the host pointer stays "
-               "hidden over the guest.  Said once.", r->cw, r->ch,
-               (unsigned long long)r->mod);
-    }
     zwp_linux_buffer_params_v1_destroy(params);
+    /* Advertised but refused: copy from now on (wl_cursor asks), and this
+     * image too when it is still the newest. */
+    if (!w->gc_told_fail) {
+        w->gc_told_fail = true;
+        nb_err("cursor: the compositor refused to import the guest's cursor "
+               "image (%ux%u AR24 modifier 0x%016llx); copying it instead.  "
+               "Said once.", r->cw, r->ch, (unsigned long long)r->mod);
+    }
+    if (r->gen == w->gc_gen &&
+        gc_copy(w, r->fd, r->cw, r->ch, r->stride, r->offset, r->fourcc,
+                r->mod, r->hx, r->hy) != 0) {
+        nb_err("cursor: the guest's cursor cannot be shown; the host pointer "
+               "stays hidden over the guest");
+    }
+    close(r->fd);
     free(r);
 }
 
@@ -8460,10 +8664,6 @@ static int wl_cursor(struct nb_session *s, const struct nb_buf_desc *d,
         }
         return 0;
     }
-    /* The EXACT pair: a cursor needs its alpha, so no opaque twin. */
-    if (!wl_format_ok(s, d->fourcc, d->modifier)) {
-        return -EINVAL;
-    }
     if (!w->gc_surf) {
         w->gc_surf = wl_compositor_create_surface(w->comp);
         if (!w->gc_surf) {
@@ -8472,6 +8672,12 @@ static int wl_cursor(struct nb_session *s, const struct nb_buf_desc *d,
         if (w->viewporter) {
             w->gc_vp = wp_viewporter_get_viewport(w->viewporter, w->gc_surf);
         }
+    }
+    /* The EXACT pair: a cursor needs its alpha, so no opaque twin.  A
+     * display that does not take it (or refused it once) gets a copy. */
+    if (w->gc_told_fail || !wl_format_ok(s, d->fourcc, d->modifier)) {
+        return gc_copy(w, d->fd, d->width, d->height, d->stride, d->offset,
+                       d->fourcc, d->modifier, hx, hy);
     }
     for (i = 0; i < 4; i++) {
         if (w->gc[i].valid && w->gc[i].id == d->id && w->gc[i].w == d->width &&
@@ -8493,8 +8699,13 @@ static int wl_cursor(struct nb_session *s, const struct nb_buf_desc *d,
     *r = (struct nb_gc_req){
         .w = w, .gen = w->gc_gen, .id = d->id, .cw = d->width,
         .ch = d->height, .stride = d->stride, .offset = d->offset,
-        .mod = d->modifier, .hx = hx, .hy = hy,
+        .fourcc = d->fourcc, .mod = d->modifier, .hx = hx, .hy = hy,
+        .fd = fcntl(d->fd, F_DUPFD_CLOEXEC, 0),
     };
+    if (r->fd < 0) {
+        free(r);
+        return -errno;
+    }
     zwp_linux_buffer_params_v1_add(pp, d->fd, 0, d->offset, d->stride,
                                    (uint32_t)(d->modifier >> 32),
                                    (uint32_t)(d->modifier & 0xffffffffu));
@@ -8848,6 +9059,9 @@ static void wl_close_session(struct nb_session *s)
         if (w->gc[i].buf) {
             wl_buffer_destroy(w->gc[i].buf);
         }
+    }
+    if (w->gc_gs) {
+        nb_gs_close(w->gc_gs);
     }
     if (w->gc_vp) {
         wp_viewport_destroy(w->gc_vp);
@@ -9297,12 +9511,14 @@ static int wl_open(struct nb_session *s, const struct nb_config *cfg)
      * pointer to put it under and the display takes a LINEAR ARGB8888
      * dma-buf (what the guest's cursor plane is). */
     s->caps |= NVKVM_BROKER_CAP_MODE_HINTS | NVKVM_BROKER_CAP_MODE_LIST;
-    if (w->seat && w->dmabuf && w->dmabuf_ver >= 3 &&
-        nb_formats_has(&w->formats, NB_FOURCC_AR24_LOCAL, 0)) {
+    if (w->seat && ((w->dmabuf && w->dmabuf_ver >= 3 &&
+                     nb_formats_has(&w->formats, NB_FOURCC_AR24_LOCAL, 0)) ||
+                    (w->shm && gc_gs_ready(w)))) {
         s->caps |= NVKVM_BROKER_CAP_CURSOR;
     } else {
-        nb_log("guest cursor: not offered (needs a pointer and a display that "
-               "imports LINEAR ARGB8888 dma-bufs); the guest draws its own");
+        nb_log("guest cursor: not offered (needs a pointer, and a display "
+               "that imports LINEAR ARGB8888 dma-bufs or a GPU that copies "
+               "them); the guest draws its own");
     }
     if (w->dmabuf_ver >= 3) {
         s->caps |= NVKVM_BROKER_CAP_MODIFIERS;

@@ -229,6 +229,57 @@ int main(void)
         CHECK(nb_gs_targets(g, TW, TH, NULL, NULL, NULL, NULL, 0, tg, why, sizeof(why)) ==
               NB_GS_TARGETS, "back to dma-buf targets");
     }
+    /* A cursor image: LINEAR ARGB8888 drawn 1:1 with its alpha kept and read
+     * back as ARGB8888 bytes, exactly; without .alpha it comes out opaque. */
+    {
+        static uint32_t mem[64 * 64];
+        struct gbm_bo *cur = gbm_bo_create(dev, 64, 64, GBM_FORMAT_ARGB8888,
+                                           GBM_BO_USE_LINEAR);
+        struct nb_gs_draw d = {
+            .src_key = 5, .target = 0, .dw = 64, .dh = 64, .sw = 64, .sh = 64,
+            .nearest = true, .alpha = true,
+        };
+        void *cmap = NULL;
+        uint32_t cst;
+        uint8_t *c;
+
+        CHECK(cur != NULL, "LINEAR ARGB8888 cursor buffer");
+        c = gbm_bo_map(cur, 0, 0, 64, 64, GBM_BO_TRANSFER_WRITE, &cst, &cmap);
+        CHECK(c != NULL, "map the cursor buffer");
+        for (int y = 0; y < 64; y++) {
+            for (int x = 0; x < 64; x++) {
+                /* left: transparent; right top: opaque white; right bottom:
+                 * half-transparent red, premultiplied. */
+                uint32_t v = x < 32 ? 0x00000000u
+                           : y < 32 ? 0xffffffffu : 0x80800000u;
+                *(uint32_t *)(c + (size_t)y * cst + (size_t)x * 4) = v;
+            }
+        }
+        gbm_bo_unmap(cur, cmap);
+        CHECK(nb_gs_targets_readback(g, 64, 64, why, sizeof(why)) ==
+              NB_GS_TARGETS, "cursor read-back targets: %s", why);
+        CHECK(nb_gs_src(g, 5, gbm_bo_get_fd(cur), 64, 64,
+                        gbm_bo_get_stride(cur), 0, GBM_FORMAT_ARGB8888, 0) >= 0,
+              "import the cursor");
+        CHECK(nb_gs_draw(g, &d, 1000000, NULL) == 0, "draw the cursor");
+        CHECK(nb_gs_readback(g, 0, mem) == 0, "read the cursor back");
+        CHECK(mem[10 * 64 + 10] == 0x00000000u, "transparent stays %08x",
+              mem[10 * 64 + 10]);
+        CHECK(mem[10 * 64 + 50] == 0xffffffffu, "opaque white %08x",
+              mem[10 * 64 + 50]);
+        CHECK(mem[50 * 64 + 50] == 0x80800000u, "half red, alpha kept %08x",
+              mem[50 * 64 + 50]);
+        d.alpha = false;
+        CHECK(nb_gs_draw(g, &d, 1000000, NULL) == 0, "draw opaque");
+        CHECK(nb_gs_readback(g, 0, mem) == 0, "read opaque back");
+        CHECK(mem[10 * 64 + 10] >> 24 == 0xff, "opaque without .alpha %08x",
+              mem[10 * 64 + 10]);
+        nb_gs_src_drop(g, 5);
+        gbm_bo_destroy(cur);
+        CHECK(nb_gs_targets(g, TW, TH, NULL, NULL, NULL, NULL, 0, tg, why,
+                            sizeof(why)) == NB_GS_TARGETS,
+              "back to dma-buf targets after the cursor");
+    }
     /*
      * TEST_GPUSCALE_BENCH=WxH: the per-frame cost at a real output size (a
      * 1600x900-class source stretched over the output), 500 draws, of the
