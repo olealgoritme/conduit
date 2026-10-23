@@ -46,7 +46,10 @@ case "${MSYSTEM:-}" in
   MINGW32) fe_dfl_env='___mingw_fe_dfl_env' ;;
   *)       fe_dfl_env='__mingw_fe_dfl_env' ;;
 esac
-export LDFLAGS="${LDFLAGS:+${LDFLAGS} }-Wl,-u,${fe_dfl_env}"
+native_file_fixed="$(cygpath -m "$(mktemp -d)")/mingw-native.ini"
+sed "s|'-ltre'|'-Wl,-u,${fe_dfl_env}', '-ltre'|g" "${native_file}" > "${native_file_fixed}"
+grep -q -- "-u,${fe_dfl_env}" "${native_file_fixed}"
+native_file="${native_file_fixed}"
 
 setup_mode=()
 case "${build_mode}" in
