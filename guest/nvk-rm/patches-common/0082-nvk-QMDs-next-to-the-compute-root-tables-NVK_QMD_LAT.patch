@@ -1,0 +1,238 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Sat, 24 Oct 2026 01:14:35 +0200
+Subject: [PATCH] nvk: QMDs next to the compute root tables (NVK_QMD_LAT),
+ fewer dispatch waits
+
+A dispatch's QMD comes from the general command buffer upload stream,
+which NVK on RM places in system memory on Windows. The compute root
+descriptor table is already in the latency-bound stream, which
+NVK_RM_UPLOAD_VRAM=compute places in CPU-mapped VRAM. After a barrier's
+idle, the scheduler reads the next QMD only when the launch method
+executes, so every dependent dispatch first waits for a 384-byte read
+across PCIe and the guest's IOMMU. In a Windows guest on an RTX 5090
+(Conduit's guest/nvk-rm/tools/dispcost), a vkd3d-proton UAV barrier
+between 5-workgroup dispatches costs 1.97 us per dispatch with the QMDs
+in system memory and 1.10 us with all upload memory in VRAM
+(NVK_RM_UPLOAD_VRAM=1). NVIDIA's driver on the host takes 0.99 us.
+
+- NVK_QMD_LAT (default 1 on Windows, 0 elsewhere): on Maxwell B and
+  later, QMDs come from the latency-bound upload stream
+  (nvk_cmd_buffer_upload_alloc_lat). NVK_QMD_LAT=0 keeps them in the
+  general upload stream. With NVK_RM_UPLOAD_VRAM=0 both streams are in
+  system memory and nothing changes.
+- NVK_DISPATCH_INDIRECT_PREFETCH=1 (opt-in, A/B): an indirect dispatch
+  copies its arguments into the root table and the QMD with two pushbuffer
+  segments that point at the indirect buffer. Each is a no-prefetch GPFIFO
+  entry, and each costs the front end a fetch round trip, about 1 us per
+  indirect dispatch even without barriers. With the knob, only the first
+  segment after a barrier, event wait, secondary or the start of the
+  command buffer is no-prefetch, as for NVK_INDIRECT_PUSH's draw records
+  (indirect_push_synced).
+- NVK_BARRIER_DEDUP=1 (opt-in, A/B): when the flush of a
+  vkCmdPipelineBarrier2 is INVALIDATE_SHADER_CACHES with DATA and
+  FLUSH_DATA (any shader storage write in the source scope, which covers
+  every D3D12 UAV barrier on vkd3d-proton), the shader data caches are
+  already invalidated after the idle. Its destination side then emits no
+  second INVALIDATE_SHADER_CACHES_NO_WFI for GLOBAL_DATA alone. The
+  constant cache invalidate stays for uniform reads and the texture data
+  cache invalidate for sampled reads. Barriers with image barriers are
+  unchanged.
+
+On Blackwell, with compute as the last subchannel, a compute-to-compute
+SHADER_WRITE -> SHADER_READ barrier (or vkd3d-proton's UAV barrier) is
+three single-dword methods:
+  INVALIDATE_SHADER_CACHES { DATA, FLUSH_DATA }    (an implicit idle)
+  INVALIDATE_TEXTURE_DATA_CACHE_NO_WFI { LINES_ALL }
+  INVALIDATE_SHADER_CACHES_NO_WFI { GLOBAL_DATA }  (dropped by the knob)
+NVK_DIAG_NO_WFI_BARRIER never applied to these barriers. It skips the
+explicit WAIT_FOR_IDLE branch, and a barrier with a storage write never
+takes that branch.
+---
+ src/nouveau/vulkan/nvk_cmd_buffer.c   | 64 ++++++++++++++++++++++++++-
+ src/nouveau/vulkan/nvk_cmd_buffer.h   |  5 +++
+ src/nouveau/vulkan/nvk_cmd_dispatch.c | 31 ++++++++++++-
+ 3 files changed, 98 insertions(+), 2 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvk_cmd_buffer.c b/src/nouveau/vulkan/nvk_cmd_buffer.c
+index d810686..5b4b31b 100644
+--- a/src/nouveau/vulkan/nvk_cmd_buffer.c
++++ b/src/nouveau/vulkan/nvk_cmd_buffer.c
+@@ -372,6 +372,33 @@ nvk_cmd_buffer_upload_data(struct nvk_cmd_buffer *cmd,
+    return VK_SUCCESS;
+ }
+ 
++/* NVK_QMD_LAT (default 1 on Windows, 0 elsewhere): QMDs come from the
++ * latency-bound upload stream (nvk_cmd_buffer_upload_alloc_lat), next to
++ * the compute root descriptor tables, instead of the general upload
++ * stream.  On RM under Windows that stream is CPU-mapped VRAM
++ * (NVK_RM_UPLOAD_VRAM=compute, the default) while the general one is
++ * system memory.  The scheduler reads a dispatch's QMD when the launch
++ * method executes, so after a barrier's idle every dependent dispatch
++ * first waits for a QMD read across PCIe and the guest's IOMMU.
++ * NVK_QMD_LAT=0 keeps QMDs in the general upload stream.
++ */
++static bool
++nvk_qmd_lat(void)
++{
++#ifdef _WIN32
++   const bool dflt = true;
++#else
++   const bool dflt = false;
++#endif
++   static uint32_t state;
++   uint32_t v = p_atomic_read(&state);
++   if (unlikely(v == 0)) {
++      v = debug_get_bool_option("NVK_QMD_LAT", dflt) ? 2 : 1;
++      p_atomic_set(&state, v);
++   }
++   return v == 2;
++}
++
+ VkResult
+ nvk_cmd_buffer_alloc_qmd(struct nvk_cmd_buffer *cmd,
+                          uint32_t size, uint32_t alignment,
+@@ -383,8 +410,12 @@ nvk_cmd_buffer_alloc_qmd(struct nvk_cmd_buffer *cmd,
+    /* On Maxwell B and later, we have INVALIDATE_SKED_CACHES so we can just
+     * allocate from wherever we want (the upload stream in this case).
+     */
+-   if (pdev->info.cls_compute >= MAXWELL_COMPUTE_B)
++   if (pdev->info.cls_compute >= MAXWELL_COMPUTE_B) {
++      if (nvk_qmd_lat())
++         return nvk_cmd_buffer_upload_alloc_lat(cmd, size, alignment,
++                                                addr, ptr);
+       return nvk_cmd_buffer_upload_alloc(cmd, size, alignment, addr, ptr);
++   }
+ 
+    /* The GPU compute scheduler (SKED) has a cache.  Maxwell B added the
+     * INVALIDATE_SKED_CACHES instruction to manage the SKED cache.  We call
+@@ -595,6 +626,27 @@ nvk_diag_no_wfi_barrier(void)
+    return v == 2;
+ }
+ 
++/* NVK_BARRIER_DEDUP=1 (opt-in, A/B): a pipeline barrier whose flush is
++ * INVALIDATE_SHADER_CACHES with DATA and FLUSH_DATA (any shader storage
++ * write in the source scope) already invalidated the shader data caches
++ * after the idle; its destination side then emits no second
++ * INVALIDATE_SHADER_CACHES_NO_WFI for GLOBAL_DATA alone (the constant
++ * cache invalidate stays when the destination reads uniforms).  Barriers
++ * with image barriers are left alone (a layout transition may record work
++ * in between).
++ */
++static bool
++nvk_barrier_dedup(void)
++{
++   static uint32_t state;
++   uint32_t v = p_atomic_read(&state);
++   if (unlikely(v == 0)) {
++      v = debug_get_bool_option("NVK_BARRIER_DEDUP", false) ? 2 : 1;
++      p_atomic_set(&state, v);
++   }
++   return v == 2;
++}
++
+ /* NVK_DIAG_WFI_COUNT=1 (debug): counts the idles pipeline barriers record
+  * (explicit WAIT_FOR_IDLE, shader data flushes, and skipped ones under
+  * NVK_DIAG_NO_WFI_BARRIER) and logs the per-second rates through
+@@ -797,6 +849,8 @@ nvk_cmd_flush_wait_dep(struct nvk_cmd_buffer *cmd,
+    if (barriers & NVK_BARRIER_FLUSH_SHADER_DATA) {
+       struct nv_push *p = nvk_cmd_buffer_push(cmd, 2);
+       nvk_diag_wfi_count(1);
++      if (wait)
++         cmd->barrier_data_invalidated = true;
+ 
+       /* This is also implicitly a WFI */
+       if (nvk_cmd_buffer_last_subchannel(cmd) == SUBC_NVA097) {
+@@ -956,6 +1010,10 @@ nvk_cmd_invalidate_deps(struct nvk_cmd_buffer *cmd,
+    if (cmd->compute_only)
+       barriers &= ~NVK_BARRIER_INVALIDATE_RASTER_CACHE;
+ 
++   /* NVK_BARRIER_DEDUP: this barrier's flush invalidated them already */
++   if (cmd->barrier_data_invalidated)
++      barriers &= ~NVK_BARRIER_INVALIDATE_SHADER_DATA;
++
+    if (!barriers)
+       return;
+ 
+@@ -1086,9 +1144,13 @@ nvk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
+ 
+    nvk_cmd_profile_count_barrier(cmd);
+    cmd->indirect_push_synced = false;
++   cmd->barrier_data_invalidated = false;
+    nvk_cmd_flush_wait_dep(cmd, pDependencyInfo, true);
+    nvk_cmd_image_layout_transition(cmd, pDependencyInfo);
++   if (!nvk_barrier_dedup() || pDependencyInfo->imageMemoryBarrierCount > 0)
++      cmd->barrier_data_invalidated = false;
+    nvk_cmd_invalidate_deps(cmd, 1, pDependencyInfo);
++   cmd->barrier_data_invalidated = false;
+ }
+ 
+ void
+diff --git a/src/nouveau/vulkan/nvk_cmd_buffer.h b/src/nouveau/vulkan/nvk_cmd_buffer.h
+index 295be4a..cf35fbb 100644
+--- a/src/nouveau/vulkan/nvk_cmd_buffer.h
++++ b/src/nouveau/vulkan/nvk_cmd_buffer.h
+@@ -407,6 +407,11 @@ struct nvk_cmd_buffer {
+     * without another wait.
+     */
+    bool indirect_push_synced;
++
++   /* NVK_BARRIER_DEDUP: set while one vkCmdPipelineBarrier2 is recorded,
++    * after its flush already invalidated the shader data (L1) caches
++    */
++   bool barrier_data_invalidated;
+    struct nvk_pass_profile_counts pass_profile_pass_counts;
+    struct nvk_pass_profile_counts pass_profile_op_counts;
+    struct nvk_pass_profile_counts pass_profile_cmd_counts;
+diff --git a/src/nouveau/vulkan/nvk_cmd_dispatch.c b/src/nouveau/vulkan/nvk_cmd_dispatch.c
+index f320b4d..3277987 100644
+--- a/src/nouveau/vulkan/nvk_cmd_dispatch.c
++++ b/src/nouveau/vulkan/nvk_cmd_dispatch.c
+@@ -465,6 +465,29 @@ nvk_cmd_dispatch_shader(struct nvk_cmd_buffer *cmd,
+                               groupCountX, groupCountY, groupCountZ);
+ }
+ 
++/* NVK_DISPATCH_INDIRECT_PREFETCH=1 (opt-in, A/B): the pushbuffer segments
++ * that copy indirect dispatch arguments into the root table and the QMD
++ * are no-prefetch GPFIFO entries only for the first one after a barrier,
++ * event wait, secondary or the start of the command buffer, as for
++ * NVK_INDIRECT_PUSH's draw records (indirect_push_synced): Vulkan requires
++ * the arguments to be written before a barrier the dispatch follows, and
++ * the host fetches GPFIFO entries in order.  Otherwise every segment is a
++ * no-prefetch entry, and each one costs the front end a fetch round trip
++ * (two per indirect dispatch, about 1 us on an RTX 5090 in a Windows
++ * guest, also without barriers).
++ */
++static bool
++nvk_dispatch_indirect_prefetch(void)
++{
++   static uint32_t state;
++   uint32_t v = p_atomic_read(&state);
++   if (unlikely(v == 0)) {
++      v = debug_get_bool_option("NVK_DISPATCH_INDIRECT_PREFETCH", false) ? 2 : 1;
++      p_atomic_set(&state, v);
++   }
++   return v == 2;
++}
++
+ static void
+ nvk_cmd_compute_indirect_copy(struct nvk_cmd_buffer *cmd, uint64_t dst_addr,
+                               uint64_t src_addr, uint32_t size)
+@@ -484,7 +507,13 @@ nvk_cmd_compute_indirect_copy(struct nvk_cmd_buffer *cmd, uint64_t dst_addr,
+       .completion_type = COMPLETION_TYPE_FLUSH_ONLY,
+    });
+    nv_push_update_count(p, DIV_ROUND_UP(size, 4));
+-   nvk_cmd_buffer_push_indirect(cmd, src_addr, ALIGN_POT(size, 4));
++   if (nvk_dispatch_indirect_prefetch()) {
++      nvk_cmd_buffer_push_indirect_ext(cmd, src_addr, ALIGN_POT(size, 4),
++                                       !cmd->indirect_push_synced);
++      cmd->indirect_push_synced = true;
++   } else {
++      nvk_cmd_buffer_push_indirect(cmd, src_addr, ALIGN_POT(size, 4));
++   }
+ }
+ 
+ VKAPI_ATTR void VKAPI_CALL
+-- 
+2.43.0
+
