@@ -185,6 +185,20 @@ struct HeliosDxvkDevice {
                                        std::uint64_t* value,
                                        std::uint8_t* copy,
                                        std::size_t copy_len) const noexcept;
+  // nvk_present_fence_async in two halves, for a Present whose immediate-
+  // context work is still queued on the UMD's threaded front end
+  // (UmdPresentAhead). The reserve half runs on the presenting thread and
+  // touches no immediate context: the next value of the same present ECL
+  // timeline and its RM fence (no copy-engine record). 0 = *fence_handle is
+  // the caller's, 3 = not available here (nothing reserved that needs a
+  // signal).
+  std::int32_t nvk_present_fence_reserve(std::uint32_t* fence_handle,
+                                         std::uint64_t* value) const noexcept;
+  // The submit half, on the thread that owns the immediate context, after
+  // the frame's records: flush, and the submission thread signals `value`
+  // right after that submission. False when the device failed; `value` is
+  // then signalled at once (best effort) so the KMD's wait ends.
+  bool nvk_present_fence_submit(std::uint64_t value) const noexcept;
   // Close a fence the caller still owns.
   void nvk_rm_fence_close(std::uint32_t fence_handle) const noexcept;
 
@@ -288,6 +302,14 @@ struct HeliosDxvkDevice {
   // NEXT one in the list, the last takes the first's. The swap executes on
   // the CS thread (ordered), no device drain.
   bool rotate_resource_backings(
+      const std::size_t* d3d11_resource_ptrs,
+      std::size_t count) const;
+  // The checks of rotate_resource_backings that do not depend on what the
+  // CS thread has run (every entry a texture with an image, one compatible
+  // ring), without rotating anything: a rotation queued for later
+  // (UmdPresentAhead) is refused up front for exactly the rings the
+  // immediate call would refuse.
+  bool rotate_resource_backings_ok(
       const std::size_t* d3d11_resource_ptrs,
       std::size_t count) const;
 

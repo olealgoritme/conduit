@@ -82,6 +82,7 @@ pub mod hr;
 // Typed ABI adapters are portable; only noop::log_backtrace requires Windows.
 pub mod noop;
 pub mod nvk_present;
+pub mod present_window;
 pub mod refusals;
 pub mod scanout_event;
 pub mod shader_diag;

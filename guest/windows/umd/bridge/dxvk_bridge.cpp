@@ -1752,6 +1752,57 @@ std::int32_t HeliosDxvkDevice::nvk_present_fence_async(std::size_t d3d11_resourc
   });
 }
 
+std::int32_t HeliosDxvkDevice::nvk_present_fence_reserve(std::uint32_t* fence_handle,
+                                                         std::uint64_t* value) const noexcept {
+  return bridge_guard("nvk_present_fence_reserve", std::int32_t(3), [&]() -> std::int32_t {
+    *fence_handle = 0;
+    *value = 0;
+    if (!impl || !impl->context || impl->device == nullptr
+     || impl->backend != helios_bridge::IcdBackend::NvkRm
+     || !(impl->icd.caps & HELIOS_ICD_CAP_RM_FENCE)
+     || !impl->icd.ecl_fence_reserve || !impl->icd.ecl_fence_create
+     || !impl->icd.ecl_fence_signal)
+      return 3;
+    // The same timeline as nvk_present_fence_async: a Present that takes the
+    // drained path after a queued one reserves the next value, and the
+    // front end's drain has emitted the queued signal before it.
+    const std::uint64_t key = reinterpret_cast<std::uintptr_t>(impl.get()) & ~std::uint64_t(1);
+    const VkDevice vk_device = impl->device->vkd()->device();
+    std::uint64_t v = 0;
+    if (key == 0 || impl->icd.ecl_fence_reserve(vk_device, key, &v) != VK_SUCCESS || v == 0)
+      return 3;
+    std::uint32_t fence = 0;
+    // A reserved value that is never signalled is covered by the next one.
+    if (impl->icd.ecl_fence_create(vk_device, key, v, &fence) != VK_SUCCESS || fence == 0)
+      return 3;
+    *fence_handle = fence;
+    *value = v;
+    return 0;
+  });
+}
+
+bool HeliosDxvkDevice::nvk_present_fence_submit(std::uint64_t value) const noexcept {
+  return bridge_guard("nvk_present_fence_submit", false, [&]() -> bool {
+    if (!impl || !impl->context || impl->device == nullptr || !impl->icd.ecl_fence_signal)
+      return false;
+    const std::uint64_t key = reinterpret_cast<std::uintptr_t>(impl.get()) & ~std::uint64_t(1);
+    const VkDevice vk_device = impl->device->vkd()->device();
+    const auto signal = impl->icd.ecl_fence_signal;
+    const VkQueue queue = impl->device->queues().graphics.queueHandle;
+    auto* immediateContext = static_cast<dxvk::D3D11ImmediateContext*>(impl->context);
+    if (immediateContext->HeliosSubmitFrameThen([signal, vk_device, queue, key, value] {
+          signal(vk_device, queue, key, value);
+        }))
+      return true;
+    // The KMD already holds a fence for `value` in a present: signal it now
+    // rather than leave the present to the host's 5 s fence timeout.
+    impl->device->lockSubmission();
+    signal(vk_device, queue, key, value);
+    impl->device->unlockSubmission();
+    return false;
+  });
+}
+
 void HeliosDxvkDevice::nvk_rm_fence_close(std::uint32_t fence_handle) const noexcept {
   bridge_guard("nvk_rm_fence_close", false, [&]() -> bool {
     if (impl && fence_handle && impl->icd.rm_fence_close && impl->device != nullptr)
@@ -2761,6 +2812,75 @@ std::size_t HeliosDxvkDevice::create_tess_shader_sig(
   });
 }
 
+namespace {
+  // rotate_resource_backings' ring checks: every entry a texture with an
+  // image (with `need_storage`, with a storage too), all of one shape. Logs
+  // a refusal. Rc refs: a swap executes later on the CS thread and must not
+  // race resource destruction.
+  bool rotation_ring_images(const std::size_t* ptrs, std::size_t count, bool need_storage,
+                            std::vector<dxvk::Rc<dxvk::DxvkImage>>* images) {
+    images->reserve(count);
+    for (std::size_t i = 0; i < count; ++i) {
+      auto* resource = reinterpret_cast<ID3D11Resource*>(ptrs[i]);
+      auto* texture = resource ? dxvk::GetCommonTexture(resource) : nullptr;
+      if (!texture || texture->GetImage() == nullptr
+       || (need_storage && texture->GetImage()->storage() == nullptr)) {
+        umd_log("rotate_resource_backings: entry without image storage");
+        return false;
+      }
+      images->push_back(texture->GetImage());
+    }
+
+    // DXGI may only rotate identities within one compatible swapchain ring.
+    // invalidateImage replaces the storage but intentionally leaves the
+    // stable DxvkImage's format/shape metadata in place, so accepting a
+    // mixed ring would attach (for example) packed RGB10A2 storage to a
+    // BGRA8 image and make every downstream user reinterpret its bytes.
+    const auto& expected = (*images)[0]->info();
+    for (std::size_t i = 1; i < images->size(); ++i) {
+      const auto& actual = (*images)[i]->info();
+      if (actual.type        != expected.type
+       || actual.format      != expected.format
+       || actual.sampleCount != expected.sampleCount
+       || actual.extent.width  != expected.extent.width
+       || actual.extent.height != expected.extent.height
+       || actual.extent.depth  != expected.extent.depth
+       || actual.numLayers   != expected.numLayers
+       || actual.mipLevels   != expected.mipLevels) {
+        char msg[320];
+        std::snprintf(msg, sizeof(msg),
+          "rotate_resource_backings: incompatible slot %zu/%zu "
+          "expected fmt=%u extent=%ux%ux%u samples=%u layers=%u mips=%u; "
+          "got fmt=%u extent=%ux%ux%u samples=%u layers=%u mips=%u",
+          i, images->size(),
+          static_cast<unsigned>(expected.format),
+          expected.extent.width, expected.extent.height, expected.extent.depth,
+          static_cast<unsigned>(expected.sampleCount),
+          expected.numLayers, expected.mipLevels,
+          static_cast<unsigned>(actual.format),
+          actual.extent.width, actual.extent.height, actual.extent.depth,
+          static_cast<unsigned>(actual.sampleCount),
+          actual.numLayers, actual.mipLevels);
+        umd_log(msg);
+        return false;
+      }
+    }
+    return true;
+  }
+}
+
+bool HeliosDxvkDevice::rotate_resource_backings_ok(
+    const std::size_t* d3d11_resource_ptrs,
+    std::size_t count) const {
+  if (!impl || !impl->d3d11 || !impl->context || !d3d11_resource_ptrs || count < 2)
+    return false;
+  return bridge_guard("rotate_resource_backings_ok", false, [&]() -> bool {
+    // No storage read: the CS thread may be swapping storages right now.
+    std::vector<dxvk::Rc<dxvk::DxvkImage>> images;
+    return rotation_ring_images(d3d11_resource_ptrs, count, false, &images);
+  });
+}
+
 bool HeliosDxvkDevice::rotate_resource_backings(
     const std::size_t* d3d11_resource_ptrs,
     std::size_t count) const {
@@ -2769,54 +2889,10 @@ bool HeliosDxvkDevice::rotate_resource_backings(
   return bridge_guard("rotate_resource_backings", false, [&]() -> bool {
       // Collect the DXVK images first; refuse the whole rotation if any entry
       // is not a storage-backed texture (a partial rotation would corrupt the
-      // swapchain identity mapping). Rc refs: the swap executes later on the
-      // CS thread and must not race resource destruction.
+      // swapchain identity mapping).
       std::vector<dxvk::Rc<dxvk::DxvkImage>> images;
-      images.reserve(count);
-      for (std::size_t i = 0; i < count; ++i) {
-        auto* resource = reinterpret_cast<ID3D11Resource*>(d3d11_resource_ptrs[i]);
-        auto* texture = resource ? dxvk::GetCommonTexture(resource) : nullptr;
-        if (!texture || texture->GetImage() == nullptr || texture->GetImage()->storage() == nullptr) {
-          umd_log("rotate_resource_backings: entry without image storage");
-          return false;
-        }
-        images.push_back(texture->GetImage());
-      }
-
-      // DXGI may only rotate identities within one compatible swapchain ring.
-      // invalidateImage replaces the storage but intentionally leaves the
-      // stable DxvkImage's format/shape metadata in place, so accepting a
-      // mixed ring would attach (for example) packed RGB10A2 storage to a
-      // BGRA8 image and make every downstream user reinterpret its bytes.
-      const auto& expected = images[0]->info();
-      for (std::size_t i = 1; i < images.size(); ++i) {
-        const auto& actual = images[i]->info();
-        if (actual.type        != expected.type
-         || actual.format      != expected.format
-         || actual.sampleCount != expected.sampleCount
-         || actual.extent.width  != expected.extent.width
-         || actual.extent.height != expected.extent.height
-         || actual.extent.depth  != expected.extent.depth
-         || actual.numLayers   != expected.numLayers
-         || actual.mipLevels   != expected.mipLevels) {
-          char msg[320];
-          std::snprintf(msg, sizeof(msg),
-            "rotate_resource_backings: incompatible slot %zu/%zu "
-            "expected fmt=%u extent=%ux%ux%u samples=%u layers=%u mips=%u; "
-            "got fmt=%u extent=%ux%ux%u samples=%u layers=%u mips=%u",
-            i, images.size(),
-            static_cast<unsigned>(expected.format),
-            expected.extent.width, expected.extent.height, expected.extent.depth,
-            static_cast<unsigned>(expected.sampleCount),
-            expected.numLayers, expected.mipLevels,
-            static_cast<unsigned>(actual.format),
-            actual.extent.width, actual.extent.height, actual.extent.depth,
-            static_cast<unsigned>(actual.sampleCount),
-            actual.numLayers, actual.mipLevels);
-          umd_log(msg);
-          return false;
-        }
-      }
+      if (!rotation_ring_images(d3d11_resource_ptrs, count, true, &images))
+        return false;
 
       // CS-side identity rotation (18th session), mirroring upstream
       // D3D11SwapChain::RotateBackBuffers: swap the storages ON the CS thread

@@ -1595,57 +1595,28 @@ static NVK_RM_COPY_REFUSED: AtomicUsize = AtomicUsize::new(0);
 const HELIOS_ICD_CAP_RM_FENCE: u32 = 1 << 4;
 const HELIOS_ICD_CAP_PRESENT_FENCE_KMD: u32 = 1 << 6;
 
-/// The NVK half of a present, after the frame (and any Blt copy) is recorded.
-///
-/// S4 (dxvk-on-nvk.md 3.5 level 2, `docs/rm-fence-marker.md`): the frame is
-/// only made SUBMITTED here (DXVK's CS thread and submission queue drained,
-/// no GPU wait), then NVK signals its present timeline after it on DXVK's
-/// queue and turns the value into an RM fence:
-/// - scanout 0: the fence goes with the flip (`scanout_present_fenced`): the
-///   KMD sends the flip when it fires (capability bit 32), or NVK's flip
-///   thread does with an older KMD. The presenting thread never waits.
-/// - DWM composition: with `NvkRmFencePresent` and a KMD that takes fences in
-///   WDDM markers (capability bit 33) the fence rides the WDDM present's
-///   `HEPR`/`HERF` tail (returned here for `finish_present`). Otherwise the
-///   v1 CPU wait (S3) and an unmarked present.
-///
-/// Without RM fences (no DRM fences on the host, an older NVK or librmclient,
-/// `NvkRmFence=0`): the S3 behaviour, a CPU wait for the frame's GPU work
-/// before the flip or the WDDM present.
-///
-/// `blt_source`: the source allocation of the WDDM present that follows (the
-/// KMD's Blt source), which a composed frame's fence's copy-engine Present
-/// record names (docs/rm-copy-engine-present.md 12). It is the present's
-/// source even when the UMD copied the frame into DXGI's destination first
-/// (`shown` is then that destination): the KMD's Blt still reads the source,
-/// and the fence follows the copy. 380.1: with `false` there, every windowed
-/// Heaven frame went without a record ("copy-engine record 0 (without 0,
-/// refused 0)") and the KMD's route fell back on every one (`CeRtRecNone`).
-///
-/// `dwm_reads_source`: no DXGI destination and not a blt-model present
-/// ([`nvk_dwm_reads_source`]: a flip-model swap chain presents its own buffer,
-/// which DWM samples directly). Such a frame, unless it is a
-/// primary, is made complete before the WDDM present (`NvkComposedComplete`):
-/// DWM on NVK samples from its own RM channel, which the fence that retires the
-/// present's DMA buffer does not hold.
-unsafe fn nvk_present_frame(
-    h: Hdevice,
+/// How an NVK present shows its frame, decided from the knobs, the ICD's caps and the source
+/// alone, before any immediate-context work: [`nvk_present_frame`] and the queued Present
+/// (`UmdPresentAhead`, [`nvk_present_queued`]) decide alike.
+#[derive(Clone, Copy)]
+struct NvkFramePlan {
+    /// NVK's own scan-out source instead of a WDDM present.
+    scanout: bool,
+    /// RM fences work (`NvkRmFence` and the ICD's cap).
+    fences: bool,
+    /// `FlipLedger`: the buffer's resource id the marker names; 0 = no ledger.
+    frame_resid: u32,
+    /// `NvkComposedComplete`: the frame completes on the CPU before the present.
+    must_complete: bool,
+    /// The WDDM present's marker carries the frame's RM fence.
+    marker_fences: bool,
+}
+
+unsafe fn nvk_frame_plan(
+    dev: &HeliosDevice,
     shown: ddi::D3D10DDI_HRESOURCE,
-    blt_source: ddi::D3D10DDI_HRESOURCE,
     dwm_reads_source: bool,
-) -> Result<NvkFrame, i32> {
-    let Some(dev) = helios_device(h) else {
-        return Err(E_FAIL);
-    };
-    if crate::knobs::is_dwm_process() {
-        // DWM is up on NVK: the crash-loop guard's healthy mark (docs/dwm-on-nvk.md 4.1).
-        crate::bridge::note_dwm_nvk_present();
-        dwm_flip_read_points(dev);
-    }
-    nvk_log_present_source(shown);
-    if let Some(context) = d3d11_context(h) {
-        context.Flush();
-    }
+) -> NvkFramePlan {
     // DWM itself never takes scanout 0 through NVK's own source (a level-2
     // user source would hide its flips from dxgkrnl's flip queue and present
     // statistics): every DWM frame is a WDDM flip (docs/dwm-on-nvk.md).
@@ -1697,37 +1668,100 @@ unsafe fn nvk_present_frame(
     } else {
         0
     };
-    let ledger = frame_resid != 0;
-    if ledger {
-        let n = FLIP_NO_WAIT.fetch_add(1, Ordering::Relaxed) + 1;
-        if n == 1 || n % 4096 == 0 {
-            log_error!(
-                "FlipLedger: {n} flip-model presents without a CPU wait; the KMD's frame-done table \
-                 tracks the buffer (resource id {frame_resid})"
-            );
-        }
-    }
     // A frame DWM samples directly is complete before DWM can see it (the S3 wait below):
     // nothing on DWM's RM channel waits for a fence in the marker.
     // DWM's own frame too (measured: the transients stayed with only the producers' frames
     // completed, and went with DWM's as well).
     let must_complete = !scanout
-        && !ledger
+        && frame_resid == 0
         && crate::knobs::nvk_composed_complete()
         && (crate::knobs::is_dwm_process() || (dwm_reads_source && !nvk_source_is_primary(shown)));
-    if must_complete {
-        let n = NVK_COMPOSED_COMPLETE.fetch_add(1, Ordering::Relaxed) + 1;
-        if n == 1 || n % 4096 == 0 {
-            log_error!(
-                "NVK present: {n} composed frames that DWM samples directly completed before \
-                 their present (NvkComposedComplete)"
-            );
-        }
-    }
     let marker_fences = fences
         && !must_complete
         && crate::knobs::nvk_rm_fence_present()
         && caps & HELIOS_ICD_CAP_PRESENT_FENCE_KMD != 0;
+    NvkFramePlan { scanout, fences, frame_resid, must_complete, marker_fences }
+}
+
+impl NvkFramePlan {
+    /// The plan's counters and their log lines, once per present that carries it out.
+    fn note(&self) {
+        if self.frame_resid != 0 {
+            let n = FLIP_NO_WAIT.fetch_add(1, Ordering::Relaxed) + 1;
+            if n == 1 || n % 4096 == 0 {
+                log_error!(
+                    "FlipLedger: {n} flip-model presents without a CPU wait; the KMD's frame-done \
+                     table tracks the buffer (resource id {})",
+                    self.frame_resid
+                );
+            }
+        }
+        if self.must_complete {
+            let n = NVK_COMPOSED_COMPLETE.fetch_add(1, Ordering::Relaxed) + 1;
+            if n == 1 || n % 4096 == 0 {
+                log_error!(
+                    "NVK present: {n} composed frames that DWM samples directly completed before \
+                     their present (NvkComposedComplete)"
+                );
+            }
+        }
+    }
+}
+
+/// The NVK half of a present, after the frame (and any Blt copy) is recorded.
+///
+/// S4 (dxvk-on-nvk.md 3.5 level 2, `docs/rm-fence-marker.md`): the frame is
+/// only made SUBMITTED here (DXVK's CS thread and submission queue drained,
+/// no GPU wait), then NVK signals its present timeline after it on DXVK's
+/// queue and turns the value into an RM fence:
+/// - scanout 0: the fence goes with the flip (`scanout_present_fenced`): the
+///   KMD sends the flip when it fires (capability bit 32), or NVK's flip
+///   thread does with an older KMD. The presenting thread never waits.
+/// - DWM composition: with `NvkRmFencePresent` and a KMD that takes fences in
+///   WDDM markers (capability bit 33) the fence rides the WDDM present's
+///   `HEPR`/`HERF` tail (returned here for `finish_present`). Otherwise the
+///   v1 CPU wait (S3) and an unmarked present.
+///
+/// Without RM fences (no DRM fences on the host, an older NVK or librmclient,
+/// `NvkRmFence=0`): the S3 behaviour, a CPU wait for the frame's GPU work
+/// before the flip or the WDDM present.
+///
+/// `blt_source`: the source allocation of the WDDM present that follows (the
+/// KMD's Blt source), which a composed frame's fence's copy-engine Present
+/// record names (docs/rm-copy-engine-present.md 12). It is the present's
+/// source even when the UMD copied the frame into DXGI's destination first
+/// (`shown` is then that destination): the KMD's Blt still reads the source,
+/// and the fence follows the copy. 380.1: with `false` there, every windowed
+/// Heaven frame went without a record ("copy-engine record 0 (without 0,
+/// refused 0)") and the KMD's route fell back on every one (`CeRtRecNone`).
+///
+/// `dwm_reads_source`: no DXGI destination and not a blt-model present
+/// ([`nvk_dwm_reads_source`]: a flip-model swap chain presents its own buffer,
+/// which DWM samples directly). Such a frame, unless it is a
+/// primary, is made complete before the WDDM present (`NvkComposedComplete`):
+/// DWM on NVK samples from its own RM channel, which the fence that retires the
+/// present's DMA buffer does not hold.
+unsafe fn nvk_present_frame(
+    h: Hdevice,
+    shown: ddi::D3D10DDI_HRESOURCE,
+    blt_source: ddi::D3D10DDI_HRESOURCE,
+    dwm_reads_source: bool,
+) -> Result<NvkFrame, i32> {
+    let Some(dev) = helios_device(h) else {
+        return Err(E_FAIL);
+    };
+    if crate::knobs::is_dwm_process() {
+        // DWM is up on NVK: the crash-loop guard's healthy mark (docs/dwm-on-nvk.md 4.1).
+        crate::bridge::note_dwm_nvk_present();
+        dwm_flip_read_points(dev);
+    }
+    nvk_log_present_source(shown);
+    if let Some(context) = d3d11_context(h) {
+        context.Flush();
+    }
+    let plan = nvk_frame_plan(dev, shown, dwm_reads_source);
+    plan.note();
+    let NvkFramePlan { scanout, fences, frame_resid, marker_fences, .. } = plan;
 
     // Composed with marker fences: a fence for a value DXVK's submission thread
     // signals right after the frame, so nothing here waits for the CS and
@@ -2241,6 +2275,183 @@ unsafe fn nvk_present_impl(
     let hr = nvk_present_impl_timed(a, boundary, h, src_h, dst_h, src_alloc, dst_alloc, &mut t);
     t.finish();
     hr
+}
+
+/// May this present take the queued path (`UmdPresentAhead`)? A flip-model present (DXGI's
+/// `Flip` flag, no `Blt`) without a DXGI destination: nothing is copied before the present, and
+/// the KMD copies nothing from the source, so no read-ledger claim on the source can be issued
+/// ahead of the frame's own last command list (which would then wait for its own Present).
+fn nvk_present_queue_shape(no_destination: bool, present_flags: u32) -> bool {
+    no_destination
+        && present_flags & DXGI_PRESENT_FLAG_FLIP != 0
+        && present_flags & DXGI_PRESENT_FLAG_BLT == 0
+}
+
+/// Why a present that owed the front end's drain paid it after all (`UmdPresentAhead`), each
+/// logged once per process.
+#[derive(Clone, Copy)]
+#[repr(u32)]
+enum QueueSkip {
+    Dwm = 0,
+    Shape = 1,
+    PresentGate = 2,
+    AsyncFenceOff = 3,
+    Plan = 4,
+    NoSource = 5,
+    NoFence = 6,
+}
+
+impl QueueSkip {
+    fn text(self) -> &'static str {
+        match self {
+            Self::Dwm => "dwm.exe",
+            Self::Shape => "not a flip-model present without a DXGI destination",
+            Self::PresentGate => "HELIOS_NVK_PRESENT_GATE=1",
+            Self::AsyncFenceOff => "NvkAsyncPresentFence is 0",
+            Self::Plan => "the frame goes to scanout 0, completes on the CPU, or carries no RM fence",
+            Self::NoSource => "the source has no allocation or resource",
+            Self::NoFence => "no present fence could be reserved (ICD without ECL fences)",
+        }
+    }
+}
+
+static NVK_QUEUE_SKIP_SEEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static NVK_QUEUED_PRESENTS: AtomicUsize = AtomicUsize::new(0);
+static NVK_QUEUE_SKIPS: AtomicUsize = AtomicUsize::new(0);
+static NVK_QUEUED_SUBMIT_FAILED: AtomicUsize = AtomicUsize::new(0);
+
+fn nvk_queue_skip(why: QueueSkip) -> Option<i32> {
+    NVK_QUEUE_SKIPS.fetch_add(1, Ordering::Relaxed);
+    let bit = 1u32 << (why as u32);
+    if NVK_QUEUE_SKIP_SEEN.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
+        log_error!("UmdPresentAhead: a present drains the front end: {}", why.text());
+    }
+    None
+}
+
+/// `UmdPresentAhead` (ROADMAP T2): the NVK present without the front end's drain. `None` when
+/// this present cannot take it; nothing was done then, and the caller drains and presents as
+/// usual.
+///
+/// The present is split at the immediate context. The app thread (here) makes the frame's RM
+/// fence for the next value of the device's present timeline and sends the WDDM present with
+/// that fence in its marker, as the asynchronous fence path of [`nvk_present_frame`] does; the
+/// immediate-context half ([`nvk_present_worker_half`]: the flush and the fence's signal) goes
+/// into the front end's ring behind the frame's records. The KMD waits for the fence before it
+/// shows the buffer, and DXVK's submission thread signals it right after the submission that
+/// carries the frame, so the present still follows every submission of the frame in queue
+/// order. The app thread then waits only while more than `UmdPresentAhead` presents are queued
+/// on the worker ([`Frontend::present_queued`]).
+#[allow(clippy::too_many_arguments)]
+unsafe fn nvk_present_queued(
+    fe: &Frontend,
+    a: &ddi::DXGI_DDI_ARG_PRESENT,
+    boundary: PresentBoundaryEntry,
+    h: Hdevice,
+    src_h: ddi::D3D10DDI_HRESOURCE,
+    dst_h: ddi::D3D10DDI_HRESOURCE,
+    src_alloc: u32,
+    dst_alloc: u32,
+) -> Option<i32> {
+    let dev = helios_device(h)?;
+    let present_flags = *(&a.Flags as *const ddi::DXGI_DDI_PRESENT_FLAGS as *const u32);
+    if crate::knobs::is_dwm_process() {
+        return nvk_queue_skip(QueueSkip::Dwm);
+    }
+    if !nvk_present_queue_shape(dst_h.pDrvPrivate.is_null(), present_flags) {
+        return nvk_queue_skip(QueueSkip::Shape);
+    }
+    if nvk_present_gate() {
+        return nvk_queue_skip(QueueSkip::PresentGate);
+    }
+    if !crate::knobs::nvk_async_present_fence() {
+        return nvk_queue_skip(QueueSkip::AsyncFenceOff);
+    }
+    let dwm_reads_source = nvk_dwm_reads_source(true, present_flags, crate::knobs::nvk_blt_fence());
+    let plan = nvk_frame_plan(dev, src_h, dwm_reads_source);
+    if plan.scanout || !plan.marker_fences {
+        return nvk_queue_skip(QueueSkip::Plan);
+    }
+    let Some(src) = load_resource(src_h).filter(|_| src_alloc != 0) else {
+        return nvk_queue_skip(QueueSkip::NoSource);
+    };
+    let src_raw = src.as_raw() as usize;
+    // No copy-engine record: a flip-model present has no KMD Blt to describe, and the record
+    // would name the texture's storage as of now, which a rotation still queued on the worker
+    // has not swapped yet.
+    let Some((fence, value)) = dev.dxvk.nvk_present_fence_reserve() else {
+        return nvk_queue_skip(QueueSkip::NoFence);
+    };
+
+    let mut t = present_timing::Stamps::start();
+    nvk_log_present_source(src_h);
+    plan.note();
+    t.mark(0);
+    // SAFETY: the record runs on the worker while the device lives (DestroyDevice drains) and
+    // while the source lives (a resource destroy drains first).
+    let pos = fe.queue_dxgi(move || unsafe { nvk_present_worker_half(h, src_raw, value) });
+    t.mark(1);
+    let n = NVK_QUEUED_PRESENTS.fetch_add(1, Ordering::Relaxed) + 1;
+    if n == 1 || n % 4096 == 0 {
+        log_error!(
+            "UmdPresentAhead: {n} NVK presents queued behind the front end's records (RM fence \
+             value {value}); {} drained instead, {} worker submissions failed",
+            NVK_QUEUE_SKIPS.load(Ordering::Relaxed),
+            NVK_QUEUED_SUBMIT_FAILED.load(Ordering::Relaxed),
+        );
+    }
+    let correlation = PresentStreamCorrelation {
+        rm_fence_handle: fence,
+        rm_fence_value: value,
+        rm_copy: None,
+        frame_resid: plan.frame_resid,
+        ..PresentStreamCorrelation::default()
+    };
+    t.mark(2);
+    let result = finish_present(
+        h,
+        src_h,
+        dst_h,
+        src_alloc,
+        dst_alloc,
+        PresentRequest {
+            kind: PresentKind::Present,
+            boundary,
+            dxgi_context: a.pDXGIContext,
+            flags: present_flags,
+        },
+        None,
+        correlation,
+    );
+    t.mark(3);
+    nvk_release_unsent_fence(h, fence, &result);
+    t.finish();
+    fe.present_queued(h, pos);
+    Some(match result {
+        Ok(hr) => hr,
+        Err(hr) => hr,
+    })
+}
+
+/// The immediate-context half of a queued present, on the front end's worker behind the
+/// frame's records: what [`nvk_present_frame`] (the flush, the asynchronous fence's signal) and
+/// [`nvk_present_impl_timed`] (the Blt-source mark) do there, in the same order.
+unsafe fn nvk_present_worker_half(h: Hdevice, src: usize, value: u64) {
+    let Some(dev) = helios_device(h) else {
+        return;
+    };
+    if let Some(context) = d3d11_context(h) {
+        context.Flush();
+    }
+    if !dev.dxvk.nvk_present_fence_submit(value) {
+        let n = NVK_QUEUED_SUBMIT_FAILED.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 8 {
+            log_error!("UmdPresentAhead: the frame's submission failed (value {value}, x{n})");
+        }
+        // The device failed (HeliosSubmitFrameThen): the app thread's next DDI reports it.
+        set_runtime_error(h, crate::hr::D3DDDIERR_DEVICEREMOVED);
+    }
+    let _ = dev.dxvk.mark_blt_source(src);
 }
 
 /// Per-present stage times of the NVK present (`nvk_present_impl`), logged every
@@ -2968,15 +3179,25 @@ unsafe fn dxgi_present_impl(
     if report_if_removed(h, "Present") {
         return crate::hr::D3DDDIERR_DEVICEREMOVED;
     }
-    let context = d3d11_context(h);
     let src_h = dxgi_resource_handle(a.hSurfaceToPresent);
     let dst_h = dxgi_resource_handle(a.hDstResource);
     let src_alloc = resource_allocation(src_h);
     let dst_alloc = resource_allocation(dst_h);
     if helios_device(h).is_some_and(|dev| dev.dxvk.is_nvk()) {
         probe_present_entry(boundary, a, src_alloc, dst_alloc);
+        // `UmdPresentAhead`: the front end's drain is still owed here. Queue the Present, or
+        // pay the drain before anything below touches the immediate context.
+        if let Some(fe) = super::frontend::take_owed_present(h) {
+            let queued =
+                nvk_present_queued(fe, a, boundary, h, src_h, dst_h, src_alloc, dst_alloc);
+            if let Some(hr) = queued {
+                return hr;
+            }
+            fe.present_drain(h);
+        }
         return nvk_present_impl(a, boundary, h, src_h, dst_h, src_alloc, dst_alloc);
     }
+    let context = d3d11_context(h);
     // SAFETY: src_h is the runtime's live source for this Present.
     let snapshot_required = unsafe { requires_present_snapshot(src_h) };
     if snapshot_required && a.SrcSubResourceIndex != 0 {
@@ -3517,8 +3738,70 @@ pub(crate) unsafe fn rotate_ring(
             dev.dxvk.handoff_refresh_key(p);
         }
     }
+    rotate_ring_records(first, last, states);
+    RotationOutcome::Rotated
+}
 
-    // Rotate the WDDM identity records in lockstep with the storages.
+/// `UmdPresentAhead`: [`rotate_ring`] for an NVK device whose immediate-context work may still
+/// be queued on the threaded front end. The storage rotation and the ledger keys go into the
+/// ring, so they apply after every record before this DDI and before every record after it, as
+/// the drained call orders them on the immediate context; the WDDM identity records move now,
+/// in DDI order, because the next present on this thread names its allocation from them.
+///
+/// The phases are apart here, so a ring the bridge would refuse is refused up front
+/// (`rotate_resource_backings_ok`: the same shape checks, without reading a storage the CS
+/// thread may be swapping). What is left for the worker to fail on is an image without a
+/// storage, which DXGI's swap-chain buffers always have; it is logged as a lost rotation.
+unsafe fn rotate_ring_queued(
+    dev: &crate::device_funcs::HeliosDevice,
+    h: Hdevice,
+    fe: &Frontend,
+    states: &[*mut ResourceState],
+) -> RotationOutcome {
+    let (Some(&first), Some(&last)) = (states.first(), states.last()) else {
+        // Unreachable: the caller validated len >= 2.
+        ROTATE_SKIPPED.fetch_add(1, Ordering::Relaxed);
+        return RotationOutcome::BridgeRefused;
+    };
+    let ptrs: Vec<usize> = states.iter().map(|s| (**s).com_raw).collect();
+    if !dev.dxvk.rotate_resource_backings_ok(ptrs.as_ptr(), ptrs.len()) {
+        ROTATE_REFUSED.fetch_add(1, Ordering::Relaxed);
+        return RotationOutcome::BridgeRefused;
+    }
+    let refresh = crate::knobs::flip_ledger() != 0;
+    // SAFETY: the record runs on the worker while the device lives; the textures live until a
+    // destroy, which drains first.
+    fe.queue_dxgi(move || unsafe {
+        let Some(dev) = helios_device(h) else {
+            return;
+        };
+        if !dev.dxvk.rotate_resource_backings(ptrs.as_ptr(), ptrs.len()) {
+            ROTATE_REFUSED.fetch_add(1, Ordering::Relaxed);
+            log_error!(
+                "DXGI RotateResourceIdentities: the queued backing rotation FAILED after the \
+                 identity records moved; this swap chain's buffers no longer match ({})",
+                rotate_counter_summary()
+            );
+            return;
+        }
+        if refresh {
+            for &p in &ptrs {
+                dev.dxvk.handoff_refresh_key(p);
+            }
+        }
+    });
+    fe.note_queued_rotation();
+    rotate_ring_records(first, last, states);
+    RotationOutcome::Rotated
+}
+
+/// Rotate the WDDM identity records in lockstep with the storages (the second phase of
+/// [`rotate_ring`] and [`rotate_ring_queued`]).
+unsafe fn rotate_ring_records(
+    first: *mut ResourceState,
+    last: *mut ResourceState,
+    states: &[*mut ResourceState],
+) {
     let first_allocation = (*first).allocation.take();
     let first_km_resource = (*first).km_resource;
     // `ownership` rotates with the allocation it describes; `rt_resource`
@@ -3549,12 +3832,28 @@ pub(crate) unsafe fn rotate_ring(
     (*last).ownership = first_ownership;
     (*last).present_private = first_present_private;
     (*last).snapshot_source = first_snapshot_source;
-
-    RotationOutcome::Rotated
 }
 
 pub(crate) unsafe extern "system" fn dxgi_rotate_resource_identities(
     arg: *mut ddi::DXGI_DDI_ARG_ROTATE_RESOURCE_IDENTITIES,
+) -> i32 {
+    rotate_resource_identities(arg, None)
+}
+
+/// `UmdPresentAhead`: [`dxgi_rotate_resource_identities`] of an NVK device with the threaded
+/// front end, without its drain (`rotate_ring_queued`). The front end's wrapper calls it.
+pub(crate) unsafe fn dxgi_rotate_resource_identities_queued(
+    arg: *mut ddi::DXGI_DDI_ARG_ROTATE_RESOURCE_IDENTITIES,
+    fe: &Frontend,
+) -> i32 {
+    rotate_resource_identities(arg, Some(fe))
+}
+
+/// `queued`: the front end that takes the storage rotation into its ring (`rotate_ring_queued`);
+/// `None` = rotate now (the front end, if any, drained before the call).
+unsafe fn rotate_resource_identities(
+    arg: *mut ddi::DXGI_DDI_ARG_ROTATE_RESOURCE_IDENTITIES,
+    queued: Option<&Frontend>,
 ) -> i32 {
     if arg.is_null() {
         return 0;
@@ -3604,9 +3903,10 @@ pub(crate) unsafe extern "system" fn dxgi_rotate_resource_identities(
         states.push(state);
     }
 
-    let outcome = match helios_device(h) {
-        Some(dev) => rotate_ring(dev, &states),
-        None => {
+    let outcome = match (helios_device(h), queued) {
+        (Some(dev), Some(fe)) => rotate_ring_queued(dev, h, fe, &states),
+        (Some(dev), None) => rotate_ring(dev, &states),
+        (None, _) => {
             ROTATE_NO_DEVICE.fetch_add(1, Ordering::Relaxed);
             RotationOutcome::NoDevice
         }
