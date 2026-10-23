@@ -91,6 +91,10 @@ impl Backend for WinBackend {
     fn set_time(&self, t: &UtcTime) -> Result<(), String> {
         set_system_time(t)
     }
+
+    fn upscaler(&self, mode: Option<&str>) -> Result<conduit_ctl::UpscalerState, String> {
+        crate::sys::upscaler(mode)
+    }
 }
 
 /// `SetSystemTime` needs `SeSystemtimePrivilege` enabled, not just held (an

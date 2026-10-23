@@ -16,7 +16,8 @@ use crate::virt::{self, Link};
 use anyhow::Result;
 use conduit_ctl::{
     b64_decode, b64_encode, App, Apps, Chunk, GetArgs, Icon, Listing, Op, Pong, PutArgs, Request,
-    Response, RunArgs, Sha256, Started, Written, CHUNK, MAX_FILE, MAX_ICON,
+    Response, RunArgs, Sha256, Started, UpscalerState, Written, CHUNK, MAX_FILE, MAX_ICON,
+    UPSCALER_MODES,
 };
 use serde::de::DeserializeOwned;
 use std::collections::VecDeque;
@@ -324,6 +325,20 @@ impl Client {
 
     pub fn icon(&mut self, key: &str) -> R<Icon> {
         self.ask(Op::Icon { key: key.into() }, T_ICON)
+    }
+
+    /// Set (`Some`) or read the guest's upscaler override (`upscaler`).
+    pub fn upscaler(&mut self, mode: Option<&str>) -> R<UpscalerState> {
+        let s: UpscalerState = self.ask(
+            Op::Upscaler {
+                mode: mode.map(str::to_string),
+            },
+            T_RUN,
+        )?;
+        Ok(UpscalerState {
+            mode: clean(&s.mode, 16),
+            ..s
+        })
     }
 
     pub fn ls(&mut self, path: &str) -> R<Listing> {
@@ -1201,6 +1216,44 @@ pub fn list_apps(vm: &str) -> Result<Vec<App>> {
     let mut apps = c.apps().map_err(|e| friendly(vm, e))?;
     sort_apps(&mut apps);
     Ok(apps)
+}
+
+/// The mode word `conduit upscaler` takes, lower-cased; an error names the
+/// valid ones.
+pub fn upscaler_mode(word: &str) -> Result<&'static str> {
+    let w = word.trim().to_ascii_lowercase();
+    UPSCALER_MODES
+        .iter()
+        .find(|m| **m == w)
+        .copied()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "unknown upscaler mode {word:?}; one of: {}",
+                UPSCALER_MODES.join(", ")
+            )
+        })
+}
+
+/// `conduit upscaler VM [MODE]`: set or show what games get (Windows
+/// guests; the tray writes HKLM\SOFTWARE\Helios Upscaler).
+pub fn upscaler(vm: &str, mode: Option<&str>) -> Result<()> {
+    let mode = mode.map(upscaler_mode).transpose()?;
+    let mut c = Client::connect(vm)?;
+    let s = c.upscaler(mode).map_err(|e| friendly(vm, e))?;
+    let games = match s.optiscaler_games {
+        0 => String::new(),
+        1 => " (1 OptiScaler game follows it)".to_string(),
+        n => format!(" ({n} OptiScaler games follow it)"),
+    };
+    if mode.is_some() {
+        ui::info(format!(
+            "{vm}: upscaler {}{games}, for games started from now on",
+            s.mode
+        ));
+    } else {
+        println!("{}{games}", s.mode);
+    }
+    Ok(())
 }
 
 /// `conduit apps VM`.
