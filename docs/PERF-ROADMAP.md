@@ -174,8 +174,14 @@ removes a Venus dependency, **[F]** flip or vblank work.
   thread.
 - **Risk.** Ordering with the KMD Blt; the read ledger and the present stream
   must carry the reserved value.
+- **State.** Composed presents with an RM fence in the marker skip the gate
+  (`NvkAsyncPresentFence`, default 1). The threaded front end's drain at
+  Present remains; `UmdPresentAhead` (opt-in, default 0) queues an NVK
+  flip-model Present behind the frame's records instead and bounds the app's
+  run-ahead to N Presents ([d3d11-threaded-frontend.md](../guest/windows/docs/d3d11-threaded-frontend.md) 5.8).
 - **Measure.** `NVK present timing gate=`, `present-gate avg_us`, PresentMon
-  `MsInPresentAPI`, `HELIOS_VK_FRAMETIME`, StageTrace.
+  `MsInPresentAPI`, `HELIOS_VK_FRAMETIME`, StageTrace, the front end's
+  `present drain` and `queued presents` summary.
 
 ### T3. Per-waiter GPU wakes instead of one shared non-stall event per device
 - **What.** A wake source per NVK sync or waiting thread (an RM

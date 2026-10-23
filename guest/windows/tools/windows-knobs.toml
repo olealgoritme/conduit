@@ -934,6 +934,12 @@ read = "once per process"
 effect = "A class mask of front-end calls forced onto the synchronous path, for bisecting the threaded front end. 0: none."
 see = "[d3d11-threaded-frontend.md](../guest/windows/docs/d3d11-threaded-frontend.md)"
 
+[umd.UmdPresentAhead]
+class = "experiment"
+read = "once per process"
+effect = "0: every D3D11 Present drains the threaded front end. 1..16: an NVK flip-model Present with an asynchronous RM fence is queued behind the frame's records instead, and the app thread runs at most this many Presents ahead of the front end's worker. HELIOS_UMD_PRESENT_AHEAD overrides it per process."
+see = "[d3d11-threaded-frontend.md](../guest/windows/docs/d3d11-threaded-frontend.md)"
+
 [umd.UmdPresentBatchFold]
 class = "debug"
 read = "once per process"
@@ -1231,6 +1237,12 @@ effect = "When set, the Venus renderer logs every submission and shared-memory o
 class = "debug"
 read = "once per process"
 effect = "The D3D11 DDI level this process reports (WDDM 1.3 or 2.3); wins over HKLM\\SOFTWARE\\Helios UmdDdiLevel, UmdDdiLevelDwm and UmdDdiAllowList."
+
+[env.HELIOS_UMD_PRESENT_AHEAD]
+class = "experiment"
+read = "once per process"
+effect = "0..16 overrides HKLM\\SOFTWARE\\Helios UmdPresentAhead for this process."
+see = "[d3d11-threaded-frontend.md](../guest/windows/docs/d3d11-threaded-frontend.md)"
 
 [env.HELIOS_VKD3D_ADMISSION_SPIN_US]
 class = "tuning"
