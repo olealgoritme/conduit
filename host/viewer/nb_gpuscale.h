@@ -85,14 +85,23 @@ int  nb_gs_src(struct nb_gs *g, int key, int fd, uint32_t w, uint32_t h,
                uint64_t mod);
 void nb_gs_src_drop(struct nb_gs *g, int key);
 
+/* nb_gs_draw.src_key: the frame-generation history (nb_gs_fg_push) instead
+ * of a guest buffer; fg_t says which picture between its two frames. */
+#define NB_GS_SRC_FG (-2)
+
 struct nb_gs_draw {
     int    src_key;
     int    target;              /* 0..NB_GS_TARGETS-1                        */
     int    dx, dy, dw, dh;      /* destination, target pixels, y down        */
-    double sx, sy, sw, sh;      /* source rectangle, buffer pixels           */
+    double sx, sy, sw, sh;      /* source rectangle, buffer pixels (ignored
+                                 * for NB_GS_SRC_FG: the history is cropped) */
     bool   nearest;
     bool   alpha;               /* keep the source's alpha (a cursor image);
                                  * otherwise the target is opaque            */
+    /* Picture enhancement (docs/VIEWER-ENHANCE.md); zero = the plain pass. */
+    int    upscale;             /* NB_UPSCALE_* (nb_view.h)                  */
+    int    sharp;               /* 0..100                                    */
+    float  fg_t;                /* NB_GS_SRC_FG: 0 previous .. 1 newest      */
 };
 
 /*
@@ -105,6 +114,40 @@ int nb_gs_draw(struct nb_gs *g, const struct nb_gs_draw *d,
 
 /* Tests: one pixel of a target, 0xRRGGBB (row y counted from the top). */
 int nb_gs_read(struct nb_gs *g, int target, int x, int y, uint32_t *rgb);
+
+/*
+ * PICTURE ENHANCEMENT (docs/VIEWER-ENHANCE.md): the upscalers and frame
+ * generation run in this same context, which is then GLES 3.1 (asked for
+ * first, GLES 2 otherwise).  Programs are compiled when first used.
+ *
+ * With nb_gs_draw.upscale set, a guest frame is first copied into an
+ * internal texture (an external dma-buf texture cannot be gathered from),
+ * then drawn by the chosen pass: FSR 1 (EASU, then RCAS into the target),
+ * NIS (compute, then a 1:1 copy), CAS (sharpened at the guest's size, then
+ * scaled).  A pass that cannot run (no GLES 3.1, a shader the driver
+ * refuses, a scale it does not do: nb_enhance.h nb_enh_pick) falls back to
+ * the plain pass; nb_gs_enh_status says which ran and why.
+ */
+bool nb_gs_enhance_ok(struct nb_gs *g, const char **why);
+/* The pass the last draw used (NB_UPSCALE_*), and why it is not the one
+ * asked for (NULL when it is). */
+int  nb_gs_enh_status(const struct nb_gs *g, const char **why);
+
+/*
+ * FRAME GENERATION (nb_fg.h decides when).  Push a guest frame: it is
+ * copied (source rectangle sx..sh) into a two-frame history, its luma
+ * pyramid is built and the optical flow from the previous frame estimated
+ * (block matching, coarse to fine).  Waits for the GPU (bounded), so the
+ * guest buffer may be released after.  1: a pair is ready to interpolate;
+ * 0: this is the first frame of a new history (size changed, reset);
+ * -errno on failure.  Then nb_gs_draw with src_key NB_GS_SRC_FG.
+ */
+int  nb_gs_fg_push(struct nb_gs *g, int src_key, double sx, double sy,
+                   double sw, double sh, unsigned timeout_us,
+                   unsigned *gpu_us);
+void nb_gs_fg_reset(struct nb_gs *g);
+/* Whether the history holds a frame to draw. */
+bool nb_gs_fg_ready(const struct nb_gs *g);
 
 /*
  * GPU PRIORITY OF THE PASS.  The pass sits between the guest's frame and the

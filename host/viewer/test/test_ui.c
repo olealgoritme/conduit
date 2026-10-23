@@ -798,6 +798,66 @@ static void test_mode_list(void)
     CHECK(nb_ui_find(&ui, NB_UI_ID_RES_MODE, 0) < 0, "no list");
 }
 
+/* Picture enhancement: upscaler, sharpness, frame generation (one setting
+ * per VM, saved; Smooth Motion only where the host has it). */
+static void test_enhance(void)
+{
+    struct nb_vstore st;
+    struct nb_ui ui;
+    struct nb_ui_env e = env_of(1920, 1080, 120);
+    unsigned bits;
+
+    nb_vstore_init(&st);
+    nb_ui_init(&ui, &st);
+    e.enhance_ok = true;
+    nb_ui_set_open(&ui, &e, true);
+    nb_ui_layout(&ui, &e, NULL, NULL);
+    CHECK(nb_ui_find(&ui, NB_UI_ID_UPSCALE, NB_UPSCALE_FSR) >= 0 &&
+          nb_ui_find(&ui, NB_UI_ID_UPSCALE, NB_UPSCALE_NIS) >= 0 &&
+          nb_ui_find(&ui, NB_UI_ID_UPSCALE, NB_UPSCALE_CAS) >= 0,
+          "upscaler chips");
+    CHECK(nb_ui_find(&ui, NB_UI_ID_SHARP, 50) < 0, "no sharpness while off");
+    CHECK(nb_ui_find(&ui, NB_UI_ID_FGEN, NB_FGEN_NVSM) < 0,
+          "Smooth Motion hidden without an RTX 40/50 host");
+    bits = click(&ui, &e, NB_UI_ID_UPSCALE, NB_UPSCALE_FSR);
+    CHECK(st.upscale == NB_UPSCALE_FSR && (bits & NB_UI_ENHANCE) &&
+          (bits & NB_UI_SAVE) && !(bits & (NB_UI_VIEW | NB_UI_RES)),
+          "FSR bits %#x", bits);
+    CHECK(strstr(ui.notice, "FSR") != NULL, "notice '%s'", ui.notice);
+    bits = click(&ui, &e, NB_UI_ID_SHARP, 75);
+    CHECK(st.sharp == 75 && (bits & NB_UI_ENHANCE), "sharpness 75");
+    bits = click(&ui, &e, NB_UI_ID_SHARP, 75);
+    CHECK(!(bits & (NB_UI_ENHANCE | NB_UI_SAVE)), "same again: nothing");
+    bits = click(&ui, &e, NB_UI_ID_FGEN, NB_FGEN_2X);
+    CHECK(st.fgen == NB_FGEN_2X && (bits & NB_UI_ENHANCE) &&
+          (bits & NB_UI_SAVE), "2x");
+    CHECK(strstr(ui.notice, "Frame generation") != NULL, "notice '%s'",
+          ui.notice);
+    e.nvsm_ok = true;
+    nb_ui_layout(&ui, &e, NULL, NULL);
+    bits = click(&ui, &e, NB_UI_ID_FGEN, NB_FGEN_NVSM);
+    CHECK(st.fgen == NB_FGEN_NVSM, "Smooth Motion offered and chosen");
+    /* Without the GPU pass the choices that need it are drawn, not taken. */
+    e.enhance_ok = false;
+    nb_ui_layout(&ui, &e, NULL, NULL);
+    bits = click(&ui, &e, NB_UI_ID_UPSCALE, NB_UPSCALE_NIS);
+    CHECK(st.upscale == NB_UPSCALE_FSR && !(bits & NB_UI_ENHANCE),
+          "disabled upscaler chip does nothing");
+    bits = click(&ui, &e, NB_UI_ID_UPSCALE, NB_UPSCALE_OFF);
+    CHECK(st.upscale == NB_UPSCALE_OFF, "off is always possible");
+    {
+        uint32_t *px;
+
+        nb_ui_layout(&ui, &e, NULL, NULL);
+        px = calloc((size_t)ui.lw * (size_t)ui.lh, 4);
+        CHECK(px != NULL, "panel pixels");
+        if (px) {
+            nb_ui_paint_panel(&ui, &e, px, ui.lw, ui.lh, ui.lw);
+            free(px);
+        }
+    }
+}
+
 int main(void)
 {
     test_area_hit();
@@ -809,6 +869,7 @@ int main(void)
     test_drag();
     test_paint();
     test_mode_list();
+    test_enhance();
     printf("test_ui: %d checks, %d failed\n", checks, fails);
     return fails ? 1 : 0;
 }

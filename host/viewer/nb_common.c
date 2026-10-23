@@ -419,6 +419,15 @@ void nb_vstore_setup(struct nb_vstore *st, const struct nb_config *cfg)
     if (cfg->sync >= 0) {
         st->sync = cfg->sync;
     }
+    if (cfg->upscale >= 0) {
+        st->upscale = cfg->upscale;
+    }
+    if (cfg->sharp >= 0) {
+        st->sharp = cfg->sharp;
+    }
+    if (cfg->fgen >= 0) {
+        st->fgen = cfg->fgen;
+    }
     nb_view_apply_res(&st->cur);
     nb_view_summary(&st->cur, sum, sizeof(sum));
     nb_log("display: %s%s%s%s", sum, cfg->view_state ? " (saved in " : "",

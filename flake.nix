@@ -205,6 +205,7 @@
           wayland-protocols
           (pkgs.libxcb or pkgs.xorg.libxcb)
           (pkgs.libgbm or pkgs.mesa)
+          vulkan-headers
         ];
         makeFlags = [ "all" ];
         enableParallelBuilding = true;

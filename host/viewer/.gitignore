@@ -22,3 +22,8 @@ test-scanout
 test-vmpause
 build_id.h
 test-present
+test-fg
+test-enhance
+test-vkpresent
+nb_shaders.h
+nb_shaders.h.tmp

@@ -3301,6 +3301,15 @@ static void usage(void)
 "                       commits when the compositor offers it (default on;\n"
 "                       also CONDUIT_VIEWER_EXPLICIT_SYNC=0)\n"
 "  --linear-only        deprecated alias for --present-mode=linear\n"
+"  --upscale=MODE       the viewer's GPU pass scales the picture with an\n"
+"                       upscaler (saved per VM; the menu changes it):\n"
+"                       off (default), fsr (FSR 1 EASU+RCAS), nis (NVIDIA\n"
+"                       Image Scaling), cas (sharpen, plain scale)\n"
+"  --sharpness=N        0..100 for the upscalers (default 50)\n"
+"  --framegen=MODE      host frame generation: off (default), 2x, 3x (the\n"
+"                       viewer's optical flow; about one guest frame of\n"
+"                       latency), nvidia (Smooth Motion, RTX 40/50 hosts).\n"
+"                       docs/VIEWER-ENHANCE.md\n"
 "Conduit display options (Wayland backend):\n"
 "  --sync=MODE          when a frame reaches the screen (saved per VM with\n"
 "                       --view-state; the menu, CTRL+ALT+M, changes it):\n"
@@ -3574,6 +3583,9 @@ int main(int argc, char **argv)
      * numbers either way. */
     cfg.overlay_mode = NB_OVERLAY_WINDOWED;
     cfg.sync = -1;
+    cfg.upscale = -1;
+    cfg.sharp = -1;
+    cfg.fgen = -1;
     {
         const char *e = getenv("CONDUIT_VIEWER_EXPLICIT_SYNC");
 
@@ -3703,6 +3715,25 @@ int main(int argc, char **argv)
             if (!m) { NEEDVAL(); m = v; }
             if (nb_sync_parse(m, &cfg.sync) != 0) {
                 nb_err("--sync must be fullscreen, immediate, vsync or latch");
+                return 2;
+            }
+        }
+        else if (!strncmp(a, "--upscale=", 10)) {
+            if (nb_upscale_parse(a + 10, &cfg.upscale) != 0) {
+                nb_err("--upscale must be off, fsr, nis or cas");
+                return 2;
+            }
+        }
+        else if (!strncmp(a, "--sharpness=", 12)) {
+            cfg.sharp = nb_sharp_parse(a + 12);
+            if (cfg.sharp < 0) {
+                nb_err("--sharpness must be 0..100");
+                return 2;
+            }
+        }
+        else if (!strncmp(a, "--framegen=", 11)) {
+            if (nb_fgen_parse(a + 11, &cfg.fgen) != 0) {
+                nb_err("--framegen must be off, 2x, 3x or nvidia");
                 return 2;
             }
         }

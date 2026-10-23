@@ -11,6 +11,10 @@
  *
  * Every library is dlopen'ed: a viewer that never goes fullscreen at a
  * non-native size never loads a GL driver.
+ *
+ * The context is GLES 3.1 where the driver has it (asked for first), for the
+ * picture-enhancement passes at the end of this file; the plain pass is the
+ * same GLES 2 shader either way.
  */
 #include <dirent.h>
 #include <dlfcn.h>
@@ -29,6 +33,9 @@
 
 #include "nb_gpuscale.h"
 #include "nb_gpusel.h"
+#include "nb_enhance.h"
+#include "shaders/nis_coef.h"
+#include "nb_shaders.h"         /* generated: shaders/embed.sh */
 
 /* ── the slice of EGL / GLES2 / GBM used here, spelled locally ────────── */
 
@@ -98,6 +105,19 @@ typedef unsigned char GLboolean;
 #define GL_TEXTURE0               0x84C0
 #define GL_SCISSOR_TEST           0x0C11
 #define GL_BLEND                  0x0BE2
+#define GL_TEXTURE_2D             0x0DE1
+#define GL_VERSION                0x1F02
+#define GL_RGBA                   0x1908
+#define GL_UNSIGNED_BYTE          0x1401
+#define GL_RGBA8                  0x8058
+#define GL_RGBA16F                0x881A
+#define GL_RGBA32F                0x8814
+#define GL_COMPUTE_SHADER         0x91B9
+#define GL_WRITE_ONLY             0x88B9
+#define GL_INFO_LOG_LENGTH        0x8B84
+#define GL_TEXTURE_FETCH_BARRIER_BIT     0x00000008
+#define GL_SHADER_IMAGE_ACCESS_BARRIER_BIT 0x00000020
+#define GL_FRAMEBUFFER_BARRIER_BIT       0x00000400
 
 struct gbm_device;
 struct gbm_bo;
@@ -174,6 +194,20 @@ struct fns {
     void (*ReadPixels)(GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, void *);
     void (*RenderbufferStorage)(GLenum, GLenum, GLsizei, GLsizei);
     void (*Uniform1f)(GLint, GLfloat);
+    /* GLES 3.1, optional: the enhancement passes (NULL: not offered) */
+    const unsigned char *(*GetString)(GLenum);
+    void (*GetProgramInfoLog)(GLuint, GLsizei, GLsizei *, GLchar *);
+    void (*FramebufferTexture2D)(GLenum, GLenum, GLenum, GLuint, GLint);
+    void (*TexSubImage2D)(GLenum, GLint, GLint, GLint, GLsizei, GLsizei,
+                          GLenum, GLenum, const void *);
+    void (*TexStorage2D)(GLenum, GLsizei, GLenum, GLsizei, GLsizei);
+    void (*Uniform2f)(GLint, GLfloat, GLfloat);
+    void (*Uniform2i)(GLint, GLint, GLint);
+    void (*Uniform1ui)(GLint, GLuint);
+    void (*DispatchCompute)(GLuint, GLuint, GLuint);
+    void (*BindImageTexture)(GLuint, GLuint, GLint, GLboolean, GLint, GLenum,
+                             GLenum);
+    void (*MemoryBarrier)(GLbitfield);
     /* GBM */
     struct gbm_device *(*gbm_create_device)(int);
     void (*gbm_device_destroy)(struct gbm_device *);
@@ -188,6 +222,20 @@ struct fns {
 };
 
 #define NB_GS_SRC 8
+#define NB_FG_LEVELS 4          /* luma pyramid: 1/2 .. 1/16 of the frame */
+
+/* An internal texture (immutable storage, one level). */
+struct gs_tex {
+    GLuint   id;
+    uint32_t w, h;
+    GLenum   fmt;
+};
+
+/* The enhancement programs (enh_progs[] gives their sources). */
+enum {
+    P_COPY = 0, P_EASU, P_RCAS, P_CAS, P_NIS, P_FG_DOWN, P_FG_FLOW,
+    P_FG_INTERP, P_COUNT
+};
 
 struct nb_gs {
     struct fns f;
@@ -216,7 +264,24 @@ struct nb_gs {
         EGLImage img;
         GLuint   tex;
     } s[NB_GS_SRC];
+    /* picture enhancement */
+    bool        es31;           /* GLES 3.1 and every entry point it needs */
+    char        enh_why[200];   /* why not, or the last shader failure    */
+    struct { GLuint id; bool tried; } pr[P_COUNT];
+    GLuint      vs;             /* the quad vertex shader, shared         */
+    GLuint      fbo_t;          /* renders into the internal textures     */
+    struct gs_tex in_tex, out_tex, cas_tex, coef[2];
+    bool        coef_ok;
+    int         enh_used;       /* NB_UPSCALE_* the last draw ran          */
+    const char *enh_used_why;
+    /* frame generation: two frames, their luma pyramids, the flow */
+    struct gs_tex hist[2], lum[2][NB_FG_LEVELS], flow[NB_FG_LEVELS], mid;
+    int         fg_cur, fg_n, fg_levels;
+    uint32_t    fg_w, fg_h;
 };
+
+static void enh_down(struct nb_gs *g);
+static bool enh_probe(struct nb_gs *g);
 
 static void say(char *why, size_t n, const char *fmt, ...)
 {
@@ -316,6 +381,22 @@ static bool load(struct nb_gs *g, char *why, size_t n)
     G(RenderbufferStorage, "glRenderbufferStorage");
     G(Uniform1f, "glUniform1f");
 #undef G
+    /* GLES 3.x / 3.1 (and a few GLES 2 ones only the enhancement passes
+     * use): optional, from the library or eglGetProcAddress. */
+#define O(field, name) do { *(void **)&f->field = sym(g->h_gles, name); \
+        if (!f->field) { *(void **)&f->field = f->GetProcAddress(name); } } while (0)
+    O(GetString, "glGetString");
+    O(GetProgramInfoLog, "glGetProgramInfoLog");
+    O(FramebufferTexture2D, "glFramebufferTexture2D");
+    O(TexSubImage2D, "glTexSubImage2D");
+    O(TexStorage2D, "glTexStorage2D");
+    O(Uniform2f, "glUniform2f");
+    O(Uniform2i, "glUniform2i");
+    O(Uniform1ui, "glUniform1ui");
+    O(DispatchCompute, "glDispatchCompute");
+    O(BindImageTexture, "glBindImageTexture");
+    O(MemoryBarrier, "glMemoryBarrier");
+#undef O
 #define B(field, name) do { *(void **)&f->field = sym(g->h_gbm, name); \
         if (!f->field) { say(why, n, "libgbm lacks %s", name); return false; } } while (0)
     B(gbm_create_device, "gbm_create_device");
@@ -411,10 +492,10 @@ static bool egl_up(struct nb_gs *g, char *why, size_t n)
     struct fns *f = &g->f;
     const char *ext;
     EGLint major, minor;
-    EGLint attr_pr[] = { EGL_CONTEXT_CLIENT_VERSION, 2,
+    EGLint attr_pr[] = { EGL_CONTEXT_CLIENT_VERSION, 3,
                          EGL_CONTEXT_PRIORITY_LEVEL_IMG,
                          EGL_CONTEXT_PRIORITY_HIGH_IMG, EGL_NONE };
-    EGLint attr[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE };
+    EGLint attr[] = { EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE };
     bool bad = false;
     enum nb_gs_prio want =
         nb_gs_prio_parse(getenv("CONDUIT_VIEWER_GPU_PRIORITY"), &bad);
@@ -456,21 +537,29 @@ static bool egl_up(struct nb_gs *g, char *why, size_t n)
      */
     g->prio_req = want;
     g->prio_got = NB_GS_PRIO_UNKNOWN;
-    if (want == NB_GS_PRIO_REALTIME &&
-        has_ext(ext, "EGL_NV_context_priority_realtime")) {
-        attr_pr[3] = EGL_CONTEXT_PRIORITY_REALTIME_NV;
-        g->ctx = f->CreateContext(g->dpy, EGL_NO_CONFIG_KHR, EGL_NO_CONTEXT,
-                                  attr_pr);
-    }
-    if (!g->ctx && want >= NB_GS_PRIO_HIGH &&
-        has_ext(ext, "EGL_IMG_context_priority")) {
-        attr_pr[3] = EGL_CONTEXT_PRIORITY_HIGH_IMG;
-        g->ctx = f->CreateContext(g->dpy, EGL_NO_CONFIG_KHR, EGL_NO_CONTEXT,
-                                  attr_pr);
-    }
-    if (!g->ctx) {
-        g->ctx = f->CreateContext(g->dpy, EGL_NO_CONFIG_KHR, EGL_NO_CONTEXT,
-                                  attr);
+    /*
+     * GLES 3 first (the driver gives the highest compatible version, 3.1+
+     * on every current one), for the enhancement passes; GLES 2 when it has
+     * none.  The plain pass is a GLES 2 shader and runs in either.
+     */
+    for (EGLint ver = 3; ver >= 2 && !g->ctx; ver--) {
+        attr_pr[1] = attr[1] = ver;
+        if (want == NB_GS_PRIO_REALTIME &&
+            has_ext(ext, "EGL_NV_context_priority_realtime")) {
+            attr_pr[3] = EGL_CONTEXT_PRIORITY_REALTIME_NV;
+            g->ctx = f->CreateContext(g->dpy, EGL_NO_CONFIG_KHR,
+                                      EGL_NO_CONTEXT, attr_pr);
+        }
+        if (!g->ctx && want >= NB_GS_PRIO_HIGH &&
+            has_ext(ext, "EGL_IMG_context_priority")) {
+            attr_pr[3] = EGL_CONTEXT_PRIORITY_HIGH_IMG;
+            g->ctx = f->CreateContext(g->dpy, EGL_NO_CONFIG_KHR,
+                                      EGL_NO_CONTEXT, attr_pr);
+        }
+        if (!g->ctx) {
+            g->ctx = f->CreateContext(g->dpy, EGL_NO_CONFIG_KHR,
+                                      EGL_NO_CONTEXT, attr);
+        }
     }
     if (!g->ctx || !f->MakeCurrent(g->dpy, EGL_NO_SURFACE, EGL_NO_SURFACE,
                                    g->ctx)) {
@@ -489,6 +578,7 @@ static bool egl_up(struct nb_gs *g, char *why, size_t n)
     } else {
         g->prio_got = NB_GS_PRIO_MEDIUM;    /* no priorities at all */
     }
+    g->es31 = enh_probe(g);
     return true;
 }
 
@@ -609,6 +699,7 @@ static void gs_down(struct nb_gs *g)
         if (g->prog) {
             f->DeleteProgram(g->prog);
         }
+        enh_down(g);
         f->MakeCurrent(g->dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
         f->DestroyContext(g->dpy, g->ctx);
     }
@@ -1048,22 +1139,56 @@ static uint64_t now_ns(void)
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
+/* Wait for everything submitted so far (bounded).  0, or -errno. */
+static int gs_finish(struct nb_gs *g, unsigned timeout_us, unsigned *gpu_us)
+{
+    struct fns *f = &g->f;
+    EGLSync sync;
+    EGLint r;
+    uint64_t t0 = now_ns();
+
+    sync = f->CreateSyncKHR(g->dpy, EGL_SYNC_FENCE_KHR, NULL);
+    if (!sync) {
+        f->Flush();
+        return -EIO;
+    }
+    r = f->ClientWaitSyncKHR(g->dpy, sync, EGL_SYNC_FLUSH_COMMANDS_BIT_KHR,
+                             (EGLTime)timeout_us * 1000u);
+    f->DestroySyncKHR(g->dpy, sync);
+    if (gpu_us) {
+        *gpu_us = (unsigned)((now_ns() - t0) / 1000u);
+    }
+    if (r == EGL_TIMEOUT_EXPIRED_KHR) {
+        return -ETIMEDOUT;
+    }
+    return r == EGL_CONDITION_SATISFIED_KHR ? 0 : -EIO;
+}
+
+static int src_index(const struct nb_gs *g, int key)
+{
+    for (int i = 0; i < NB_GS_SRC; i++) {
+        if (g->s[i].valid && g->s[i].key == key) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static int enh_frame(struct nb_gs *g, int si, const struct nb_gs_draw *d);
+
 int nb_gs_draw(struct nb_gs *g, const struct nb_gs_draw *d,
                unsigned timeout_us, unsigned *gpu_us)
 {
     struct fns *f = &g->f;
-    int si = -1;
-    EGLSync sync;
-    EGLint r;
-    uint64_t t0;
+    int si = d->src_key == NB_GS_SRC_FG ? -1 : src_index(g, d->src_key);
+    bool enh = d->src_key == NB_GS_SRC_FG ||
+               (d->upscale > NB_UPSCALE_OFF && !d->alpha && g->es31);
 
-    for (int i = 0; i < NB_GS_SRC; i++) {
-        if (g->s[i].valid && g->s[i].key == d->src_key) {
-            si = i;
-        }
+    if ((si < 0 && d->src_key != NB_GS_SRC_FG) || d->target < 0 ||
+        d->target >= NB_GS_TARGETS || !g->t[d->target].valid) {
+        return -EINVAL;
     }
-    if (si < 0 || d->target < 0 || d->target >= NB_GS_TARGETS ||
-        !g->t[d->target].valid) {
+    if (d->src_key == NB_GS_SRC_FG && (!g->es31 || g->fg_n < 1)) {
         return -EINVAL;
     }
     f->BindFramebuffer(GL_FRAMEBUFFER, g->t[d->target].fbo);
@@ -1074,6 +1199,19 @@ int nb_gs_draw(struct nb_gs *g, const struct nb_gs_draw *d,
         f->ClearColor(0, 0, 0, 1);
         f->Clear(GL_COLOR_BUFFER_BIT);
     }
+    if (enh) {
+        int r = enh_frame(g, si, d);
+
+        if (r < 0) {
+            return r;
+        }
+        return gs_finish(g, timeout_us, gpu_us);
+    }
+    g->enh_used = NB_UPSCALE_OFF;
+    g->enh_used_why = d->upscale > NB_UPSCALE_OFF && !d->alpha
+                          ? (g->enh_why[0] ? g->enh_why : "no GLES 3.1")
+                          : NULL;
+    f->UseProgram(g->prog);     /* an enhancement pass may have run */
     /*
      * Rows are addressed top-down in both buffers (row 0 of a dma-buf is
      * GL's y = 0, in a texture and in a framebuffer alike), so the
@@ -1093,22 +1231,7 @@ int nb_gs_draw(struct nb_gs *g, const struct nb_gs_draw *d,
     f->Uniform1f(g->u_swap, g->readback ? 1.0f : 0.0f);
     f->Uniform1f(g->u_alpha, d->alpha ? 1.0f : 0.0f);
     f->DrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-    t0 = now_ns();
-    sync = f->CreateSyncKHR(g->dpy, EGL_SYNC_FENCE_KHR, NULL);
-    if (!sync) {
-        f->Flush();
-        return -EIO;
-    }
-    r = f->ClientWaitSyncKHR(g->dpy, sync, EGL_SYNC_FLUSH_COMMANDS_BIT_KHR,
-                             (EGLTime)timeout_us * 1000u);
-    f->DestroySyncKHR(g->dpy, sync);
-    if (gpu_us) {
-        *gpu_us = (unsigned)((now_ns() - t0) / 1000u);
-    }
-    if (r == EGL_TIMEOUT_EXPIRED_KHR) {
-        return -ETIMEDOUT;
-    }
-    return r == EGL_CONDITION_SATISFIED_KHR ? 0 : -EIO;
+    return gs_finish(g, timeout_us, gpu_us);
 }
 
 int nb_gs_read(struct nb_gs *g, int target, int x, int y, uint32_t *rgb)
@@ -1123,4 +1246,640 @@ int nb_gs_read(struct nb_gs *g, int target, int x, int y, uint32_t *rgb)
                     px);
     *rgb = ((uint32_t)px[0] << 16) | ((uint32_t)px[1] << 8) | px[2];
     return 0;
+}
+
+/* ── picture enhancement (docs/VIEWER-ENHANCE.md) ──────────────────────────── */
+/*
+ * Everything below runs only when an upscaler or frame generation is on.  The
+ * passes render into internal textures (immutable RGBA8 / RGBA16F storage)
+ * and end in the same target framebuffer as the plain pass, so the targets,
+ * the read-back level and the caller's fence wait are unchanged.
+ *
+ * Sources: shaders/ and the vendored third_party/ headers, embedded as
+ * strings by shaders/embed.sh (nb_shaders.h); shaders/check.sh compiles the
+ * same programs offline.
+ */
+
+struct enh_src {
+    const char *name;
+    bool        compute;
+    const char *src[6];
+};
+
+static const struct enh_src enh_progs[P_COUNT] = {
+    [P_COPY]      = { "copy", false, { nb_sh_es_frag, nb_sh_copy } },
+    [P_EASU]      = { "FSR 1 EASU", false,
+                      { nb_sh_es_frag, nb_sh_easu_head, nb_sh_ffx_a,
+                        nb_sh_ffx_fsr1, nb_sh_easu_main } },
+    [P_RCAS]      = { "FSR 1 RCAS", false,
+                      { nb_sh_es_frag, nb_sh_rcas_head, nb_sh_ffx_a,
+                        nb_sh_ffx_fsr1, nb_sh_rcas_main } },
+    [P_CAS]       = { "CAS", false,
+                      { nb_sh_es_frag, nb_sh_cas_head, nb_sh_ffx_a,
+                        nb_sh_ffx_cas, nb_sh_cas_main } },
+    [P_NIS]       = { "NIS", true,
+                      { nb_sh_es_comp, nb_sh_nis_head, nb_sh_nis_scaler,
+                        nb_sh_nis_main } },
+    [P_FG_DOWN]   = { "frame generation (pyramid)", true,
+                      { nb_sh_es_comp, nb_sh_fg_down } },
+    [P_FG_FLOW]   = { "frame generation (flow)", true,
+                      { nb_sh_es_comp, nb_sh_fg_flow } },
+    [P_FG_INTERP] = { "frame generation (interpolation)", true,
+                      { nb_sh_es_comp, nb_sh_fg_interp } },
+};
+
+/* GLES 3.1 with every entry point the passes call.  Called once, current. */
+static bool enh_probe(struct nb_gs *g)
+{
+    struct fns *f = &g->f;
+    const char *v;
+    int maj = 0, min = 0;
+
+    if (!f->GetString || !f->FramebufferTexture2D || !f->TexStorage2D ||
+        !f->TexSubImage2D || !f->Uniform2f || !f->Uniform2i ||
+        !f->Uniform1ui || !f->DispatchCompute || !f->BindImageTexture ||
+        !f->MemoryBarrier || !f->GetProgramInfoLog) {
+        say(g->enh_why, sizeof(g->enh_why), "the GL library lacks GLES 3.1 "
+            "entry points");
+        return false;
+    }
+    v = (const char *)f->GetString(GL_VERSION);
+    if (!v || sscanf(v, "OpenGL ES %d.%d", &maj, &min) != 2 ||
+        maj * 10 + min < 31) {
+        say(g->enh_why, sizeof(g->enh_why), "the GPU pass is %s, GLES 3.1 "
+            "needed", v ? v : "of unknown version");
+        return false;
+    }
+    g->enh_why[0] = '\0';
+    return true;
+}
+
+bool nb_gs_enhance_ok(struct nb_gs *g, const char **why)
+{
+    if (why) {
+        *why = g && !g->es31 ? g->enh_why : NULL;
+    }
+    return g && g->es31;
+}
+
+int nb_gs_enh_status(const struct nb_gs *g, const char **why)
+{
+    if (why) {
+        *why = g ? g->enh_used_why : NULL;
+    }
+    return g ? g->enh_used : NB_UPSCALE_OFF;
+}
+
+static void tex_free(struct nb_gs *g, struct gs_tex *t)
+{
+    if (t->id) {
+        g->f.DeleteTextures(1, &t->id);
+    }
+    memset(t, 0, sizeof(*t));
+}
+
+/* t at w x h in fmt, (re)made when it is not.  Linear filtering (nearest for
+ * RGBA32F, which is not filterable: a linear one would be incomplete). */
+static void tex_need(struct nb_gs *g, struct gs_tex *t, uint32_t w,
+                     uint32_t h, GLenum fmt)
+{
+    struct fns *f = &g->f;
+    GLint filt = fmt == GL_RGBA32F ? GL_NEAREST : GL_LINEAR;
+
+    if (t->id && t->w == w && t->h == h && t->fmt == fmt) {
+        return;
+    }
+    tex_free(g, t);
+    f->GenTextures(1, &t->id);
+    f->BindTexture(GL_TEXTURE_2D, t->id);
+    f->TexStorage2D(GL_TEXTURE_2D, 1, fmt, (GLsizei)w, (GLsizei)h);
+    f->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filt);
+    f->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filt);
+    f->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    f->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    t->w = w;
+    t->h = h;
+    t->fmt = fmt;
+}
+
+static void tex_bind(struct nb_gs *g, int unit, const struct gs_tex *t,
+                     bool nearest)
+{
+    struct fns *f = &g->f;
+    GLint filt = nearest || t->fmt == GL_RGBA32F ? GL_NEAREST : GL_LINEAR;
+
+    f->ActiveTexture(GL_TEXTURE0 + (GLenum)unit);
+    f->BindTexture(GL_TEXTURE_2D, t->id);
+    f->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filt);
+    f->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filt);
+}
+
+static void enh_down(struct nb_gs *g)
+{
+    struct fns *f = &g->f;
+
+    for (int i = 0; i < P_COUNT; i++) {
+        if (g->pr[i].id) {
+            f->DeleteProgram(g->pr[i].id);
+        }
+        g->pr[i].id = 0;
+        g->pr[i].tried = false;
+    }
+    if (g->vs) {
+        f->DeleteShader(g->vs);
+        g->vs = 0;
+    }
+    if (g->fbo_t) {
+        f->DeleteFramebuffers(1, &g->fbo_t);
+        g->fbo_t = 0;
+    }
+    tex_free(g, &g->in_tex);
+    tex_free(g, &g->out_tex);
+    tex_free(g, &g->cas_tex);
+    tex_free(g, &g->coef[0]);
+    tex_free(g, &g->coef[1]);
+    tex_free(g, &g->mid);
+    for (int k = 0; k < 2; k++) {
+        tex_free(g, &g->hist[k]);
+        for (int l = 0; l < NB_FG_LEVELS; l++) {
+            tex_free(g, &g->lum[k][l]);
+        }
+    }
+    for (int l = 0; l < NB_FG_LEVELS; l++) {
+        tex_free(g, &g->flow[l]);
+    }
+    g->coef_ok = false;
+    g->fg_n = 0;
+}
+
+static GLuint enh_shader(struct nb_gs *g, GLenum type, const char *const *src,
+                         int n, const char *name)
+{
+    struct fns *f = &g->f;
+    GLuint s = f->CreateShader(type);
+    GLint ok = 0;
+
+    f->ShaderSource(s, n, src, NULL);
+    f->CompileShader(s);
+    f->GetShaderiv(s, GL_COMPILE_STATUS, &ok);
+    if (!ok) {
+        char log[1024] = "";
+
+        f->GetShaderInfoLog(s, sizeof(log), NULL, log);
+        fprintf(stderr, "conduit-viewer: gpu-scale: the %s shader does not "
+                "compile here: %s\n", name, log);
+        say(g->enh_why, sizeof(g->enh_why), "the %s shader does not compile "
+            "on this GPU's driver", name);
+        f->DeleteShader(s);
+        return 0;
+    }
+    return s;
+}
+
+/* The program k, built the first time it is asked for.  0: unavailable. */
+static GLuint enh_prog(struct nb_gs *g, int k)
+{
+    struct fns *f = &g->f;
+    const struct enh_src *e = &enh_progs[k];
+    GLuint sh, p;
+    GLint ok = 0;
+    int n = 0;
+
+    if (g->pr[k].tried) {
+        return g->pr[k].id;
+    }
+    g->pr[k].tried = true;
+    if (!g->es31) {
+        return 0;
+    }
+    while (n < 6 && e->src[n]) {
+        n++;
+    }
+    if (!e->compute && !g->vs) {
+        static const char *const vsrc[1] = { nb_sh_quad_vert };
+
+        g->vs = enh_shader(g, GL_VERTEX_SHADER, vsrc, 1, "quad");
+        if (!g->vs) {
+            return 0;
+        }
+    }
+    sh = enh_shader(g, e->compute ? GL_COMPUTE_SHADER : GL_FRAGMENT_SHADER,
+                    e->src, n, e->name);
+    if (!sh) {
+        return 0;
+    }
+    p = f->CreateProgram();
+    f->AttachShader(p, sh);
+    if (!e->compute) {
+        f->AttachShader(p, g->vs);
+    }
+    f->LinkProgram(p);
+    f->DeleteShader(sh);
+    f->GetProgramiv(p, GL_LINK_STATUS, &ok);
+    if (!ok) {
+        char log[1024] = "";
+
+        f->GetProgramInfoLog(p, sizeof(log), NULL, log);
+        fprintf(stderr, "conduit-viewer: gpu-scale: the %s program does not "
+                "link here: %s\n", e->name, log);
+        say(g->enh_why, sizeof(g->enh_why), "the %s program does not link on "
+            "this GPU's driver", e->name);
+        f->DeleteProgram(p);
+        return 0;
+    }
+    g->pr[k].id = p;
+    return p;
+}
+
+static GLint U(struct nb_gs *g, GLuint p, const char *name)
+{
+    return g->f.GetUniformLocation(p, name);
+}
+
+/* Render into an internal texture, all of it. */
+static void rt_tex(struct nb_gs *g, const struct gs_tex *t)
+{
+    struct fns *f = &g->f;
+
+    if (!g->fbo_t) {
+        f->GenFramebuffers(1, &g->fbo_t);
+    }
+    f->BindFramebuffer(GL_FRAMEBUFFER, g->fbo_t);
+    f->FramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                            GL_TEXTURE_2D, t->id, 0);
+    f->Viewport(0, 0, (GLsizei)t->w, (GLsizei)t->h);
+}
+
+/* Render into the draw's target, at its destination rectangle. */
+static void rt_target(struct nb_gs *g, const struct nb_gs_draw *d)
+{
+    g->f.BindFramebuffer(GL_FRAMEBUFFER, g->t[d->target].fbo);
+    g->f.Viewport(d->dx, d->dy, d->dw, d->dh);
+}
+
+/* The plain pass from an internal texture into the current viewport. */
+static void copy_draw(struct nb_gs *g, const struct gs_tex *t, bool nearest,
+                      float swap)
+{
+    struct fns *f = &g->f;
+    GLuint p = g->pr[P_COPY].id;
+
+    f->UseProgram(p);
+    tex_bind(g, 0, t, nearest);
+    f->Uniform1i(U(g, p, "u_src"), 0);
+    f->Uniform4f(U(g, p, "u_rect"), 0, 0, 1, 1);
+    f->Uniform1f(U(g, p, "u_swap"), swap);
+    f->DrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+}
+
+/*
+ * The guest's buffer (source slot si, rectangle sx..sh) into an internal
+ * RGBA8 texture of the rectangle's size, through the plain GLES 2 program:
+ * the one place the external dma-buf texture is read.
+ */
+static void enh_ingest(struct nb_gs *g, int si, double sx, double sy,
+                       double sw, double sh, struct gs_tex *dst)
+{
+    struct fns *f = &g->f;
+    uint32_t w = sw >= 1.0 ? (uint32_t)(sw + 0.5) : 1;
+    uint32_t h = sh >= 1.0 ? (uint32_t)(sh + 0.5) : 1;
+
+    tex_need(g, dst, w, h, GL_RGBA8);
+    rt_tex(g, dst);
+    f->UseProgram(g->prog);
+    f->ActiveTexture(GL_TEXTURE0);
+    f->BindTexture(GL_TEXTURE_EXTERNAL_OES, g->s[si].tex);
+    f->TexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER,
+                     GL_LINEAR);
+    f->TexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER,
+                     GL_LINEAR);
+    f->Uniform4f(g->u_rect, (GLfloat)(sx / g->s[si].w),
+                 (GLfloat)(sy / g->s[si].h), (GLfloat)(sw / g->s[si].w),
+                 (GLfloat)(sh / g->s[si].h));
+    f->Uniform1f(g->u_swap, 0.0f);
+    f->Uniform1f(g->u_alpha, 0.0f);
+    f->DrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+}
+
+static bool nis_coef_up(struct nb_gs *g)
+{
+    if (g->coef_ok) {
+        return true;
+    }
+    tex_need(g, &g->coef[0], 2, NB_NIS_PHASES, GL_RGBA32F);
+    g->f.TexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 2, NB_NIS_PHASES, GL_RGBA,
+                       GL_FLOAT, nb_nis_coef_scale);
+    tex_need(g, &g->coef[1], 2, NB_NIS_PHASES, GL_RGBA32F);
+    g->f.TexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 2, NB_NIS_PHASES, GL_RGBA,
+                       GL_FLOAT, nb_nis_coef_usm);
+    g->coef_ok = true;
+    return true;
+}
+
+static void nis_uniforms(struct nb_gs *g, GLuint p, const struct nb_nis_cfg *c)
+{
+    struct fns *f = &g->f;
+
+#define UF(n) f->Uniform1f(U(g, p, #n), c->n)
+#define UU(n) f->Uniform1ui(U(g, p, #n), c->n)
+    UF(kDetectRatio); UF(kDetectThres); UF(kMinContrastRatio);
+    UF(kRatioNorm); UF(kContrastBoost); UF(kEps); UF(kSharpStartY);
+    UF(kSharpScaleY); UF(kSharpStrengthMin); UF(kSharpStrengthScale);
+    UF(kSharpLimitMin); UF(kSharpLimitScale); UF(kScaleX); UF(kScaleY);
+    UF(kDstNormX); UF(kDstNormY); UF(kSrcNormX); UF(kSrcNormY);
+    UU(kInputViewportOriginX); UU(kInputViewportOriginY);
+    UU(kInputViewportWidth); UU(kInputViewportHeight);
+    UU(kOutputViewportOriginX); UU(kOutputViewportOriginY);
+    UU(kOutputViewportWidth); UU(kOutputViewportHeight);
+#undef UF
+#undef UU
+}
+
+/*
+ * Draw the internal texture `in` into the target with the upscaler the
+ * draw asks for, or the best one that runs here (nb_enh_pick, then what the
+ * driver compiled).  0, or -EIO when not even the plain copy runs.
+ */
+static int enh_draw(struct nb_gs *g, const struct gs_tex *in,
+                    const struct nb_gs_draw *d)
+{
+    struct fns *f = &g->f;
+    uint32_t dw = (uint32_t)(d->dw > 0 ? d->dw : 1);
+    uint32_t dh = (uint32_t)(d->dh > 0 ? d->dh : 1);
+    float swap = g->readback ? 1.0f : 0.0f;
+    const char *why = NULL;
+    int m = nb_enh_pick(d->upscale, in->w, in->h, dw, dh, &why);
+    struct nb_nis_cfg nc;
+    GLuint p;
+
+    if (!enh_prog(g, P_COPY)) {
+        return -EIO;
+    }
+    if (m == NB_UPSCALE_NIS &&
+        (!enh_prog(g, P_NIS) || !nis_coef_up(g) ||
+         !nb_nis_config(&nc, nb_sharp_unit(d->sharp), in->w, in->h, dw, dh))) {
+        why = g->pr[P_NIS].id ? "NIS: scale out of its range; FSR instead"
+                              : "NIS does not run on this GPU's driver; FSR "
+                                "instead";
+        m = NB_UPSCALE_FSR;
+    }
+    if (m == NB_UPSCALE_FSR &&
+        (!enh_prog(g, P_EASU) ||
+         (nb_rcas_on(d->sharp) && !enh_prog(g, P_RCAS)))) {
+        why = g->enh_why;
+        m = NB_UPSCALE_OFF;
+    }
+    if (m == NB_UPSCALE_CAS && !enh_prog(g, P_CAS)) {
+        why = g->enh_why;
+        m = NB_UPSCALE_OFF;
+    }
+    g->enh_used = m;
+    g->enh_used_why = m == d->upscale ? NULL : why;
+
+    switch (m) {
+    case NB_UPSCALE_FSR:
+        /* EASU into an output-size texture, then RCAS 1:1 into the target. */
+        tex_need(g, &g->out_tex, dw, dh, GL_RGBA8);
+        rt_tex(g, &g->out_tex);
+        p = g->pr[P_EASU].id;
+        f->UseProgram(p);
+        tex_bind(g, 0, in, false);
+        f->Uniform1i(U(g, p, "u_src"), 0);
+        f->Uniform4f(U(g, p, "u_rect"), 0, 0, 1, 1);
+        f->Uniform4f(U(g, p, "u_io"), (GLfloat)in->w, (GLfloat)in->h,
+                     (GLfloat)dw, (GLfloat)dh);
+        f->Uniform1f(U(g, p, "u_swap"), 0.0f);
+        f->DrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        rt_target(g, d);
+        if (!nb_rcas_on(d->sharp)) {
+            copy_draw(g, &g->out_tex, true, swap);
+            break;
+        }
+        p = g->pr[P_RCAS].id;
+        f->UseProgram(p);
+        tex_bind(g, 0, &g->out_tex, true);
+        f->Uniform1i(U(g, p, "u_src"), 0);
+        f->Uniform4f(U(g, p, "u_rect"), 0, 0, 1, 1);
+        f->Uniform2i(U(g, p, "u_org"), d->dx, d->dy);
+        f->Uniform2i(U(g, p, "u_max"), (GLint)dw - 1, (GLint)dh - 1);
+        f->Uniform1f(U(g, p, "u_stops"), nb_rcas_stops(d->sharp));
+        f->Uniform1f(U(g, p, "u_swap"), swap);
+        f->DrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        break;
+    case NB_UPSCALE_NIS:
+        /* NIS (compute) into an output-size image, then 1:1. */
+        tex_need(g, &g->out_tex, dw, dh, GL_RGBA8);
+        p = g->pr[P_NIS].id;
+        f->UseProgram(p);
+        nis_uniforms(g, p, &nc);
+        tex_bind(g, 0, in, false);
+        tex_bind(g, 1, &g->coef[0], true);
+        tex_bind(g, 2, &g->coef[1], true);
+        f->Uniform1i(U(g, p, "in_texture"), 0);
+        f->Uniform1i(U(g, p, "coef_scaler"), 1);
+        f->Uniform1i(U(g, p, "coef_usm"), 2);
+        f->BindImageTexture(0, g->out_tex.id, 0, 0, 0, GL_WRITE_ONLY,
+                            GL_RGBA8);
+        f->DispatchCompute((dw + NB_NIS_BLOCK_W - 1) / NB_NIS_BLOCK_W,
+                           (dh + NB_NIS_BLOCK_H - 1) / NB_NIS_BLOCK_H, 1);
+        f->MemoryBarrier(GL_TEXTURE_FETCH_BARRIER_BIT |
+                         GL_FRAMEBUFFER_BARRIER_BIT);
+        rt_target(g, d);
+        copy_draw(g, &g->out_tex, true, swap);
+        break;
+    case NB_UPSCALE_CAS:
+        /* Sharpened at the guest's resolution, then the plain scale. */
+        tex_need(g, &g->cas_tex, in->w, in->h, GL_RGBA8);
+        rt_tex(g, &g->cas_tex);
+        p = g->pr[P_CAS].id;
+        f->UseProgram(p);
+        tex_bind(g, 0, in, true);
+        f->Uniform1i(U(g, p, "u_src"), 0);
+        f->Uniform4f(U(g, p, "u_rect"), 0, 0, 1, 1);
+        f->Uniform2i(U(g, p, "u_max"), (GLint)in->w - 1, (GLint)in->h - 1);
+        f->Uniform2f(U(g, p, "u_in"), (GLfloat)in->w, (GLfloat)in->h);
+        f->Uniform1f(U(g, p, "u_sharp"), nb_sharp_unit(d->sharp));
+        f->Uniform1f(U(g, p, "u_swap"), 0.0f);
+        f->DrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        rt_target(g, d);
+        copy_draw(g, &g->cas_tex, d->nearest, swap);
+        break;
+    default:
+        rt_target(g, d);
+        copy_draw(g, in, d->nearest, swap);
+        break;
+    }
+    return 0;
+}
+
+/* ── frame generation: history, pyramid, flow, interpolation ── */
+
+static void dispatch8(struct nb_gs *g, uint32_t w, uint32_t h)
+{
+    g->f.DispatchCompute((w + 7) / 8, (h + 7) / 8, 1);
+    g->f.MemoryBarrier(GL_TEXTURE_FETCH_BARRIER_BIT |
+                       GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+}
+
+/* Luma pyramid of history slot k: level l is 1/2^(l+1) of the frame. */
+static void fg_pyramid(struct nb_gs *g, int k)
+{
+    struct fns *f = &g->f;
+    GLuint p = g->pr[P_FG_DOWN].id;
+    const struct gs_tex *src = &g->hist[k];
+
+    f->UseProgram(p);
+    f->Uniform1i(U(g, p, "u_src"), 0);
+    for (int l = 0; l < g->fg_levels; l++) {
+        struct gs_tex *dst = &g->lum[k][l];
+        uint32_t w = (src->w + 1) / 2, h = (src->h + 1) / 2;
+
+        tex_need(g, dst, w, h, GL_RGBA16F);
+        tex_bind(g, 0, src, false);
+        f->Uniform2i(U(g, p, "u_size"), (GLint)w, (GLint)h);
+        f->Uniform2f(U(g, p, "u_inv_src"), 1.0f / (GLfloat)src->w,
+                     1.0f / (GLfloat)src->h);
+        f->Uniform1i(U(g, p, "u_luma"), l == 0);
+        f->BindImageTexture(0, dst->id, 0, 0, 0, GL_WRITE_ONLY, GL_RGBA16F);
+        dispatch8(g, w, h);
+        src = dst;
+    }
+}
+
+/* Flow from history slot k^1 to k, coarsest level first. */
+static void fg_flow(struct nb_gs *g, int k)
+{
+    struct fns *f = &g->f;
+    GLuint p = g->pr[P_FG_FLOW].id;
+
+    f->UseProgram(p);
+    f->Uniform1i(U(g, p, "u_prev"), 0);
+    f->Uniform1i(U(g, p, "u_cur"), 1);
+    f->Uniform1i(U(g, p, "u_coarse"), 2);
+    for (int l = g->fg_levels - 1; l >= 0; l--) {
+        const struct gs_tex *lv = &g->lum[k][l];
+        bool refine = l < g->fg_levels - 1;
+
+        tex_need(g, &g->flow[l], lv->w, lv->h, GL_RGBA16F);
+        tex_bind(g, 0, &g->lum[k ^ 1][l], false);
+        tex_bind(g, 1, lv, false);
+        /* unit 2 is read only when refining; otherwise any other texture
+         * (not one bound for writing or sampled here) */
+        tex_bind(g, 2, refine ? &g->flow[l + 1] : &g->hist[k], true);
+        f->Uniform2i(U(g, p, "u_size"), (GLint)lv->w, (GLint)lv->h);
+        f->Uniform2i(U(g, p, "u_csize"),
+                     refine ? (GLint)g->flow[l + 1].w : 1,
+                     refine ? (GLint)g->flow[l + 1].h : 1);
+        f->Uniform2f(U(g, p, "u_inv"), 1.0f / (GLfloat)lv->w,
+                     1.0f / (GLfloat)lv->h);
+        f->Uniform1f(U(g, p, "u_scale"), (GLfloat)(2u << l));
+        f->Uniform1i(U(g, p, "u_radius"), 4);
+        f->Uniform1i(U(g, p, "u_refine"), refine);
+        f->BindImageTexture(0, g->flow[l].id, 0, 0, 0, GL_WRITE_ONLY,
+                            GL_RGBA16F);
+        dispatch8(g, lv->w, lv->h);
+    }
+}
+
+void nb_gs_fg_reset(struct nb_gs *g)
+{
+    if (g) {
+        g->fg_n = 0;
+    }
+}
+
+bool nb_gs_fg_ready(const struct nb_gs *g)
+{
+    return g && g->fg_n > 0;
+}
+
+int nb_gs_fg_push(struct nb_gs *g, int src_key, double sx, double sy,
+                  double sw, double sh, unsigned timeout_us, unsigned *gpu_us)
+{
+    int si = src_index(g, src_key), k;
+    uint32_t w = sw >= 1.0 ? (uint32_t)(sw + 0.5) : 1;
+    uint32_t h = sh >= 1.0 ? (uint32_t)(sh + 0.5) : 1;
+    int r;
+
+    if (si < 0) {
+        return -EINVAL;
+    }
+    if (!g->es31 || !enh_prog(g, P_COPY) || !enh_prog(g, P_FG_DOWN) ||
+        !enh_prog(g, P_FG_FLOW) || !enh_prog(g, P_FG_INTERP)) {
+        return -ENOTSUP;
+    }
+    if (w != g->fg_w || h != g->fg_h) {
+        g->fg_n = 0;            /* a new mode or crop: a new history */
+        g->fg_w = w;
+        g->fg_h = h;
+        g->fg_levels = 1;
+        for (uint32_t lw = (w + 1) / 2, lh = (h + 1) / 2;
+             g->fg_levels < NB_FG_LEVELS && lw >= 32 && lh >= 32;
+             lw = (lw + 1) / 2, lh = (lh + 1) / 2) {
+            g->fg_levels++;
+        }
+    }
+    k = g->fg_n ? g->fg_cur ^ 1 : 0;
+    enh_ingest(g, si, sx, sy, sw, sh, &g->hist[k]);
+    fg_pyramid(g, k);
+    if (g->fg_n >= 1) {
+        fg_flow(g, k);
+    }
+    g->fg_cur = k;
+    g->fg_n = g->fg_n >= 1 ? 2 : 1;
+    r = gs_finish(g, timeout_us, gpu_us);
+    if (r < 0) {
+        g->fg_n = 0;
+        return r;
+    }
+    return g->fg_n == 2;
+}
+
+/* The picture at phase t: a history frame, or the interpolation into mid. */
+static const struct gs_tex *fg_pick(struct nb_gs *g, float t)
+{
+    struct fns *f = &g->f;
+    GLuint p = g->pr[P_FG_INTERP].id;
+    const struct gs_tex *a = &g->hist[g->fg_cur ^ 1];
+    const struct gs_tex *b = &g->hist[g->fg_cur];
+
+    if (g->fg_n < 2 || t >= 0.999f) {
+        return b;
+    }
+    if (t <= 0.001f) {
+        return a;
+    }
+    tex_need(g, &g->mid, g->fg_w, g->fg_h, GL_RGBA8);
+    f->UseProgram(p);
+    tex_bind(g, 0, a, false);
+    tex_bind(g, 1, b, false);
+    tex_bind(g, 2, &g->flow[0], true);
+    f->Uniform1i(U(g, p, "u_prev"), 0);
+    f->Uniform1i(U(g, p, "u_cur"), 1);
+    f->Uniform1i(U(g, p, "u_flow"), 2);
+    f->Uniform2i(U(g, p, "u_size"), (GLint)g->fg_w, (GLint)g->fg_h);
+    f->Uniform2i(U(g, p, "u_fsize"), (GLint)g->flow[0].w,
+                 (GLint)g->flow[0].h);
+    f->Uniform2f(U(g, p, "u_inv"), 1.0f / (GLfloat)g->fg_w,
+                 1.0f / (GLfloat)g->fg_h);
+    f->Uniform1f(U(g, p, "u_fscale"), 2.0f);
+    f->Uniform1f(U(g, p, "u_t"), t);
+    f->BindImageTexture(0, g->mid.id, 0, 0, 0, GL_WRITE_ONLY, GL_RGBA8);
+    dispatch8(g, g->fg_w, g->fg_h);
+    return &g->mid;
+}
+
+/* One enhanced draw (nb_gs_draw): the source into an internal texture (or
+ * the generated picture), then the upscaler into the bound target. */
+static int enh_frame(struct nb_gs *g, int si, const struct nb_gs_draw *d)
+{
+    const struct gs_tex *in;
+
+    if (d->src_key == NB_GS_SRC_FG) {
+        in = fg_pick(g, d->fg_t);
+    } else {
+        enh_ingest(g, si, d->sx, d->sy, d->sw, d->sh, &g->in_tex);
+        in = &g->in_tex;
+    }
+    return enh_draw(g, in, d);
 }

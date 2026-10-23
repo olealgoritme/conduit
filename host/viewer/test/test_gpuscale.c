@@ -17,6 +17,7 @@
 #include <time.h>
 
 #include "nb_gpuscale.h"
+#include "nb_view.h"
 
 static int checks, fails;
 #define CHECK(c, ...) do { checks++; if (!(c)) { fails++; \
@@ -74,6 +75,287 @@ static void bench(struct nb_gs *g, const char *what, unsigned bw, unsigned bh,
     }
     printf("test_gpuscale: %ux%u %s: avg %u us, p50 %u us, p99 %u us, max %u "
            "us\n", bw, bh, what, sum / 500, v[250], v[495], mx);
+}
+
+/* A LINEAR XRGB8888 source: red left of `edge`, blue from it on. */
+static struct gbm_bo *edge_src(struct gbm_device *dev, int edge)
+{
+    struct gbm_bo *bo = gbm_bo_create(dev, SW, SH, GBM_FORMAT_XRGB8888,
+                                      GBM_BO_USE_LINEAR);
+    void *map = NULL;
+    uint32_t stride;
+    uint8_t *p;
+
+    if (!bo) {
+        return NULL;
+    }
+    p = gbm_bo_map(bo, 0, 0, SW, SH, GBM_BO_TRANSFER_WRITE, &stride, &map);
+    if (!p) {
+        gbm_bo_destroy(bo);
+        return NULL;
+    }
+    for (int y = 0; y < SH; y++) {
+        for (int x = 0; x < SW; x++) {
+            *(uint32_t *)(p + (size_t)y * stride + (size_t)x * 4) =
+                x < edge ? 0xff0000 : 0x0000ff;
+        }
+    }
+    gbm_bo_unmap(bo, map);
+    return bo;
+}
+
+/* Within `tol` per channel. */
+static bool close_to(uint32_t a, uint32_t b, int tol)
+{
+    for (int sh = 0; sh < 24; sh += 8) {
+        int d = (int)((a >> sh) & 0xff) - (int)((b >> sh) & 0xff);
+
+        if (d < -tol || d > tol) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/*
+ * PICTURE ENHANCEMENT (docs/VIEWER-ENHANCE.md) on this GPU: each upscaler
+ * draws the quadrant picture 2x into the letterboxed target; flat areas stay
+ * their colour (sharpening only acts on edges), the bars stay black, the
+ * pass that ran is the one asked for.  Then frame generation: two frames
+ * whose red/blue edge moves 8 pixels; the halfway picture must put the edge
+ * halfway (a cross-fade would make both sides purple).
+ */
+static void test_enhance(struct nb_gs *g, struct gbm_device *dev)
+{
+    static const int ups[3] = { NB_UPSCALE_FSR, NB_UPSCALE_NIS,
+                                NB_UPSCALE_CAS };
+    const char *why = NULL;
+
+    if (!nb_gs_enhance_ok(g, &why)) {
+        printf("test_gpuscale: enhancement SKIPPED: %s\n", why ? why : "?");
+        return;
+    }
+    for (int i = 0; i < 3; i++) {
+        struct nb_gs_draw d = {
+            .src_key = 3, .target = 1, .dx = 160, .dy = 0, .dw = 320,
+            .dh = 180, .sx = 0, .sy = 0, .sw = SW, .sh = SH,
+            .upscale = ups[i], .sharp = 50,
+        };
+        unsigned us = 0;
+        int r = nb_gs_draw(g, &d, 1000000, &us);
+        int used = nb_gs_enh_status(g, &why);
+
+        CHECK(r == 0, "%s draw (%d)", nb_upscale_label(ups[i]), r);
+        CHECK(used == ups[i], "%s ran (got %s: %s)", nb_upscale_label(ups[i]),
+              nb_upscale_label(used), why ? why : "");
+        CHECK(px(g, 1, 10, 90) == 0 && px(g, 1, 630, 90) == 0,
+              "%s: bars black", nb_upscale_label(ups[i]));
+        CHECK(close_to(px(g, 1, 200, 20), 0xff0000, 2), "%s: red %06x",
+              nb_upscale_label(ups[i]), px(g, 1, 200, 20));
+        CHECK(close_to(px(g, 1, 200, 160), 0x00ff00, 2), "%s: green %06x",
+              nb_upscale_label(ups[i]), px(g, 1, 200, 160));
+        CHECK(close_to(px(g, 1, 440, 90), 0x0000ff, 2), "%s: blue %06x",
+              nb_upscale_label(ups[i]), px(g, 1, 440, 90));
+        printf("test_gpuscale: %s 160x90 -> 320x180: %u us\n",
+               nb_upscale_label(ups[i]), us);
+    }
+    /* Smaller than the source: FSR steps aside, and says why. */
+    {
+        struct nb_gs_draw d = {
+            .src_key = 3, .target = 2, .dx = 0, .dy = 0, .dw = 80, .dh = 45,
+            .sx = 0, .sy = 0, .sw = SW, .sh = SH, .upscale = NB_UPSCALE_FSR,
+        };
+
+        CHECK(nb_gs_draw(g, &d, 1000000, NULL) == 0, "FSR downscale draw");
+        CHECK(nb_gs_enh_status(g, &why) == NB_UPSCALE_OFF && why,
+              "FSR downscale -> plain pass");
+    }
+    /* Frame generation. */
+    {
+        struct gbm_bo *a = edge_src(dev, 64), *b = edge_src(dev, 72);
+        struct nb_gs_draw d = {
+            .src_key = NB_GS_SRC_FG, .target = 0, .dx = 0, .dy = 0,
+            .dw = SW, .dh = SH, .nearest = true, .fg_t = 0.5f,
+        };
+        unsigned us = 0;
+
+        CHECK(a && b, "edge sources");
+        if (!a || !b) {
+            return;
+        }
+        CHECK(nb_gs_src(g, 6, gbm_bo_get_fd(a), SW, SH, gbm_bo_get_stride(a),
+                        0, GBM_FORMAT_XRGB8888, 0) >= 0, "import frame A");
+        CHECK(nb_gs_src(g, 7, gbm_bo_get_fd(b), SW, SH, gbm_bo_get_stride(b),
+                        0, GBM_FORMAT_XRGB8888, 0) >= 0, "import frame B");
+        nb_gs_fg_reset(g);
+        CHECK(nb_gs_fg_push(g, 6, 0, 0, SW, SH, 1000000, &us) == 0,
+              "first frame: no pair");
+        CHECK(nb_gs_fg_push(g, 7, 0, 0, SW, SH, 1000000, &us) == 1,
+              "second frame: a pair");
+        printf("test_gpuscale: frame generation push (pyramid + flow) "
+               "160x90: %u us\n", us);
+        CHECK(nb_gs_draw(g, &d, 1000000, &us) == 0, "halfway picture");
+        CHECK(close_to(px(g, 0, 20, 45), 0xff0000, 4), "far left red %06x",
+              px(g, 0, 20, 45));
+        CHECK(close_to(px(g, 0, 140, 45), 0x0000ff, 4), "far right blue %06x",
+              px(g, 0, 140, 45));
+        CHECK(close_to(px(g, 0, 66, 45), 0xff0000, 40),
+              "x=66 is red at t=1/2 (the edge moved to 68): %06x",
+              px(g, 0, 66, 45));
+        CHECK(close_to(px(g, 0, 70, 45), 0x0000ff, 40),
+              "x=70 is blue at t=1/2: %06x", px(g, 0, 70, 45));
+        d.fg_t = 1.0f;
+        CHECK(nb_gs_draw(g, &d, 1000000, NULL) == 0 &&
+              px(g, 0, 70, 45) == 0xff0000 && px(g, 0, 72, 45) == 0x0000ff,
+              "t=1 is frame B exactly");
+        d.fg_t = 0.0f;
+        CHECK(nb_gs_draw(g, &d, 1000000, NULL) == 0 &&
+              px(g, 0, 63, 45) == 0xff0000 && px(g, 0, 64, 45) == 0x0000ff,
+              "t=0 is frame A exactly");
+        /* the generated picture through an upscaler */
+        d.fg_t = 0.5f;
+        d.upscale = NB_UPSCALE_FSR;
+        d.sharp = 50;
+        d.dw = 2 * SW > TW ? TW : 2 * SW;
+        d.dh = 2 * SH > TH ? TH : 2 * SH;
+        CHECK(nb_gs_draw(g, &d, 1000000, NULL) == 0 &&
+              nb_gs_enh_status(g, NULL) == NB_UPSCALE_FSR,
+              "generated picture upscaled with FSR");
+        nb_gs_src_drop(g, 6);
+        nb_gs_src_drop(g, 7);
+        gbm_bo_destroy(a);
+        gbm_bo_destroy(b);
+    }
+}
+
+/*
+ * TEST_ENH_BENCH=1: what the enhancement passes cost at real sizes, a
+ * 1920x1080 guest frame drawn at 3840x2160 (median of 60 after a warm-up,
+ * the pass waited for as the viewer does).  Numbers for
+ * docs/VIEWER-ENHANCE.md; not a check.
+ */
+static unsigned med(unsigned *v, int n)
+{
+    for (int i = 1; i < n; i++) {
+        unsigned k = v[i];
+        int j = i - 1;
+
+        while (j >= 0 && v[j] > k) {
+            v[j + 1] = v[j];
+            j--;
+        }
+        v[j + 1] = k;
+    }
+    return v[n / 2];
+}
+
+static unsigned wall_us(const struct timespec *a)
+{
+    struct timespec b;
+
+    clock_gettime(CLOCK_MONOTONIC, &b);
+    return (unsigned)((b.tv_sec - a->tv_sec) * 1000000 +
+                      (b.tv_nsec - a->tv_nsec) / 1000);
+}
+
+static void enh_bench(struct nb_gs *g, struct gbm_device *dev)
+{
+    enum { BW = 1920, BH = 1080, OW = 3840, OH = 2160, N = 60 };
+    struct gbm_bo *bo[2];
+    struct nb_gs_target tg[NB_GS_TARGETS];
+    char why[200] = "";
+    unsigned v[N];
+
+    for (int k = 0; k < 2; k++) {
+        void *map = NULL;
+        uint32_t stride;
+        uint8_t *p;
+
+        bo[k] = gbm_bo_create(dev, BW, BH, GBM_FORMAT_XRGB8888,
+                              GBM_BO_USE_LINEAR);
+        p = bo[k] ? gbm_bo_map(bo[k], 0, 0, BW, BH, GBM_BO_TRANSFER_WRITE,
+                               &stride, &map) : NULL;
+        if (!p) {
+            printf("test_gpuscale: bench SKIPPED (no 1080p buffer)\n");
+            return;
+        }
+        for (int y = 0; y < BH; y++) {
+            for (int x = 0; x < BW; x++) {
+                /* a texture moving 6 px per frame */
+                int u = x + 6 * k;
+
+                *(uint32_t *)(p + (size_t)y * stride + (size_t)x * 4) =
+                    (uint32_t)(((u * 7) ^ (y * 3)) & 0xff) << 16 |
+                    (uint32_t)((u + y) & 0xff) << 8 | (uint32_t)(y & 0xff);
+            }
+        }
+        gbm_bo_unmap(bo[k], map);
+        nb_gs_src(g, 10 + k, gbm_bo_get_fd(bo[k]), BW, BH,
+                  gbm_bo_get_stride(bo[k]), 0, GBM_FORMAT_XRGB8888, 0);
+    }
+    if (nb_gs_targets(g, OW, OH, NULL, NULL, NULL, NULL, 0, tg, why,
+                      sizeof(why)) != NB_GS_TARGETS) {
+        printf("test_gpuscale: bench SKIPPED (%s)\n", why);
+        return;
+    }
+    for (int up = NB_UPSCALE_OFF; up < NB_UPSCALE_COUNT; up++) {
+        struct nb_gs_draw d = {
+            .src_key = 10, .dw = OW, .dh = OH, .sw = BW, .sh = BH,
+            .upscale = up, .sharp = 50,
+        };
+
+        for (int i = 0; i < N + 5; i++) {
+            struct timespec a;
+
+            d.target = i % NB_GS_TARGETS;
+            clock_gettime(CLOCK_MONOTONIC, &a);
+            nb_gs_draw(g, &d, 1000000, NULL);
+            if (i >= 5) {
+                v[i - 5] = wall_us(&a);
+            }
+        }
+        printf("test_gpuscale: bench %dx%d -> %dx%d %-18s %5u us\n", BW, BH,
+               OW, OH, up ? nb_upscale_label(up) : "plain (bilinear)",
+               med(v, N));
+    }
+    for (int i = 0; i < N + 5; i++) {
+        struct timespec a;
+
+        clock_gettime(CLOCK_MONOTONIC, &a);
+        nb_gs_fg_push(g, 10 + (i & 1), 0, 0, BW, BH, 1000000, NULL);
+        if (i >= 5) {
+            v[i - 5] = wall_us(&a);
+        }
+    }
+    printf("test_gpuscale: bench frame generation: push %dx%d (copy, "
+           "pyramid, flow) %u us\n", BW, BH, med(v, N));
+    {
+        struct nb_gs_draw d = {
+            .src_key = NB_GS_SRC_FG, .dw = OW, .dh = OH, .fg_t = 0.5f,
+        };
+
+        for (int up = NB_UPSCALE_OFF; up <= NB_UPSCALE_FSR; up++) {
+            d.upscale = up;
+            d.sharp = 50;
+            for (int i = 0; i < N + 5; i++) {
+                struct timespec a;
+
+                d.target = i % NB_GS_TARGETS;
+                clock_gettime(CLOCK_MONOTONIC, &a);
+                nb_gs_draw(g, &d, 1000000, NULL);
+                if (i >= 5) {
+                    v[i - 5] = wall_us(&a);
+                }
+            }
+            printf("test_gpuscale: bench frame generation: generated "
+                   "picture at %dx%d, %s: %u us\n", OW, OH,
+                   up ? "FSR 1" : "plain", med(v, N));
+        }
+    }
+    nb_gs_src_drop(g, 10);
+    nb_gs_src_drop(g, 11);
+    gbm_bo_destroy(bo[0]);
+    gbm_bo_destroy(bo[1]);
 }
 
 int main(void)
@@ -280,6 +562,13 @@ int main(void)
                             sizeof(why)) == NB_GS_TARGETS,
               "back to dma-buf targets after the cursor");
     }
+    test_enhance(g, dev);
+    if (getenv("TEST_ENH_BENCH") && nb_gs_enhance_ok(g, NULL)) {
+        enh_bench(g, dev);
+    }
+    CHECK(nb_gs_targets(g, TW, TH, NULL, NULL, NULL, NULL, 0, tg, why,
+                        sizeof(why)) == NB_GS_TARGETS,
+          "targets after the enhancement tests");
     /*
      * TEST_GPUSCALE_BENCH=WxH: the per-frame cost at a real output size (a
      * 1600x900-class source stretched over the output), 500 draws, of the

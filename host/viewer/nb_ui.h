@@ -42,6 +42,7 @@
 #define NB_UI_SYNC      (1u << 13)  /* st->sync changed: re-apply presentation */
 #define NB_UI_VM_PAUSE  (1u << 14)  /* run the VM pause command              */
 #define NB_UI_VM_RESUME (1u << 15)  /* run the VM resume command             */
+#define NB_UI_ENHANCE   (1u << 16)  /* st->upscale/sharp/fgen changed        */
 
 /* Pointer shapes the area editor asks for. */
 enum {
@@ -68,6 +69,11 @@ struct nb_ui_env {
     bool     translucent;       /* the panel layer can blend (Wayland: yes) */
     bool     no_stats;          /* this backend has no stats overlay (X11)  */
     bool     immediate;         /* frames are presented immediately now     */
+    /* Picture enhancement (nb_view.h NB_UPSCALE_*, NB_FGEN_*). */
+    bool     enhance_ok;        /* this backend has the GPU pass for them   */
+    bool     nvsm_ok;           /* NVIDIA Smooth Motion is available here   */
+    bool     nvsm_restart;      /* chosen, but active only after a restart  */
+    const char *enhance_why;    /* NULL, or why the choice is not in force  */
     /* The display's mode list from the backend (CMD_MODES); NULL or empty
      * with an older backend, which leaves the old presets. */
     const struct nb_modes *modes;
@@ -102,6 +108,9 @@ enum {
     NB_UI_ID_RULE_DEFAULT,      /* the current layout becomes the default    */
     NB_UI_ID_SYNC,              /* arg: NB_SYNC_*                            */
     NB_UI_ID_VM_PAUSE,          /* Pause, or Resume while paused             */
+    NB_UI_ID_UPSCALE,           /* arg: NB_UPSCALE_*                         */
+    NB_UI_ID_SHARP,             /* arg: sharpness 0..100                     */
+    NB_UI_ID_FGEN,              /* arg: NB_FGEN_*                            */
 };
 
 /* One clickable thing on the panel, panel CONTENT coordinates (logical; the

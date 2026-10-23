@@ -24,7 +24,10 @@ make -C host/viewer check      # selftests: no display, no GPU (CI runs this)
 ```
 
 Build dependencies: `libwayland-dev wayland-protocols libxcb*-dev libgbm-dev`
-(`make deps` at the repo root installs them).
+(`make deps` at the repo root installs them); `libvulkan-dev` (headers only)
+for the NVIDIA Smooth Motion presenter. `make check-shaders` compiles the
+upscaling and frame-generation shaders offline with `glslangValidator`, when
+it is installed ([`docs/VIEWER-ENHANCE.md`](../../docs/VIEWER-ENHANCE.md)).
 
 ## Run
 
@@ -37,7 +40,8 @@ host/viewer/test-standalone.sh 5 240 2560x1440    # no VM: GPU test pattern at 2
 ```
 
 `conduit-viewer --help` lists the options (`--res`, `--area`, `--scale`,
-`--overlay`, `--resize`, `--direct-mode`, `--sync`, `--gpu-scale=auto|on|off`, `--gpu`, `--stats`, ...). Only the invoking user and root
+`--overlay`, `--resize`, `--direct-mode`, `--sync`, `--gpu-scale=auto|on|off`, `--gpu`,
+`--upscale`, `--sharpness`, `--framegen`, `--stats`, ...). Only the invoking user and root
 may connect (SO_PEERCRED; see `--allow-user`).
 
 The window's app id (Wayland) and class (X11) are `conduit-viewer`, for
@@ -51,7 +55,7 @@ compositor window rules.
 | `Ctrl+Alt+G` | grab mouse and keyboard (games); released on focus loss |
 | `Ctrl+Alt+O` | performance overlay |
 | `Ctrl+Alt+D` | direct mode: overlay hidden, tearing allowed, lowest latency |
-| `Ctrl+Alt+M` | the menu: guest resolution, picture area (drag its edges), scaling, filter, profiles, presentation (immediate/vsync), stats, fullscreen, VM actions |
+| `Ctrl+Alt+M` | the menu: guest resolution, picture area (drag its edges), scaling, filter, upscaling, frame generation, profiles, presentation (immediate/vsync), stats, fullscreen, VM actions |
 | `Ctrl+Alt+R` | next guest resolution: native, 2560x1440, 1920x1080, 1600x900, 1280x960, the last custom one |
 | `Ctrl+Alt+S` | next scale mode: fit, stretch, integer, none |
 | `Ctrl+Alt+A` | next picture area: full, 21:9, 16:9, 16:10, 4:3, custom |

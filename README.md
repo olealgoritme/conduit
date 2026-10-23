@@ -309,14 +309,16 @@ or `packaging/release.sh X.Y.Z`); GitHub then builds every package for that tag.
 | `Ctrl+Alt+G` | Capture the mouse (for games) / release it |
 | `Ctrl+Alt+O` | Performance overlay on/off (fps, frame times, latency) |
 | `Ctrl+Alt+D` | Direct mode: lowest latency (fullscreen, no overlay) |
-| `Ctrl+Alt+M` | Menu: guest resolution, picture area, scaling, profiles, VM restart/shut down |
+| `Ctrl+Alt+M` | Menu: guest resolution, picture area, scaling, upscaling, frame generation, profiles, VM restart/shut down |
 | `Ctrl+Alt+R` | Next guest resolution: Native (follows the window), 2560x1440, 1920x1080, 1600x900, 1280x960, your custom one |
 | `Ctrl+Alt+S` / `Ctrl+Alt+A` | Next scale mode (fit, stretch, integer, centered) / picture area (full, 21:9, 16:9, 16:10, 4:3) |
 
 `conduit view myvm --res 1280x960 --scale stretch` runs the VM at 1280x960
 stretched to the window. The settings are saved per VM. See
 [docs/VIEWER.md](docs/VIEWER.md) for all keys, the picture-area editor and
-profiles.
+profiles. Host-side upscaling (FSR 1, NIS, CAS) and frame generation (2x,
+3x, NVIDIA Smooth Motion) are in the menu too:
+[docs/VIEWER-ENHANCE.md](docs/VIEWER-ENHANCE.md).
 
 ## Play it from another computer (Moonlight)
 

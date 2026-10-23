@@ -607,7 +607,110 @@ void nb_vstore_init(struct nb_vstore *st)
     memset(st, 0, sizeof(*st));
     nb_view_defaults(&st->cur);
     st->sync = NB_SYNC_FULLSCREEN;
+    st->upscale = NB_UPSCALE_OFF;
+    st->sharp = NB_SHARP_DEFAULT;
+    st->fgen = NB_FGEN_OFF;
     st->prof_at = -1;
+}
+
+/* ── picture enhancement ───────────────────────────────────────────────── */
+
+int nb_upscale_parse(const char *s, int *up)
+{
+    if (!s) {
+        return -1;
+    }
+    if (!strcmp(s, "off") || !strcmp(s, "none")) {
+        *up = NB_UPSCALE_OFF;
+    } else if (!strcmp(s, "fsr") || !strcmp(s, "fsr1")) {
+        *up = NB_UPSCALE_FSR;
+    } else if (!strcmp(s, "nis")) {
+        *up = NB_UPSCALE_NIS;
+    } else if (!strcmp(s, "cas") || !strcmp(s, "sharpen")) {
+        *up = NB_UPSCALE_CAS;
+    } else {
+        return -1;
+    }
+    return 0;
+}
+
+const char *nb_upscale_name(int up)
+{
+    switch (up) {
+    case NB_UPSCALE_FSR: return "fsr";
+    case NB_UPSCALE_NIS: return "nis";
+    case NB_UPSCALE_CAS: return "cas";
+    default:             return "off";
+    }
+}
+
+const char *nb_upscale_label(int up)
+{
+    switch (up) {
+    case NB_UPSCALE_FSR: return "FSR 1";
+    case NB_UPSCALE_NIS: return "NIS";
+    case NB_UPSCALE_CAS: return "Sharpen only (CAS)";
+    default:             return "Off";
+    }
+}
+
+int nb_fgen_parse(const char *s, int *fg)
+{
+    if (!s) {
+        return -1;
+    }
+    if (!strcmp(s, "off") || !strcmp(s, "none") || !strcmp(s, "1x")) {
+        *fg = NB_FGEN_OFF;
+    } else if (!strcmp(s, "2x")) {
+        *fg = NB_FGEN_2X;
+    } else if (!strcmp(s, "3x")) {
+        *fg = NB_FGEN_3X;
+    } else if (!strcmp(s, "nvidia") || !strcmp(s, "smooth-motion")) {
+        *fg = NB_FGEN_NVSM;
+    } else {
+        return -1;
+    }
+    return 0;
+}
+
+const char *nb_fgen_name(int fg)
+{
+    switch (fg) {
+    case NB_FGEN_2X:   return "2x";
+    case NB_FGEN_3X:   return "3x";
+    case NB_FGEN_NVSM: return "nvidia";
+    default:           return "off";
+    }
+}
+
+const char *nb_fgen_label(int fg)
+{
+    switch (fg) {
+    case NB_FGEN_2X:   return "2x";
+    case NB_FGEN_3X:   return "3x";
+    case NB_FGEN_NVSM: return "NVIDIA Smooth Motion (RTX 40/50 host)";
+    default:           return "Off";
+    }
+}
+
+int nb_fgen_mult(int fg)
+{
+    return fg == NB_FGEN_2X ? 2 : fg == NB_FGEN_3X ? 3 : 1;
+}
+
+int nb_sharp_parse(const char *s)
+{
+    char *end;
+    long v;
+
+    if (!s || !*s) {
+        return -1;
+    }
+    v = strtol(s, &end, 10);
+    if (*end || v < 0) {
+        return -1;
+    }
+    return v > 100 ? 100 : (int)v;
 }
 
 /* ── presentation sync ─────────────────────────────────────────────────── */
@@ -753,6 +856,24 @@ void nb_vstore_parse(struct nb_vstore *st, const char *text)
             if (nb_sync_parse(eq + 1, &v) == 0) {
                 st->sync = v;
             }
+        } else if (!strcmp(line, "upscale")) {
+            int v;
+
+            if (nb_upscale_parse(eq + 1, &v) == 0) {
+                st->upscale = v;
+            }
+        } else if (!strcmp(line, "sharpness")) {
+            int v = nb_sharp_parse(eq + 1);
+
+            if (v >= 0) {
+                st->sharp = v;
+            }
+        } else if (!strcmp(line, "framegen")) {
+            int v;
+
+            if (nb_fgen_parse(eq + 1, &v) == 0) {
+                st->fgen = v;
+            }
         } else {
             view_kv(&st->cur, line, eq + 1);
         }
@@ -802,6 +923,15 @@ size_t nb_vstore_format(const struct nb_vstore *st0, char *buf, size_t n)
     }
     if (st->sync != NB_SYNC_FULLSCREEN) {
         PUT("sync=%s\n", nb_sync_name(st->sync));
+    }
+    if (st->upscale != NB_UPSCALE_OFF) {
+        PUT("upscale=%s\n", nb_upscale_name(st->upscale));
+    }
+    if (st->sharp != NB_SHARP_DEFAULT) {
+        PUT("sharpness=%d\n", st->sharp);
+    }
+    if (st->fgen != NB_FGEN_OFF) {
+        PUT("framegen=%s\n", nb_fgen_name(st->fgen));
     }
     for (i = 0; i < st->nrecent; i++) {
         PUT("recent=%ux%u\n", st->recent[i][0], st->recent[i][1]);

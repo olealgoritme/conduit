@@ -89,6 +89,39 @@ const char *nb_sync_label(int sync);                  /* menu form              
 /* Whether frames should be presented immediately in this state. */
 bool        nb_sync_immediate(int sync, bool fullscreen);
 
+/*
+ * Picture enhancement (docs/VIEWER-ENHANCE.md): an upscaler or sharpener in
+ * the viewer's GPU pass, and host-side frame generation.  Like sync, one
+ * setting per VM, not part of a layout or a profile; all off by default.
+ */
+enum {
+    NB_UPSCALE_OFF = 0,         /* the plain bilinear/nearest pass (or none)  */
+    NB_UPSCALE_FSR,             /* AMD FidelityFX FSR 1: EASU + RCAS         */
+    NB_UPSCALE_NIS,             /* NVIDIA Image Scaling                      */
+    NB_UPSCALE_CAS,             /* AMD FidelityFX CAS: sharpen, plain scale  */
+    NB_UPSCALE_COUNT
+};
+enum {
+    NB_FGEN_OFF = 0,
+    NB_FGEN_2X,                 /* one generated frame per guest frame       */
+    NB_FGEN_3X,                 /* two                                       */
+    NB_FGEN_NVSM,               /* NVIDIA Smooth Motion through a Vulkan
+                                 * swapchain (RTX 40/50 hosts)               */
+    NB_FGEN_COUNT
+};
+#define NB_SHARP_DEFAULT 50     /* sharpness, 0..100                         */
+int         nb_upscale_parse(const char *s, int *up);  /* off|fsr|nis|cas */
+const char *nb_upscale_name(int up);                   /* settings-file form */
+const char *nb_upscale_label(int up);                  /* menu form          */
+int         nb_fgen_parse(const char *s, int *fg);     /* off|2x|3x|nvidia   */
+const char *nb_fgen_name(int fg);
+const char *nb_fgen_label(int fg);
+/* Frames shown per guest frame by the viewer's own generation: 2 or 3, and
+ * 1 for off and for Smooth Motion (the driver generates those). */
+int         nb_fgen_mult(int fg);
+/* 0..100, from a settings-file value; -1 for junk. */
+int         nb_sharp_parse(const char *s);
+
 struct nb_place {
     struct nb_rect area;        /* the output area, window coordinates       */
     struct nb_rect pic;         /* the whole picture; may exceed the area    */
@@ -170,6 +203,9 @@ struct nb_rule {
 struct nb_vstore {
     struct nb_view    cur;
     int               sync;                     /* NB_SYNC_*             */
+    int               upscale;                  /* NB_UPSCALE_*          */
+    int               sharp;                    /* 0..100                */
+    int               fgen;                     /* NB_FGEN_*             */
     struct nb_profile prof[NB_MAX_PROFILES];
     int               nprof;
     int               prof_at;                  /* last loaded, -1 none  */
