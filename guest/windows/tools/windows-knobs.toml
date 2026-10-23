@@ -1517,6 +1517,11 @@ class = "debug"
 read = "once per process"
 effect = "1 skips 3D state methods whose value the GPU already has (Conduit's per-draw cost patches); 0 emits them as upstream NVK does, for bisecting."
 
+[env.NVK_CPU_CBUF_BIND]
+class = "experiment"
+read = "physical device creation"
+effect = "1 promotes uniform buffers from push descriptors and from descriptor sets without update-after-bind to bound constant buffers and binds them from a CPU copy of the descriptor, without the MME descriptor read; descriptor buffers keep NVK_UBO_DESC_CBUF's choice. 0 leaves them to NVK_UBO_DESC_CBUF."
+
 [env.NVK_DRAW_SYSVAL_SKIP]
 class = "experiment"
 read = "device creation"

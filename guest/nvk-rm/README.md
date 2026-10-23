@@ -62,6 +62,7 @@ Patch numbers are file numbers in the directory named in the patch tables.
 | `NVK_NULL_VB_ZERO_PAGE` | 1 | a null vertex buffer is bound to the 4 KiB zero page instead of address 0 / size 0 (common 41) |
 | `NVK_ZERO_PAGE_VRAM` | 1 | the zero page (null descriptors) lives in VRAM instead of uncached system memory (common 41) |
 | `NVK_UBO_DESC_CBUF` | 0 on Windows, 1 elsewhere | promote UBO descriptors to bound cbufs (windows 0051) |
+| `NVK_CPU_CBUF_BIND` | 0 | promote UBOs from push descriptors and from descriptor sets without update-after-bind to bound cbufs, bound from a CPU copy of the descriptor instead of the MME descriptor read; descriptor buffers keep `NVK_UBO_DESC_CBUF`'s choice (windows 0065) |
 | `NVK_INDIRECT_PUSH` | 0 | indirect draw records as inline macro data from the pushbuffer (common 28); testing only |
 | `NVK_MDI_BATCH` | 0 | read indirect multi-draw records in batches of n (max 204; 64 suggested) (common 24) |
 | `NVK_DRAW_SYSVAL_SKIP` | 0 | write draw parameters to the root table only for shaders that read them (common 35) |
@@ -298,6 +299,7 @@ Each patch builds on its own.
 | 0060 | the composed present waits for its copy at acquire, not at present |
 | 0061 | Mesa honours `MESA_LOG_FILE` on Windows; composed acquire/present failures go to `helios-wsi-<pid>.log` |
 | 0062 | `helios_icd_interface` v8, `ecl_fence_create_v3`: the RM fence and copy-engine record of a composed D3D11 present, for a value reserved on an ECL timeline that the submission thread signals after the frame's work, so the presenting thread does not wait for DXVK to submit the frame |
+| 0065 | `NVK_CPU_CBUF_BIND=1`: UBOs whose descriptor the CPU knows at the draw (push descriptors, descriptor sets without update-after-bind, read from a system memory copy of the set's UBO descriptors) are bound cbufs, bound with plain methods; descriptor buffers stay as `NVK_UBO_DESC_CBUF` says; part of the shader cache key through the set layout hash |
 
 ## `patches-windows-dxvk/`
 

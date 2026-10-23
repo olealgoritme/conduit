@@ -1,0 +1,332 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Fri, 23 Oct 2026 23:44:40 +0200
+Subject: [PATCH] nvk: NVK_CPU_CBUF_BIND binds UBO descriptors the CPU knows as
+ cbufs
+
+With NVK_UBO_DESC_CBUF off (the Windows default, 0051) every UBO from a
+descriptor set or push descriptor is a bindless cbuf load in the shader.
+NVK_CPU_CBUF_BIND=1 (default off) promotes the UBOs whose descriptor the
+CPU knows when a draw is recorded to bound cbufs again, and binds them
+with SET_CONSTANT_BUFFER_SELECTOR and BIND_GROUP_CONSTANT_BUFFER from the
+CPU instead of NVK_MME_BIND_CBUF_DESC:
+
+- push descriptors: from the push set's CPU data, as before;
+- descriptor sets whose layout has no UPDATE_AFTER_BIND pool flag and no
+  UPDATE_AFTER_BIND or UPDATE_UNUSED_WHILE_PENDING binding: their UBO
+  descriptors cannot change while the set is bound, so every set with
+  such a layout keeps a system memory copy of the range that holds its
+  UBO (and mutable) descriptors, written next to the pool memory by every
+  descriptor write and copy (nvk_descriptor_set::ubo_shadow).  The draw
+  reads the copy, not the pool memory, which is VRAM through the BAR on
+  RM.
+
+Descriptor buffers stay as NVK_UBO_DESC_CBUF says (bindless by default
+on Windows): an application may write them until the submit, and DXVK
+writes them on a worker thread after the bind.  If a promoted set's
+descriptor is not on the CPU at the draw after all, the MME bind is the
+fallback.  Compute shaders do not promote UBO descriptors, as before.
+
+The address and size come from the descriptor as the MME macro decodes
+it, aligned to the cbuf alignment and clamped to NVK_MAX_CBUF_SIZE; a
+null descriptor (size 0) binds the slot invalid.  Slots whose address
+and size did not change are not bound again (common 0004).
+
+With the knob set, set layouts hash whether their UBO descriptors are on
+the CPU, so shaders compiled with and without promotion do not share
+cache entries; without it, nothing changes.
+---
+ src/nouveau/vulkan/nvk_cmd_buffer.c           | 33 +++++++++----
+ src/nouveau/vulkan/nvk_descriptor_set.c       | 48 +++++++++++++++++++
+ src/nouveau/vulkan/nvk_descriptor_set.h       |  9 ++++
+ .../vulkan/nvk_descriptor_set_layout.c        |  9 ++++
+ .../vulkan/nvk_descriptor_set_layout.h        | 25 ++++++++++
+ .../vulkan/nvk_nir_lower_descriptors.c        |  9 +++-
+ src/nouveau/vulkan/nvk_physical_device.c      | 11 +++++
+ src/nouveau/vulkan/nvk_physical_device.h      |  6 +++
+ 8 files changed, 140 insertions(+), 10 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvk_cmd_buffer.c b/src/nouveau/vulkan/nvk_cmd_buffer.c
+index 626fbcb..e16998c 100644
+--- a/src/nouveau/vulkan/nvk_cmd_buffer.c
++++ b/src/nouveau/vulkan/nvk_cmd_buffer.c
+@@ -1373,17 +1373,34 @@ nvk_cmd_buffer_get_cbuf_addr(struct nvk_cmd_buffer *cmd,
+    }
+ 
+    case NVK_CBUF_TYPE_UBO_DESC: {
+-      if (desc->sets[cbuf->desc_set].type != NVK_DESCRIPTOR_SET_TYPE_PUSH)
+-         return false;
++      const struct nvk_descriptor_set_binding *binding =
++         &desc->sets[cbuf->desc_set];
++      const void *ubo_desc_data;
++      if (binding->type == NVK_DESCRIPTOR_SET_TYPE_PUSH) {
++         struct nvk_push_descriptor_set *push = binding->push;
++         if (push == NULL)
++            return false;
++
++         assert(cbuf->desc_offset < NVK_PUSH_DESCRIPTOR_SET_SIZE);
++         ubo_desc_data = &push->data[cbuf->desc_offset];
++      } else if (binding->type == NVK_DESCRIPTOR_SET_TYPE_SET) {
++         /* NVK_CPU_CBUF_BIND: the set's UBO descriptors cannot change while
++          * it is bound, so the CPU copy is what the GPU would read.
++          */
++         const struct nvk_descriptor_set *set = binding->set;
++         if (set == NULL || set->ubo_shadow == NULL ||
++             cbuf->desc_offset + sizeof(union nvk_buffer_descriptor) >
++                set->ubo_shadow_size_B)
++            return false;
+ 
+-      struct nvk_push_descriptor_set *push = desc->sets[cbuf->desc_set].push;
+-      if (push == NULL)
++         ubo_desc_data = (const char *)set->ubo_shadow + cbuf->desc_offset;
++      } else {
+          return false;
++      }
+ 
+-      assert(cbuf->desc_offset < NVK_PUSH_DESCRIPTOR_SET_SIZE);
+-      union nvk_buffer_descriptor desc;
+-      memcpy(&desc, &push->data[cbuf->desc_offset], sizeof(desc));
+-      *addr_out = nvk_ubo_descriptor_addr(pdev, desc);
++      union nvk_buffer_descriptor ubo_desc;
++      memcpy(&ubo_desc, ubo_desc_data, sizeof(ubo_desc));
++      *addr_out = nvk_ubo_descriptor_addr(pdev, ubo_desc);
+       return true;
+    }
+ 
+diff --git a/src/nouveau/vulkan/nvk_descriptor_set.c b/src/nouveau/vulkan/nvk_descriptor_set.c
+index 49a1cc5..d7261fa 100644
+--- a/src/nouveau/vulkan/nvk_descriptor_set.c
++++ b/src/nouveau/vulkan/nvk_descriptor_set.c
+@@ -33,6 +33,8 @@ struct nvk_descriptor_writer {
+    struct nvk_descriptor_set *set;
+    void *set_map;
+    uint32_t set_size_B;
++   void *shadow;
++   uint32_t shadow_size_B;
+    uint32_t dirty_start;
+    uint32_t dirty_end;
+ };
+@@ -70,6 +72,8 @@ nvk_descriptor_writer_init_set(const struct nvk_physical_device *pdev,
+    w->set = set;
+    w->set_map = set->map;
+    w->set_size_B = set->size_B;
++   w->shadow = set->ubo_shadow;
++   w->shadow_size_B = set->ubo_shadow_size_B;
+ }
+ 
+ static void
+@@ -130,6 +134,14 @@ write_desc(struct nvk_descriptor_writer *w, uint32_t binding, uint32_t elem,
+ {
+    void *dst = desc_ubo_data(w, binding, elem, desc_size);
+    memcpy(dst, desc_data, desc_size);
++
++   if (w->shadow != NULL) {
++      const uint32_t offset = (char *)dst - (char *)w->set_map;
++      if (offset < w->shadow_size_B) {
++         memcpy((char *)w->shadow + offset, desc_data,
++                MIN2(desc_size, w->shadow_size_B - offset));
++      }
++   }
+ }
+ 
+ static void
+@@ -593,6 +605,8 @@ nvk_descriptor_set_destroy(struct nvk_device *dev,
+    list_del(&set->link);
+    if (set->size_B > 0)
+       nvk_descriptor_pool_free(pool, set->mem_offset_B, set->size_B);
++   if (set->ubo_shadow != NULL)
++      vk_free(&dev->vk.alloc, set->ubo_shadow);
+    vk_descriptor_set_layout_unref(&dev->vk, &set->layout->vk);
+ 
+    vk_object_free(&dev->vk, NULL, set);
+@@ -800,6 +814,40 @@ nvk_descriptor_set_create(struct nvk_device *dev,
+       }
+    }
+ 
++   /* NVK_CPU_CBUF_BIND: see nvk_descriptor_set::ubo_shadow.  Sets in host
++    * only pools are never bound.
++    */
++   if (pdev->cpu_cbuf_bind && set->size_B > 0 && pool->host_mem == NULL &&
++       nvk_descriptor_set_layout_ubo_descs_on_cpu(layout)) {
++      uint32_t shadow_size_B = 0;
++      for (uint32_t b = 0; b < layout->binding_count; b++) {
++         const struct nvk_descriptor_set_binding_layout *binding =
++            &layout->binding[b];
++         if (binding->type != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER &&
++             binding->type != VK_DESCRIPTOR_TYPE_MUTABLE_EXT)
++            continue;
++
++         uint32_t array_size = binding->array_size;
++         if (binding->flags & VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT)
++            array_size = variable_count;
++
++         shadow_size_B = MAX2(shadow_size_B,
++                              binding->offset + array_size * binding->stride);
++      }
++      shadow_size_B = MIN2(shadow_size_B, set->size_B);
++
++      if (shadow_size_B > 0) {
++         set->ubo_shadow = vk_zalloc(&dev->vk.alloc, shadow_size_B, 16,
++                                     VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
++         if (set->ubo_shadow == NULL) {
++            nvk_descriptor_pool_free(pool, set->mem_offset_B, set->size_B);
++            vk_object_free(&dev->vk, NULL, set);
++            return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
++         }
++         set->ubo_shadow_size_B = shadow_size_B;
++      }
++   }
++
+    vk_descriptor_set_layout_ref(&layout->vk);
+    set->layout = layout;
+ 
+diff --git a/src/nouveau/vulkan/nvk_descriptor_set.h b/src/nouveau/vulkan/nvk_descriptor_set.h
+index 0e6bb9e..18653d9 100644
+--- a/src/nouveau/vulkan/nvk_descriptor_set.h
++++ b/src/nouveau/vulkan/nvk_descriptor_set.h
+@@ -46,6 +46,15 @@ struct nvk_descriptor_set {
+    uint64_t mem_offset_B;
+    uint32_t size_B;
+ 
++   /* NVK_CPU_CBUF_BIND: a system memory copy of the first ubo_shadow_size_B
++    * bytes of the set, which hold all of its UBO descriptors, so a draw can
++    * read them without reading the mapped pool memory (VRAM through the BAR
++    * on RM).  NULL when the layout's UBO descriptors may change after the
++    * set is bound (nvk_descriptor_set_layout_ubo_descs_on_cpu).
++    */
++   void *ubo_shadow;
++   uint32_t ubo_shadow_size_B;
++
+    union nvk_buffer_descriptor dynamic_buffers[];
+ };
+ 
+diff --git a/src/nouveau/vulkan/nvk_descriptor_set_layout.c b/src/nouveau/vulkan/nvk_descriptor_set_layout.c
+index 108b903..046f695 100644
+--- a/src/nouveau/vulkan/nvk_descriptor_set_layout.c
++++ b/src/nouveau/vulkan/nvk_descriptor_set_layout.c
+@@ -358,6 +358,15 @@ nvk_CreateDescriptorSetLayout(VkDevice device,
+          }
+       }
+    }
++
++   /* NVK_CPU_CBUF_BIND: whether the shaders get the UBOs of this set as
++    * bound cbufs depends on the layout flags, which are not hashed above.
++    */
++   if (pdev->cpu_cbuf_bind) {
++      const bool ubo_descs_on_cpu =
++         nvk_descriptor_set_layout_ubo_descs_on_cpu(layout);
++      BLAKE3_UPDATE_VALUE(ubo_descs_on_cpu);
++   }
+ #undef BLAKE3_UPDATE_VALUE
+ 
+    _mesa_blake3_final(&blake3_ctx, layout->vk.blake3);
+diff --git a/src/nouveau/vulkan/nvk_descriptor_set_layout.h b/src/nouveau/vulkan/nvk_descriptor_set_layout.h
+index 1948687..782e322 100644
+--- a/src/nouveau/vulkan/nvk_descriptor_set_layout.h
++++ b/src/nouveau/vulkan/nvk_descriptor_set_layout.h
+@@ -88,4 +88,29 @@ vk_to_nvk_descriptor_set_layout(struct vk_descriptor_set_layout *layout)
+    return container_of(layout, struct nvk_descriptor_set_layout, vk);
+ }
+ 
++/* Whether the UBO descriptors of a set with this layout are fixed from the
++ * time the set is bound until the command buffer completes, so a draw can
++ * read them on the CPU when it is recorded (NVK_CPU_CBUF_BIND).  Descriptor
++ * buffers can be written until the submit, and update-after-bind sets until
++ * the submit too.
++ */
++static inline bool
++nvk_descriptor_set_layout_ubo_descs_on_cpu(
++   const struct nvk_descriptor_set_layout *layout)
++{
++   if (layout->flags &
++       (VK_DESCRIPTOR_SET_LAYOUT_CREATE_DESCRIPTOR_BUFFER_BIT_EXT |
++        VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT))
++      return false;
++
++   for (uint32_t b = 0; b < layout->binding_count; b++) {
++      if (layout->binding[b].flags &
++          (VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT |
++           VK_DESCRIPTOR_BINDING_UPDATE_UNUSED_WHILE_PENDING_BIT))
++         return false;
++   }
++
++   return true;
++}
++
+ #endif
+diff --git a/src/nouveau/vulkan/nvk_nir_lower_descriptors.c b/src/nouveau/vulkan/nvk_nir_lower_descriptors.c
+index ad6b60d..ef94c2f 100644
+--- a/src/nouveau/vulkan/nvk_nir_lower_descriptors.c
++++ b/src/nouveau/vulkan/nvk_nir_lower_descriptors.c
+@@ -62,6 +62,7 @@ struct lower_descriptors_ctx {
+    bool indirect_bind;
+    bool has_task_shader;
+    bool ubo_desc_cbufs;
++   bool cpu_cbuf_bind;
+    nir_address_format ubo_addr_format;
+    nir_address_format ssbo_addr_format;
+ 
+@@ -460,8 +461,11 @@ build_cbuf_map(nir_shader *nir, struct lower_descriptors_ctx *ctx)
+           cbufs[i].key.type == NVK_CBUF_TYPE_UBO_DESC)
+          continue;
+ 
+-      /* See nvk_physical_device::ubo_desc_cbufs */
+-      if (!ctx->ubo_desc_cbufs && cbufs[i].key.type == NVK_CBUF_TYPE_UBO_DESC)
++      /* See nvk_physical_device::ubo_desc_cbufs and ::cpu_cbuf_bind */
++      if (!ctx->ubo_desc_cbufs && cbufs[i].key.type == NVK_CBUF_TYPE_UBO_DESC &&
++          !(ctx->cpu_cbuf_bind &&
++            nvk_descriptor_set_layout_ubo_descs_on_cpu(
++               ctx->set_layouts[cbufs[i].key.desc_set])))
+          continue;
+ 
+       /* Prior to Turing, indirect cbufs require splitting the pushbuf and
+@@ -1568,6 +1572,7 @@ nvk_nir_lower_descriptors(nir_shader *nir,
+          shader_flags & VK_SHADER_CREATE_INDIRECT_BINDABLE_BIT_EXT,
+       .has_task_shader = (shader_flags & VK_SHADER_CREATE_NO_TASK_SHADER_BIT_EXT) == 0,
+       .ubo_desc_cbufs = pdev->ubo_desc_cbufs,
++      .cpu_cbuf_bind = pdev->cpu_cbuf_bind,
+       .ssbo_addr_format = nvk_ssbo_addr_format(pdev, rs),
+       .ubo_addr_format = nvk_ubo_addr_format(pdev, rs),
+    };
+diff --git a/src/nouveau/vulkan/nvk_physical_device.c b/src/nouveau/vulkan/nvk_physical_device.c
+index 17dcc9b..ba488f1 100644
+--- a/src/nouveau/vulkan/nvk_physical_device.c
++++ b/src/nouveau/vulkan/nvk_physical_device.c
+@@ -1631,6 +1631,17 @@ nvk_create_physical_device_for_nvkmd(struct nvk_instance *instance,
+ #else
+    pdev->ubo_desc_cbufs = debug_get_bool_option("NVK_UBO_DESC_CBUF", true);
+ #endif
++   /* NVK_CPU_CBUF_BIND=1 (default off): UBO descriptors whose value the CPU
++    * knows when a draw is recorded are promoted to bound cbufs even without
++    * NVK_UBO_DESC_CBUF, and bound with plain methods instead of
++    * NVK_MME_BIND_CBUF_DESC: push descriptors, and descriptor sets whose
++    * layout rules out updates after binding (no UPDATE_AFTER_BIND or
++    * UPDATE_UNUSED_WHILE_PENDING), through a CPU copy of their UBO
++    * descriptors (nvk_descriptor_set::ubo_shadow). Descriptor buffers can be
++    * written until the submit (DXVK writes them on a worker thread), so
++    * their UBOs keep whatever NVK_UBO_DESC_CBUF says.
++    */
++   pdev->cpu_cbuf_bind = debug_get_bool_option("NVK_CPU_CBUF_BIND", false);
+ 
+    pdev->nak = nak_compiler_create(&pdev->info);
+    if (pdev->nak == NULL) {
+diff --git a/src/nouveau/vulkan/nvk_physical_device.h b/src/nouveau/vulkan/nvk_physical_device.h
+index 68e4ab0..5ebf188 100644
+--- a/src/nouveau/vulkan/nvk_physical_device.h
++++ b/src/nouveau/vulkan/nvk_physical_device.h
+@@ -47,6 +47,12 @@ struct nvk_physical_device {
+     * nvk_physical_device.c.
+     */
+    bool ubo_desc_cbufs;
++
++   /* NVK_CPU_CBUF_BIND: promote UBO descriptors the CPU knows at draw time
++    * (push descriptors, descriptor sets without update-after-bind) to bound
++    * cbufs and bind them from the CPU. See nvk_physical_device.c.
++    */
++   bool cpu_cbuf_bind;
+    bool ssbo_align_4b;
+ 
+    struct nvkmd_pdev *nvkmd;
+-- 
+2.43.0
+
