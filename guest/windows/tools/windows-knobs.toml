@@ -1001,6 +1001,11 @@ class = "experiment"
 read = "DXVK instance and device creation"
 effect = "Internal: the D3D11 bridge sets it to nvk for a process that runs on NVK on RM and clears it for Venus, before DXVK starts; DXVK then picks the NVK paths. A value set by hand is overwritten."
 
+[env.HELIOS_DXVK_DESCRIPTOR_REUSE]
+class = "experiment"
+read = "once per process"
+effect = "1: on the descriptor-buffer path (NVK), a dirty descriptor set takes the bindings of stages whose buffers or views are not dirty from its last write in the same submission, without looking up and tracking those resources again (third_party/patches/dxvk/0023). Read-only bindings only. Unset or another value: every binding of a dirty set is looked up and tracked."
+
 [env.HELIOS_DXVK_FOREIGN_IMPORT]
 class = "experiment"
 read = "DXVK device creation"
