@@ -1006,6 +1006,11 @@ class = "experiment"
 read = "once per process"
 effect = "1: on the descriptor-buffer path (NVK), a dirty descriptor set takes the bindings of stages whose buffers or views are not dirty from its last write in the same submission, without looking up and tracking those resources again (third_party/patches/dxvk/0023). Read-only bindings only. Unset or another value: every binding of a dirty set is looked up and tracked."
 
+[env.HELIOS_DXVK_DIRECT_IMAGE_MAPPING]
+class = "experiment"
+read = "once per process (D3D11 device creation)"
+effect = "1: a D3D11 device on NVK on RM uses DXVK's upstream default for d3d11.disableDirectImageMapping (false), so qualifying D3D11_USAGE_DYNAMIC textures are mapped directly instead of through a staging buffer and a copy at Unmap (third_party/patches/dxvk/0024). Venus devices keep direct mapping disabled. An explicit d3d11.disableDirectImageMapping (dxvk.conf, DXVK_CONFIG, app profile) wins. Unset or another value: disabled on every device."
+
 [env.HELIOS_DXVK_FOREIGN_IMPORT]
 class = "experiment"
 read = "DXVK device creation"

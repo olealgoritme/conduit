@@ -29,8 +29,8 @@ Classes:
 |---|---:|---:|---:|---:|---:|---:|
 | KMD: service key | 7 | 27 | 26 | 28 | 12 | 100 |
 | UMDs and ICD policy: `HKLM\SOFTWARE\Helios` | 20 | 19 | 25 | 11 | 0 | 75 |
-| Environment variables | 8 | 33 | 102 | 32 | 0 | 175 |
-| All | 35 | 79 | 153 | 71 | 12 | 350 |
+| Environment variables | 8 | 33 | 102 | 34 | 0 | 177 |
+| All | 35 | 79 | 153 | 73 | 12 | 352 |
 
 ## What the installation writes
 
@@ -446,13 +446,14 @@ Per-process: they act only on the process whose environment carries them (and it
 | `VKD3D_SHADER_CACHE_PATH` | `unset`; unset: the bridge sets it per process | first D3D12 device creation | vkd3d-proton's shader cache folder. When unset, the D3D12 bridge sets it to %LOCALAPPDATA%\Helios\vkd3d, else the temp folder, else 0 (no disk cache); a value already set, 0 included, is kept. | [vkd3d_bridge.cpp:1174](../guest/windows/umd12/bridge/vkd3d_bridge.cpp#L1174) |
 | `ZINK_VULKAN_ICD` | `unset` | once per process | The Vulkan ICD Zink loads on Windows: a DLL path, or loader for the Vulkan loader; unset loads NVK from next to the driver or the Helios install directory. | [0034-zink-load-a-Vulkan-ICD-directly-on-Windows-NVK-on-RM.patch:76](../guest/nvk-rm/patches-windows/0034-zink-load-a-Vulkan-ICD-directly-on-Windows-NVK-on-RM.patch#L76) |
 
-### Experiment, not for users (32)
+### Experiment, not for users (34)
 
 | Name | Default (code) | Read | Effect | Source |
 |---|---|---|---|---|
 | `HELIOS_D3D11_FRONTEND` | `unset` | once per process | 1 turns the D3D11 threaded front end on for this process, 0 turns it off; it wins over HKLM\SOFTWARE\Helios UmdThreadedFrontend. Other values fall through to the registry. See [d3d11-threaded-frontend.md](../guest/windows/docs/d3d11-threaded-frontend.md). | [knobs.rs:405](../guest/windows/umd/src/knobs.rs#L405) |
 | `HELIOS_DXVK_BACKEND` | `unset` | DXVK instance and device creation | Internal: the D3D11 bridge sets it to nvk for a process that runs on NVK on RM and clears it for Venus, before DXVK starts; DXVK then picks the NVK paths. A value set by hand is overwritten. *Note: our code sets it for the process ("", "nvk"): [dxvk_bridge.cpp:3537](../guest/windows/umd/bridge/dxvk_bridge.cpp#L3537), [dxvk_bridge.cpp:3541](../guest/windows/umd/bridge/dxvk_bridge.cpp#L3541).* | [0001-helios-nvk-backend-and-foreign-import.patch:105](../guest/windows/third_party/patches/dxvk/0001-helios-nvk-backend-and-foreign-import.patch#L105) |
 | `HELIOS_DXVK_DESCRIPTOR_REUSE` | `unset` | once per process | 1: on the descriptor-buffer path (NVK), a dirty descriptor set takes the bindings of stages whose buffers or views are not dirty from its last write in the same submission, without looking up and tracking those resources again (third_party/patches/dxvk/0023). Read-only bindings only. Unset or another value: every binding of a dirty set is looked up and tracked. | [0023-helios-descriptor-reuse-clean-stages.patch:63](../guest/windows/third_party/patches/dxvk/0023-helios-descriptor-reuse-clean-stages.patch#L63) |
+| `HELIOS_DXVK_DIRECT_IMAGE_MAPPING` | `unset` | once per process (D3D11 device creation) | 1: a D3D11 device on NVK on RM uses DXVK's upstream default for d3d11.disableDirectImageMapping (false), so qualifying D3D11_USAGE_DYNAMIC textures are mapped directly instead of through a staging buffer and a copy at Unmap (third_party/patches/dxvk/0024). Venus devices keep direct mapping disabled. An explicit d3d11.disableDirectImageMapping (dxvk.conf, DXVK_CONFIG, app profile) wins. Unset or another value: disabled on every device. | [0024-helios-nvk-direct-image-mapping.patch:55](../guest/windows/third_party/patches/dxvk/0024-helios-nvk-direct-image-mapping.patch#L55) |
 | `HELIOS_DXVK_FOREIGN_IMPORT` | `unset` | DXVK device creation | Internal: the D3D11 bridge sets it to 1 from HKLM\SOFTWARE\Helios ForeignImport (else empty) before the device is created; 1 lets a Venus DXVK device import NVK-made (foreign) resources through explicit DRM-modifier images. A value set by hand is overwritten. | [dxvk_bridge.cpp:3572](../guest/windows/umd/bridge/dxvk_bridge.cpp#L3572), [0001-helios-nvk-backend-and-foreign-import.patch:118](../guest/windows/third_party/patches/dxvk/0001-helios-nvk-backend-and-foreign-import.patch#L118) |
 | `HELIOS_FLUSH_GATE_HEFL` | `unset` | once per process | 1 also sends the HEFL flush-gate packet to the KMD at a shared-surface flush (needs the KMD capability). Unset or other: no HEFL. See [flush-gate.md](../guest/windows/docs/flush-gate.md). | [transfer.rs:490](../guest/windows/umd/src/forward/transfer.rs#L490) |
 | `HELIOS_HANDOFF_LEDGER` | `unset` | once per process | 1 (in every process sharing the surface) turns on the cross-process hand-off ledger for shared surfaces. Unset: the releaser CPU wait and Venus producer publication. See [shared-surfaces.md](../guest/windows/docs/shared-surfaces.md). | [transfer.rs:460](../guest/windows/umd/src/forward/transfer.rs#L460), [dxvk_bridge.cpp:705](../guest/windows/umd/bridge/dxvk_bridge.cpp#L705) |
