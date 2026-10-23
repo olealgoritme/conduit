@@ -1,0 +1,37 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "Thomas H.P. Andersen" <phomes@gmail.com>
+Date: Sun, 18 Oct 2026 16:50:43 +0200
+Subject: [PATCH] nak: fix insert order when annotate is off
+
+insert(1, ..) should be condtioned on whether annotation is enabled
+
+it got set to 1 by default when annotation was added in
+efc4ac0d27eec2e9c241accd95c396352e477d15
+
+Assisted-by: LLM
+Reviewed-by: Mel Henning <mhenning@darkrefraction.com>
+Part-of: <https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/45351>
+(cherry picked from commit 77781ae80d72d8202b73222ca181f5261027c5ce)
+---
+ src/nouveau/compiler/nak/opt_bar_prop.rs | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/src/nouveau/compiler/nak/opt_bar_prop.rs b/src/nouveau/compiler/nak/opt_bar_prop.rs
+index 27eb552a..5b0f882c 100644
+--- a/src/nouveau/compiler/nak/opt_bar_prop.rs
++++ b/src/nouveau/compiler/nak/opt_bar_prop.rs
+@@ -242,8 +242,10 @@ impl BarPropPass {
+                                         .into(),
+                                 }),
+                             );
++                            bmovs.insert(1, instr);
++                        } else {
++                            bmovs.insert(0, instr);
+                         }
+-                        bmovs.insert(1, instr);
+                         bmovs.into()
+                     }
+                 }
+-- 
+2.43.0
+
