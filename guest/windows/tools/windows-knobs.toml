@@ -1001,6 +1001,11 @@ class = "experiment"
 read = "DXVK instance and device creation"
 effect = "Internal: the D3D11 bridge sets it to nvk for a process that runs on NVK on RM and clears it for Venus, before DXVK starts; DXVK then picks the NVK paths. A value set by hand is overwritten."
 
+[env.HELIOS_DXVK_DIRECT_IMAGE_MAPPING]
+class = "experiment"
+read = "once per process (D3D11 device creation)"
+effect = "1: a D3D11 device on NVK on RM uses DXVK's upstream default for d3d11.disableDirectImageMapping (false), so qualifying D3D11_USAGE_DYNAMIC textures are mapped directly instead of through a staging buffer and a copy at Unmap (third_party/patches/dxvk/0024). Venus devices keep direct mapping disabled. An explicit d3d11.disableDirectImageMapping (dxvk.conf, DXVK_CONFIG, app profile) wins. Unset or another value: disabled on every device."
+
 [env.HELIOS_DXVK_FOREIGN_IMPORT]
 class = "experiment"
 read = "DXVK device creation"

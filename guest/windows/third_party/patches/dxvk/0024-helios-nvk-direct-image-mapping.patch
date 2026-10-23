@@ -1,0 +1,72 @@
+Helios DXVK fork: direct image mapping on NVK on RM (opt-in)
+
+Conduit guest/windows. Applied after 0022 by ci/windows/Build-Driver.ps1;
+it does not depend on 0023.
+
+The fork defaults d3d11.disableDirectImageMapping to true for every device.
+The reason is Venus-only. A direct-mapped image is LINEAR, host-visible and
+PREINITIALIZED, so it cannot carry VkExternalMemoryImageCreateInfo. vkr
+exports all host-visible memory anyway, the host NVIDIA driver drops the
+bind, and the GPU reads zeros. On NVK on RM (HELIOS_DXVK_BACKEND=nvk) there
+is no vkr. NVK makes external memory only for shared images. Direct mapping
+is used only for D3D11_USAGE_DYNAMIC textures: one mip and one layer, LINEAR
+supported, and one row, video-shaped or larger than 1 MiB.
+
+With the option on, every such texture goes through DXVK's DYNAMIC path:
+- Map(WRITE_DISCARD) gets a staging buffer.
+- Unmap records a buffer-to-image copy on the CS thread.
+- The copy runs outside a render pass, so an Unmap between draws ends the
+  render pass.
+- The GPU copies the data a second time.
+
+HELIOS_DXVK_DIRECT_IMAGE_MAPPING=1 gives an NVK device DXVK's upstream
+default, so direct mapping is allowed. A Venus device keeps the option on.
+d3d11.disableDirectImageMapping in a DXVK config, DXVK_CONFIG or an app
+profile still wins. The first device that has the knob logs one line.
+
+Default off: direct-mapped textures on NVK on RM have not been checked under
+the installed driver yet.
+
+diff --git a/src/d3d11/d3d11_options.cpp b/src/d3d11/d3d11_options.cpp
+index bf102080..bbb984c2 100644
+--- a/src/d3d11/d3d11_options.cpp
++++ b/src/d3d11/d3d11_options.cpp
+@@ -1,3 +1,6 @@
++#include <atomic>
++
++#include "../dxvk/dxvk_helios_backend.h"
+ #include "../util/util_math.h"
+ 
+ #include "d3d11_options.h"
+@@ -40,7 +43,30 @@ namespace dxvk {
+     // dwm's black wallpaper / solid-color / mica brush surfaces. Force every
+     // mappable image through the buffer-backed paths (which carry the
+     // matching handleTypes fix in vn_buffer.c).
+-    this->disableDirectImageMapping = config.getOption<bool>("d3d11.disableDirectImageMapping", true);
++    //
++    // Conduit: none of that exists on NVK on RM (HELIOS_DXVK_BACKEND=nvk):
++    // NVK makes no external memory unless DXVK asks for a shared image, and
++    // only D3D11_USAGE_DYNAMIC textures are mapped directly. With
++    // HELIOS_DXVK_DIRECT_IMAGE_MAPPING=1 an NVK device gets DXVK's own
++    // default (direct mapping allowed); a Venus device keeps it disabled.
++    // d3d11.disableDirectImageMapping in a DXVK config or app profile still
++    // wins.
++    static const bool s_heliosDirectImageMapping =
++      env::getEnvVar("HELIOS_DXVK_DIRECT_IMAGE_MAPPING") == "1";
++
++    const bool heliosDirectMap = s_heliosDirectImageMapping && heliosBackendNvk();
++
++    this->disableDirectImageMapping = config.getOption<bool>("d3d11.disableDirectImageMapping", !heliosDirectMap);
++
++    if (heliosDirectMap) {
++      static std::atomic<bool> s_heliosDirectMapLogged = { false };
++
++      if (!s_heliosDirectMapLogged.exchange(true)) {
++        Logger::info(str::format("Helios: NVK direct image mapping ",
++          this->disableDirectImageMapping ? "disabled by d3d11.disableDirectImageMapping"
++                                          : "allowed (HELIOS_DXVK_DIRECT_IMAGE_MAPPING=1)"));
++      }
++    }
+ 
+     // Clamp LOD bias so that people don't abuse this in unintended ways
+     this->samplerLodBias = dxvk::fclamp(this->samplerLodBias, -2.0f, 1.0f);
