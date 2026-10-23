@@ -36,6 +36,18 @@ if [[ -f "${series}" ]]; then
   done < "${series}"
 fi
 
+# mingw-w64 14 (MSYS2 crt r532 and later) moved the reference to
+# __mingw_fe_dfl_env into libmingwex.a(fesetenv.o) while the definition stays
+# in libmingw32.a(CRT_fp10.o). GCC lists -lmingw32 before -lmingwex, so a DLL
+# that pulls in fesetenv fails to link. Forcing the symbol undefined makes the
+# linker extract CRT_fp10.o when it scans libmingw32. 32-bit x86 C symbols
+# carry a leading underscore.
+case "${MSYSTEM:-}" in
+  MINGW32) fe_dfl_env='___mingw_fe_dfl_env' ;;
+  *)       fe_dfl_env='__mingw_fe_dfl_env' ;;
+esac
+export LDFLAGS="${LDFLAGS:+${LDFLAGS} }-Wl,-u,${fe_dfl_env}"
+
 setup_mode=()
 case "${build_mode}" in
   --clean)
