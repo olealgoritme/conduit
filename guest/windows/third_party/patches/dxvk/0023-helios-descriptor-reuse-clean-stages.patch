@@ -1,0 +1,238 @@
+Helios DXVK fork: descriptor-buffer set writes reuse the bindings of clean stages (opt-in)
+
+Conduit guest/windows. Applied after 0022 by ci/windows/Build-Driver.ps1.
+
+On NVK DXVK binds resources through descriptor buffers. Merged graphics
+pipelines have two sets, one for the views and one for the uniform buffers
+of all stages. When anything in a set is dirty, the whole set is written
+into new descriptor memory: for every binding the CS thread looks up the
+resource, its descriptor or buffer range, checks it for graphics stores and
+tracks it in the command list. Re-binding one constant buffer of the vertex
+shader re-reads and re-tracks every constant buffer of the pixel shader
+too, and one VS shader resource view does the same for every PS view. Each
+binding costs a few dependent loads into view, image and buffer objects on
+the CS thread.
+
+The dirty mask is kept per stage and class (buffer, view). With
+HELIOS_DXVK_DESCRIPTOR_REUSE=1 a set write keeps, per layout type and set,
+what each binding held (descriptor pointer or uniform buffer range). A
+binding whose stage and class are not dirty takes that value without the
+lookup and the tracking; the new set memory is still written whole by the
+descriptor worker, so nothing reads descriptor memory the GPU may use.
+Stage-local bind changes gain (XXSetConstantBuffers(1), XXSetShaderResources
+of one stage); a Map(WRITE_DISCARD) of a constant buffer dirties the buffers
+of every stage it may be bound to (invalidateBuffer), so it gains nothing.
+
+The stored values are used only:
+- for the same pipeline bindings and set layout, in the same submission
+  (tracking ID): a new command list, a render pass begin and a pipeline
+  change dirty all graphics stages, so the first write after them is a full
+  write and refreshes every entry;
+- on the graphics path without full hazard tracking (not compute, not
+  unsynchronized render passes);
+- for read-only bindings whose resource had no graphics stores when it was
+  written, no storage images or buffers, no implicit resolves and no shared
+  images (the Helios sampled-shared hook still sees each of those per write).
+
+A clean binding still holds the same view or buffer slice, so its descriptor
+(owned by the resource allocation's view map) and its range are what a
+full write would produce. Bindings of sets that are not dirty at all are
+never re-checked by DXVK either; this applies the same rule per stage.
+
+Default off: no measurement on NVK yet. The first context logs one line when
+it is on. The legacy descriptor-set path and the descriptor-heap path are
+unchanged.
+
+diff --git a/src/dxvk/dxvk_context.cpp b/src/dxvk/dxvk_context.cpp
+index 3db58a32..a6f7b5b4 100644
+--- a/src/dxvk/dxvk_context.cpp
++++ b/src/dxvk/dxvk_context.cpp
+@@ -1,4 +1,5 @@
+ #include <algorithm>
++#include <atomic>
+ #include <cmath>
+ #include <cstring>
+ #include <limits>
+@@ -35,6 +36,16 @@ namespace dxvk {
+       m_descriptorHeap = new DxvkResourceDescriptorHeap(device.ptr());
+ 
+       m_features.set(DxvkContextFeature::DescriptorBuffer);
++
++      // Helios: see HeliosDescriptorReuse in dxvk_context.h
++      static const bool s_heliosDescriptorReuse =
++        env::getEnvVar("HELIOS_DXVK_DESCRIPTOR_REUSE") == "1";
++      static std::atomic<bool> s_heliosDescriptorReuseLogged = { false };
++
++      m_heliosDescriptorReuseOn = s_heliosDescriptorReuse;
++
++      if (s_heliosDescriptorReuse && !s_heliosDescriptorReuseLogged.exchange(true))
++        Logger::info("Helios: descriptor writes reuse the bindings of clean stages (HELIOS_DXVK_DESCRIPTOR_REUSE=1)");
+     } else {
+       m_descriptorPool = new DxvkDescriptorPool(device.ptr());
+ 
+@@ -7534,14 +7545,58 @@ namespace dxvk {
+       heapOffsets[setIndex] = setStorage.offset >> pipelineLayout->getDescriptorOffsetShift();
+ 
+       // Allocate descriptor update entry to write descriptor pointers to
++      uint32_t uniformBufferCount = layout->getUniformBuffersInSet(pipelineLayoutType, setIndex).bindingCount;
++
+       auto e = m_descriptorWorker.allocEntry(setLayout, setStorage.mapPtr, range.bindingCount,
+-        layout->getUniformBuffersInSet(pipelineLayoutType, setIndex).bindingCount);
++        uniformBufferCount);
+ 
+       size_t bufferCount = 0u;
+ 
++      // Helios: HeliosDescriptorReuse (dxvk_context.h). Not where every
++      // binding is tracked for hazards (compute, unsynchronized passes).
++      HeliosDescriptorReuse* heliosReuse = nullptr;
++      bool heliosReuseValid = false;
++
++      if (!TrackBindings && unlikely(m_heliosDescriptorReuseOn)
++       && setIndex < DxvkDescriptorSets::SetCount) {
++        heliosReuse = &m_heliosDescriptorReuse[uint32_t(pipelineLayoutType)][setIndex];
++        heliosReuseValid = heliosReuse->layout == layout
++                        && heliosReuse->setLayout == setLayout
++                        && heliosReuse->trackingId == m_trackingId;
++
++        if (!heliosReuseValid) {
++          heliosReuse->layout = layout;
++          heliosReuse->setLayout = setLayout;
++          heliosReuse->trackingId = m_trackingId;
++          heliosReuse->descriptors.resize(range.bindingCount);
++          heliosReuse->buffers.resize(uniformBufferCount);
++          heliosReuse->reusable.assign(range.bindingCount, 0u);
++        }
++      }
++
+       for (uint32_t j = 0; j < range.bindingCount; j++) {
+         const auto& binding = range.bindings[j];
+ 
++        // A binding whose stage and class are clean is what this set's last
++        // write in this submission held: nothing re-bound it since, and the
++        // resource was tracked then.
++        if (heliosReuseValid && heliosReuse->reusable[j]
++         && !m_descriptorState.testDirtyMask(DxvkDescriptorState::computeMask(binding.getStageMask(),
++              binding.isUniformBuffer() ? DxvkDescriptorClass::Buffer : DxvkDescriptorClass::View))) {
++          if (binding.isUniformBuffer()) {
++            e.buffers[bufferCount] = heliosReuse->buffers[bufferCount];
++            bufferCount++;
++          } else {
++            e.descriptors[j] = heliosReuse->descriptors[j];
++          }
++
++          continue;
++        }
++
++        // Only read-only bindings of resources without graphics stores, and
++        // no implicit resolves or shared images, are reused.
++        bool heliosReusable = false;
++
+         if (binding.isUniformBuffer()) {
+           const auto& slice = this->getUniformBuffer(binding.getResourceIndex());
+           auto sliceInfo = slice.getSliceInfo();
+@@ -7554,6 +7609,8 @@ namespace dxvk {
+ 
+           if (likely(sliceInfo.size))
+             trackUniformBufferBinding<TrackBindings>(binding, slice);
++
++          heliosReusable = !sliceInfo.size || !slice.buffer()->hasGfxStores();
+         } else {
+           const auto& res = this->getResource(binding.getResourceIndex());
+ 
+@@ -7562,6 +7619,9 @@ namespace dxvk {
+               if (res.imageView && likely(e.descriptors[j] = res.imageView->getDescriptor(binding.getViewType()))) {
+                 if (likely(!res.imageView->isMultisampled() || binding.isMultisampled())) {
+                   trackImageViewBinding<TrackBindings, false>(binding, *res.imageView);
++
++                  heliosReusable = !res.imageView->hasGfxStores()
++                    && res.imageView->image()->info().sharing.mode == DxvkSharedHandleMode::None;
+                   break;
+                 } else if (m_device->config().enableImplicitResolves) {
+                   auto view = m_implicitResolves.getResolveView(*res.imageView, m_trackingId);
+@@ -7574,6 +7634,7 @@ namespace dxvk {
+               }
+ 
+               e.descriptors[j] = m_device->getDescriptorProperties().getNullDescriptor(VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE);
++              heliosReusable = !res.imageView;
+             } break;
+ 
+             case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE: {
+@@ -7588,10 +7649,13 @@ namespace dxvk {
+             case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER: {
+               if (res.bufferView && likely(e.descriptors[j] = res.bufferView->getDescriptor(false))) {
+                 trackBufferViewBinding<TrackBindings, false>(binding, *res.bufferView);
++
++                heliosReusable = !res.bufferView->buffer()->hasGfxStores();
+                 break;
+               }
+ 
+               e.descriptors[j] = m_device->getDescriptorProperties().getNullDescriptor(VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER);
++              heliosReusable = !res.bufferView;
+             } break;
+ 
+             case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER: {
+@@ -7606,10 +7670,13 @@ namespace dxvk {
+             case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER: {
+               if (res.bufferView && likely(e.descriptors[j] = res.bufferView->getDescriptor(true))) {
+                 trackBufferViewBinding<TrackBindings, false>(binding, *res.bufferView);
++
++                heliosReusable = !res.bufferView->buffer()->hasGfxStores();
+                 break;
+               }
+ 
+               e.descriptors[j] = m_device->getDescriptorProperties().getNullDescriptor(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);
++              heliosReusable = !res.bufferView;
+             } break;
+ 
+             case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER: {
+@@ -7625,6 +7692,15 @@ namespace dxvk {
+               /* Nothing to do */;
+           }
+         }
++
++        if (heliosReuse) {
++          heliosReuse->reusable[j] = uint8_t(heliosReusable);
++
++          if (binding.isUniformBuffer())
++            heliosReuse->buffers[bufferCount - 1u] = e.buffers[bufferCount - 1u];
++          else
++            heliosReuse->descriptors[j] = e.descriptors[j];
++        }
+       }
+     }
+ 
+diff --git a/src/dxvk/dxvk_context.h b/src/dxvk/dxvk_context.h
+index 5fb677e5..9f525221 100644
+--- a/src/dxvk/dxvk_context.h
++++ b/src/dxvk/dxvk_context.h
+@@ -1849,6 +1849,30 @@ namespace dxvk {
+ 
+     DxvkDescriptorCopyWorker m_descriptorWorker;
+ 
++    /**
++     * \brief Helios: what the last write of a descriptor set held
++     *
++     * HELIOS_DXVK_DESCRIPTOR_REUSE=1 (default off). A dirty set is written
++     * whole into new descriptor memory, but only the bindings whose stage
++     * and class (buffer or view) are dirty changed since its last write.
++     * The others take the descriptor pointer or the uniform buffer range
++     * stored here, without looking up the resource and tracking it again.
++     * Valid for the layout and the submission (tracking ID) it was written
++     * in; every new command list, render pass and pipeline dirties all
++     * graphics stages, so the first write after one is a full write.
++     */
++    struct HeliosDescriptorReuse {
++      const DxvkPipelineBindings*           layout      = nullptr;
++      const DxvkDescriptorSetLayout*        setLayout   = nullptr;
++      uint64_t                              trackingId  = 0u;
++      std::vector<const DxvkDescriptor*>    descriptors;
++      std::vector<DxvkDescriptorCopyBuffer> buffers;
++      std::vector<uint8_t>                  reusable;
++    };
++
++    std::array<std::array<HeliosDescriptorReuse, DxvkDescriptorSets::SetCount>, 3u> m_heliosDescriptorReuse;
++    bool                    m_heliosDescriptorReuseOn = false;
++
+     Rc<DxvkLatencyTracker>  m_latencyTracker;
+     uint64_t                m_latencyFrameId = 0u;
+     bool                    m_endLatencyTracking = false;
