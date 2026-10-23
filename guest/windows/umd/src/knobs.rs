@@ -418,6 +418,28 @@ pub(crate) fn frontend_ring_bytes() -> usize {
     (UMD_FRONTEND_RING_KIB.get().clamp(256, 65536) as usize) * 1024
 }
 
+/// `UmdPresentAhead` (ROADMAP T2, `docs/d3d11-threaded-frontend.md` 5.8): 0 (default) = a
+/// Present drains the threaded front end first (the worker replays the whole frame into DXVK
+/// before the present goes out). N = 1..16 = an NVK flip-model Present whose WDDM present
+/// carries an RM fence for a reserved value (`NvkAsyncPresentFence`) does not drain: the fence
+/// is made on the app thread, its signal is queued behind the frame's records, and the app
+/// thread waits only while more than N Presents are still queued on the worker. Larger values
+/// are 16. `HELIOS_UMD_PRESENT_AHEAD` overrides it per process.
+pub(crate) static UMD_PRESENT_AHEAD: DwordKnob = DwordKnob::new(c"UmdPresentAhead", 0);
+
+/// [`UMD_PRESENT_AHEAD`], or `HELIOS_UMD_PRESENT_AHEAD` from the environment, clamped to
+/// 0..=16. Read once per process.
+pub(crate) fn umd_present_ahead() -> u32 {
+    static CELL: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *CELL.get_or_init(|| {
+        std::env::var("HELIOS_UMD_PRESENT_AHEAD")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or_else(|| UMD_PRESENT_AHEAD.get())
+            .min(helios_umd_common::present_window::MAX_FRAMES as u32)
+    })
+}
+
 // --- NVK on RM (dxvk-on-nvk S3) ----------------------------------------------
 //
 // Which ICD a process runs on is decided in the bridge

@@ -223,6 +223,20 @@ mod ffi {
             copy: *mut u8,
             copy_len: usize,
         ) -> i32;
+        /// NVK (`UmdPresentAhead`): the presenting-thread half of
+        /// `nvk_present_fence_async`, a fence for the next value of the same
+        /// timeline (no copy record, no immediate context). 0 = the fence is
+        /// the caller's, 3 = not available here.
+        /// # Safety: both pointers are live writable storage.
+        unsafe fn nvk_present_fence_reserve(
+            self: &HeliosDxvkDevice,
+            fence_handle: *mut u32,
+            value: *mut u64,
+        ) -> i32;
+        /// NVK (`UmdPresentAhead`): the immediate-context half, after the
+        /// frame's records: flush, the submission thread signals `value` after
+        /// that submission. False when the device failed (`value` signalled).
+        fn nvk_present_fence_submit(self: &HeliosDxvkDevice, value: u64) -> bool;
         /// NVK: close a fence the caller still owns.
         fn nvk_rm_fence_close(self: &HeliosDxvkDevice, fence_handle: u32);
         /// Flush gate (docs/flush-gate.md): flush, then the point the HEFL
@@ -317,6 +331,14 @@ mod ffi {
         /// storage (memory + VkImage + KMT handles); the last takes the
         /// first's. The swap executes on the CS thread (ordered); no drain.
         unsafe fn rotate_resource_backings(
+            self: &HeliosDxvkDevice,
+            d3d11_resource_ptrs: *const usize,
+            count: usize,
+        ) -> bool;
+        /// `rotate_resource_backings`' checks that do not depend on the CS
+        /// thread (textures with images, one compatible ring); rotates nothing.
+        /// # Safety: as `rotate_resource_backings`.
+        unsafe fn rotate_resource_backings_ok(
             self: &HeliosDxvkDevice,
             d3d11_resource_ptrs: *const usize,
             count: usize,
@@ -1071,6 +1093,24 @@ impl BridgeDevice {
         }
     }
 
+    /// `UmdPresentAhead`: a fence for the next value of the present timeline, made on the
+    /// presenting thread without touching the immediate context; [`Self::nvk_present_fence_submit`]
+    /// queues its signal later. `None` when not available (nothing that needs a signal).
+    pub(crate) fn nvk_present_fence_reserve(&self) -> Option<(u32, u64)> {
+        let d = self.get()?;
+        let (mut fence, mut value) = (0u32, 0u64);
+        // SAFETY: the out-pointers borrow live locals for this synchronous call.
+        let r = unsafe { d.nvk_present_fence_reserve(&mut fence, &mut value) };
+        (r == 0 && fence != 0 && value != 0).then_some((fence, value))
+    }
+
+    /// `UmdPresentAhead`, on the thread that owns the immediate context: flush, and DXVK's
+    /// submission thread signals `value` right after that submission. False when the device
+    /// failed (the value is then signalled at once).
+    pub(crate) fn nvk_present_fence_submit(&self, value: u64) -> bool {
+        self.get().is_some_and(|d| d.nvk_present_fence_submit(value))
+    }
+
     pub(crate) fn nvk_rm_fence_close(&self, fence: u32) {
         if let Some(d) = self.get() {
             d.nvk_rm_fence_close(fence);
@@ -1311,6 +1351,20 @@ impl BridgeDevice {
     ) -> bool {
         self.get()
             .is_some_and(|d| unsafe { d.rotate_resource_backings(d3d11_resource_ptrs, count) })
+    }
+
+    /// Would [`Self::rotate_resource_backings`] take this ring (the checks that do not depend
+    /// on the CS thread)? Rotates nothing.
+    ///
+    /// # Safety
+    /// As [`Self::rotate_resource_backings`].
+    pub(crate) unsafe fn rotate_resource_backings_ok(
+        &self,
+        d3d11_resource_ptrs: *const usize,
+        count: usize,
+    ) -> bool {
+        self.get()
+            .is_some_and(|d| unsafe { d.rotate_resource_backings_ok(d3d11_resource_ptrs, count) })
     }
 
     /// # Safety

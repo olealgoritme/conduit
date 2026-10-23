@@ -18,6 +18,7 @@ use core::mem::size_of;
 use helios_umd_common::cmd_queue::CmdQueue;
 use helios_umd_common::cmd_record::FrontendSync;
 use helios_umd_common::frame_trace::{self, Acc, FrameTracer};
+use helios_umd_common::present_window::PresentWindow;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
@@ -78,6 +79,11 @@ struct Stats {
     present_drain_us: AtomicU64,
     present_drain_max_us: AtomicU64,
     present_drain_hist: [AtomicU64; 6],
+    /// `UmdPresentAhead`: Presents queued without a drain (their wait for the window is in the
+    /// drain figures above), those of them that waited, and rotations queued behind them.
+    queued_presents: AtomicU64,
+    queued_waits: AtomicU64,
+    queued_rotations: AtomicU64,
 }
 
 /// Present drains between two summary lines (a process that never destroys
@@ -107,6 +113,17 @@ pub(crate) struct Frontend {
     force: FrontendSync,
     /// `UmdFrameTrace`: per-Present timing records.
     trace: Option<Tracer>,
+    /// `UmdPresentAhead` non-zero: the Present records still queued on the worker. `None` =
+    /// every Present drains.
+    ahead: Option<std::sync::Mutex<PresentWindow>>,
+}
+
+thread_local! {
+    /// The front end whose Present drain the DXGI Present running on this thread still owes
+    /// (`UmdPresentAhead`): set by the Present wrappers, taken by `present.rs` where the Present
+    /// decides between queueing and draining ([`take_owed_present`]).
+    static OWED_PRESENT: core::cell::Cell<*const Frontend> =
+        const { core::cell::Cell::new(core::ptr::null()) };
 }
 
 /// `RtlDllShutdownInProgress`: process teardown has started, other threads
@@ -234,10 +251,12 @@ impl Frontend {
         q.set_abandon_check(dll_shutdown_in_progress);
         q.set_thread_init(producer_priority, apply_priority);
         let force = crate::knobs::frontend_sync();
+        let ahead = crate::knobs::umd_present_ahead();
         log_error!(
-            "D3D11 threaded front end: on (ring {} KiB, synchronous classes: {})",
+            "D3D11 threaded front end: on (ring {} KiB, synchronous classes: {}, UmdPresentAhead {})",
             q.capacity() / 1024,
-            force.names()
+            force.names(),
+            ahead
         );
         let trace = (crate::knobs::UMD_FRAME_TRACE.get() != 0).then(|| {
             let freq = qpc_freq();
@@ -254,6 +273,7 @@ impl Frontend {
             stats: Stats::default(),
             force,
             trace,
+            ahead: (ahead != 0).then(|| std::sync::Mutex::new(PresentWindow::new(ahead))),
         }
     }
 
@@ -290,14 +310,18 @@ impl Frontend {
         let hist: Vec<String> = s.present_drain_hist.iter().map(|a| r(a).to_string()).collect();
         format!(
             "D3D11 front end: {} | sync(calls/waited):{} | present drain: n={} avg_us={} max_us={} \
-             hist(<50/<200/<500/<1000/<2000/more)={} | discard={} no_overwrite={} discard_waits={} \
-             getdata_early={} getdata_hints={} errors={}/{} dropped",
+             hist(<50/<200/<500/<1000/<2000/more)={} | queued presents={} waited={} rotations={} \
+             | discard={} no_overwrite={} discard_waits={} getdata_early={} getdata_hints={} \
+             errors={}/{} dropped",
             self.q.summary(),
             sync,
             r(&s.presents),
             r(&s.present_drain_us) / presents,
             r(&s.present_drain_max_us),
             hist.join("/"),
+            r(&s.queued_presents),
+            r(&s.queued_waits),
+            r(&s.queued_rotations),
             r(&s.split_discard),
             r(&s.split_no_overwrite),
             r(&s.discard_waits),
@@ -375,7 +399,7 @@ impl Frontend {
 
     /// The drain before a Present, timed; every [`PRESENTS_PER_SUMMARY`]
     /// presents the summary goes to the log.
-    unsafe fn present_drain(&self, h: Hdevice) {
+    pub(crate) unsafe fn present_drain(&self, h: Hdevice) {
         let t0 = std::time::Instant::now();
         let q0 = self.trace.as_ref().map(|_| qpc());
         // Spin (no sleep/wake handshake) for the frame's tail: the worker is
@@ -391,6 +415,51 @@ impl Frontend {
                 self.enter(h);
             }
         }
+        self.note_present(t0, q0);
+    }
+
+    /// `UmdPresentAhead`: does this front end queue eligible Presents instead of draining?
+    #[inline(always)]
+    pub(crate) fn presents_ahead(&self) -> bool {
+        self.ahead.is_some()
+    }
+
+    /// Queue `f` (a DXGI call's immediate-context half, `UmdPresentAhead`) behind everything
+    /// recorded so far. Returns the position past it (0 when it ran inline).
+    ///
+    /// # Safety
+    /// As every record: `f` runs on the worker with the device alive (destruction drains).
+    pub(crate) unsafe fn queue_dxgi(&self, f: impl FnOnce() + 'static) -> u64 {
+        unsafe { self.record0(move |_| f()) }
+    }
+
+    /// A rotation queued with [`queue_dxgi`](Self::queue_dxgi) (counted only).
+    pub(crate) fn note_queued_rotation(&self) {
+        self.stats.queued_rotations.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The end of a Present queued at `pos` instead of drained: report a stashed worker error,
+    /// then wait only if more than `UmdPresentAhead` Presents are still queued on the worker.
+    /// Timed and traced as the drain it replaces.
+    pub(crate) unsafe fn present_queued(&self, h: Hdevice, pos: u64) {
+        let t0 = std::time::Instant::now();
+        let q0 = self.trace.as_ref().map(|_| qpc());
+        unsafe { self.enter(h) };
+        self.stats.queued_presents.fetch_add(1, Ordering::Relaxed);
+        let wait = self
+            .ahead
+            .as_ref()
+            .and_then(|w| lock_ignore_poison(w).push(pos, self.q.done()));
+        if let Some(p) = wait {
+            if self.q.wait_done_spinning(p, PRESENT_DRAIN_SPIN) {
+                self.stats.queued_waits.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        self.note_present(t0, q0);
+    }
+
+    /// The Present's share of the stats and the frame trace (`present_drain`, `present_queued`).
+    fn note_present(&self, t0: std::time::Instant, q0: Option<u64>) {
         let us = t0.elapsed().as_micros() as u64;
         if let (Some(t), Some(q0)) = (&self.trace, q0) {
             let (full_n, full_us) = self.q.full_waits();
@@ -1782,17 +1851,105 @@ macro_rules! sync_dxgi {
     };
 }
 
-sync_dxgi!(fe_dxgi_present => dxgi_present, DXGI_DDI_ARG_PRESENT, present);
+/// `UmdPresentAhead`: a single-surface Present of an NVK device runs with its drain owed instead
+/// of paid up front. `present.rs` takes the debt where the Present decides
+/// ([`take_owed_present`]): a Present it queues pays nothing but the window
+/// ([`Frontend::present_queued`]), any other drains there, before its first immediate-context
+/// use. A Present that returns before deciding (a removed device, a refused argument) drains
+/// here after it, so no Present leaves without one or the other.
+unsafe fn present_owing(
+    fe: &Frontend,
+    h: Hdevice,
+    single_surface: bool,
+    call: impl FnOnce() -> i32,
+) -> i32 {
+    let nvk = unsafe { helios_device(h) }.is_some_and(|d| d.dxvk.is_nvk());
+    if !fe.presents_ahead() || !single_surface || !nvk {
+        unsafe { fe.present_drain(h) };
+        return call();
+    }
+    OWED_PRESENT.with(|c| c.set(fe as *const Frontend));
+    let hr = call();
+    if !OWED_PRESENT.with(|c| c.replace(core::ptr::null())).is_null() {
+        unsafe { fe.present_drain(h) };
+    }
+    hr
+}
+
+/// The front end whose Present drain the current Present owes, if it is `h`'s
+/// ([`present_owing`]). The caller now owes it: it either queues the Present
+/// ([`Frontend::present_queued`]) or calls [`Frontend::present_drain`] before it
+/// touches the immediate context.
+pub(crate) unsafe fn take_owed_present<'a>(h: Hdevice) -> Option<&'a Frontend> {
+    let fe = unsafe { fe_of(h) }?;
+    let owed = OWED_PRESENT.with(|c| c.get());
+    if owed.is_null() || !core::ptr::eq(owed, fe) {
+        return None;
+    }
+    OWED_PRESENT.with(|c| c.set(core::ptr::null()));
+    Some(fe)
+}
+
+unsafe extern "system" fn fe_dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT) -> i32 {
+    if !arg.is_null() {
+        let h = unsafe { dxgi_device_handle((*arg).hDevice) };
+        if let Some(fe) = unsafe { fe_of(h) } {
+            let call = || unsafe { dxgi_present(arg) };
+            return unsafe { present_owing(fe, h, true, call) };
+        }
+    }
+    unsafe { dxgi_present(arg) }
+}
+
+unsafe extern "system" fn fe_dxgi_present1(arg: *mut ddi::DXGI_DDI_ARG_PRESENT1) -> i32 {
+    if !arg.is_null() {
+        let h = unsafe { dxgi_device_handle((*arg).hDevice) };
+        if let Some(fe) = unsafe { fe_of(h) } {
+            let single = unsafe { (*arg).SurfacesToPresent == 1 };
+            let call = || unsafe { dxgi_present1(arg) };
+            return unsafe { present_owing(fe, h, single, call) };
+        }
+    }
+    unsafe { dxgi_present1(arg) }
+}
+
+unsafe extern "system" fn fe_dxgi_present1_6_1(arg: *mut ddi::DXGI1_6_1_DDI_ARG_PRESENT) -> i32 {
+    if !arg.is_null() {
+        let h = unsafe { dxgi_device_handle((*arg).hDevice) };
+        if let Some(fe) = unsafe { fe_of(h) } {
+            let single = unsafe { (*arg).SurfacesToPresent == 1 };
+            let call = || unsafe { dxgi_present1_6_1(arg) };
+            return unsafe { present_owing(fe, h, single, call) };
+        }
+    }
+    unsafe { dxgi_present1_6_1(arg) }
+}
+
+/// `RotateResourceIdentities`: with `UmdPresentAhead` an NVK device's rotation is queued behind
+/// the Presents it follows ([`dxgi_rotate_resource_identities_queued`]); otherwise it drains.
+unsafe extern "system" fn fe_dxgi_rotate_resource_identities(
+    arg: *mut ddi::DXGI_DDI_ARG_ROTATE_RESOURCE_IDENTITIES,
+) -> i32 {
+    if !arg.is_null() {
+        let h = unsafe { dxgi_device_handle((*arg).hDevice) };
+        if let Some(fe) = unsafe { fe_of(h) } {
+            if fe.presents_ahead() && unsafe { helios_device(h) }.is_some_and(|d| d.dxvk.is_nvk()) {
+                unsafe { fe.enter(h) };
+                return unsafe { dxgi_rotate_resource_identities_queued(arg, fe) };
+            }
+            unsafe { fe.sync_enter(h, SyncReason::Dxgi) };
+        }
+    }
+    unsafe { dxgi_rotate_resource_identities(arg) }
+}
+
 sync_dxgi!(fe_dxgi_set_display_mode => dxgi_set_display_mode, DXGI_DDI_ARG_SETDISPLAYMODE);
-sync_dxgi!(fe_dxgi_rotate_resource_identities => dxgi_rotate_resource_identities, DXGI_DDI_ARG_ROTATE_RESOURCE_IDENTITIES);
 sync_dxgi!(fe_dxgi_blt => dxgi_blt, DXGI_DDI_ARG_BLT);
 sync_dxgi!(fe_dxgi_resolve_shared_resource => dxgi_resolve_shared_resource, DXGI_DDI_ARG_RESOLVESHAREDRESOURCE);
 sync_dxgi!(fe_dxgi_blt1 => dxgi_blt1, DXGI_DDI_ARG_BLT1);
 sync_dxgi!(fe_dxgi_offer_resources => dxgi_offer_resources, DXGI_DDI_ARG_OFFERRESOURCES);
 sync_dxgi!(fe_dxgi_reclaim_resources => dxgi_reclaim_resources, DXGI_DDI_ARG_RECLAIMRESOURCES);
 sync_dxgi!(fe_dxgi_present_mpo => dxgi_present_mpo, DXGI_DDI_ARG_PRESENTMULTIPLANEOVERLAY, present);
-sync_dxgi!(fe_dxgi_present1 => dxgi_present1, DXGI_DDI_ARG_PRESENT1, present);
-sync_dxgi!(fe_dxgi_present1_6_1 => dxgi_present1_6_1, DXGI1_6_1_DDI_ARG_PRESENT, present);
 sync_dxgi!(fe_dxgi_offer_resources1 => dxgi_offer_resources1, DXGI_DDI_ARG_OFFERRESOURCES1);
 sync_dxgi!(fe_dxgi_reclaim_resources1 => dxgi_reclaim_resources1, DXGI_DDI_ARG_RECLAIMRESOURCES1);
 sync_dxgi!(fe_dxgi_present_mpo1 => dxgi_present_mpo1, DXGI1_6_1_DDI_ARG_PRESENTMULTIPLANEOVERLAY, present);

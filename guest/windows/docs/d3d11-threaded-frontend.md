@@ -101,7 +101,7 @@ Every immediate-context entry point is in exactly one class.
 |---|---|---|
 | **deferred** | snapshot args, push a closure, return | `*SetShader`, `*SetConstantBuffers{,1}`, `*SetShaderResources`, `*SetSamplers`, IA binds, `SetRenderTargets`, viewports/scissors, blend/depth/raster state, `CsSetUnorderedAccessViews`, `SoSetTargets`, `SetPredication`, all draws and dispatches, clears, `Discard`, `ClearView`, copies, resolve, `GenMips`, `CopyStructureCount`, `QueryBegin/End`, buffer `UpdateSubresourceUP`, `Flush` (no shared resources), `CommandListExecute` (phase 2; synchronous in phase 1) |
 | **split** | answer now, defer the rest | `Map(WRITE_DISCARD/NO_OVERWRITE)` of a dynamic buffer and its `Unmap`, `QueryGetData`, object destruction |
-| **synchronous** | `drain()`, then the unchanged forward call on the app thread | `Map` of everything else (staging, `READ`, `WRITE`, textures), texture `UpdateSubresourceUP`, the DXGI DDIs that order against rendering (`Present`, `Present1`, MPO presents, `Blt`, `Blt1`, `RotateResourceIdentities`, `SetDisplayMode`, `ResolveSharedResource`, offer/reclaim), `Flush` with shared resources, `Discard` of a buffer, `AcquireResource/ReleaseResource`, `CommandListExecute` (phase 1), resource destruction (waits for the worker, then runs on the calling thread); tiled-resource DDIs, markers and video DDIs through the safety net |
+| **synchronous** | `drain()`, then the unchanged forward call on the app thread | `Map` of everything else (staging, `READ`, `WRITE`, textures), texture `UpdateSubresourceUP`, the DXGI DDIs that order against rendering (`Present`, `Present1`, MPO presents, `Blt`, `Blt1`, `RotateResourceIdentities`, `SetDisplayMode`, `ResolveSharedResource`, offer/reclaim; with `UmdPresentAhead` an NVK flip-model `Present` and `RotateResourceIdentities` are split instead, 5.8), `Flush` with shared resources, `Discard` of a buffer, `AcquireResource/ReleaseResource`, `CommandListExecute` (phase 1), resource destruction (waits for the worker, then runs on the calling thread); tiled-resource DDIs, markers and video DDIs through the safety net |
 | **device-level** | unchanged, inline, concurrent with the worker | `Create*`, `Open*`, `Calc*`, `Check*`, `RetrieveSubObject`, `RelocateDeviceFuncs`, the free-threaded `RecycleDestroyCommandList` / `RecycleCreate*`, the caps-only DXGI DDIs |
 
 "Synchronous" means the ring is drained, not that the worker is idle: it may still be running queued destructions,
@@ -280,8 +280,39 @@ creates + `RotateResourceIdentities`) are DXGI calls or resource lifetime calls 
 
 The cost is that the app waits at `Present` for the worker's tail of the frame. Because the worker runs concurrently
 with the app's recording, the tail is the worker's lag behind the app (the last records of the frame), not the frame's
-front-end work. Deferring `Present` itself (letting the app start frame N+1 while the worker presents N) needs the
-present callback on the worker (`pfnSetAsyncCallbacksCb`) and is out of scope.
+front-end work.
+
+**`UmdPresentAhead` (opt-in, default 0; ROADMAP T2).** With N = 1..16 an NVK Present does not drain when it can be
+split at the immediate context, so the app records frame N+1 while the worker replays frame N:
+
+- **Which Presents.** `Present` and single-surface `Present1` of an NVK device (not dwm.exe), flip-model (`Flip`
+  flag, no `Blt`), no DXGI destination, a composed frame whose WDDM present carries the RM fence of the asynchronous
+  fence path (`NvkRmFencePresent`, `NvkAsyncPresentFence`, an ICD with ECL fences, not `NvkComposedComplete`, not
+  NVK's scanout 0). A fullscreen primary under independent flip and a borderless flip-model window take this path;
+  the queued-presents count in the summary line says whether a game does.
+  Every other Present drains as above; the first time each reason applies the log says why (`UmdPresentAhead: a
+  present drains the front end: ...`).
+- **The split.** The app thread reserves the next value of the device's present ECL timeline, makes its RM fence
+  (`nvk_present_fence_reserve`, no immediate context) and sends the WDDM present with the fence in its marker, as the
+  asynchronous fence path does. The immediate-context half goes into the ring behind the frame's records: `Flush`,
+  `HeliosSubmitFrameThen` with the timeline signal (`nvk_present_fence_submit`), the Blt-source mark. The runtime
+  callbacks (`pfnRenderCb`, `pfnPresentCb`) stay on the app thread inside the DDI call.
+- **Ordering.** The signal is attached by the worker after it replayed every record of the frame, so DXVK's submission
+  thread runs it right after the submission that carries the frame, as before; the KMD shows the buffer only after the
+  fence fires. Values are reserved in Present order on one thread and signalled in ring order, which is the same
+  order; a Present that drains instead reserves its value after the drain emitted every queued signal.
+- **Rotation.** `RotateResourceIdentities` of such a device does not drain either: the DXVK storage rotation and the
+  `FlipLedger` key refresh go into the ring (they apply between the records before and after the DDI, as the drained
+  call orders them on the immediate context), the WDDM identity records rotate at once on the app thread (the next
+  Present names its allocation from them). The shape checks of the storage rotation run first
+  (`rotate_resource_backings_ok`), so a ring the bridge would refuse is refused before anything moves.
+- **The bound.** After the WDDM present the app thread waits only while more than N Present records are still queued
+  on the worker (`umd_common::present_window`, the same spin-then-sleep wait as the drain). DXGI's own frame-latency
+  wait (`SetMaximumFrameLatency`) is not touched: it runs in the runtime on the presents' retirement, as before.
+- **Not split.** The copy-engine Present record is left out (a flip-model present has no KMD Blt, and the record would
+  describe the texture's storage before a queued rotation swapped it). Blt-model and copied presents keep the drain:
+  their KMD copy claims the source in the read ledger at the present, and the frame's own last command list, still
+  queued, could wait on the GPU for that claim.
 
 ### 5.9 Shared resources, KMT handles
 
@@ -325,6 +356,10 @@ The bridge exposes them as `fe_map_discard`, `fe_buffer_map_ptr`, `fe_emit_inval
 - `HKLM\SOFTWARE\Helios\UmdThreadedFrontend` (DWORD): 1 = on for every process except dwm.exe (default), 0 = off,
   2 = on including dwm.exe. Process override `HELIOS_D3D11_FRONTEND=0|1`.
 - `UmdFrontendRingKiB` (DWORD, default 4096, clamped 256–65536).
+- `UmdPresentAhead` (DWORD, default 0, max 16): 0 = every Present drains; N = eligible NVK Presents are queued and the
+  app thread runs at most N of them ahead of the worker (5.8). Process override `HELIOS_UMD_PRESENT_AHEAD=N`. The
+  start-up line names the value in force; the summary line counts `queued presents`, how many of them `waited` for
+  the window, and queued `rotations` (their wait time is in the `present drain` figures).
 - `HELIOS_FE_WORKER_POLL_PAUSES` (process environment, default 32, max 4096): pause instructions between two looks at
   the producer's write cursor while the worker waits on an empty ring. Every look pulls the producer's cache line to the
   worker, and the next push pays a cache-line transfer to publish; spaced looks let records run in batches. 0 or 1 =
@@ -364,7 +399,7 @@ The bridge exposes them as `fe_map_discard`, `fe_buffer_map_ptr`, `fe_emit_inval
    GetData; synchronous everything else with the `d3d11_context` safety net; DXVK patch 0018 (with the worker's
    pre-allocated discard slices).
 2. Texture `UpdateSubresourceUP` payloads; `CommandListExecute` if CS2 shows it (until then synchronous).
-3. Split resource destruction; tune spin/park; consider deferring `Present`.
+3. Split resource destruction; tune spin/park; `Present` without the drain (`UmdPresentAhead`, opt-in, 5.8).
 
 ## 9. Measuring
 
