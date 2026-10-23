@@ -1,0 +1,615 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Sat, 24 Oct 2026 01:42:59 +0200
+Subject: [PATCH] nak: schedule for memory-level parallelism (NAK_SCHED_MLP)
+
+NAK's prepass scheduler puts a load about ten instructions above its
+use, even when the load does not depend on the computation in between.
+With few warps, as in a dispatch of one to five workgroups, nothing then
+hides the latency. A warp waits for its independent loads one at a time,
+and after a barrier's L1 invalidate every one of them is an L2 round
+trip. In a shader with an integer chain and 27 independent loads,
+NVIDIA's code issues 25 of the loads within its first ~170 instructions
+(35 GPRs). NAK's code issues each load right before its use, all into one
+register on one scoreboard (24 GPRs), and a 5-workgroup dispatch of it
+costs 6.5 us after a barrier against NVIDIA's 2.4 us (RTX 5090).
+
+Causes, and what NAK_SCHED_MLP changes:
+
+- The prepass's list scheduler records when an instruction becomes ready
+  (instr_info), but enters it in the future-ready set at the graph's
+  static ready cycle, which is 0 in the prepass. So no edge latency ever
+  delays anything, and a load becomes ready as soon as its use is placed.
+  With the knob, the future-ready set takes the recorded cycle.
+- estimate_variable_latency() models a global, local, texture or surface
+  access as 32 cycles, an L1 hit. Levels 1-3 model it as 320/240 (1) or
+  640/480 (2, 3) cycles (memory / texture and surface).
+- Level 3 also hoists: while registers are below the scheduling threshold,
+  the prepass (and the post-RA scheduler) prefer every other instruction,
+  ready now or soon, over a memory access. Both walk backwards, so the
+  accesses rise as far as their operands allow.
+- Read-only accesses (constant-order loads, texture reads) are not ordered
+  against the shader's other memory operations in the prepass graph.
+  Barriers still order them.
+- When all six scoreboards are busy, a variable-latency instruction shares
+  one (as NAK_BAR_SHARE) instead of waiting for the oldest.
+- Occupancy: the occupancy target (NAK_OCC_TARGET) is chosen on the plain
+  schedule, and the shader is then scheduled again for that target with
+  loads in flight. A unit whose MLP schedule does not fit the register
+  target falls back to the plain schedule for the same target, so the
+  knob does not cross an occupancy cliff.
+
+The knob (0-3, default 0) is part of nak_knobs_key() (bits 18-19) and so
+of NVK's shader cache key.
+
+Offline (drm-shim, GB202), the test shader at level 3 has 28 of 28 loads
+in flight at 40 GPRs and 48 warps, against 1 of 28 at level 0. On the
+Steel Nomad corpus (115 compute, 136 fragment, 41 vertex shaders),
+level 3 against level 0: instructions +0.8% (compute), +0.1% (fragment),
++3% (vertex), from register copies around vector destinations; memory
+spills 8 -> 2 (compute) and 14 -> 30 (fragment); average warps per SM
+41.5 -> 41.9 (compute) and unchanged elsewhere.
+---
+ src/nouveau/compiler/nak/api.rs               |  20 ++-
+ src/nouveau/compiler/nak/calc_instr_deps.rs   |   8 +-
+ src/nouveau/compiler/nak/knobs.rs             |  30 ++++
+ .../compiler/nak/opt_instr_sched_common.rs    |  77 +++++++++-
+ .../compiler/nak/opt_instr_sched_postpass.rs  |  20 +++
+ .../compiler/nak/opt_instr_sched_prepass.rs   | 131 +++++++++++++++---
+ 6 files changed, 264 insertions(+), 22 deletions(-)
+
+diff --git a/src/nouveau/compiler/nak/api.rs b/src/nouveau/compiler/nak/api.rs
+index 2b1e57e..58ada35 100644
+--- a/src/nouveau/compiler/nak/api.rs
++++ b/src/nouveau/compiler/nak/api.rs
+@@ -544,7 +544,15 @@ fn nak_compile_shader_internal(
+     // NAK_GPR_CAP overrides the occupancy target of its stage
+     let gpr_cap = s.gpr_cap();
+     let occ_target = occ_target_enabled();
+-    s.opt_instr_sched_prepass_target(gpr_cap);
++    // NAK_SCHED_MLP: the occupancy target is chosen on the plain schedule
++    // (a schedule with loads in flight costs more to bring down), then the
++    // shader is scheduled again for it with loads in flight
++    let mlp = crate::knobs::sched_mlp();
++    let mlp_later = mlp > 0 && occ_target && gpr_cap.is_none();
++    s.opt_instr_sched_prepass_target_mlp(
++        gpr_cap,
++        if mlp_later { 0 } else { mlp },
++    );
+     if DEBUG.print() {
+         eprintln!("NAK IR after opt_instr_sched_prepass:\n{}", &s);
+     }
+@@ -553,7 +561,7 @@ fn nak_compile_shader_internal(
+         gpr_target = s.choose_gpr_target();
+         if let Some(t) = gpr_target {
+             // Schedule again for the target so there is less to spill
+-            s.opt_instr_sched_prepass_target(Some(t));
++            s.opt_instr_sched_prepass_target_mlp(Some(t), mlp);
+             if DEBUG.print() {
+                 eprintln!(
+                     "NAK IR after opt_instr_sched_prepass for {} GPRs:\n{}",
+@@ -561,6 +569,14 @@ fn nak_compile_shader_internal(
+                     &s
+                 );
+             }
++        } else if mlp_later {
++            s.opt_instr_sched_prepass_target_mlp(None, mlp);
++            if DEBUG.print() {
++                eprintln!(
++                    "NAK IR after opt_instr_sched_prepass (NAK_SCHED_MLP):\n{}",
++                    &s
++                );
++            }
+         }
+     }
+     s.assign_regs_target(gpr_target, occ_target);
+diff --git a/src/nouveau/compiler/nak/calc_instr_deps.rs b/src/nouveau/compiler/nak/calc_instr_deps.rs
+index 46c1634..c0c48f1 100644
+--- a/src/nouveau/compiler/nak/calc_instr_deps.rs
++++ b/src/nouveau/compiler/nak/calc_instr_deps.rs
+@@ -746,7 +746,9 @@ fn assign_barriers(f: &mut Function, sm: &ShaderModelInfo) {
+             if deps.dep_is_waited_after(rd_dep, bi, ip) {
+                 let rd_bar = match bars.try_find_free_bar() {
+                     Some(b) => b,
+-                    None if crate::knobs::bar_share() => {
++                    None if crate::knobs::bar_share()
++                        || crate::knobs::sched_mlp() > 0 =>
++                    {
+                         bars.share_some_bar(None)
+                     }
+                     None => {
+@@ -762,7 +764,9 @@ fn assign_barriers(f: &mut Function, sm: &ShaderModelInfo) {
+             if deps.dep_is_waited_after(wr_dep, bi, ip) {
+                 let wr_bar = match bars.try_find_free_bar() {
+                     Some(b) => b,
+-                    None if crate::knobs::bar_share() => {
++                    None if crate::knobs::bar_share()
++                        || crate::knobs::sched_mlp() > 0 =>
++                    {
+                         bars.share_some_bar(my_rd)
+                     }
+                     None => {
+diff --git a/src/nouveau/compiler/nak/knobs.rs b/src/nouveau/compiler/nak/knobs.rs
+index 7ac2fbc..e9c83d4 100644
+--- a/src/nouveau/compiler/nak/knobs.rs
++++ b/src/nouveau/compiler/nak/knobs.rs
+@@ -64,6 +64,10 @@
+ //!   in convergent control flow, where its uniform values can use the
+ //!   uniform datapath (nak_nir_lower_early_exit.c).  0 keeps the divergent
+ //!   if or the loop around the whole body
++//! - NAK_SCHED_MLP (0-3, default 0): global, local and texture accesses are
++//!   modeled with their real latencies in the instruction schedulers, so
++//!   independent loads issue early and stay in flight together; scoreboards
++//!   are shared when all six are busy (sched_mlp())
+ 
+ use std::env;
+ use std::sync::OnceLock;
+@@ -103,6 +107,31 @@ static UNIFORM_ATOMICS: OnceLock<bool> = OnceLock::new();
+ static F16_CVT: OnceLock<bool> = OnceLock::new();
+ static LOOP_CONT_SYNC: OnceLock<bool> = OnceLock::new();
+ static EARLY_EXIT: OnceLock<bool> = OnceLock::new();
++static SCHED_MLP: OnceLock<u32> = OnceLock::new();
++
++/// NAK_SCHED_MLP (0-3, default 0): memory-level parallelism in the
++/// instruction schedulers.  The schedulers model a global, local or
++/// texture access as 32 cycles, so a load is placed about ten instructions
++/// before its use, and a warp whose loads do not depend on each other still
++/// waits for them one at a time.  With 1, 2 or 3 they are modeled as
++/// 160/120, 320/240 or 640/480 cycles (global and local memory/texture and
++/// surface), so independent loads are issued as early as their operands and
++/// the register target allow, and a variable-latency instruction that finds
++/// all six scoreboards busy shares one (as NAK_BAR_SHARE) instead of waiting
++/// for the oldest
++pub fn sched_mlp() -> u32 {
++    let v = SCHED_MLP.get_or_init(|| match env::var("NAK_SCHED_MLP") {
++        Ok(s) => match s.trim().parse::<u32>() {
++            Ok(v) if v <= 3 => v,
++            _ => {
++                eprintln!("NAK: ignoring NAK_SCHED_MLP=\"{}\" (not 0-3)", s);
++                0
++            }
++        },
++        Err(_) => 0,
++    });
++    *v
++}
+ 
+ /// NAK_IMM_CSE for a shader: compute shaders unless set
+ pub fn imm_cse(compute: bool) -> bool {
+@@ -303,4 +332,5 @@ pub extern "C" fn nak_knobs_key() -> u32 {
+         | (u32::from(f16_cvt()) << 15)
+         | (u32::from(!loop_cont_sync()) << 16)
+         | (u32::from(early_exit()) << 17)
++        | (sched_mlp() << 18)
+ }
+diff --git a/src/nouveau/compiler/nak/opt_instr_sched_common.rs b/src/nouveau/compiler/nak/opt_instr_sched_common.rs
+index d1e5553..093e61a 100644
+--- a/src/nouveau/compiler/nak/opt_instr_sched_common.rs
++++ b/src/nouveau/compiler/nak/opt_instr_sched_common.rs
+@@ -255,11 +255,78 @@ pub fn estimate_block_weight(cfg: &CFG<BasicBlock>, block_idx: usize) -> u64 {
+ /// Memory instructions were copied from L1 data cache latencies.
+ /// For instructions not mentioned in the paper, I made up numbers.
+ /// This could probably be improved.
++/// NAK_SCHED_MLP: what a global, local, texture or surface access costs
++/// once it misses L1 (an L2 round trip and more), not the 32 cycles of an
++/// L1 hit, so the schedulers put independent loads far enough ahead of
++/// their uses to have several in flight.  1: 320 cycles (memory) / 240
++/// (texture, surface); 2 and 3: 640 / 480
++fn mlp_latency(op: &Op, level: u32) -> Option<u32> {
++    if level == 0 {
++        return None;
++    }
++    let (mem, tex) = match level {
++        1 => (320, 240),
++        _ => (640, 480),
++    };
++    if is_mlp_mem(op) {
++        Some(if matches!(op, Op::Ld(_) | Op::Atom(_)) { mem } else { tex })
++    } else {
++        None
++    }
++}
++
++/// NAK_SCHED_MLP: a read of memory that nothing the shader does can
++/// change (a constant-order load: read-only buffers; a texture read), which
++/// needs no order against the shader's other memory operations
++pub fn is_read_only_mem(op: &Op) -> bool {
++    match op {
++        Op::Ld(ld) => matches!(ld.access.order, MemOrder::Constant),
++        Op::Tex(_)
++        | Op::Tld(_)
++        | Op::Tld4(_)
++        | Op::Tmml(_)
++        | Op::Txd(_)
++        | Op::Txq(_) => true,
++        _ => false,
++    }
++}
++
++/// A global or local memory, texture or surface access whose result
++/// NAK_SCHED_MLP schedules for: what misses L1 and goes to L2 or further
++pub fn is_mlp_mem(op: &Op) -> bool {
++    match op {
++        Op::Ld(ld) => !matches!(ld.access.space, MemSpace::Shared),
++        Op::Atom(atom) => !matches!(atom.mem_space, MemSpace::Shared),
++        Op::Tex(_)
++        | Op::Tld(_)
++        | Op::Tld4(_)
++        | Op::Tmml(_)
++        | Op::Txd(_)
++        | Op::SuLd(_)
++        | Op::SuAtom(_)
++        | Op::SuLdGa(_) => true,
++        _ => false,
++    }
++}
++
+ pub fn estimate_variable_latency(sm: &ShaderModelInfo, op: &Op) -> u32 {
++    estimate_variable_latency_mlp(sm, op, crate::knobs::sched_mlp())
++}
++
++/// estimate_variable_latency() at a given NAK_SCHED_MLP level
++pub fn estimate_variable_latency_mlp(
++    sm: &ShaderModelInfo,
++    op: &Op,
++    mlp: u32,
++) -> u32 {
+     if !sm.op_needs_scoreboard(op) {
+         return 0;
+     }
+ 
++    if let Some(latency) = mlp_latency(op, mlp) {
++        return latency;
++    }
++
+     match op {
+         // Multi-function unit
+         Op::Rro(_) | Op::MuFu(_) => 15,
+@@ -353,6 +420,10 @@ pub struct NodeLabel {
+     pub ready_cycle: u32,
+ 
+     pub exec_latency: u32,
++
++    /// NAK_SCHED_MLP=3 (post-RA scheduler): a memory access that goes as
++    /// early as its operands and registers allow, ahead of the critical path
++    pub mlp_first: bool,
+ }
+ 
+ pub struct EdgeLabel {
+@@ -401,7 +472,11 @@ impl ReadyInstr {
+         // NodeLabel::cycles_to_end is cycles from the beginning of the
+         // instruction to the top of the block, but we want from the end of the
+         // instruction to the top of the block
+-        let cycles_to_end = label.cycles_to_end + label.exec_latency;
++        let mut cycles_to_end = label.cycles_to_end + label.exec_latency;
++        if label.mlp_first {
++            // The schedulers walk backwards: lowest priority puts it first
++            cycles_to_end = 0;
++        }
+         ReadyInstr {
+             cycles_to_end,
+             index: i,
+diff --git a/src/nouveau/compiler/nak/opt_instr_sched_postpass.rs b/src/nouveau/compiler/nak/opt_instr_sched_postpass.rs
+index 8f5ce6b..71f5b5d 100644
+--- a/src/nouveau/compiler/nak/opt_instr_sched_postpass.rs
++++ b/src/nouveau/compiler/nak/opt_instr_sched_postpass.rs
+@@ -132,6 +132,8 @@ fn generate_dep_graph(sm: &ShaderModelInfo, instrs: &[Instr]) -> DepGraph {
+         let label = &mut g.nodes[ip].label;
+         label.exec_latency = sm.exec_latency(&instr.op);
+         label.ready_cycle = ready_cycle;
++        label.mlp_first =
++            crate::knobs::sched_mlp() >= 3 && is_mlp_mem(&instr.op);
+     }
+ 
+     g
+@@ -162,6 +164,24 @@ fn generate_order(
+             future_ready_instrs.pop();
+         }
+ 
++        // NAK_SCHED_MLP=3: with only memory accesses ready, an instruction
++        // that becomes ready later goes first (we walk backwards, so the
++        // accesses end up earlier)
++        if ready_instrs
++            .peek()
++            .is_some_and(|r| g.nodes[r.index].label.mlp_first)
++        {
++            let later = future_ready_instrs
++                .iter()
++                .filter(|f| !g.nodes[f.index].label.mlp_first)
++                .max()
++                .cloned();
++            if let Some(f) = later {
++                current_cycle = max(current_cycle, f.ready_cycle.0);
++                continue;
++            }
++        }
++
+         // Pick a ready instruction
+         let next_idx = match ready_instrs.pop() {
+             None => match future_ready_instrs.peek() {
+diff --git a/src/nouveau/compiler/nak/opt_instr_sched_prepass.rs b/src/nouveau/compiler/nak/opt_instr_sched_prepass.rs
+index d2d7904..c654e44 100644
+--- a/src/nouveau/compiler/nak/opt_instr_sched_prepass.rs
++++ b/src/nouveau/compiler/nak/opt_instr_sched_prepass.rs
+@@ -5,8 +5,9 @@ use crate::api::{GetDebugFlags, DEBUG};
+ use crate::ir::*;
+ use crate::liveness::{BlockLiveness, LiveSet, Liveness, SimpleLiveness};
+ use crate::opt_instr_sched_common::{
+-    calc_statistics, estimate_variable_latency, side_effect_type, DepGraph,
+-    EdgeLabel, FutureReadyInstr, ReadyInstr, SideEffect,
++    calc_statistics, estimate_variable_latency_mlp, is_mlp_mem,
++    is_read_only_mem, side_effect_type,
++    DepGraph, EdgeLabel, FutureReadyInstr, ReadyInstr, SideEffect,
+ };
+ use rustc_hash::FxHashMap;
+ use std::cmp::Reverse;
+@@ -65,7 +66,11 @@ fn next_occupancy_cliff_with_reserved(
+         - reserved
+ }
+ 
+-fn generate_dep_graph(sm: &ShaderModelInfo, instrs: &[Instr]) -> DepGraph {
++fn generate_dep_graph(
++    sm: &ShaderModelInfo,
++    instrs: &[Instr],
++    mlp: u32,
++) -> DepGraph {
+     let mut g = DepGraph::new((0..instrs.len()).map(|_| Default::default()));
+ 
+     let mut defs = FxHashMap::<SSAValue, (usize, usize)>::default();
+@@ -90,6 +95,10 @@ fn generate_dep_graph(sm: &ShaderModelInfo, instrs: &[Instr]) -> DepGraph {
+                 }
+                 last_barrier_op = Some(ip);
+             }
++            SideEffect::Memory if mlp > 0 && is_read_only_mem(&instr.op) => {
++                // NAK_SCHED_MLP: nothing to order against; barriers still
++                // order it (above)
++            }
+             SideEffect::Memory => {
+                 if let Some(mem_ip) = last_memory_op {
+                     g.add_edge(mem_ip, ip, EdgeLabel { latency: 0 });
+@@ -124,7 +133,7 @@ fn generate_dep_graph(sm: &ShaderModelInfo, instrs: &[Instr]) -> DepGraph {
+                                     &instr.op,
+                                     i,
+                                 ),
+-                                estimate_variable_latency(sm, &def_instr.op),
++                                estimate_variable_latency_mlp(sm, &def_instr.op, mlp),
+                             )
+                         };
+ 
+@@ -142,7 +151,7 @@ fn generate_dep_graph(sm: &ShaderModelInfo, instrs: &[Instr]) -> DepGraph {
+                 } else {
+                     max(
+                         sm.paw_latency(&def_instr.op, def_idx),
+-                        estimate_variable_latency(sm, &def_instr.op),
++                        estimate_variable_latency_mlp(sm, &def_instr.op, mlp),
+                     )
+                 };
+ 
+@@ -378,6 +387,8 @@ struct GenerateOrder<'a> {
+     net_live: NetLive,
+     live: LiveSet,
+     instrs: &'a [Instr],
++    /// NAK_SCHED_MLP level of this attempt (0: the plain schedule)
++    mlp: u32,
+ }
+ 
+ impl<'a> GenerateOrder<'a> {
+@@ -385,6 +396,7 @@ impl<'a> GenerateOrder<'a> {
+         max_regs: PerRegFile<i32>,
+         instrs: &'a [Instr],
+         live_out: &LiveSet,
++        mlp: u32,
+     ) -> Self {
+         let net_live = NetLive::new(instrs, live_out);
+         let live: LiveSet = live_out.clone();
+@@ -394,6 +406,7 @@ impl<'a> GenerateOrder<'a> {
+             net_live,
+             live,
+             instrs,
++            mlp,
+         }
+     }
+ 
+@@ -515,8 +528,44 @@ impl<'a> GenerateOrder<'a> {
+                 <= thresholds.heuristic_threshold
+                 && used_regs[RegFile::Pred] < self.max_regs[RegFile::Pred]
+             {
+-                let ReadyInstr { index, .. } = ready_instrs.pop_last().unwrap();
+-                index
++                // NAK_SCHED_MLP=3: while registers are free, every other
++                // ready instruction goes below a memory access (we walk
++                // backwards), so the accesses rise as far as their operands
++                // allow and are in flight together
++                let deferred = if self.mlp >= 3 {
++                    ready_instrs
++                        .iter()
++                        .rev()
++                        .find(|r| !is_mlp_mem(&self.instrs[r.index].op))
++                        .cloned()
++                } else {
++                    None
++                };
++                // With only accesses ready, an instruction that becomes
++                // ready later still goes first: time moves on to it
++                let later = if self.mlp >= 3
++                    && deferred.is_none()
++                {
++                    future_ready_instrs
++                        .iter()
++                        .rev()
++                        .find(|f| !is_mlp_mem(&self.instrs[f.index].op))
++                        .cloned()
++                } else {
++                    None
++                };
++                if let Some(r) = deferred {
++                    ready_instrs.remove(&r);
++                    r.index
++                } else if let Some(f) = later {
++                    future_ready_instrs.remove(&f);
++                    current_cycle = max(current_cycle, f.ready_cycle.0);
++                    f.index
++                } else {
++                    let ReadyInstr { index, .. } =
++                        ready_instrs.pop_last().unwrap();
++                    index
++                }
+             } else {
+                 let (new_score, ready_instr) = ready_instrs
+                     .iter()
+@@ -579,8 +628,21 @@ impl<'a> GenerateOrder<'a> {
+                 );
+                 dep_instr.num_uses -= 1;
+                 if dep_instr.num_uses <= 0 {
+-                    future_ready_instrs
+-                        .insert(FutureReadyInstr::new(g, edge.head_idx));
++                    // NAK_SCHED_MLP: the instruction becomes ready when the
++                    // latencies of the edges to its scheduled uses have
++                    // passed (instr_info), not at the graph's static ready
++                    // cycle, which no edge latency ever reaches; without
++                    // this, a load is ready as soon as its use is placed and
++                    // lands right above it
++                    let fri = if self.mlp > 0 {
++                        FutureReadyInstr {
++                            ready_cycle: Reverse(dep_instr.ready_cycle),
++                            index: edge.head_idx,
++                        }
++                    } else {
++                        FutureReadyInstr::new(g, edge.head_idx)
++                    };
++                    future_ready_instrs.insert(fri);
+                 }
+             }
+ 
+@@ -646,9 +708,10 @@ fn sched_buffer(
+     live_in_count: PerRegFile<u32>,
+     live_out: &LiveSet,
+     thresholds: ScheduleThresholds,
++    mlp: u32,
+ ) -> Option<InstructionOrder> {
+     let (mut new_order, live_in_count2) = GenerateOrder::new(
+-        max_regs, instrs, live_out,
++        max_regs, instrs, live_out, mlp,
+     )
+     .generate_order(&graph.g, &graph.init_ready_list, thresholds)?;
+ 
+@@ -669,8 +732,8 @@ struct ScheduleUnitGraph {
+ }
+ 
+ impl ScheduleUnitGraph {
+-    fn new(sm: &ShaderModelInfo, instrs: &[Instr]) -> Self {
+-        let mut g = generate_dep_graph(sm, instrs);
++    fn new(sm: &ShaderModelInfo, instrs: &[Instr], mlp: u32) -> Self {
++        let mut g = generate_dep_graph(sm, instrs, mlp);
+ 
+         let init_ready_list = calc_statistics(&mut g);
+ 
+@@ -703,6 +766,8 @@ struct ScheduleUnit {
+     branch: Option<Instr>,
+ 
+     graph: Option<ScheduleUnitGraph>,
++    /// NAK_SCHED_MLP: the graph with the plain latencies, for the fallback
++    plain_graph: Option<ScheduleUnitGraph>,
+ }
+ 
+ impl ScheduleUnit {
+@@ -712,21 +777,42 @@ impl ScheduleUnit {
+         max_regs: PerRegFile<i32>,
+         schedule_type: ScheduleType,
+         thresholds: ScheduleThresholds,
++        mlp: u32,
+     ) {
+         let graph = self
+             .graph
+-            .get_or_insert_with(|| ScheduleUnitGraph::new(sm, &self.instrs));
++            .get_or_insert_with(|| ScheduleUnitGraph::new(sm, &self.instrs, mlp));
+ 
+         self.last_tried_schedule_type = Some(schedule_type);
+-        let new_order = sched_buffer(
++        let mut new_order = sched_buffer(
+             max_regs,
+             &self.instrs,
+             graph,
+             self.live_in_count.unwrap(),
+             self.live_out.as_ref().unwrap(),
+             thresholds,
++            mlp,
+         );
+ 
++        // NAK_SCHED_MLP: a schedule that keeps loads in flight needs more
++        // registers; where it does not fit the register target, the plain
++        // schedule for the same target is used, so the knob never costs
++        // occupancy
++        if new_order.is_none() && mlp > 0 {
++            let plain = self
++                .plain_graph
++                .get_or_insert_with(|| ScheduleUnitGraph::new(sm, &self.instrs, 0));
++            new_order = sched_buffer(
++                max_regs,
++                &self.instrs,
++                plain,
++                self.live_in_count.unwrap(),
++                self.live_out.as_ref().unwrap(),
++                thresholds,
++                0,
++            );
++        }
++
+         if let Some(x) = new_order {
+             self.new_order = Some(x);
+         }
+@@ -825,6 +911,7 @@ impl Function {
+         &mut self,
+         sm: &ShaderModelInfo,
+         max_regs: PerRegFile<i32>,
++        mlp: u32,
+     ) {
+         let liveness = SimpleLiveness::for_function(self);
+         let mut live_out_sets: Vec<LiveSet> = Vec::new();
+@@ -956,7 +1043,7 @@ impl Function {
+                 let schedule_type = *schedule_types.last().unwrap();
+                 let thresholds = schedule_type.thresholds(max_regs, u);
+ 
+-                u.schedule(sm, max_regs, schedule_type, thresholds);
++                u.schedule(sm, max_regs, schedule_type, thresholds, mlp);
+ 
+                 if u.new_order.is_some() {
+                     // Success!
+@@ -990,7 +1077,7 @@ impl Function {
+                 && u.last_tried_schedule_type != Some(schedule_type)
+             {
+                 let thresholds = schedule_type.thresholds(max_regs, &u);
+-                u.schedule(sm, max_regs, schedule_type, thresholds);
++                u.schedule(sm, max_regs, schedule_type, thresholds, mlp);
+             }
+ 
+             block.instrs = u.to_instrs();
+@@ -1044,6 +1131,16 @@ impl Shader<'_> {
+     /// hardware-reserved ones), as for NAK_GPR_CAP or the occupancy target;
+     /// None schedules for the hardware maximum.
+     pub fn opt_instr_sched_prepass_target(&mut self, gpr_target: Option<u32>) {
++        let mlp = crate::knobs::sched_mlp();
++        self.opt_instr_sched_prepass_target_mlp(gpr_target, mlp);
++    }
++
++    /// opt_instr_sched_prepass_target() at a given NAK_SCHED_MLP level
++    pub fn opt_instr_sched_prepass_target_mlp(
++        &mut self,
++        gpr_target: Option<u32>,
++        mlp: u32,
++    ) {
+         if DEBUG.annotate() {
+             self.remove_annotations();
+         }
+@@ -1069,7 +1166,7 @@ impl Shader<'_> {
+         max_regs[RegFile::GPR] -= SW_RESERVED_GPRS;
+ 
+         for f in &mut self.functions {
+-            f.opt_instr_sched_prepass(self.sm, max_regs);
++            f.opt_instr_sched_prepass(self.sm, max_regs, mlp);
+         }
+     }
+ }
+-- 
+2.43.0
+

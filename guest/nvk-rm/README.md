@@ -104,6 +104,7 @@ Patch numbers are file numbers in the directory named in the patch tables.
 | `NAK_PHI_AVOID` | 1 | new values stay out of the registers the block's phi copies want (common 62) |
 | `NAK_F16_CVT` | 1 | scalar f16 conversions on SM86+ run on the ALU (F2FP) and FMA (HADD2.F32) pipes instead of F2F on the quarter-rate conversion pipe (common 74) |
 | `NAK_EARLY_EXIT` | 1 | in compute shaders, the lanes that leave early exit and the rest runs in convergent control flow with uniform registers; 0 keeps the divergent if or loop around the body (common 77) |
+| `NAK_SCHED_MLP` | 0 | 1-3: the schedulers model global, local and texture latency as an L2 round trip (320/640 cycles) instead of 32, so independent loads issue early and stay in flight together; 3 also hoists them as far as their operands allow; read-only accesses are not ordered against stores; scoreboards are shared when all six are busy; never costs occupancy (common 83) |
 | `NAK_LOOP_CONT_SYNC` | 0 | 1 syncs lanes at the end of every divergent loop iteration; off, loops without a continue skip that sync (common 75) |
 | `NAK_UNROLL_MAX` | 32 | most iterations NIR fully unrolls a loop with a known trip count (common 65) |
 | `NAK_VEC_CSE` | 1 | the copies that make a splat a register vector serve its later uses in the block (common 66) |
@@ -402,6 +403,7 @@ backend. Numbers are file numbers (there is no 0016 or 0025).
 | 0076 | NAK: the GPR copy of a uniform value that the legalizer makes serves the block's non-ALU uses too (`NAK_DEBUG=noucse` makes a copy per use) |
 | 0077 | NAK: in compute shaders, a trailing loop that never iterates and a trailing divergent if with a small guarded side become an early exit (EXIT for the lanes that leave) followed by the rest of the shader at the top level, where its uniform values use the uniform datapath; the rematerializer, `nak_nir_opt_uniform_address` and divergent top-level loops follow (`NAK_EARLY_EXIT=0` restores the old structure; part of the shader cache key) |
 | 0082 | QMDs from the latency-bound upload stream next to the compute root tables, so on Windows they are in CPU-mapped VRAM and a dependent dispatch no longer waits for a system memory read after a barrier's idle (`NVK_QMD_LAT`, default on on Windows); opt-in `NVK_DISPATCH_INDIRECT_PREFETCH` (prefetchable indirect argument copies after the first one since a barrier) and `NVK_BARRIER_DEDUP` (no second shader data invalidate after a storage-write flush). Measured with `tools/dispcost` |
+| 0083 | NAK: `NAK_SCHED_MLP` (0-3, default 0): the prepass enters an instruction in its future-ready set at the cycle its edge latencies give (it used the graph's static cycle, so no latency ever delayed anything), memory/texture latencies of an L2 round trip, level 3 hoists accesses ahead of everything else while registers are free (prepass and post-RA), read-only accesses unordered against other memory operations, shared scoreboards when all six are busy; the occupancy target is chosen on the plain schedule and a unit that does not fit its register target keeps the plain schedule; part of the shader cache key |
 
 ## Per-draw cost (common 0001-0007)
 
