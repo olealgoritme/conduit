@@ -8,7 +8,6 @@ insert(1, ..) should be condtioned on whether annotation is enabled
 it got set to 1 by default when annotation was added in
 efc4ac0d27eec2e9c241accd95c396352e477d15
 
-Assisted-by: LLM
 Reviewed-by: Mel Henning <mhenning@darkrefraction.com>
 Part-of: <https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/45351>
 (cherry picked from commit 77781ae80d72d8202b73222ca181f5261027c5ce)

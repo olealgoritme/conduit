@@ -9,7 +9,6 @@ off. The result was still correct but we missed the perf oportunity.
 
 This fixes it and adds mme tests for it
 
-Assisted-by: LLM
 Reviewed-by: Mel Henning <mhenning@darkrefraction.com>
 Part-of: <https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/45264>
 (cherry picked from commit 0f737d4e20d9aabc5164d04c94edf6488db003c5)
