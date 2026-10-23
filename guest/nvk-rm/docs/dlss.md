@@ -21,8 +21,8 @@ default|dlss|fsr|xess` pick between them.
 | NVK: CUDA cubins without libelf (patches-windows 0066) | done, tested on 1490 real cubins |
 | NVK: `Dlss` / `NVK_DLSS` switch for VK_NVX_binary_import (patches-windows 0067) | done |
 | DXVK: NVX extensions on Windows (`HELIOS_DXVK_NVX`, DXVK 0025) | done |
-| NVK: a module's whole code, its globals and constant banks 2-4 (patches-common 0078) | done, compiles, not run on a GPU |
-| NVK: SASS from the host-built cubin cache (patches-common 0079) | done, compiles; keys checked against the host tool on 240 real modules |
+| NVK: a module's whole code, its globals and constant banks 2-4 (patches-common 0084) | done, compiles, not run on a GPU |
+| NVK: SASS from the host-built cubin cache (patches-common 0085) | done, compiles; keys checked against the host tool on 240 real modules |
 | Host tool `nvk-cubin-cache.py` (PTX to sm_120 SASS) | done; all 261 PTX-only modules of the 310.9.16 DLLs compile on the host, none with anything NVK refuses |
 | `conduit upscaler`, ctl op `upscaler`, tray, viewer menu row | done, unit tests |
 | `Install-OptiScaler.ps1` (per-game, user-downloaded OptiScaler) | written, not run |
@@ -109,7 +109,7 @@ guest/nvk-rm/tools/cubin-cache/nvk-cubin-cache.py build -o cubin nvngx_dlss.dll 
   return and call addresses into the instructions of 19 of the 261 modules
   (the SR input/output kernels that call `__cuda_sm20_*` math slow paths),
   which NVK cannot relocate; with it those calls go through an address in
-  bank 4, which NVK fills (0078).
+  bank 4, which NVK fills (0084).
 - `--limit N` compiles at most N modules (a quick check).
 - Python 3.8+, standard library only. Tests:
   `python3 -m unittest -v test_nvk_cubin_cache` (in the tool's folder; CI runs
@@ -121,10 +121,10 @@ redistribute it.
 
 On the host (RTX 5090, driver 610.57.04) the 261 PTX-only modules of the
 three 310.9.16 DLLs compile in about a minute. Their cubins use banks 2-4,
-module globals and subroutine calls through bank 4, all of which 0078 loads;
+module globals and subroutine calls through bank 4, all of which 0084 loads;
 `scan`/`build` report none that NVK would refuse.
 
-In the guest, NVK (0079) looks in `NVK_CUBIN_CACHE_DIR`, else the registry
+In the guest, NVK (0085) looks in `NVK_CUBIN_CACHE_DIR`, else the registry
 `HKLM\SOFTWARE\Helios` `CubinCache` (REG_SZ), else
 `%ProgramData%\Helios\ngx\cubin`. A hit logs `NVK: CUDA module sm_120 SASS
 from the cubin cache (<key>, PTX sm_89)`; a miss logs the file it looked for.
@@ -140,7 +140,7 @@ modules in `nvngx_dlss.dll` 310.9.16, 66 read the addresses of module globals
 (`.nv.global`, `.nv.global.init`) from constant bank 4, filled through
 `R_CUDA_64` relocations, and others read compiler constants from bank 2 or
 `__constant__` data from bank 3. Upstream NVK binds only bank 0, so those
-kernels read zeros. 0078 puts the globals and banks 1-7 of each module in one
+kernels read zeros. 0084 puts the globals and banks 1-7 of each module in one
 GPU buffer, applies the relocations into them and binds the banks at launch.
 A relocation of another type, or one in kernel code, fails the module with a
 message rather than running with a wrong address (none of the shipped or JIT
@@ -319,13 +319,13 @@ Run:
 
 - `nv_cubin_elf` (0066): synthetic cubins and 1490 real cubins (DLSS 3.5.10
   and 310.9.1) parse the same as with libelf, under ASan/UBSan.
-- 0078 and 0079 compile (`-fsyntax-only`, `-Wall`) for x86_64 and i686 MinGW
+- 0084 and 0085 compile (`-fsyntax-only`, `-Wall`) for x86_64 and i686 MinGW
   and native Linux.
-- 0078's ELF reader, placement and relocation pass (extracted into a test
+- 0084's ELF reader, placement and relocation pass (extracted into a test
   program, ASan/UBSan) accept all 1021 shipped cubins of the three 310.9.16
   DLLs (sm_75 to sm_120) and all 522 host-compiled cubins; every address it
   writes points into the module's data or code.
-- 0079's fatbin walk and Mesa's BLAKE3 give the same key as the host tool for
+- 0085's fatbin walk and Mesa's BLAKE3 give the same key as the host tool for
   all 240 PTX modules of `nvngx_dlss.dll` and `nvngx_dlssg.dll` 310.9.16.
 - `nvk-cubin-cache.py build --compiler cuda` on the host (RTX 5090, driver
   610.57.04): all 261 PTX-only modules of the 310.9.16 DLLs, sm_120, nothing

@@ -381,7 +381,7 @@ class CubinInfo:
         self.problems = []              # what NVK refuses
 
     def nvk_problems(self):
-        """Why NVK (patches-common 0078) would refuse this cubin: it loads
+        """Why NVK (patches-common 0084) would refuse this cubin: it loads
         the module's code, bank 0 (parameters), banks 1-7 and the module's
         globals, and applies R_CUDA_32/64 relocations in that data (to data
         or code symbols); a relocation anywhere else (in code) or of another
