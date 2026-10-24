@@ -84,7 +84,7 @@ index b85aa5d..dac9df5 100644
                  let lo = b.copy(0.into());
                  let hi = b.sel(srcs(0).bnot(), 0.into(), 0x3ff00000.into());
 diff --git a/src/nouveau/compiler/nak/knobs.rs b/src/nouveau/compiler/nak/knobs.rs
-index 87d4d91..e5d1508 100644
+index 0a8b369..96c2d70 100644
 --- a/src/nouveau/compiler/nak/knobs.rs
 +++ b/src/nouveau/compiler/nak/knobs.rs
 @@ -113,6 +113,31 @@ static RA_LRU: OnceLock<bool> = OnceLock::new();

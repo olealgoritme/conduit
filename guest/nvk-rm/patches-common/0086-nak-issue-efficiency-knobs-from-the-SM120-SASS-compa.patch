@@ -171,7 +171,7 @@ index 195dd88..b8a9168 100644
              total_gprs += free_gprs;
              gpr_limit += free_gprs;
 diff --git a/src/nouveau/compiler/nak/knobs.rs b/src/nouveau/compiler/nak/knobs.rs
-index 8216ee5..87d4d91 100644
+index d6729ac..0a8b369 100644
 --- a/src/nouveau/compiler/nak/knobs.rs
 +++ b/src/nouveau/compiler/nak/knobs.rs
 @@ -109,6 +109,60 @@ static F16_CVT: OnceLock<bool> = OnceLock::new();
@@ -233,7 +233,7 @@ index 8216ee5..87d4d91 100644
 +    *RA_LRU.get_or_init(|| parse("NAK_RA_LRU", env::var("NAK_RA_LRU"), false))
 +}
  
- /// NAK_SCHED_MLP (0-3, default 0): memory-level
+ /// NAK_SCHED_MLP (0-3; default 3 on Windows, 0 elsewhere): memory-level
  /// parallelism in the instruction schedulers.  Without it the prepass never
 diff --git a/src/nouveau/compiler/nak/opt_instr_sched_prepass.rs b/src/nouveau/compiler/nak/opt_instr_sched_prepass.rs
 index 9a24167..649a022 100644
