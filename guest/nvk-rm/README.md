@@ -142,7 +142,7 @@ file per process.
 | `NVK_PASS_PROFILE=4` | adds the 24 most written 3D methods per pass and bind counts |
 | `NVK_PASS_PROFILE=5` | dumps the draws of one render pass matching `NVK_PASS_DUMP`, after `NVK_PASS_DUMP_DELAY_S` (20) s (`nvk-prepass-dump-<pid>.txt`) |
 | `NVK_DISPATCH_PROFILE=1` | GPU time of every dispatch per compute shader (vkd3d-proton DXIL hash, code hash, workgroup size), with grids (indirect arguments read back), GPRs and warps, every two seconds, in the `NVK_PASS_PROFILE` file; alone or with `NVK_PASS_PROFILE`; each dispatch waits for idle before and after it |
-| `NVK_DISPATCH_CAPTURE=<hash>[,...]` | captures one dispatch of each listed compute shader (DXIL hash as `NVK_DISPATCH_PROFILE` prints it) with its SPIR-V, push constants, grid and the contents of every image, buffer, sampler and root buffer address it reads, for replaying it outside the game; after `NVK_DISPATCH_CAPTURE_DELAY_S` (20) s and, if set, once the file `NVK_DISPATCH_CAPTURE_TRIGGER` exists; `_SKIP`, `_COUNT`, `_POST=1` (outputs too), `_MAX_MB`; written to `NVK_DISPATCH_CAPTURE_DIR` (`%ProgramData%\Helios\dcap`), one directory per capture, log `nvk-dcap.log` |
+| `NVK_DISPATCH_CAPTURE=<hash>[,...]` | captures one dispatch of each listed compute shader, or one draw with each listed fragment shader (DXIL hash as `NVK_DISPATCH_PROFILE` prints it, or the 8-digit code hash), with its SPIR-V, push constants, grid and the contents of every image, buffer, sampler and root buffer address it reads, for replaying it outside the game; after `NVK_DISPATCH_CAPTURE_DELAY_S` (20) s and, if set, once the file `NVK_DISPATCH_CAPTURE_TRIGGER` exists; `_SKIP`, `_COUNT`, `_POST=1` (outputs too), `_MAX_MB`; written to `NVK_DISPATCH_CAPTURE_DIR` (`%ProgramData%\Helios\dcap`), one directory per capture, log `nvk-dcap.log` |
 | `NVK_SHADER_STATS=1` | NAK statistics of every uploaded shader (`nvk-shaders-<pid>.txt`) |
 | `NVK_WAIT_STATS=1` | CPU wait counts and times per site, woken and timed-out waits, once a second (`nvk-waits-<pid>.txt`) |
 | `NVK_DEBUG=vm` | VA and memory alloc/free/bind lines with times, threads and freeing call stacks (`NVK_VM_LOG`, else `nvk-vm-<pid>.log` in `%TEMP%`) |
@@ -216,10 +216,13 @@ the first windows (loading and shader compiles).
 `NVK_DISPATCH_CAPTURE=<hash>[,...]` writes one dispatch of each listed
 compute shader (the `src` hash the profile prints) with its SPIR-V, push
 constants, grid and the contents of every image, buffer, sampler and root
-buffer address it reads. `tests/perf/dispatch-replay/` replays such a capture
-on any Vulkan driver (NVK in the guest, NVIDIA's driver on a Linux host),
-times the dispatch alone and compares what two drivers wrote; its README has
-the knobs, the capture format and the limits.
+buffer address it reads. A listed fragment shader (DXIL hash or 8-digit code
+hash) captures a direct draw with it instead (common 0088): both shaders, their
+resources, the attachments and the pipeline state.
+`tests/perf/dispatch-replay/` replays such a capture on any Vulkan driver (NVK
+in the guest, NVIDIA's driver on a Linux host), times the dispatch or draw
+alone and compares what two drivers wrote; its README has the knobs, the
+capture format and the limits.
 
 ## `patches/`: the RM backend
 
@@ -392,6 +395,7 @@ backend. Numbers are file numbers (there is no 0016 or 0025).
 | 0075 | NAK: a divergent loop with no continue skips the per-iteration lane sync (BSSY/BSYNC around the body) and its breaks go to the loop's exit sync directly (`NAK_LOOP_CONT_SYNC=1` restores the sync; part of the shader cache key) |
 | 0076 | NAK: the GPR copy of a uniform value that the legalizer makes serves the block's non-ALU uses too (`NAK_DEBUG=noucse` makes a copy per use) |
 | 0077 | NAK: in compute shaders, a trailing loop that never iterates and a trailing divergent if with a small guarded side become an early exit (EXIT for the lanes that leave) followed by the rest of the shader at the top level, where its uniform values use the uniform datapath; the rematerializer, `nak_nir_opt_uniform_address` and divergent top-level loops follow (`NAK_EARLY_EXIT=0` restores the old structure; part of the shader cache key) |
+| 0088 | `NVK_DISPATCH_CAPTURE` captures draws: a listed hash that matches the bound fragment shader (DXIL source hash or code hash) captures a direct `vkCmdDraw` with both shaders' SPIR-V, their descriptors and root buffers, the color, depth and stencil attachments and the pipeline state (`"kind": "draw"`, `vs.spv`), for `dispatch-replay`; the common runtime gets `vk_device::graphics_spirv_hook` and graphics shaders their SPIR-V source hash. A capture whose staging with the outputs cannot be mapped is made without them |
 
 ## Per-draw cost (common 0001-0007)
 

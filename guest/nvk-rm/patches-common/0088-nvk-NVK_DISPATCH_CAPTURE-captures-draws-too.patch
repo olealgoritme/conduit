@@ -1,0 +1,1151 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Sat, 24 Oct 2026 04:26:43 +0200
+Subject: [PATCH] nvk: NVK_DISPATCH_CAPTURE captures draws too
+
+A hash in NVK_DISPATCH_CAPTURE that matches the bound fragment shader
+(its DXIL source hash or its 8-digit code hash) captures a direct
+vkCmdDraw with it: both shaders' SPIR-V, their descriptors and root
+buffers, the color, depth and stencil attachments' contents and the
+pipeline state (topology, rasterization, depth bias, viewport, scissor,
+render area, depth/stencil and blend state, attachment formats), in the
+same capture format with "kind": "draw" and vs.spv.  dispatch-replay
+replays it as that draw.
+
+The common runtime gets vk_device::graphics_spirv_hook, called with the
+SPIR-V of each graphics shader of a new pipeline, and graphics shaders
+get their SPIR-V source hash.  Draws with vertex attributes,
+tessellation, geometry or mesh shaders, multisampling or multiview are
+logged, not captured.
+
+A capture whose staging with the outputs (NVK_DISPATCH_CAPTURE_POST)
+cannot be mapped is made without the outputs.
+---
+ src/nouveau/vulkan/nvk_cmd_draw.c         |  31 +
+ src/nouveau/vulkan/nvk_dispatch_capture.c | 744 ++++++++++++++++++++--
+ src/nouveau/vulkan/nvk_dispatch_capture.h |  11 +
+ src/vulkan/runtime/vk_device.h            |  14 +
+ src/vulkan/runtime/vk_pipeline.c          |  53 ++
+ 5 files changed, 807 insertions(+), 46 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvk_cmd_draw.c b/src/nouveau/vulkan/nvk_cmd_draw.c
+index 0b3bb8d..422bff0 100644
+--- a/src/nouveau/vulkan/nvk_cmd_draw.c
++++ b/src/nouveau/vulkan/nvk_cmd_draw.c
+@@ -5,6 +5,7 @@
+ #include "nvk_buffer.h"
+ #include "nvk_entrypoints.h"
+ #include "nvk_cmd_buffer.h"
++#include "nvk_dispatch_capture.h"
+ #include "nvk_device.h"
+ #include "nvk_format.h"
+ #include "nvk_pass_profile.h"
+@@ -5769,6 +5770,13 @@ nvk_cmd_draw_indexed_direct(struct nvk_cmd_buffer *cmd, uint32_t draw_index,
+    P_NVC597_DRAW_INDEX_BUFFER_BEGIN_END_B(p, index_count);
+ }
+ 
++static void
++nvk_cmd_draw_impl(VkCommandBuffer commandBuffer,
++                  uint32_t vertexCount,
++                  uint32_t instanceCount,
++                  uint32_t firstVertex,
++                  uint32_t firstInstance);
++
+ VKAPI_ATTR void VKAPI_CALL
+ nvk_CmdDraw(VkCommandBuffer commandBuffer,
+             uint32_t vertexCount,
+@@ -5778,6 +5786,29 @@ nvk_CmdDraw(VkCommandBuffer commandBuffer,
+ {
+    VK_FROM_HANDLE(nvk_cmd_buffer, cmd, commandBuffer);
+ 
++   /* NVK_DISPATCH_CAPTURE of a draw with a listed fragment shader */
++   struct nvk_dcap *dcap = NULL;
++   if (unlikely(nvk_cmd_buffer_device(cmd)->dcap != NULL) &&
++       vertexCount != 0 && instanceCount != 0)
++      dcap = nvk_dcap_draw_begin(cmd, vertexCount, instanceCount,
++                                 firstVertex, firstInstance);
++
++   nvk_cmd_draw_impl(commandBuffer, vertexCount, instanceCount, firstVertex,
++                     firstInstance);
++
++   if (unlikely(dcap != NULL))
++      nvk_dcap_draw_end(cmd, dcap);
++}
++
++static void
++nvk_cmd_draw_impl(VkCommandBuffer commandBuffer,
++                  uint32_t vertexCount,
++                  uint32_t instanceCount,
++                  uint32_t firstVertex,
++                  uint32_t firstInstance)
++{
++   VK_FROM_HANDLE(nvk_cmd_buffer, cmd, commandBuffer);
++
+    if (unlikely(!vertexCount || !instanceCount))
+       return;
+ 
+diff --git a/src/nouveau/vulkan/nvk_dispatch_capture.c b/src/nouveau/vulkan/nvk_dispatch_capture.c
+index 7725c19..0a49c5d 100644
+--- a/src/nouveau/vulkan/nvk_dispatch_capture.c
++++ b/src/nouveau/vulkan/nvk_dispatch_capture.c
+@@ -52,6 +52,17 @@
+  * A command buffer of the async compute family that captures runs on the
+  * channel with every engine (it uses the copy engine).
+  *
++ * Draws (NVK_DISPATCH_CAPTURE lists a fragment shader, by source hash or
++ * by the 8-digit code hash NVK_SHADER_STATS prints): every graphics shader
++ * gets a recipe when its pipeline is created (vk_device::
++ * graphics_spirv_hook); a direct vkCmdDraw with a listed fragment shader
++ * and a vertex shader only (no tessellation, geometry or vertex attributes,
++ * single sample) is captured with both shaders' SPIR-V and resources, the
++ * color, depth and stencil attachments before and (with _POST) after the
++ * draw, and the state a replay needs (viewport, scissor, render area,
++ * topology, rasterization, depth/stencil and blend state); manifest "kind"
++ * "draw".
++ *
+  * Limits: direct and indirect vkCmdDispatch only (not device-generated
+  * commands); single-plane, single-sample, non-sparse-residency images
+  * (color, or the depth or stencil aspect of a depth view); descriptors as
+@@ -172,6 +183,8 @@ struct dcap_bda {
+ 
+ struct nvk_dcap_recipe {
+    uint64_t src_hash;
++   uint32_t code_hash;
++   mesa_shader_stage stage;
+    uint32_t *spirv;
+    size_t spirv_size;
+    uint32_t push_size;
+@@ -233,11 +246,50 @@ struct dcap_res {
+    uint32_t sampler_index;
+    struct vk_sampler_state sampler;
+ 
++   /* Draws: an attachment (DCAP_ROLE_*), its index and format */
++   uint8_t role;
++   uint32_t attachment;
++   VkFormat att_format;
++
+    /* Staging */
+    uint64_t off_B, size_B, post_off_B;
+    char note[160];
+ };
+ 
++enum dcap_role {
++   DCAP_ROLE_NONE,
++   DCAP_ROLE_COLOR,
++   DCAP_ROLE_DEPTH,
++   DCAP_ROLE_STENCIL,
++};
++
++/* What a draw capture records of the state */
++struct dcap_draw {
++   uint32_t vertex_count, instance_count, first_vertex, first_instance;
++   uint8_t topology;
++   bool primitive_restart;
++   VkPolygonMode polygon_mode;
++   VkCullModeFlags cull_mode;
++   VkFrontFace front_face;
++   bool depth_clamp, rasterizer_discard;
++   bool depth_bias;
++   float depth_bias_constant, depth_bias_slope, depth_bias_clamp;
++   float line_width;
++   uint32_t viewport_count, scissor_count;
++   VkViewport viewport;
++   VkRect2D scissor;
++   VkRect2D area;
++   uint32_t layers, view_mask;
++   uint32_t samples;
++   uint16_t sample_mask;
++   bool alpha_to_coverage;
++   struct vk_depth_stencil_state ds;
++   struct vk_color_blend_state cb;
++   uint32_t color_count;
++   VkFormat color_format[NVK_MAX_RTS];
++   VkFormat depth_format, stencil_format;
++};
++
+ struct nvk_dcap {
+    struct list_head link;
+    uint32_t serial, marker;
+@@ -264,6 +316,14 @@ struct nvk_dcap {
+    /* Copy of the recipe's variables for the manifest's binding list */
+    uint32_t nvars;
+    struct dcap_var vars[DCAP_MAX_VARS];
++
++   /* Draws */
++   bool draw;
++   struct dcap_draw d;
++   uint64_t vs_src_hash;
++   uint32_t vs_code_hash;
++   uint32_t *vs_spirv;
++   size_t vs_spirv_size;
+ };
+ 
+ /* ------------------------------------------------------------------------ */
+@@ -1057,6 +1117,9 @@ nvk_dcap_compute_spirv_hook(struct vk_device *vk_dev,
+    if (r == NULL)
+       return;
+    r->src_hash = vk_shader->src_hash;
++   r->stage = MESA_SHADER_COMPUTE;
++   r->code_hash = shader->code_size > 0 ?
++      _mesa_hash_data(shader->code_ptr, shader->code_size) : 0;
+ 
+    /* The bindings as the pipeline layout lays them out, for descriptor
+     * buffers and push descriptors (a bound set has its own layout)
+@@ -1102,6 +1165,90 @@ nvk_dcap_compute_spirv_hook(struct vk_device *vk_dev,
+    }
+ }
+ 
++static int dcap_draw_slot(const struct nvk_dcap_dev *dcap,
++                          const struct nvk_dcap_recipe *rc);
++
++/* The bindings as set layouts lay them out, for descriptor buffers and push
++ * descriptors (a bound set has its own layout)
++ */
++static void
++dcap_recipe_layouts(struct nvk_dcap_recipe *r, uint32_t set_count,
++                    const struct vk_descriptor_set_layout *const *sets)
++{
++   for (uint32_t i = 0; i < r->nvars; i++) {
++      struct dcap_var *v = &r->vars[i];
++      if (v->set >= set_count || sets[v->set] == NULL)
++         continue;
++      const struct nvk_descriptor_set_layout *sl =
++         vk_to_nvk_descriptor_set_layout(
++            (struct vk_descriptor_set_layout *)sets[v->set]);
++      if (v->binding >= sl->binding_count)
++         continue;
++      const struct nvk_descriptor_set_binding_layout *bl =
++         &sl->binding[v->binding];
++      v->have_layout = true;
++      v->layout_type = bl->type;
++      v->layout_offset = bl->offset;
++      v->layout_stride = bl->stride;
++      v->layout_array_size = bl->array_size;
++      v->layout_set_flags = sl->flags;
++   }
++}
++
++/* Every graphics shader gets a recipe (the vertex shader of a captured draw
++ * is not in the list); only listed ones are logged
++ */
++static void
++nvk_dcap_graphics_spirv_hook(struct vk_device *vk_dev,
++                             struct vk_shader *vk_shader,
++                             const uint32_t *spirv, size_t spirv_size_B,
++                             uint32_t set_layout_count,
++                             struct vk_descriptor_set_layout *const *set_layouts)
++{
++   struct nvk_device *dev = container_of(vk_dev, struct nvk_device, vk);
++   struct nvk_dcap_dev *dcap = dev->dcap;
++   if (dcap == NULL)
++      return;
++   struct nvk_shader *shader = container_of(vk_shader, struct nvk_shader, vk);
++
++   simple_mtx_lock(&dcap->mutex);
++   const bool have = shader->dcap_recipe != NULL;
++   simple_mtx_unlock(&dcap->mutex);
++   if (have)
++      return;
++
++   struct nvk_dcap_recipe *r = dcap_scan_spirv(spirv, spirv_size_B);
++   if (r == NULL)
++      return;
++   r->src_hash = vk_shader->src_hash;
++   r->stage = vk_shader->stage;
++   r->code_hash = shader->code_size > 0 ?
++      _mesa_hash_data(shader->code_ptr, shader->code_size) : 0;
++   dcap_recipe_layouts(r, set_layout_count,
++                       (const struct vk_descriptor_set_layout *const *)
++                       set_layouts);
++
++   simple_mtx_lock(&dcap->mutex);
++   if (shader->dcap_recipe == NULL) {
++      shader->dcap_recipe = r;
++      r = NULL;
++   }
++   simple_mtx_unlock(&dcap->mutex);
++
++   if (r != NULL) {
++      nvk_dcap_recipe_free(r);
++   } else if (dcap_draw_slot(dcap, shader->dcap_recipe) >= 0) {
++      const struct nvk_dcap_recipe *sr = shader->dcap_recipe;
++      dcap_log(dcap, "%s shader %016" PRIx64 " (code %08x): %u bytes of "
++               "SPIR-V, push constants %u B, %u resource variables, %u "
++               "descriptor references, %u root addresses%s%s",
++               _mesa_shader_stage_to_string(sr->stage), sr->src_hash,
++               sr->code_hash, (unsigned)sr->spirv_size, sr->push_size,
++               sr->nvars, sr->nrefs, sr->nbdas,
++               sr->nunsupported ? "; unsupported: " : "", sr->unsupported);
++   }
++}
++
+ /* ------------------------------------------------------------------------ */
+ /* Recording a capture */
+ 
+@@ -1212,12 +1359,12 @@ dcap_bound_at(struct nvk_device *dev, uint64_t addr)
+ 
+ /* The descriptor of v at index, as the GPU will read it */
+ static const void *
+-dcap_desc_ptr(struct nvk_cmd_buffer *cmd, const struct dcap_var *v,
++dcap_desc_ptr(struct nvk_cmd_buffer *cmd, struct nvk_descriptor_state *desc,
++              const struct dcap_var *v,
+               uint32_t index, bool *edb_out, char *err, size_t err_size)
+ {
+    struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
+    const struct nvk_physical_device *pdev = nvk_device_physical(dev);
+-   struct nvk_descriptor_state *desc = &cmd->state.cs.descriptors;
+ 
+    if (v->set >= NVK_MAX_SETS) {
+       snprintf(err, err_size, "set %u out of range", v->set);
+@@ -1291,9 +1438,25 @@ dcap_desc_ptr(struct nvk_cmd_buffer *cmd, const struct dcap_var *v,
+    }
+ }
+ 
++static bool
++dcap_fill_image_aspect(struct nvk_device *dev, struct dcap_res *r,
++                       const struct nvk_image_view *view,
++                       VkImageAspectFlags want);
++
+ static bool
+ dcap_fill_image(struct nvk_device *dev, struct dcap_res *r,
+                 const struct nvk_image_view *view)
++{
++   return dcap_fill_image_aspect(dev, r, view, 0);
++}
++
++/* want: the aspect to capture of a depth/stencil view, 0: depth if it has
++ * one, else stencil
++ */
++static bool
++dcap_fill_image_aspect(struct nvk_device *dev, struct dcap_res *r,
++                       const struct nvk_image_view *view,
++                       VkImageAspectFlags want)
+ {
+    const struct nvk_image *img =
+       container_of(view->vk.image, struct nvk_image, vk);
+@@ -1325,7 +1488,9 @@ dcap_fill_image(struct nvk_device *dev, struct dcap_res *r,
+    r->extent = vk_image_mip_level_extent(&img->vk, r->base_mip);
+ 
+    VkImageAspectFlags aspect = view->vk.aspects;
+-   if (aspect & VK_IMAGE_ASPECT_DEPTH_BIT)
++   if (want != 0 && (aspect & want))
++      aspect = want;
++   else if (aspect & VK_IMAGE_ASPECT_DEPTH_BIT)
+       aspect = VK_IMAGE_ASPECT_DEPTH_BIT;
+    else if (aspect & VK_IMAGE_ASPECT_STENCIL_BIT)
+       aspect = VK_IMAGE_ASPECT_STENCIL_BIT;
+@@ -1399,7 +1564,8 @@ dcap_fill_buffer(struct nvk_device *dev, struct dcap_res *r,
+ }
+ 
+ static void
+-dcap_resolve_ref(struct nvk_cmd_buffer *cmd, struct nvk_dcap *cap,
++dcap_resolve_ref(struct nvk_cmd_buffer *cmd, struct nvk_descriptor_state *desc,
++                 struct nvk_dcap *cap,
+                  const struct dcap_var *v, uint32_t index, struct dcap_res *r)
+ {
+    struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
+@@ -1407,7 +1573,7 @@ dcap_resolve_ref(struct nvk_cmd_buffer *cmd, struct nvk_dcap *cap,
+    struct nvk_dcap_dev *dcap = dev->dcap;
+ 
+    bool edb = false;
+-   const uint8_t *d = dcap_desc_ptr(cmd, v, index, &edb, r->note,
++   const uint8_t *d = dcap_desc_ptr(cmd, desc, v, index, &edb, r->note,
+                                     sizeof(r->note));
+    if (d == NULL) {
+       r->kind = DCAP_RES_ERROR;
+@@ -1544,6 +1710,444 @@ dcap_resolve_ref(struct nvk_cmd_buffer *cmd, struct nvk_dcap *cap,
+    }
+ }
+ 
++/* Whether the next matching call of this slot is captured; its call index
++ * and capture serial
++ */
++static bool
++dcap_take(struct nvk_dcap_dev *dcap, int slot, uint32_t *call_index_out,
++          uint32_t *serial_out)
++{
++   const int64_t now = os_time_get_nano();
++   if (now < dcap->arm_ns)
++      return false;
++
++   simple_mtx_lock(&dcap->mutex);
++   if (!dcap->triggered) {
++      if (now < dcap->trigger_check_ns) {
++         simple_mtx_unlock(&dcap->mutex);
++         return false;
++      }
++      dcap->trigger_check_ns = now + 250000000ll;
++      dcap->triggered = dcap_file_exists(dcap->trigger);
++      if (!dcap->triggered) {
++         simple_mtx_unlock(&dcap->mutex);
++         return false;
++      }
++      dcap_log(dcap, "trigger file %s found: armed", dcap->trigger);
++   }
++   const bool take = dcap->taken[slot] < dcap->count &&
++                     dcap->seen[slot]++ >= dcap->skip;
++   *call_index_out = dcap->seen[slot] - 1;
++   *serial_out = 0;
++   if (take) {
++      dcap->taken[slot]++;
++      *serial_out = ++dcap->serial;
++   }
++   simple_mtx_unlock(&dcap->mutex);
++   return take;
++}
++
++/* The slot of a fragment shader in the list: by source hash, or by code
++ * hash (an 8-digit entry)
++ */
++static int
++dcap_draw_slot(const struct nvk_dcap_dev *dcap,
++               const struct nvk_dcap_recipe *rc)
++{
++   int slot = dcap_hash_slot(dcap, rc->src_hash);
++   if (slot >= 0 || rc->code_hash == 0)
++      return slot;
++   return dcap_hash_slot(dcap, rc->code_hash);
++}
++
++/* A recipe's descriptors and root addresses as resources of cap (shared
++ * with the ones already there)
++ */
++static void
++dcap_add_recipe_resources(struct nvk_cmd_buffer *cmd,
++                          struct nvk_descriptor_state *desc,
++                          struct nvk_dcap *cap,
++                          const struct nvk_dcap_recipe *rc)
++{
++   struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
++
++   /* The recipe's variables, for the manifest's binding list */
++   uint32_t var_base[DCAP_MAX_VARS];
++   for (uint32_t i = 0; i < rc->nvars; i++) {
++      const struct dcap_var *v = &rc->vars[i];
++      uint32_t j;
++      for (j = 0; j < cap->nvars; j++) {
++         if (cap->vars[j].set == v->set && cap->vars[j].binding == v->binding)
++            break;
++      }
++      if (j == cap->nvars && cap->nvars < DCAP_MAX_VARS)
++         cap->vars[cap->nvars++] = *v;
++      var_base[i] = j;
++   }
++
++   for (uint32_t i = 0; i < rc->nrefs && cap->nres < DCAP_MAX_RES; i++) {
++      const struct dcap_ref *ref = &rc->refs[i];
++      const struct dcap_var *v = &rc->vars[ref->var];
++      uint32_t index = ref->add;
++      if (ref->pc_off != DCAP_NONE && ref->pc_off + 4 <= NVK_MAX_PUSH_SIZE) {
++         uint32_t w;
++         memcpy(&w, cap->push + ref->pc_off, 4);
++         index += w;
++      }
++      bool dup = false;
++      for (uint32_t j = 0; j < cap->nres; j++) {
++         const struct dcap_res *o = &cap->res[j];
++         if (o->var != DCAP_NONE && o->role == DCAP_ROLE_NONE &&
++             o->set == v->set && o->binding == v->binding &&
++             o->index == index && o->dtype == v->type) {
++            dup = true;
++            break;
++         }
++      }
++      if (dup)
++         continue;
++      struct dcap_res *r = &cap->res[cap->nres++];
++      r->var = var_base[ref->var];
++      r->set = v->set;
++      r->binding = v->binding;
++      r->index = index;
++      r->dtype = v->type;
++      r->pc_off = ref->pc_off;
++      r->add = ref->add;
++      r->writable = v->writable;
++      dcap_resolve_ref(cmd, desc, cap, v, index, r);
++   }
++
++   for (uint32_t i = 0; i < rc->nbdas && cap->nres < DCAP_MAX_RES; i++) {
++      const struct dcap_bda *b = &rc->bdas[i];
++      bool dup = false;
++      for (uint32_t j = 0; j < cap->nres; j++) {
++         if (cap->res[j].kind == DCAP_RES_BDA &&
++             cap->res[j].pc_off == b->pc_off) {
++            cap->res[j].writable |= b->writable;
++            dup = true;
++            break;
++         }
++      }
++      if (dup)
++         continue;
++      struct dcap_res *r = &cap->res[cap->nres++];
++      r->var = DCAP_NONE;
++      r->pc_off = b->pc_off;
++      r->writable = b->writable;
++      uint64_t addr = 0;
++      if (b->pc_off + 8 <= NVK_MAX_PUSH_SIZE)
++         memcpy(&addr, cap->push + b->pc_off, 8);
++      dcap_fill_buffer(dev, r, DCAP_RES_BDA, addr,
++                       b->size_B != 0 ? b->size_B : DCAP_BDA_RUNTIME_MAX,
++                       DCAP_BDA_RUNTIME_MAX);
++   }
++}
++
++/* The staging buffer of cap (inputs, then outputs with _POST); false (and
++ * logged) if it cannot be had.  When a mapping of inputs and outputs cannot
++ * be had, the capture goes without the outputs.
++ */
++static bool
++dcap_alloc_staging(struct nvk_device *dev, struct nvk_dcap *cap)
++{
++   struct nvk_dcap_dev *dcap = dev->dcap;
++retry:;
++   uint64_t off = DCAP_HEADER_B;
++   for (uint32_t i = 0; i < cap->nres; i++) {
++      struct dcap_res *r = &cap->res[i];
++      if (r->size_B == 0)
++         continue;
++      r->off_B = off;
++      off = align64(off + r->size_B, 256);
++   }
++   if (cap->post) {
++      for (uint32_t i = 0; i < cap->nres; i++) {
++         struct dcap_res *r = &cap->res[i];
++         if (r->size_B == 0 || !r->writable)
++            continue;
++         r->post_off_B = off;
++         off = align64(off + r->size_B, 256);
++      }
++   }
++   cap->mem_size_B = off;
++   if (off > dcap->max_B) {
++      dcap_log(dcap, "shader %016" PRIx64 " call %u: %" PRIu64 " MiB of "
++               "staging is over NVK_DISPATCH_CAPTURE_MAX_MB, not captured",
++               cap->src_hash, cap->call_index, off >> 20);
++      return false;
++   }
++   VkResult result = nvkmd_dev_alloc_mapped_mem(dev->nvkmd, &dev->vk.base,
++                                                off, 0, NVKMD_MEM_GART,
++                                                NVKMD_MEM_MAP_RDWR, &cap->mem);
++   if (result != VK_SUCCESS && cap->post) {
++      dcap_log(dcap, "shader %016" PRIx64 " call %u: no staging memory "
++               "(%" PRIu64 " MiB): %s; capturing without the outputs",
++               cap->src_hash, cap->call_index, off >> 20,
++               vk_Result_to_str(result));
++      cap->mem = NULL;
++      cap->post = false;
++      for (uint32_t i = 0; i < cap->nres; i++)
++         cap->res[i].post_off_B = 0;
++      goto retry;
++   }
++   if (result != VK_SUCCESS) {
++      cap->mem = NULL;
++      dcap_log(dcap, "shader %016" PRIx64 " call %u: no staging memory "
++               "(%" PRIu64 " MiB): %s", cap->src_hash, cap->call_index,
++               off >> 20, vk_Result_to_str(result));
++      return false;
++   }
++   memset(cap->mem->map, 0, DCAP_HEADER_B);
++   return true;
++}
++
++/* Copies of every captured resource into the staging buffer (post: the
++ * writable ones into their output slots)
++ */
++static void
++dcap_copy_resources(struct nvk_cmd_buffer *cmd, struct nvk_dcap *cap,
++                    bool post)
++{
++   const uint64_t va = cap->mem->va->addr;
++   for (uint32_t i = 0; i < cap->nres; i++) {
++      const struct dcap_res *r = &cap->res[i];
++      if (r->size_B == 0 || (post && !r->writable))
++         continue;
++      const uint64_t dst = va + (post ? r->post_off_B : r->off_B);
++      if (r->kind == DCAP_RES_IMAGE)
++         dcap_copy_image(cmd, r, dst);
++      else
++         dcap_copy_linear(cmd, r->addr, dst, r->size_B);
++   }
++}
++
++/* Waits for everything recorded before on the 3D and compute engines and
++ * flushes their writes, as a barrier from all commands to transfers
++ */
++static void
++dcap_barrier_all(struct nvk_cmd_buffer *cmd)
++{
++   const VkMemoryBarrier2 mb = {
++      .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
++      .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
++      .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
++      .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
++      .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT |
++                       VK_ACCESS_2_MEMORY_WRITE_BIT,
++   };
++   const VkDependencyInfo dep = {
++      .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
++      .memoryBarrierCount = 1,
++      .pMemoryBarriers = &mb,
++   };
++   nvk_cmd_flush_wait_dep(cmd, &dep, true);
++   nvk_cmd_invalidate_deps(cmd, 1, &dep);
++}
++
++static void
++dcap_free(struct nvk_dcap *cap)
++{
++   if (cap->mem != NULL)
++      nvkmd_mem_unref(cap->mem);
++   free(cap->spirv);
++   free(cap->vs_spirv);
++   free(cap);
++}
++
++struct nvk_dcap *
++nvk_dcap_draw_begin(struct nvk_cmd_buffer *cmd, uint32_t vertex_count,
++                    uint32_t instance_count, uint32_t first_vertex,
++                    uint32_t first_instance)
++{
++   struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
++   struct nvk_dcap_dev *dcap = dev->dcap;
++   const struct nvk_shader *fs = cmd->state.gfx.shaders[MESA_SHADER_FRAGMENT];
++   const struct nvk_shader *vs = cmd->state.gfx.shaders[MESA_SHADER_VERTEX];
++   if (fs == NULL || fs->dcap_recipe == NULL)
++      return NULL;
++   const struct nvk_dcap_recipe *frc = fs->dcap_recipe;
++   const int slot = dcap_draw_slot(dcap, frc);
++   if (slot < 0)
++      return NULL;
++
++   struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
++   const struct nvk_rendering_state *render = &cmd->state.gfx.render;
++   const char *why = NULL;
++   if (vs == NULL || vs->dcap_recipe == NULL)
++      why = "no vertex shader with SPIR-V";
++   else if (cmd->state.gfx.shaders[MESA_SHADER_TESS_CTRL] != NULL ||
++            cmd->state.gfx.shaders[MESA_SHADER_TESS_EVAL] != NULL ||
++            cmd->state.gfx.shaders[MESA_SHADER_GEOMETRY] != NULL ||
++            cmd->state.gfx.shaders[MESA_SHADER_MESH] != NULL)
++      why = "tessellation, geometry or mesh shaders";
++   else if (dyn->vi != NULL && dyn->vi->attributes_valid != 0)
++      why = "vertex attributes";
++   else if (render->samples > 1 || dyn->ms.rasterization_samples > 1)
++      why = "multisampled rendering";
++   else if (render->view_mask != 0)
++      why = "multiview rendering";
++
++   uint32_t call_index = 0, serial = 0;
++   if (!dcap_take(dcap, slot, &call_index, &serial))
++      return NULL;
++   if (why != NULL) {
++      dcap_log(dcap, "shader %016" PRIx64 " (code %08x) draw %u: not "
++               "captured: %s", frc->src_hash, frc->code_hash, call_index, why);
++      return NULL;
++   }
++
++   struct nvk_dcap *cap = calloc(1, sizeof(*cap));
++   if (cap == NULL)
++      return NULL;
++   cap->draw = true;
++   cap->serial = serial;
++   cap->marker = DCAP_MARKER | (serial & 0xffffff);
++   cap->src_hash = frc->src_hash;
++   cap->code_hash = frc->code_hash;
++   cap->vs_src_hash = vs->dcap_recipe->src_hash;
++   cap->vs_code_hash = vs->dcap_recipe->code_hash;
++   cap->call_index = call_index;
++   cap->post = dcap->post;
++   cap->t_s = os_time_get_nano() / 1e9;
++   const struct nvk_root_descriptor_table *root =
++      (const struct nvk_root_descriptor_table *)
++      cmd->state.gfx.descriptors.root;
++   memcpy(cap->push, root->push, sizeof(cap->push));
++   cap->push_size = MAX2(frc->push_size, vs->dcap_recipe->push_size);
++   cap->spirv = malloc(frc->spirv_size);
++   if (cap->spirv != NULL) {
++      memcpy(cap->spirv, frc->spirv, frc->spirv_size);
++      cap->spirv_size = frc->spirv_size;
++   }
++   cap->vs_spirv = malloc(vs->dcap_recipe->spirv_size);
++   if (cap->vs_spirv != NULL) {
++      memcpy(cap->vs_spirv, vs->dcap_recipe->spirv,
++             vs->dcap_recipe->spirv_size);
++      cap->vs_spirv_size = vs->dcap_recipe->spirv_size;
++   }
++   snprintf(cap->unsupported, sizeof(cap->unsupported), "%s%s%s",
++            frc->unsupported, frc->nunsupported &&
++            vs->dcap_recipe->nunsupported ? "; vertex shader: " :
++            vs->dcap_recipe->nunsupported ? "vertex shader: " : "",
++            vs->dcap_recipe->unsupported);
++
++   /* State */
++   struct dcap_draw *dd = &cap->d;
++   dd->vertex_count = vertex_count;
++   dd->instance_count = instance_count;
++   dd->first_vertex = first_vertex;
++   dd->first_instance = first_instance;
++   dd->topology = dyn->ia.primitive_topology;
++   dd->primitive_restart = dyn->ia.primitive_restart_enable;
++   dd->polygon_mode = dyn->rs.polygon_mode;
++   dd->cull_mode = dyn->rs.cull_mode;
++   dd->front_face = dyn->rs.front_face;
++   dd->depth_clamp = dyn->rs.depth_clamp_enable;
++   dd->rasterizer_discard = dyn->rs.rasterizer_discard_enable;
++   dd->depth_bias = dyn->rs.depth_bias.enable;
++   dd->depth_bias_constant = dyn->rs.depth_bias.constant_factor;
++   dd->depth_bias_slope = dyn->rs.depth_bias.slope_factor;
++   dd->depth_bias_clamp = dyn->rs.depth_bias.clamp;
++   dd->line_width = dyn->rs.line.width;
++   dd->viewport_count = dyn->vp.viewport_count;
++   dd->scissor_count = dyn->vp.scissor_count;
++   dd->viewport = dyn->vp.viewports[0];
++   dd->scissor = dyn->vp.scissors[0];
++   dd->area = render->area;
++   dd->layers = render->layer_count;
++   dd->view_mask = render->view_mask;
++   dd->samples = MAX2(render->samples, 1);
++   dd->sample_mask = dyn->ms.sample_mask;
++   dd->alpha_to_coverage = dyn->ms.alpha_to_coverage_enable;
++   dd->ds = dyn->ds;
++   dd->cb = dyn->cb;
++   dd->color_count = render->color_att_count;
++
++   /* The shaders' resources: fragment, then vertex */
++   struct nvk_descriptor_state *desc = &cmd->state.gfx.descriptors;
++   dcap_add_recipe_resources(cmd, desc, cap, frc);
++   dcap_add_recipe_resources(cmd, desc, cap, vs->dcap_recipe);
++
++   /* Attachments */
++   for (uint32_t i = 0; i < render->color_att_count && i < NVK_MAX_RTS &&
++                        cap->nres < DCAP_MAX_RES; i++) {
++      dd->color_format[i] = render->color_att[i].vk_format;
++      const struct nvk_image_view *iview = render->color_att[i].iview;
++      if (iview == NULL)
++         continue;
++      struct dcap_res *r = &cap->res[cap->nres++];
++      r->var = DCAP_NONE;
++      r->pc_off = DCAP_NONE;
++      r->role = DCAP_ROLE_COLOR;
++      r->attachment = i;
++      r->att_format = render->color_att[i].vk_format;
++      r->writable = true;
++      if (!dcap_fill_image_aspect(dev, r, iview, VK_IMAGE_ASPECT_COLOR_BIT))
++         r->kind = DCAP_RES_ERROR;
++   }
++   dd->depth_format = render->depth_att.vk_format;
++   if (render->depth_att.iview != NULL && cap->nres < DCAP_MAX_RES) {
++      struct dcap_res *r = &cap->res[cap->nres++];
++      r->var = DCAP_NONE;
++      r->pc_off = DCAP_NONE;
++      r->role = DCAP_ROLE_DEPTH;
++      r->att_format = render->depth_att.vk_format;
++      r->writable = true;
++      if (!dcap_fill_image_aspect(dev, r, render->depth_att.iview,
++                                  VK_IMAGE_ASPECT_DEPTH_BIT))
++         r->kind = DCAP_RES_ERROR;
++   }
++   dd->stencil_format = render->stencil_att.vk_format;
++   if (render->stencil_att.iview != NULL && cap->nres < DCAP_MAX_RES) {
++      struct dcap_res *r = &cap->res[cap->nres++];
++      r->var = DCAP_NONE;
++      r->pc_off = DCAP_NONE;
++      r->role = DCAP_ROLE_STENCIL;
++      r->att_format = render->stencil_att.vk_format;
++      r->writable = true;
++      if (!dcap_fill_image_aspect(dev, r, render->stencil_att.iview,
++                                  VK_IMAGE_ASPECT_STENCIL_BIT))
++         r->kind = DCAP_RES_ERROR;
++   }
++
++   if (!dcap_alloc_staging(dev, cap)) {
++      dcap_free(cap);
++      return NULL;
++   }
++
++   dcap_barrier_all(cmd);
++   dcap_copy_resources(cmd, cap, false);
++   dcap_wait_copies(cmd);
++   list_addtail(&cap->link, &cmd->dcaps);
++
++   unsigned nerr = 0;
++   for (uint32_t i = 0; i < cap->nres; i++)
++      nerr += cap->res[i].kind == DCAP_RES_ERROR;
++   dcap_log(dcap, "shader %016" PRIx64 " (code %08x) draw %u recorded as "
++            "capture %u: %u resources (%u not captured), %" PRIu64 " MiB of "
++            "staging, %u vertices, %u instances, %u color attachments, area "
++            "%ux%u", cap->src_hash, cap->code_hash, call_index, serial,
++            cap->nres, nerr, cap->mem_size_B >> 20, vertex_count,
++            instance_count, render->color_att_count, render->area.extent.width,
++            render->area.extent.height);
++   return cap;
++}
++
++void
++nvk_dcap_draw_end(struct nvk_cmd_buffer *cmd, struct nvk_dcap *cap)
++{
++   if (cap == NULL)
++      return;
++   if (cap->post) {
++      dcap_barrier_all(cmd);
++      dcap_copy_resources(cmd, cap, true);
++   }
++   dcap_wait_copies(cmd);
++   dcap_release_marker(cmd, cap->mem->va->addr, cap->marker);
++   dcap_wait_copies(cmd);
++}
++
+ struct nvk_dcap *
+ nvk_dcap_begin(struct nvk_cmd_buffer *cmd, const uint32_t base_group[3],
+                const uint32_t groups[3], uint64_t indirect_addr)
+@@ -1651,7 +2255,7 @@ nvk_dcap_begin(struct nvk_cmd_buffer *cmd, const uint32_t base_group[3],
+       r->pc_off = ref->pc_off;
+       r->add = ref->add;
+       r->writable = v->writable;
+-      dcap_resolve_ref(cmd, cap, v, index, r);
++      dcap_resolve_ref(cmd, &cmd->state.cs.descriptors, cap, v, index, r);
+    }
+ 
+    /* Root buffer addresses */
+@@ -1670,44 +2274,10 @@ nvk_dcap_begin(struct nvk_cmd_buffer *cmd, const uint32_t base_group[3],
+    }
+ 
+    /* Staging: header (marker, indirect arguments), inputs, outputs */
+-   uint64_t off = DCAP_HEADER_B;
+-   for (uint32_t i = 0; i < cap->nres; i++) {
+-      struct dcap_res *r = &cap->res[i];
+-      if (r->size_B == 0)
+-         continue;
+-      r->off_B = off;
+-      off = align64(off + r->size_B, 256);
+-   }
+-   if (cap->post) {
+-      for (uint32_t i = 0; i < cap->nres; i++) {
+-         struct dcap_res *r = &cap->res[i];
+-         if (r->size_B == 0 || !r->writable)
+-            continue;
+-         r->post_off_B = off;
+-         off = align64(off + r->size_B, 256);
+-      }
+-   }
+-   cap->mem_size_B = off;
+-   if (off > dcap->max_B) {
+-      dcap_log(dcap, "shader %016" PRIx64 " call %u: %" PRIu64 " MiB of "
+-               "staging is over NVK_DISPATCH_CAPTURE_MAX_MB, not captured",
+-               cap->src_hash, call_index, off >> 20);
+-      free(cap->spirv);
+-      free(cap);
+-      return NULL;
+-   }
+-   VkResult result = nvkmd_dev_alloc_mapped_mem(dev->nvkmd, &dev->vk.base,
+-                                                off, 0, NVKMD_MEM_GART,
+-                                                NVKMD_MEM_MAP_RDWR, &cap->mem);
+-   if (result != VK_SUCCESS) {
+-      dcap_log(dcap, "shader %016" PRIx64 " call %u: no staging memory "
+-               "(%" PRIu64 " MiB): %s", cap->src_hash, call_index, off >> 20,
+-               vk_Result_to_str(result));
+-      free(cap->spirv);
+-      free(cap);
++   if (!dcap_alloc_staging(dev, cap)) {
++      dcap_free(cap);
+       return NULL;
+    }
+-   memset(cap->mem->map, 0, DCAP_HEADER_B);
+    const uint64_t va = cap->mem->va->addr;
+ 
+    dcap_flush_compute(cmd);
+@@ -1732,7 +2302,7 @@ nvk_dcap_begin(struct nvk_cmd_buffer *cmd, const uint32_t base_group[3],
+    dcap_log(dcap, "shader %016" PRIx64 " call %u recorded as capture %u: "
+             "%u resources (%u not captured), %" PRIu64 " MiB of staging, "
+             "%s grid %ux%ux%u", cap->src_hash, call_index, serial, cap->nres,
+-            nerr, off >> 20, cap->indirect ? "indirect" : "direct",
++            nerr, cap->mem_size_B >> 20, cap->indirect ? "indirect" : "direct",
+             cap->groups[0], cap->groups[1], cap->groups[2]);
+    return cap;
+ }
+@@ -1827,6 +2397,78 @@ dcap_json_sampler(FILE *f, const struct vk_sampler_state *s)
+            s->flags);
+ }
+ 
++/* The "draw" section of a draw capture's manifest (after "unsupported") */
++static void
++dcap_json_draw(FILE *f, const struct nvk_dcap *cap)
++{
++   const struct dcap_draw *d = &cap->d;
++   fprintf(f, ",\n  \"kind\": \"draw\",\n"
++           "  \"vs_spirv\": \"vs.spv\",\n"
++           "  \"vs_src_hash\": \"%016" PRIx64 "\",\n"
++           "  \"vs_code_hash\": \"%08x\",\n"
++           "  \"draw\": {\"vertex_count\": %u, \"instance_count\": %u, "
++           "\"first_vertex\": %u, \"first_instance\": %u, "
++           "\"topology\": %u, \"primitive_restart\": %u, "
++           "\"polygon_mode\": %u, \"cull_mode\": %u, \"front_face\": %u, "
++           "\"depth_clamp\": %u, \"rasterizer_discard\": %u, "
++           "\"depth_bias\": [%u, %.9g, %.9g, %.9g], \"line_width\": %.9g, "
++           "\"viewport_count\": %u, \"scissor_count\": %u, "
++           "\"viewport\": [%.9g, %.9g, %.9g, %.9g, %.9g, %.9g], "
++           "\"scissor\": [%d, %d, %u, %u], \"render_area\": [%d, %d, %u, %u], "
++           "\"layers\": %u, \"samples\": %u, \"sample_mask\": %u, "
++           "\"alpha_to_coverage\": %u,\n    \"depth\": {\"test\": %u, "
++           "\"write\": %u, \"compare_op\": %u, \"bounds_test\": [%u, %.9g, "
++           "%.9g], \"format\": %u},\n",
++           cap->vs_src_hash, cap->vs_code_hash,
++           d->vertex_count, d->instance_count, d->first_vertex,
++           d->first_instance, d->topology, d->primitive_restart,
++           d->polygon_mode, d->cull_mode, d->front_face, d->depth_clamp,
++           d->rasterizer_discard, d->depth_bias, d->depth_bias_constant,
++           d->depth_bias_slope, d->depth_bias_clamp, d->line_width,
++           d->viewport_count, d->scissor_count,
++           d->viewport.x, d->viewport.y, d->viewport.width, d->viewport.height,
++           d->viewport.minDepth, d->viewport.maxDepth,
++           d->scissor.offset.x, d->scissor.offset.y, d->scissor.extent.width,
++           d->scissor.extent.height, d->area.offset.x, d->area.offset.y,
++           d->area.extent.width, d->area.extent.height, d->layers, d->samples,
++           d->sample_mask, d->alpha_to_coverage, d->ds.depth.test_enable,
++           d->ds.depth.write_enable, d->ds.depth.compare_op,
++           d->ds.depth.bounds_test.enable, d->ds.depth.bounds_test.min,
++           d->ds.depth.bounds_test.max, d->depth_format);
++   const struct vk_stencil_test_face_state *faces[2] = {
++      &d->ds.stencil.front, &d->ds.stencil.back,
++   };
++   fprintf(f, "    \"stencil\": {\"test\": %u, \"write\": %u, "
++           "\"format\": %u", d->ds.stencil.test_enable,
++           d->ds.stencil.write_enable, d->stencil_format);
++   for (unsigned i = 0; i < 2; i++) {
++      const struct vk_stencil_test_face_state *s = faces[i];
++      fprintf(f, ", \"%s\": {\"fail\": %u, \"pass\": %u, "
++              "\"depth_fail\": %u, \"compare\": %u, \"compare_mask\": %u, "
++              "\"write_mask\": %u, \"reference\": %u}",
++              i == 0 ? "front" : "back", s->op.fail, s->op.pass,
++              s->op.depth_fail, s->op.compare, s->compare_mask,
++              s->write_mask, s->reference);
++   }
++   fprintf(f, "},\n    \"blend\": {\"logic_op_enable\": %u, "
++           "\"logic_op\": %u, \"color_write_enables\": %u, "
++           "\"constants\": [%.9g, %.9g, %.9g, %.9g], \"attachments\": [",
++           d->cb.logic_op_enable, d->cb.logic_op, d->cb.color_write_enables,
++           d->cb.blend_constants[0], d->cb.blend_constants[1],
++           d->cb.blend_constants[2], d->cb.blend_constants[3]);
++   for (uint32_t i = 0; i < d->color_count && i < NVK_MAX_RTS; i++) {
++      const struct vk_color_blend_attachment_state *a = &d->cb.attachments[i];
++      fprintf(f, "%s{\"format\": %u, \"enable\": %u, \"src_color\": %u, "
++              "\"dst_color\": %u, \"color_op\": %u, \"src_alpha\": %u, "
++              "\"dst_alpha\": %u, \"alpha_op\": %u, \"write_mask\": %u}",
++              i ? ", " : "", d->color_format[i], a->blend_enable,
++              a->src_color_blend_factor, a->dst_color_blend_factor,
++              a->color_blend_op, a->src_alpha_blend_factor,
++              a->dst_alpha_blend_factor, a->alpha_blend_op, a->write_mask);
++   }
++   fprintf(f, "]}}");
++}
++
+ static void
+ dcap_write(struct nvk_dcap_dev *dcap, struct nvk_dcap *cap)
+ {
+@@ -1843,6 +2485,8 @@ dcap_write(struct nvk_dcap_dev *dcap, struct nvk_dcap *cap)
+    bool ok = true;
+    if (cap->spirv != NULL)
+       ok &= dcap_write_file(dir, "shader.spv", cap->spirv, cap->spirv_size);
++   if (cap->vs_spirv != NULL)
++      ok &= dcap_write_file(dir, "vs.spv", cap->vs_spirv, cap->vs_spirv_size);
+    ok &= dcap_write_file(dir, "push.bin", cap->push, sizeof(cap->push));
+    uint64_t bytes = 0;
+    for (uint32_t i = 0; i < cap->nres; i++) {
+@@ -1887,6 +2531,8 @@ dcap_write(struct nvk_dcap_dev *dcap, struct nvk_dcap *cap)
+            groups[0], groups[1], groups[2], cap->indirect ? "true" : "false",
+            cap->push_size, cap->post ? "true" : "false");
+    dcap_json_str(f, cap->unsupported);
++   if (cap->draw)
++      dcap_json_draw(f, cap);
+    fprintf(f, ",\n  \"bindings\": [\n");
+    for (uint32_t i = 0; i < cap->nvars; i++) {
+       const struct dcap_var *v = &cap->vars[i];
+@@ -1915,6 +2561,12 @@ dcap_write(struct nvk_dcap_dev *dcap, struct nvk_dcap *cap)
+       if (r->pc_off != DCAP_NONE)
+          fprintf(f, "\"push_offset\": %u, \"add\": %u, ", r->pc_off, r->add);
+       fprintf(f, "\"writable\": %s", r->writable ? "true" : "false");
++      if (r->role != DCAP_ROLE_NONE) {
++         static const char *const roles[] = { "", "color", "depth", "stencil" };
++         fprintf(f, ", \"role\": \"%s\", \"attachment\": %u, "
++                 "\"attachment_format\": %u", roles[r->role], r->attachment,
++                 r->att_format);
++      }
+       if (r->size_B != 0) {
+          fprintf(f, ", \"file\": \"r%03u.bin\", \"size\": %" PRIu64, i,
+                  r->size_B);
+@@ -2009,9 +2661,7 @@ nvk_dcap_cmd_reset(struct nvk_cmd_buffer *cmd)
+                      cap->serial, cap->src_hash, marker);
+          }
+       }
+-      nvkmd_mem_unref(cap->mem);
+-      free(cap->spirv);
+-      free(cap);
++      dcap_free(cap);
+    }
+ }
+ 
+@@ -2094,6 +2744,7 @@ nvk_dcap_init(struct nvk_device *dev)
+ 
+    dev->dcap = dcap;
+    dev->vk.compute_spirv_hook = nvk_dcap_compute_spirv_hook;
++   dev->vk.graphics_spirv_hook = nvk_dcap_graphics_spirv_hook;
+ 
+    char hashes[DCAP_MAX_HASHES * 18 + 1] = "";
+    for (uint32_t i = 0; i < dcap->hash_count; i++) {
+@@ -2116,6 +2767,7 @@ nvk_dcap_finish(struct nvk_device *dev)
+    if (dcap == NULL)
+       return;
+    dev->vk.compute_spirv_hook = NULL;
++   dev->vk.graphics_spirv_hook = NULL;
+    dev->dcap = NULL;
+    hash_table_u64_foreach(dcap->samplers, entry)
+       free(entry.data);
+diff --git a/src/nouveau/vulkan/nvk_dispatch_capture.h b/src/nouveau/vulkan/nvk_dispatch_capture.h
+index 59ff238..511ca02 100644
+--- a/src/nouveau/vulkan/nvk_dispatch_capture.h
++++ b/src/nouveau/vulkan/nvk_dispatch_capture.h
+@@ -53,6 +53,17 @@ struct nvk_dcap *nvk_dcap_begin(struct nvk_cmd_buffer *cmd,
+                                 uint64_t indirect_addr);
+ void nvk_dcap_end(struct nvk_cmd_buffer *cmd, struct nvk_dcap *cap);
+ 
++/* Around a direct vkCmdDraw: begin before the draw's methods (copies of the
++ * shaders' inputs and the attachments, behind a wait for idle), end after
++ * them.  begin returns NULL when the draw is not captured.
++ */
++struct nvk_dcap *nvk_dcap_draw_begin(struct nvk_cmd_buffer *cmd,
++                                     uint32_t vertex_count,
++                                     uint32_t instance_count,
++                                     uint32_t first_vertex,
++                                     uint32_t first_instance);
++void nvk_dcap_draw_end(struct nvk_cmd_buffer *cmd, struct nvk_dcap *cap);
++
+ /* The command buffer is reset or destroyed: the GPU is done with it, so
+  * captures it ran are written and all are freed.
+  */
+diff --git a/src/vulkan/runtime/vk_device.h b/src/vulkan/runtime/vk_device.h
+index c17155e..e54b1f1 100644
+--- a/src/vulkan/runtime/vk_device.h
++++ b/src/vulkan/runtime/vk_device.h
+@@ -42,6 +42,7 @@ extern "C" {
+ struct vk_acceleration_structure_build_ops;
+ struct vk_command_buffer_ops;
+ struct vk_device_shader_ops;
++struct vk_descriptor_set_layout;
+ struct vk_pipeline_layout;
+ struct vk_shader;
+ struct vk_sync_signal;
+@@ -156,6 +157,19 @@ struct vk_device {
+                               const uint32_t *spirv, size_t spirv_size_B,
+                               const struct vk_pipeline_layout *layout);
+ 
++   /** Called by the common graphics pipeline code for every shader of a
++    * graphics pipeline it creates or links from SPIR-V, after the shader
++    * has its source hash, with that SPIR-V and the pipeline's descriptor
++    * set layouts (entries may be NULL).  The shader may come from a cache
++    * or a library and be shared with other pipelines.  While it is set,
++    * precompiled shaders keep a copy of their SPIR-V.  NULL: not called.
++    */
++   void (*graphics_spirv_hook)(struct vk_device *device,
++                               struct vk_shader *shader,
++                               const uint32_t *spirv, size_t spirv_size_B,
++                               uint32_t set_layout_count,
++                               struct vk_descriptor_set_layout *const *set_layouts);
++
+    /** Acceleration structure build vtable for common BVH building. */
+    const struct vk_acceleration_structure_build_ops *as_build_ops;
+ 
+diff --git a/src/vulkan/runtime/vk_pipeline.c b/src/vulkan/runtime/vk_pipeline.c
+index 5538199..6d8c0f9 100644
+--- a/src/vulkan/runtime/vk_pipeline.c
++++ b/src/vulkan/runtime/vk_pipeline.c
+@@ -819,6 +819,13 @@ struct vk_pipeline_precomp_shader {
+    struct vk_sampler_state *embedded_samplers;
+ 
+    struct blob nir_blob;
++
++   /* vk_spirv_source_hash() of the SPIR-V, 0 if it came from a cache; with
++    * vk_device::graphics_spirv_hook, a copy of that SPIR-V (malloc)
++    */
++   uint64_t src_hash;
++   uint32_t *spirv;
++   size_t spirv_size;
+ };
+ 
+ static struct vk_pipeline_precomp_shader *
+@@ -997,6 +1004,7 @@ vk_pipeline_precomp_shader_destroy(struct vk_device *device,
+       vk_pipeline_precomp_shader_from_cache_obj(obj);
+ 
+    blob_finish(&shader->nir_blob);
++   free(shader->spirv);
+    vk_pipeline_cache_object_finish(&shader->cache_obj);
+    vk_free(&device->alloc, shader);
+ }
+@@ -1129,6 +1137,25 @@ vk_pipeline_precompile_shader(struct vk_device *device,
+    if (stage->precomp == NULL)
+       return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
+ 
++   /* The source hash and, for vk_device::graphics_spirv_hook, the SPIR-V
++    * (vk_graphics_pipeline_spirv_hooks())
++    */
++   {
++      size_t spirv_size = 0;
++      const uint32_t *spirv = vk_stage_spirv(info, &spirv_size);
++      if (spirv != NULL) {
++         stage->precomp->src_hash = vk_spirv_source_hash(spirv, spirv_size);
++         if (device->graphics_spirv_hook != NULL &&
++             stage->stage != MESA_SHADER_COMPUTE) {
++            stage->precomp->spirv = malloc(spirv_size);
++            if (stage->precomp->spirv != NULL) {
++               memcpy(stage->precomp->spirv, spirv, spirv_size);
++               stage->precomp->spirv_size = spirv_size;
++            }
++         }
++      }
++   }
++
+    if (cache != NULL) {
+       struct vk_pipeline_cache_object *cache_obj = &stage->precomp->cache_obj;
+       cache_obj = vk_pipeline_cache_add_object(cache, cache_obj);
+@@ -2031,6 +2058,30 @@ vk_graphics_pipeline_compile_shaders(struct vk_device *device,
+    return VK_SUCCESS;
+ }
+ 
++/* Graphics shaders get the source hash of their SPIR-V, and
++ * vk_device::graphics_spirv_hook sees them with it
++ */
++static void
++vk_graphics_pipeline_spirv_hooks(struct vk_device *device,
++                                 struct vk_graphics_pipeline_compile_info *info)
++{
++   for (uint32_t i = 0; i < info->stage_count; i++) {
++      struct vk_pipeline_stage *stage = &info->stages[i];
++      if (stage->shader == NULL || stage->precomp == NULL)
++         continue;
++      if (stage->shader->src_hash == 0)
++         stage->shader->src_hash = stage->precomp->src_hash;
++      if (device->graphics_spirv_hook != NULL &&
++          stage->precomp->spirv != NULL) {
++         device->graphics_spirv_hook(device, stage->shader,
++                                     stage->precomp->spirv,
++                                     stage->precomp->spirv_size,
++                                     info->set_layout_count,
++                                     info->set_layouts);
++      }
++   }
++}
++
+ static VkResult
+ vk_graphics_pipeline_get_executable_properties(
+    struct vk_device *device,
+@@ -2310,6 +2361,8 @@ vk_create_graphics_pipeline(struct vk_device *device,
+          goto fail_stages;
+    }
+ 
++   vk_graphics_pipeline_spirv_hooks(device, &compile_info);
++
+    /* Keep a reference on the set layouts */
+    pipeline->set_layout_count = compile_info.set_layout_count;
+    for (uint32_t i = 0; i < compile_info.set_layout_count; i++) {
+-- 
+2.43.0
+

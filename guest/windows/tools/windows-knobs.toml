@@ -1464,7 +1464,7 @@ effect = "1 logs once a second (mesa_logi, MESA_LOG_FILE on Windows) how many id
 [env.NVK_DISPATCH_CAPTURE]
 class = "debug"
 read = "device creation"
-effect = "Comma-separated 16-digit source hashes (vkd3d-proton DXIL hashes, as NVK_DISPATCH_PROFILE prints them) of compute shaders to capture: one dispatch each is written with its SPIR-V, push constants, grid and the contents of every image, buffer, sampler and root buffer address it reads, for replaying it outside the game. Each capture is a directory <hash>-p<pid>-<n> with manifest.json, shader.spv, push.bin and one raw file per resource; events go to nvk-dcap.log there."
+effect = "Comma-separated 16-digit source hashes (vkd3d-proton DXIL hashes, as NVK_DISPATCH_PROFILE prints them) or 8-digit code hashes of shaders to capture: for a compute shader one dispatch each is written with its SPIR-V, push constants, grid and the contents of every image, buffer, sampler and root buffer address it reads; for a fragment shader one direct draw with it, with both shaders, their resources, the attachments and the pipeline state; for replaying it outside the game. Each capture is a directory <hash>-p<pid>-<n> with manifest.json, shader.spv (vs.spv too for a draw), push.bin and one raw file per resource; events go to nvk-dcap.log there."
 
 [env.NVK_DISPATCH_CAPTURE_COUNT]
 class = "debug"
@@ -1490,7 +1490,7 @@ effect = "With NVK_DISPATCH_CAPTURE: largest staging buffer one capture may allo
 [env.NVK_DISPATCH_CAPTURE_POST]
 class = "debug"
 read = "device creation"
-effect = "With NVK_DISPATCH_CAPTURE: 1 also copies every resource the shader may write after the dispatch (r<N>.post.bin), NVK's result to compare a replay with."
+effect = "With NVK_DISPATCH_CAPTURE: 1 also copies every resource the shader may write after the dispatch or draw (r<N>.post.bin), NVK's result to compare a replay with; a capture whose staging with these outputs cannot be mapped is made without them."
 
 [env.NVK_DISPATCH_CAPTURE_SKIP]
 class = "debug"
