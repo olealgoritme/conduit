@@ -21,9 +21,9 @@ to 2560x1440: FSR 1 29.5 dB, a4k-3d 29.5, a4k 30.6, a4k-vl 31.0.
 ---
  src/vulkan/wsi/enhance/adapt.py           |  85 ++++++++
  src/vulkan/wsi/meson.build                |  25 +++
- src/vulkan/wsi/wsi_common_win32_enhance.c | 229 ++++++++++++++++++++++
+ src/vulkan/wsi/wsi_common_win32_enhance.c | 236 ++++++++++++++++++++++
  src/vulkan/wsi/wsi_common_win32_enhance.h |   3 +
- 4 files changed, 342 insertions(+)
+ 4 files changed, 349 insertions(+)
 
 diff --git a/src/vulkan/wsi/enhance/adapt.py b/src/vulkan/wsi/enhance/adapt.py
 index 5342d9e..a78210e 100644
@@ -166,7 +166,7 @@ index 5cadd4a..fe3c795 100644
    foreach s : ['enh_scale', 'enh_easu', 'enh_rcas', 'enh_nis', 'enh_cas', 'enh_sgsr',
                 'enh_xbr', 'fg_down', 'fg_flow', 'fg_interp']
 diff --git a/src/vulkan/wsi/wsi_common_win32_enhance.c b/src/vulkan/wsi/wsi_common_win32_enhance.c
-index 99cf668..d26b662 100644
+index 99cf668..b8fc224 100644
 --- a/src/vulkan/wsi/wsi_common_win32_enhance.c
 +++ b/src/vulkan/wsi/wsi_common_win32_enhance.c
 @@ -56,6 +56,31 @@
@@ -227,7 +227,16 @@ index 99cf668..d26b662 100644
     VkDescriptorSetLayout dsl;
     VkPipelineLayout layout;
     VkPipeline pipe[P_COUNT];
-@@ -749,6 +786,7 @@ wsi_enh_create(const struct wsi_enh_create_info *info, struct wsi_enh **out)
+@@ -481,6 +518,8 @@ struct wsi_enh {
+    FILE *csv;
+ };
+ 
++static bool a4k_prepare(struct wsi_enh *e, int v);
++
+ static VkResult
+ enh_image(struct wsi_enh *e, struct enh_img *img, VkFormat format,
+           uint32_t w, uint32_t h)
+@@ -749,6 +788,7 @@ wsi_enh_create(const struct wsi_enh_create_info *info, struct wsi_enh **out)
     e->src_count = info->src_count;
     e->slot_count = info->slot_count;
     e->cur = 0;
@@ -235,7 +244,19 @@ index 99cf668..d26b662 100644
     InitializeSRWLock(&e->stat_lock);
     e->stat_t0 = os_time_get_nano();
     enh_compute_rect(e);
-@@ -879,6 +917,17 @@ wsi_enh_destroy(struct wsi_enh *e)
+@@ -795,6 +835,11 @@ wsi_enh_create(const struct wsi_enh_create_info *info, struct wsi_enh **out)
+       if (r != VK_SUCCESS)
+          goto fail;
+    }
++   /* Anime4K's pipelines now, not in the first frame (they take tens of
++    * milliseconds); a failure falls back to FSR 1 when recording */
++   if (e->cfg.scaler >= WSI_ENH_SCALER_A4K_3D && e->cfg.scaler <= WSI_ENH_SCALER_A4K_VL &&
++       e->rect.extent.width >= e->src.width && e->rect.extent.height >= e->src.height)
++      a4k_prepare(e, (int)(e->cfg.scaler - WSI_ENH_SCALER_A4K_3D));
+ 
+    const VkQueryPoolCreateInfo qci = {
+       .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+@@ -879,6 +924,17 @@ wsi_enh_destroy(struct wsi_enh *e)
        if (e->pipe[p])
           wsi->DestroyPipeline(e->dev, e->pipe[p], &e->alloc);
     }
@@ -253,7 +274,7 @@ index 99cf668..d26b662 100644
     if (e->layout)
        wsi->DestroyPipelineLayout(e->dev, e->layout, &e->alloc);
     if (e->dsl)
-@@ -1135,6 +1184,164 @@ push_sizes(struct enh_push *p, VkExtent2D src, VkExtent2D dst, VkOffset2D off)
+@@ -1135,6 +1191,164 @@ push_sizes(struct enh_push *p, VkExtent2D src, VkExtent2D dst, VkOffset2D off)
     p->dst_off[1] = off.y;
  }
  
@@ -418,7 +439,7 @@ index 99cf668..d26b662 100644
  /* The scaler: the application's image into `dst` (rect size at `off`) */
  static void
  record_scale(struct wsi_enh *e, VkCommandBuffer cmd, VkImageView src,
-@@ -1152,6 +1359,28 @@ record_scale(struct wsi_enh *e, VkCommandBuffer cmd, VkImageView src,
+@@ -1152,6 +1366,28 @@ record_scale(struct wsi_enh *e, VkCommandBuffer cmd, VkImageView src,
         (e->src_srgb || !nis_config(&nis, (float)e->cfg.sharpness / 100.0f, e->src, out,
                                     off, dst_w, dst_h)))
        s = WSI_ENH_SCALER_FSR;
