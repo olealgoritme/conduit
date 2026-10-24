@@ -176,6 +176,12 @@ own directory, with `"sequence": {"id", "index", "barrier_before"}` in the manif
 image that an earlier dispatch of the sequence captured is referred to (`"same_as"`) instead of copied
 again.
 
+`NVK_DISPATCH_CAPTURE_SEQ_START=<hash>[,...]` captures whole command buffers instead: a sequence starts
+only at the first dispatch of a command buffer whose shader is one of these hashes and runs to the end of
+the command buffer (up to `NVK_DISPATCH_CAPTURE_SEQ`, 4096 by default). It is written only if one of its
+dispatches has a shader named in `NVK_DISPATCH_CAPTURE`; `NVK_DISPATCH_CAPTURE_COUNT` limits the
+sequences written.
+
 ```
 dispatch-replay --seq [-n N] [--csv FILE --label STR] [--seq-barriers captured|all|none] DIR...
 ```

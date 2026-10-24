@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Ole Algoritme <olealgoritme@gmail.com>
 Date: Sat, 24 Oct 2026 11:40:01 +0200
-Subject: [PATCH] nvk: NVK_DISPATCH_CAPTURE_SEQ, a dispatch and the ones after
- it
+Subject: [PATCH 101/103] nvk: NVK_DISPATCH_CAPTURE_SEQ, a dispatch and the
+ ones after it
 
 NVK_DISPATCH_CAPTURE_SEQ=N: a captured dispatch of a listed shader and the
 next N - 1 dispatches recorded in the same command buffer, whatever their
@@ -16,14 +16,21 @@ A resource an earlier dispatch of the sequence captured (the same buffer
 range, or the same image subresources) is not copied again: the manifest
 refers to it ("same_as"), and the replay shares the one resource, so that
 what a dispatch writes reaches the dispatches after it, as in the game.
+
+NVK_DISPATCH_CAPTURE_SEQ_START=<hash>[,...] (with _SEQ; alone it implies
+_SEQ=4096) starts a sequence only at the first dispatch of a command
+buffer whose shader is one of these, so that the sequence is the command
+buffer's whole run of dispatches; NVK_DISPATCH_CAPTURE then names a shader
+the sequence must contain to be written (others are dropped and logged),
+and _COUNT limits the sequences written.
 ---
  src/nouveau/vulkan/nvk_cmd_buffer.c       |   2 +
- src/nouveau/vulkan/nvk_cmd_buffer.h       |   9 +
- src/nouveau/vulkan/nvk_dispatch_capture.c | 220 +++++++++++++++++-----
- 3 files changed, 189 insertions(+), 42 deletions(-)
+ src/nouveau/vulkan/nvk_cmd_buffer.h       |  13 +
+ src/nouveau/vulkan/nvk_dispatch_capture.c | 314 +++++++++++++++++++---
+ 3 files changed, 286 insertions(+), 43 deletions(-)
 
 diff --git a/src/nouveau/vulkan/nvk_cmd_buffer.c b/src/nouveau/vulkan/nvk_cmd_buffer.c
-index eb28075..9e94514 100644
+index 77473ab..d68a47c 100644
 --- a/src/nouveau/vulkan/nvk_cmd_buffer.c
 +++ b/src/nouveau/vulkan/nvk_cmd_buffer.c
 @@ -1199,6 +1199,8 @@ nvk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
@@ -36,10 +43,10 @@ index eb28075..9e94514 100644
     cmd->barrier_data_invalidated = false;
     nvk_cmd_flush_wait_dep(cmd, pDependencyInfo, true);
 diff --git a/src/nouveau/vulkan/nvk_cmd_buffer.h b/src/nouveau/vulkan/nvk_cmd_buffer.h
-index ecb2ef3..ff8ffe7 100644
+index ecb2ef3..7a165e9 100644
 --- a/src/nouveau/vulkan/nvk_cmd_buffer.h
 +++ b/src/nouveau/vulkan/nvk_cmd_buffer.h
-@@ -384,6 +384,15 @@ struct nvk_cmd_buffer {
+@@ -384,6 +384,19 @@ struct nvk_cmd_buffer {
     struct list_head owned_mem;
     /* NVK_DISPATCH_CAPTURE: captures recorded (struct nvk_dcap) */
     struct list_head dcaps;
@@ -49,6 +56,10 @@ index ecb2ef3..ff8ffe7 100644
 +    */
 +   uint32_t dcap_seq_left, dcap_seq_id, dcap_seq_index;
 +   bool dcap_seq_barrier;
++   /* NVK_DISPATCH_CAPTURE_SEQ_START: a dispatch was recorded in this
++    * command buffer; the sequence holds a listed shader
++    */
++   bool dcap_seq_cb_seen, dcap_seq_listed;
 +   /* the resources captured so far in the sequence (struct dcap_seq_res) */
 +   struct dcap_seq_res *dcap_seq_res;
 +   uint32_t dcap_seq_nres, dcap_seq_cap;
@@ -56,10 +67,10 @@ index ecb2ef3..ff8ffe7 100644
     struct list_head owned_qmd;
  
 diff --git a/src/nouveau/vulkan/nvk_dispatch_capture.c b/src/nouveau/vulkan/nvk_dispatch_capture.c
-index 21c9039..6f593bd 100644
+index 21c9039..9e63962 100644
 --- a/src/nouveau/vulkan/nvk_dispatch_capture.c
 +++ b/src/nouveau/vulkan/nvk_dispatch_capture.c
-@@ -24,6 +24,13 @@
+@@ -24,6 +24,19 @@
   *   NVK_DISPATCH_CAPTURE_POST=1   also copies what the shader may write after
   *       the dispatch (the NVK result, for comparing a replay against)
   *   NVK_DISPATCH_CAPTURE_MAX_MB   staging limit per capture (default 2048)
@@ -70,19 +81,30 @@ index 21c9039..6f593bd 100644
 + *       sequence id, their index in it and whether a pipeline barrier came
 + *       before them, for a replay of the whole sequence in one command
 + *       buffer (dispatch-replay --seq)
++ *   NVK_DISPATCH_CAPTURE_SEQ_START=<hash>[,...]  with _SEQ: a sequence
++ *       starts only at the first dispatch of a command buffer, when its
++ *       shader is one of these, so that the sequence is the command
++ *       buffer's whole run of dispatches; NVK_DISPATCH_CAPTURE still names
++ *       a shader the sequence must contain to be written (others are
++ *       dropped), and _COUNT limits the sequences written
   *
   * The SPIR-V of every compute pipeline whose shader has a listed hash is
   * scanned when the pipeline is created (vk_device::compute_spirv_hook): the
-@@ -152,6 +159,8 @@ struct nvk_dcap_dev {
+@@ -152,6 +165,13 @@ struct nvk_dcap_dev {
     bool post;
     uint64_t max_B;
     uint32_t serial;
 +   /* NVK_DISPATCH_CAPTURE_SEQ: dispatches per sequence (0: off) */
 +   uint32_t seq;
++   /* NVK_DISPATCH_CAPTURE_SEQ_START: the shaders a command buffer's first
++    * dispatch must have for a sequence to start there; sequences written
++    */
++   uint64_t start_hashes[DCAP_MAX_HASHES];
++   uint32_t start_count, seq_written;
     char dir[512];
     FILE *log;
     /* image table index -> tagged nvk_image_view / nvk_buffer_view */
-@@ -259,6 +268,23 @@ struct dcap_res {
+@@ -259,6 +279,23 @@ struct dcap_res {
     /* Staging */
     uint64_t off_B, size_B, post_off_B;
     char note[160];
@@ -106,7 +128,7 @@ index 21c9039..6f593bd 100644
  };
  
  enum dcap_role {
-@@ -321,6 +347,9 @@ struct nvk_dcap {
+@@ -321,6 +358,9 @@ struct nvk_dcap {
     bool post;
     bool compute_only;
     double t_s;
@@ -116,7 +138,7 @@ index 21c9039..6f593bd 100644
     uint8_t push[NVK_MAX_PUSH_SIZE];
     uint32_t push_size;
     uint32_t *spirv;
-@@ -1120,7 +1149,8 @@ nvk_dcap_compute_spirv_hook(struct vk_device *vk_dev,
+@@ -1120,7 +1160,8 @@ nvk_dcap_compute_spirv_hook(struct vk_device *vk_dev,
  {
     struct nvk_device *dev = container_of(vk_dev, struct nvk_device, vk);
     struct nvk_dcap_dev *dcap = dev->dcap;
@@ -126,7 +148,7 @@ index 21c9039..6f593bd 100644
        return;
     struct nvk_shader *shader = container_of(vk_shader, struct nvk_shader, vk);
  
-@@ -2289,48 +2319,14 @@ nvk_dcap_draw_end(struct nvk_cmd_buffer *cmd, struct nvk_dcap *cap)
+@@ -2289,48 +2330,14 @@ nvk_dcap_draw_end(struct nvk_cmd_buffer *cmd, struct nvk_dcap *cap)
     dcap_wait_copies(cmd);
  }
  
@@ -180,7 +202,7 @@ index 21c9039..6f593bd 100644
     struct nvk_dcap *cap = calloc(1, sizeof(*cap));
     if (cap == NULL)
        return NULL;
-@@ -2414,6 +2410,53 @@ nvk_dcap_begin(struct nvk_cmd_buffer *cmd, const uint32_t base_group[3],
+@@ -2414,6 +2421,53 @@ nvk_dcap_begin(struct nvk_cmd_buffer *cmd, const uint32_t base_group[3],
                         DCAP_BDA_RUNTIME_MAX);
     }
  
@@ -234,7 +256,7 @@ index 21c9039..6f593bd 100644
     /* Staging: header (marker, indirect arguments), inputs, outputs */
     if (!dcap_alloc_staging(dev, cap)) {
        dcap_free(cap);
-@@ -2448,6 +2491,86 @@ nvk_dcap_begin(struct nvk_cmd_buffer *cmd, const uint32_t base_group[3],
+@@ -2448,6 +2502,130 @@ nvk_dcap_begin(struct nvk_cmd_buffer *cmd, const uint32_t base_group[3],
     return cap;
  }
  
@@ -245,15 +267,20 @@ index 21c9039..6f593bd 100644
 +   struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
 +   struct nvk_dcap_dev *dcap = dev->dcap;
 +   struct nvk_shader *shader = cmd->state.cs.shader;
-+   if (shader == NULL || shader->dcap_recipe == NULL)
++   if (shader == NULL || shader->dcap_recipe == NULL) {
++      cmd->dcap_seq_cb_seen = true;
 +      return NULL;
++   }
 +   const struct nvk_dcap_recipe *rc = shader->dcap_recipe;
 +   const int64_t now = os_time_get_nano();
 +
 +   /* NVK_DISPATCH_CAPTURE_SEQ: the rest of a sequence this command buffer
 +    * started
 +    */
++   cmd->dcap_seq_cb_seen = true;
 +   if (cmd->dcap_seq_left > 0) {
++      if (dcap_hash_slot(dcap, rc->src_hash) >= 0)
++         cmd->dcap_seq_listed = true;
 +      uint32_t serial;
 +      simple_mtx_lock(&dcap->mutex);
 +      serial = ++dcap->serial;
@@ -271,6 +298,45 @@ index 21c9039..6f593bd 100644
 +   }
 +
 +   const int slot = dcap_hash_slot(dcap, rc->src_hash);
++   if (dcap->start_count > 0) {
++      /* NVK_DISPATCH_CAPTURE_SEQ_START: only a command buffer's first
++       * dispatch starts a sequence
++       */
++      const bool first = !cmd->dcap_seq_cb_seen;
++      cmd->dcap_seq_cb_seen = true;
++      bool start = false;
++      for (uint32_t i = 0; i < dcap->start_count; i++)
++         start |= dcap->start_hashes[i] == rc->src_hash;
++      if (!first || !start || now < dcap->arm_ns)
++         return NULL;
++      simple_mtx_lock(&dcap->mutex);
++      if (!dcap->triggered) {
++         dcap->triggered = dcap_file_exists(dcap->trigger);
++         if (!dcap->triggered) {
++            simple_mtx_unlock(&dcap->mutex);
++            return NULL;
++         }
++      }
++      const bool more = dcap->seq_written < dcap->count;
++      const uint32_t serial = more ? ++dcap->serial : 0;
++      simple_mtx_unlock(&dcap->mutex);
++      if (!more)
++         return NULL;
++      cmd->dcap_seq_nres = 0;
++      struct nvk_dcap *cap = dcap_begin_take(cmd, rc, shader, base_group,
++                                             groups, indirect_addr, 0, serial,
++                                             now);
++      if (cap != NULL) {
++         cap->seq_id = serial;
++         cap->seq_index = 0;
++         cmd->dcap_seq_id = serial;
++         cmd->dcap_seq_index = 1;
++         cmd->dcap_seq_left = dcap->seq > 1 ? dcap->seq - 1 : 0;
++         cmd->dcap_seq_barrier = false;
++         cmd->dcap_seq_listed = slot >= 0;
++      }
++      return cap;
++   }
 +   if (slot < 0)
 +      return NULL;
 +   if (now < dcap->arm_ns)
@@ -321,7 +387,7 @@ index 21c9039..6f593bd 100644
  void
  nvk_dcap_end(struct nvk_cmd_buffer *cmd, struct nvk_dcap *cap)
  {
-@@ -2691,13 +2814,16 @@ dcap_write(struct nvk_dcap_dev *dcap, struct nvk_dcap *cap)
+@@ -2691,13 +2869,16 @@ dcap_write(struct nvk_dcap_dev *dcap, struct nvk_dcap *cap)
             "  \"grid\": [%u, %u, %u],\n  \"indirect\": %s,\n"
             "  \"spirv\": \"shader.spv\",\n  \"entry_point\": \"main\",\n"
             "  \"push\": \"push.bin\",\n  \"push_size\": %u,\n"
@@ -340,7 +406,7 @@ index 21c9039..6f593bd 100644
     dcap_json_str(f, cap->unsupported);
     if (cap->draw)
        dcap_json_draw(f, cap);
-@@ -2738,6 +2864,10 @@ dcap_write(struct nvk_dcap_dev *dcap, struct nvk_dcap *cap)
+@@ -2738,6 +2919,10 @@ dcap_write(struct nvk_dcap_dev *dcap, struct nvk_dcap *cap)
                   "\"attachment_format\": %u", roles[r->role], r->attachment,
                   r->att_format);
        }
@@ -351,10 +417,15 @@ index 21c9039..6f593bd 100644
        if (r->size_B != 0) {
           fprintf(f, ", \"file\": \"r%03u.bin\", \"size\": %" PRIu64, i,
                   r->size_B);
-@@ -2816,6 +2946,11 @@ dcap_write(struct nvk_dcap_dev *dcap, struct nvk_dcap *cap)
+@@ -2816,14 +3001,40 @@ dcap_write(struct nvk_dcap_dev *dcap, struct nvk_dcap *cap)
  void
  nvk_dcap_cmd_reset(struct nvk_cmd_buffer *cmd)
  {
++   const bool listed = cmd->dcap_seq_listed;
++   const uint32_t nseq = cmd->dcap_seq_index;
++   cmd->dcap_seq_listed = false;
++   cmd->dcap_seq_cb_seen = false;
++   cmd->dcap_seq_index = 0;
 +   cmd->dcap_seq_left = 0;
 +   cmd->dcap_seq_barrier = false;
 +   free(cmd->dcap_seq_res);
@@ -363,11 +434,52 @@ index 21c9039..6f593bd 100644
     if (cmd->dcaps.next == NULL)
        return;
     struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
-@@ -2875,6 +3010,7 @@ nvk_dcap_init(struct nvk_device *dev)
+    struct nvk_dcap_dev *dcap = dev->dcap;
++   /* NVK_DISPATCH_CAPTURE_SEQ_START: a sequence is written only if it holds
++    * a listed shader, up to _COUNT sequences
++    */
++   bool keep = true;
++   if (dcap != NULL && dcap->start_count > 0 && !list_is_empty(&cmd->dcaps)) {
++      simple_mtx_lock(&dcap->mutex);
++      keep = listed && dcap->seq_written < dcap->count;
++      if (keep)
++         dcap->seq_written++;
++      simple_mtx_unlock(&dcap->mutex);
++      if (!keep)
++         dcap_log(dcap, "sequence of %u dispatches dropped (%s)", nseq,
++                  listed ? "enough sequences" : "no listed shader");
++   }
+    list_for_each_entry_safe(struct nvk_dcap, cap, &cmd->dcaps, link) {
+       list_del(&cap->link);
+       const uint32_t marker = *(volatile uint32_t *)cap->mem->map;
+-      if (dcap != NULL) {
++      if (dcap != NULL && !keep) {
++         /* dropped */
++      } else if (dcap != NULL) {
+          if (marker == cap->marker) {
+             dcap_write(dcap, cap);
+          } else {
+@@ -2875,6 +3086,23 @@ nvk_dcap_init(struct nvk_device *dev)
     dcap->skip = debug_get_num_option("NVK_DISPATCH_CAPTURE_SKIP", 0);
     dcap->count = debug_get_num_option("NVK_DISPATCH_CAPTURE_COUNT", 1);
     dcap->post = debug_get_bool_option("NVK_DISPATCH_CAPTURE_POST", false);
 +   dcap->seq = debug_get_num_option("NVK_DISPATCH_CAPTURE_SEQ", 0);
++   const char *starts = os_get_option("NVK_DISPATCH_CAPTURE_SEQ_START");
++   for (const char *q = starts; q != NULL && *q &&
++        dcap->start_count < DCAP_MAX_HASHES;) {
++      while (*q == ',' || *q == ' ' || *q == ';')
++         q++;
++      if (*q == 0)
++         break;
++      char *end = NULL;
++      const uint64_t h = strtoull(q, &end, 16);
++      if (end == q)
++         break;
++      dcap->start_hashes[dcap->start_count++] = h;
++      q = end;
++   }
++   if (dcap->start_count > 0 && dcap->seq == 0)
++      dcap->seq = 4096;
     dcap->max_B = (uint64_t)debug_get_num_option("NVK_DISPATCH_CAPTURE_MAX_MB",
                                                  2048) << 20;
  

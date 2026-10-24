@@ -1487,6 +1487,11 @@ class = "debug"
 read = "device creation"
 effect = "With NVK_DISPATCH_CAPTURE: largest staging buffer one capture may allocate, in MiB; a dispatch needing more is not captured (logged)."
 
+[env.NVK_DISPATCH_CAPTURE_SEQ_START]
+class = "debug"
+read = "device creation"
+effect = "Comma-separated 16-digit source hashes: a sequence (NVK_DISPATCH_CAPTURE_SEQ, 4096 when unset) starts only at the first dispatch of a command buffer whose shader is one of these, so that it holds the command buffer's whole run of dispatches; NVK_DISPATCH_CAPTURE then names a shader the sequence must contain to be written (others are dropped, logged in nvk-dcap.log), and NVK_DISPATCH_CAPTURE_COUNT limits the sequences written."
+
 [env.NVK_DISPATCH_CAPTURE_SEQ]
 class = "debug"
 read = "device creation"
