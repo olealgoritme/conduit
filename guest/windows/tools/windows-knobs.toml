@@ -639,13 +639,13 @@ see = "[enhance.md](../guest/nvk-rm/docs/enhance.md)"
 [umd.EnhanceScaler]
 class = "supported"
 read = "each swapchain creation and every registry change (composed present)"
-effect = "Upscaling in NVK's composed present: off (default), fsr (FidelityFX FSR 1), bicubic, bilinear, nearest or integer. A Vulkan surface then reports no current extent and a D3D swap chain keeps its own size, so the application renders at its own size and the picture is scaled to the window. Vulkan and Zink swapchains, and D3D11/D3D12 swap chains of processes on NVK (EnhanceD3D). A per-exe profile under HKLM\\SOFTWARE\\Helios\\Enhance\\<exe> (value Scaler) wins; the tray sets it."
+effect = "Upscaling in NVK's composed present: off (default), fsr (FidelityFX FSR 1), nis (NVIDIA Image Scaling), sgsr (Snapdragon GSR 1), cas (FidelityFX CAS), bicubic, bilinear, nearest, integer or xbr (pixel art). A Vulkan surface then reports no current extent and a D3D swap chain keeps its own size, so the application renders at its own size and the picture is scaled to the window. Vulkan and Zink swapchains, and D3D11/D3D12 swap chains of processes on NVK (EnhanceD3D). A per-exe profile under HKLM\\SOFTWARE\\Helios\\Enhance\\<exe> (value Scaler) wins; the tray sets it."
 see = "[enhance.md](../guest/nvk-rm/docs/enhance.md)"
 
 [umd.EnhanceSharpness]
 class = "supported"
 read = "each swapchain creation and every registry change (composed present)"
-effect = "0..100, FSR's RCAS sharpening (0: EASU alone); absent: 50. A per-exe profile's Sharpness wins."
+effect = "0..100: FSR's RCAS sharpening (0: EASU alone), NIS's and CAS's sharpness; absent: 50. A per-exe profile's Sharpness wins."
 see = "[enhance.md](../guest/nvk-rm/docs/enhance.md)"
 
 [umd.EnhanceStats]
@@ -1430,13 +1430,13 @@ see = "[enhance.md](../guest/nvk-rm/docs/enhance.md)"
 [env.MESA_WSI_ENHANCE_SCALER]
 class = "supported"
 read = "each swapchain creation"
-effect = "Upscaling for this process (off, fsr, bicubic, bilinear, nearest, integer); wins over the registry EnhanceScaler and per-exe profiles, and applies to every window of the process."
+effect = "Upscaling for this process (off, fsr, nis, sgsr, cas, bicubic, bilinear, nearest, integer, xbr); wins over the registry EnhanceScaler and per-exe profiles, and applies to every window of the process."
 see = "[enhance.md](../guest/nvk-rm/docs/enhance.md)"
 
 [env.MESA_WSI_ENHANCE_SHARPNESS]
 class = "supported"
 read = "each swapchain creation"
-effect = "0..100 for FSR's RCAS; wins over EnhanceSharpness."
+effect = "0..100 for FSR's RCAS, NIS and CAS; wins over EnhanceSharpness."
 see = "[enhance.md](../guest/nvk-rm/docs/enhance.md)"
 
 [env.MESA_WSI_ENHANCE_SHOW]
