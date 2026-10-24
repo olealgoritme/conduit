@@ -1,0 +1,72 @@
+From fef8751c93f7e04f4f34c3b0566e2f44ae551489 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Mon, 12 Oct 2026 23:43:02 +0200
+Subject: [PATCH 65/65] nvk: NVK_DLSS and the Helios Dlss registry value switch
+ DLSS on
+
+Upstream NVK exposes VK_NVX_binary_import (what NGX/DLSS imports its
+CUDA kernels with) only with NVK_EXPERIMENTAL=dlss.  A native Vulkan game
+on Windows gets no environment from us, so the flag also comes from a
+knob: NVK_DLSS=1/0 (it wins over NVK_EXPERIMENTAL), else on Windows
+HKLM\SOFTWARE\Helios Dlss (REG_DWORD, non-zero = on).  Default off.
+With DLSS on, instance creation logs "NVK: DLSS on (VK_NVX_binary_import)".
+---
+ src/nouveau/vulkan/nvk_instance.c | 31 +++++++++++++++++++++++++++++++
+ 1 file changed, 31 insertions(+)
+
+diff --git a/src/nouveau/vulkan/nvk_instance.c b/src/nouveau/vulkan/nvk_instance.c
+index 55b5555..776bb43 100644
+--- a/src/nouveau/vulkan/nvk_instance.c
++++ b/src/nouveau/vulkan/nvk_instance.c
+@@ -14,10 +14,15 @@
+ #include "util/build_id.h"
+ #include "util/detect_os.h"
+ #include "util/disk_cache.h"
++#include "util/log.h"
+ #include "util/mesa-blake3.h"
+ #include "util/os_misc.h"
+ #include "util/u_debug.h"
+ 
++#ifdef _WIN32
++#include <windows.h>
++#endif
++
+ VKAPI_ATTR VkResult VKAPI_CALL
+ nvk_EnumerateInstanceVersion(uint32_t *pApiVersion)
+ {
+@@ -115,6 +120,32 @@ nvk_init_experimental_flags(struct nvk_instance *instance)
+    };
+ 
+    instance->experimental_flags = parse_debug_string(os_get_option("NVK_EXPERIMENTAL"), flags);
++
++   /* DLSS (VK_NVX_binary_import) on or off without editing the
++    * NVK_EXPERIMENTAL list: NVK_DLSS=1/0, else on Windows the Helios
++    * registry value HKLM\SOFTWARE\Helios Dlss (DWORD, 0 = off), which
++    * reaches native Vulkan games too (nothing sets their environment).
++    * Default off.
++    */
++   int dlss = -1;
++   const char *dlss_env = os_get_option("NVK_DLSS");
++   if (dlss_env != NULL && dlss_env[0] != '\0')
++      dlss = debug_parse_bool_option(dlss_env, false) ? 1 : 0;
++#ifdef _WIN32
++   if (dlss < 0) {
++      DWORD value = 0, size = sizeof(value);
++      if (RegGetValueA(HKEY_LOCAL_MACHINE, "SOFTWARE\\Helios", "Dlss",
++                       RRF_RT_REG_DWORD | RRF_SUBKEY_WOW6464KEY, NULL, &value,
++                       &size) == ERROR_SUCCESS)
++         dlss = value != 0;
++   }
++#endif
++   if (dlss == 1)
++      instance->experimental_flags |= NVK_EXPERIMENTAL_DLSS;
++   else if (dlss == 0)
++      instance->experimental_flags &= ~NVK_EXPERIMENTAL_DLSS;
++   if (instance->experimental_flags & NVK_EXPERIMENTAL_DLSS)
++      mesa_logi("NVK: DLSS on (VK_NVX_binary_import)");
+ }
+ 
+ static void
+-- 
+2.43.0
+

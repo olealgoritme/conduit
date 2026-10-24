@@ -1,0 +1,89 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Sat, 24 Oct 2026 12:44:03 +0200
+Subject: [PATCH 1/4] helios: settings from HKLM\SOFTWARE\Helios\Nvapi, log
+ lines to the debugger
+
+On a Windows guest a game started by Steam or Explorer gets no per-game
+environment, so DXVK-NVAPI's DXVK_NVAPI_* variables cannot be set for
+it. A variable that is not set in the environment is now read from
+HKLM\SOFTWARE\Helios\Nvapi, a REG_SZ (or REG_DWORD, as decimal) named
+like the variable, from the 64-bit registry view. The environment still
+wins.
+
+Outside Wine, log lines also go to OutputDebugString (DebugView), since
+stderr of a GUI process goes nowhere. DXVK_NVAPI_LOG_PATH (environment
+or registry) still writes nvapi64.log.
+---
+ src/util/util_env.cpp | 31 +++++++++++++++++++++++++++++++
+ src/util/util_log.cpp |  7 ++++++-
+ 2 files changed, 37 insertions(+), 1 deletion(-)
+
+diff --git a/src/util/util_env.cpp b/src/util/util_env.cpp
+index 59c8943..cbe3dec 100644
+--- a/src/util/util_env.cpp
++++ b/src/util/util_env.cpp
+@@ -3,6 +3,34 @@
+ #include "util_log.h"
+ 
+ namespace dxvk::env {
++    // Helios (Windows guests): processes started by Steam or Explorer get no
++    // per-game environment, so a variable that is not set is read from
++    // HKLM\SOFTWARE\Helios\Nvapi, a REG_SZ (or REG_DWORD, as decimal) named
++    // like the variable. The 64-bit view is read from 32-bit processes too.
++    static std::wstring getRegistryVariable(const std::wstring& name) {
++        HKEY key{};
++        if (::RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Helios\\Nvapi", 0, KEY_QUERY_VALUE | KEY_WOW64_64KEY, &key) != ERROR_SUCCESS)
++            return {};
++
++        std::wstring value;
++        DWORD type = 0;
++        DWORD size = 0;
++        if (::RegQueryValueExW(key, name.c_str(), nullptr, &type, nullptr, &size) == ERROR_SUCCESS) {
++            if (type == REG_DWORD && size == sizeof(DWORD)) {
++                DWORD dword = 0;
++                if (::RegQueryValueExW(key, name.c_str(), nullptr, &type, reinterpret_cast<BYTE*>(&dword), &size) == ERROR_SUCCESS)
++                    value = std::to_wstring(dword);
++            } else if ((type == REG_SZ || type == REG_EXPAND_SZ) && size > 0) {
++                std::vector<wchar_t> buffer(size / sizeof(wchar_t) + 1, L'\0');
++                if (::RegQueryValueExW(key, name.c_str(), nullptr, &type, reinterpret_cast<BYTE*>(buffer.data()), &size) == ERROR_SUCCESS)
++                    value = buffer.data();
++            }
++        }
++
++        ::RegCloseKey(key);
++        return value;
++    }
++
+     std::string getEnvVariable(const std::string& name) {
+         auto wideName = str::tows(name.c_str());
+         std::wstring variable;
+@@ -13,6 +41,9 @@ namespace dxvk::env {
+             variable.resize(length);
+         }
+ 
++        if (variable.empty())
++            variable = getRegistryVariable(wideName);
++
+         return str::fromws(variable.c_str());
+     }
+ 
+diff --git a/src/util/util_log.cpp b/src/util/util_log.cpp
+index cb18502..d1ca1f0 100644
+--- a/src/util/util_log.cpp
++++ b/src/util/util_log.cpp
+@@ -23,8 +23,13 @@ namespace dxvk::log {
+         auto line = str::format(logMessage, '\n'); // Do not flush buffers
+         if (wineDbgOutput)
+             wineDbgOutput(line.c_str());
+-        else
++        else {
+             std::cerr << line;
++#if defined(_WIN32)
++            // Windows: stderr of a GUI process goes nowhere; DebugView shows this
++            ::OutputDebugStringA(line.c_str());
++#endif
++        }
+     }
+ 
+     void initialize(std::ofstream& filestream) {

@@ -76,7 +76,7 @@ use windows::Win32::Graphics::Direct3D12::{
 use super::queue;
 use super::tables12::{stage, Filling};
 use super::tables12::{CommandListTable, DeviceCoreTable};
-use super::{identity12, resource12};
+use super::{dlss12, identity12, resource12};
 use crate::{ddi12, log_error, note_refusal, UMD12_REFUSALS};
 
 /// How many physical adapters this driver's node map describes.
@@ -621,6 +621,10 @@ unsafe extern "system" fn destroy_scheduling_group(
 // be handed can name anything. ⚠ That makes the group internally consistent in
 // the way `DECISIONS.md` §7.7 asks for: the enumeration is the contract, and the
 // creates cannot contradict it.
+//
+// The one exception is the `Dlss` knob: with it on, the enumeration publishes
+// the two engine-object meta-commands of [`dlss12`] (NGX's D3D12 path through
+// dxvk-nvapi), and only those GUIDs create, initialize and execute.
 
 /// `pfnEnumerateMetaCommands` — **answers zero**, and `S_OK`.
 ///
@@ -644,12 +648,19 @@ unsafe extern "system" fn destroy_scheduling_group(
 unsafe extern "system" fn enumerate_meta_commands(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     p_num_meta_commands: *mut ddi12::UINT,
-    _p_descs: *mut ddi12::D3D12DDIARG_META_COMMAND_DESC,
+    p_descs: *mut ddi12::D3D12DDIARG_META_COMMAND_DESC,
 ) -> ddi12::HRESULT {
     ddi_time!("enumerate_meta_commands");
     if p_num_meta_commands.is_null() {
         note_refusal(&L9_REFUSALS.meta_command_enumerate_bad_arg);
         return E_INVALIDARG;
+    }
+    // `Dlss`: the two engine-object meta-commands (`dlss12`), else none.
+    if dlss12::enabled() {
+        // SAFETY: the count is non-null per the check; the array, when
+        // non-null, holds `*p_num_meta_commands` descriptors (DDI contract).
+        unsafe { dlss12::enumerate(p_num_meta_commands, p_descs) };
+        return S_OK;
     }
     // SAFETY: non-null per the check; the DDI declares it a writable count the
     // runtime owns for the duration of the call.
@@ -677,12 +688,20 @@ unsafe extern "system" fn enumerate_meta_commands(
 /// runtime owns. `p_parameter_descs` is never dereferenced.
 unsafe extern "system" fn enumerate_meta_command_parameters(
     _h_device: ddi12::D3D12DDI_HDEVICE,
-    _command_id: ddi12::GUID,
-    _stage: ddi12::D3D12DDI_META_COMMAND_PARAMETER_STAGE,
+    command_id: ddi12::GUID,
+    stage: ddi12::D3D12DDI_META_COMMAND_PARAMETER_STAGE,
     p_parameter_count: *mut ddi12::UINT,
-    _p_parameter_descs: *mut ddi12::D3D12DDIARG_META_COMMAND_PARAMETER_DESC,
+    p_parameter_descs: *mut ddi12::D3D12DDIARG_META_COMMAND_PARAMETER_DESC,
 ) -> ddi12::HRESULT {
     ddi_time!("enumerate_meta_command_parameters");
+    if let Some(kind) = dlss12::kind_of(&command_id) {
+        if p_parameter_count.is_null() {
+            return E_INVALIDARG;
+        }
+        // SAFETY: as `enumerate_meta_commands`, for parameter descriptors.
+        unsafe { dlss12::parameters(kind, stage, p_parameter_count, p_parameter_descs) };
+        return S_OK;
+    }
     if !p_parameter_count.is_null() {
         // SAFETY: non-null per the check; the DDI declares it a writable count
         // the runtime owns for the duration of the call.
@@ -730,15 +749,30 @@ unsafe extern "system" fn calc_private_meta_command_size(
 /// `h_meta_command`'s `pDrvPrivate`, when non-null, must address the private
 /// block [`calc_private_meta_command_size`] sized.
 unsafe extern "system" fn create_meta_command(
-    _h_device: ddi12::D3D12DDI_HDEVICE,
-    _command_id: ddi12::GUID,
+    h_device: ddi12::D3D12DDI_HDEVICE,
+    command_id: ddi12::GUID,
     _node_mask: ddi12::UINT,
-    _p_creation_parameters: *const c_void,
-    _creation_parameters_data_size_in_bytes: ddi12::SIZE_T,
+    p_creation_parameters: *const c_void,
+    creation_parameters_data_size_in_bytes: ddi12::SIZE_T,
     h_meta_command: ddi12::D3D12DDI_HMETACOMMAND_0052,
     _h_rt_meta_command: ddi12::D3D12DDI_HRTMETACOMMAND_0052,
 ) -> ddi12::HRESULT {
     ddi_time!("create_meta_command");
+    if let Some(kind) = dlss12::kind_of(&command_id) {
+        // SAFETY: the slot is cleared first, so a refused create leaves 0.
+        unsafe { clear_refused_slot(h_meta_command.pDrvPrivate, &L9_REFUSALS.meta_command_bad_slot) };
+        // SAFETY: the DDI contract: a live device, the blob of the given size,
+        // the private word `calc_private_meta_command_size` sized.
+        return unsafe {
+            dlss12::create(
+                kind,
+                h_device,
+                p_creation_parameters,
+                creation_parameters_data_size_in_bytes as usize,
+                h_meta_command.pDrvPrivate,
+            )
+        };
+    }
     // SAFETY: the caller guarantees the slot lies in the sized private block.
     unsafe {
         clear_refused_slot(
@@ -766,9 +800,14 @@ unsafe extern "system" fn create_meta_command(
 /// `pfnCreateMetaCommand` call on this device.
 unsafe extern "system" fn destroy_meta_command(
     _h_device: ddi12::D3D12DDI_HDEVICE,
-    _h_meta_command: ddi12::D3D12DDI_HMETACOMMAND_0052,
+    h_meta_command: ddi12::D3D12DDI_HMETACOMMAND_0052,
 ) {
     ddi_time!("destroy_meta_command");
+    // A `dlss12` slot holds a kind word and owns nothing.
+    // SAFETY: the slot word was written by `create_meta_command`.
+    if unsafe { dlss12::kind_of_slot(h_meta_command.pDrvPrivate) }.is_some() {
+        return;
+    }
     note_refusal(&L9_REFUSALS.meta_command_destroy_unexpected);
 }
 
@@ -1361,11 +1400,16 @@ unsafe extern "system" fn set_view_instance_mask(
 /// is.
 unsafe extern "system" fn initialize_meta_command(
     _h_list: ddi12::D3D12DDI_HCOMMANDLIST,
-    _h_meta_command: ddi12::D3D12DDI_HMETACOMMAND_0052,
+    h_meta_command: ddi12::D3D12DDI_HMETACOMMAND_0052,
     _p_parameters: *const c_void,
     _parameters_size: ddi12::SIZE_T,
 ) {
     ddi_time!("initialize_meta_command");
+    // `dlss12` meta-commands have nothing to initialize.
+    // SAFETY: the slot word was written by `create_meta_command`.
+    if unsafe { dlss12::kind_of_slot(h_meta_command.pDrvPrivate) }.is_some() {
+        return;
+    }
     note_refusal(&L9_REFUSALS.meta_command_initialize_refused);
 }
 
@@ -1376,12 +1420,18 @@ unsafe extern "system" fn initialize_meta_command(
 /// No pointer is dereferenced. Declared `unsafe` because the DDI's PFN typedef
 /// is.
 unsafe extern "system" fn execute_meta_command(
-    _h_list: ddi12::D3D12DDI_HCOMMANDLIST,
-    _h_meta_command: ddi12::D3D12DDI_HMETACOMMAND_0052,
-    _p_parameters: *const c_void,
-    _parameters_size: ddi12::SIZE_T,
+    h_list: ddi12::D3D12DDI_HCOMMANDLIST,
+    h_meta_command: ddi12::D3D12DDI_HMETACOMMAND_0052,
+    p_parameters: *const c_void,
+    parameters_size: ddi12::SIZE_T,
 ) {
     ddi_time!("execute_meta_command");
+    // SAFETY: the slot word was written by `create_meta_command`.
+    if let Some(kind) = unsafe { dlss12::kind_of_slot(h_meta_command.pDrvPrivate) } {
+        // SAFETY: the DDI contract: a live list, the blob of the given size.
+        unsafe { dlss12::execute(kind, h_list, p_parameters, parameters_size as usize) };
+        return;
+    }
     note_refusal(&L9_REFUSALS.meta_command_execute_refused);
 }
 

@@ -72,6 +72,114 @@ fn set(root: HKEY, sub: &str, name: &str, kind: u32, data: &[u8]) -> bool {
     ok
 }
 
+const HELIOS: &str = r"SOFTWARE\Helios";
+const OPTISCALER_GAMES: &str = r"SOFTWARE\Helios\OptiScaler";
+
+fn reg_sz(s: &str) -> Vec<u8> {
+    wide(s).iter().flat_map(|c| c.to_le_bytes()).collect()
+}
+
+fn from_reg_sz(b: &[u8]) -> String {
+    let w: Vec<u16> = b
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .take_while(|&c| c != 0)
+        .collect();
+    String::from_utf16_lossy(&w)
+}
+
+/// The REG_SZ values of a key (name, data).
+fn sz_values(root: HKEY, sub: &str) -> Vec<(String, String)> {
+    use windows_sys::Win32::Foundation::ERROR_NO_MORE_ITEMS;
+    let Some(k) = open(root, sub, false) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for i in 0.. {
+        let mut name = [0u16; 512];
+        let mut nlen = name.len() as u32;
+        let mut kind = 0u32;
+        let mut data = vec![0u8; 2048];
+        let mut dlen = data.len() as u32;
+        let r = unsafe {
+            RegEnumValueW(
+                k,
+                i,
+                name.as_mut_ptr(),
+                &mut nlen,
+                null(),
+                &mut kind,
+                data.as_mut_ptr(),
+                &mut dlen,
+            )
+        };
+        if r == ERROR_NO_MORE_ITEMS {
+            break;
+        }
+        if r != ERROR_SUCCESS || kind != REG_SZ {
+            continue;
+        }
+        data.truncate(dlen as usize);
+        out.push((
+            String::from_utf16_lossy(&name[..nlen as usize]),
+            from_reg_sz(&data),
+        ));
+    }
+    unsafe { RegCloseKey(k) };
+    out
+}
+
+/// `upscaler` (the viewer's Upscaler row): HKLM\SOFTWARE\Helios Upscaler,
+/// `Dlss` = 1 with `dlss`, and the OptiScaler.ini of every game listed
+/// under HKLM\SOFTWARE\Helios\OptiScaler (gpu_tray::upscaler).
+pub fn upscaler(mode: Option<&str>) -> Result<conduit_ctl::UpscalerState, String> {
+    use gpu_tray::upscaler as up;
+    let games: Vec<String> = sz_values(HKEY_LOCAL_MACHINE, OPTISCALER_GAMES)
+        .into_iter()
+        .map(|(_, path)| path)
+        .filter(|p| up::ini_path_ok(p))
+        .collect();
+    let mut updated = 0u32;
+    let current = match mode {
+        Some(m) => {
+            if !set(HKEY_LOCAL_MACHINE, HELIOS, "Upscaler", REG_SZ, &reg_sz(m)) {
+                return Err("cannot write HKLM\\SOFTWARE\\Helios Upscaler".into());
+            }
+            if m == "dlss" {
+                let one = 1u32.to_le_bytes();
+                if !set(HKEY_LOCAL_MACHINE, HELIOS, "Dlss", REG_DWORD, &one) {
+                    return Err("cannot write HKLM\\SOFTWARE\\Helios Dlss".into());
+                }
+            }
+            for g in &games {
+                let Ok(ini) = std::fs::read_to_string(g) else {
+                    continue;
+                };
+                let new = up::optiscaler_ini(&ini, m);
+                if new == ini || std::fs::write(g, new).is_ok() {
+                    updated += 1;
+                }
+            }
+            m.to_string()
+        }
+        None => {
+            updated = games
+                .iter()
+                .filter(|g| std::path::Path::new(g).is_file())
+                .count() as u32;
+            get(HKEY_LOCAL_MACHINE, HELIOS, "Upscaler")
+                .map(|b| from_reg_sz(&b))
+                .and_then(|s| up::mode(&s))
+                .unwrap_or("default")
+                .to_string()
+        }
+    };
+    Ok(conduit_ctl::UpscalerState {
+        mode: current,
+        optiscaler_games: updated,
+    })
+}
+
 /// Is the volume at `root` ("Z:\\") the virtiofs share `tag`? A letter in
 /// the drive map is trusted only when the volume there says so (label and
 /// file system), not just because some drive has that letter.
@@ -453,4 +561,124 @@ pub fn promote_tray_icon(exe: &str) -> bool {
         return true;
     }
     false
+}
+
+// ---- Upscaling and frame generation (gpu_tray::enhance) -----------------
+
+const HELIOS_KEY: &str = r"SOFTWARE\Helios";
+
+fn enhance_key(exe: Option<&str>) -> Option<String> {
+    match exe {
+        None => Some(HELIOS_KEY.to_string()),
+        Some(e) => gpu_tray::enhance::profile_key(e),
+    }
+}
+
+/// The stored value of a setting, globally or in `exe`'s profile (a DWORD
+/// as its decimal text)
+pub fn enhance_get(exe: Option<&str>, s: &gpu_tray::enhance::Setting) -> Option<String> {
+    let key = enhance_key(exe)?;
+    let name = if exe.is_some() {
+        s.profile_name()
+    } else {
+        s.name
+    };
+    let b = get(HKEY_LOCAL_MACHINE, &key, name)?;
+    if s.dword {
+        Some(u32::from_le_bytes(b.get(..4)?.try_into().ok()?).to_string())
+    } else {
+        let w: Vec<u16> = b
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .take_while(|&c| c != 0)
+            .collect();
+        Some(String::from_utf16_lossy(&w))
+    }
+}
+
+/// Writes a setting (HKLM: the tray runs elevated); false when it could not
+pub fn enhance_set(exe: Option<&str>, s: &gpu_tray::enhance::Setting, value: &str) -> bool {
+    let Some(key) = enhance_key(exe) else {
+        return false;
+    };
+    let name = if exe.is_some() {
+        s.profile_name()
+    } else {
+        s.name
+    };
+    if s.dword {
+        let Ok(v) = value.parse::<u32>() else {
+            return false;
+        };
+        set(HKEY_LOCAL_MACHINE, &key, name, REG_DWORD, &v.to_le_bytes())
+    } else {
+        let bytes: Vec<u8> = wide(value).iter().flat_map(|u| u.to_le_bytes()).collect();
+        set(HKEY_LOCAL_MACHINE, &key, name, REG_SZ, &bytes)
+    }
+}
+
+/// Whether `exe` has a profile
+pub fn enhance_has_profile(exe: &str) -> bool {
+    let Some(key) = gpu_tray::enhance::profile_key(exe) else {
+        return false;
+    };
+    match open(HKEY_LOCAL_MACHINE, &key, false) {
+        Some(k) => {
+            unsafe { RegCloseKey(k) };
+            true
+        }
+        None => false,
+    }
+}
+
+/// Deletes `exe`'s profile (the global settings apply to it again)
+pub fn enhance_remove_profile(exe: &str) -> bool {
+    let Some(key) = gpu_tray::enhance::profile_key(exe) else {
+        return false;
+    };
+    let k = wide(&key);
+    unsafe {
+        RegDeleteTreeW(HKEY_LOCAL_MACHINE, k.as_ptr());
+        RegDeleteKeyW(HKEY_LOCAL_MACHINE, k.as_ptr()) == ERROR_SUCCESS
+    }
+}
+
+/// The executables of the visible, titled top-level windows, front to back
+pub fn windowed_exes() -> Vec<String> {
+    use windows_sys::Win32::Foundation::{CloseHandle, BOOL, HWND, LPARAM};
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetWindow, GetWindowTextLengthW, GetWindowThreadProcessId, IsWindowVisible,
+        GW_OWNER,
+    };
+    unsafe extern "system" fn each(h: HWND, lp: LPARAM) -> BOOL {
+        let out = &mut *(lp as *mut Vec<String>);
+        if IsWindowVisible(h) == 0
+            || GetWindowTextLengthW(h) == 0
+            || !GetWindow(h, GW_OWNER).is_null()
+        {
+            return 1;
+        }
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(h, &mut pid);
+        let p = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if p.is_null() {
+            return 1;
+        }
+        let mut buf = [0u16; 1024];
+        let mut len = buf.len() as u32;
+        if QueryFullProcessImageNameW(p, 0, buf.as_mut_ptr(), &mut len) != 0 {
+            let path = String::from_utf16_lossy(&buf[..len as usize]);
+            if let Some(name) = path.rsplit('\\').next() {
+                out.push(name.to_string());
+            }
+        }
+        CloseHandle(p);
+        1
+    }
+    let mut out: Vec<String> = Vec::new();
+    unsafe { EnumWindows(Some(each), &mut out as *mut Vec<String> as LPARAM) };
+    out
 }

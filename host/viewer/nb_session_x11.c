@@ -291,6 +291,7 @@ struct nb_x11 {
      * no compositor and no ARGB visual. */
     struct nb_ui ui;
     struct nb_vmpause vmp;      /* the menu's Pause / Resume                */
+    struct nb_upscaler upscaler;    /* the menu's Upscaler row          */
     struct nb_x11_layer {
         xcb_window_t win;
         uint32_t    *px;
@@ -3140,6 +3141,7 @@ skip_dmabuf_extensions:
     x->cfg = cfg;
     nb_vstore_setup(&x->vst, cfg);
     nb_ui_init(&x->ui, &x->vst);
+    nb_upscaler_init(&x->upscaler);
     x->ui_cur = -1;
     x->gc_fd = -1;
     x->gc_k1000 = -1;
@@ -3891,6 +3893,9 @@ static const struct nb_ui_env *x11_ui_env(struct nb_x11 *x)
     e.vm_pause = x->cfg && x->cfg->vm_pause_cmd && x->cfg->vm_resume_cmd;
     e.vm_paused = x->vmp.paused;
     e.vm_pause_busy = nb_vmpause_busy(&x->vmp);
+    e.upscaler = x->cfg && x->cfg->vm_upscaler_cmd && *x->cfg->vm_upscaler_cmd;
+    e.upscaler_mode = x->upscaler.mode;
+    e.upscaler_busy = x->upscaler.pid > 0;
     e.translucent = false;
     return &e;
 }
@@ -4276,6 +4281,11 @@ static void x11_ui_do(struct nb_x11 *x, unsigned bits)
     if ((bits & NB_UI_VM_REBOOT) && x->cfg) {
         nb_run_detached(x->cfg->vm_reboot_cmd);
     }
+    if ((bits & NB_UI_UPSCALER) &&
+        !nb_upscaler_ask(&x->upscaler, x->cfg, x->ui.upscaler, x->ui.notice,
+                         sizeof(x->ui.notice))) {
+        bits |= NB_UI_NOTICE;
+    }
     if ((bits & (NB_UI_VM_PAUSE | NB_UI_VM_RESUME)) &&
         !nb_vm_pause_ask(&x->vmp, x->sink, x->cfg, (bits & NB_UI_VM_PAUSE) != 0,
                          x->ui.notice, sizeof(x->ui.notice))) {
@@ -4424,6 +4434,15 @@ static int x11_tick_ui(struct nb_x11 *x, int next)
             x11_ui_do(x, NB_UI_REDRAW | NB_UI_NOTICE);
             x11_set_status(x, x->grabbed ? "GRABBED - CTRL+ALT+G TO RELEASE"
                                          : NULL);
+        } else {
+            X11_DUE(now + NB_VMPAUSE_POLL_MS);
+        }
+    }
+    /* The menu's Upscaler command, reaped when it ends. */
+    if (x->upscaler.pid > 0) {
+        if (nb_upscaler_reap(&x->upscaler, x->ui.notice,
+                             sizeof(x->ui.notice))) {
+            x11_ui_do(x, NB_UI_REDRAW | NB_UI_NOTICE);
         } else {
             X11_DUE(now + NB_VMPAUSE_POLL_MS);
         }

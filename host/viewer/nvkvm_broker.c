@@ -3258,6 +3258,9 @@ static void usage(void)
 "  --vm-pause-cmd CMD, --vm-resume-cmd CMD\n"
 "                       commands the menu's Pause / Resume run (/bin/sh); the\n"
 "                       menu shows the VM paused once the command exits 0\n"
+"  --vm-upscaler-cmd CMD\n"
+"                       the menu's Upscaler row runs `CMD default|dlss|fsr|xess`\n"
+"                       (/bin/sh): what games get in a Windows guest\n"
 "  --open-menu          start with the menu open (CTRL+ALT+M toggles)\n"
 "\n"
 "  Display hotkeys (CTRL+ALT+...): M menu, S scale, A area, R guest\n"
@@ -3868,6 +3871,8 @@ int main(int argc, char **argv)
             cfg.vm_pause_cmd = v; }
         else if (!strcmp(a, "--vm-resume-cmd")) { NEEDVAL();
             cfg.vm_resume_cmd = v; }
+        else if (!strcmp(a, "--vm-upscaler-cmd")) { NEEDVAL();
+            cfg.vm_upscaler_cmd = v; }
         else if (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage(); return 0; }
         else if (!strcmp(a, "-V") || !strcmp(a, "--version")) {
             printf("conduit-viewer %s\n", CONDUIT_BUILD_ID); return 0; }

@@ -193,6 +193,7 @@ struct nb_config {
     const char *vm_reboot_cmd;
     const char *vm_pause_cmd;   /* menu: Pause / Resume, waited for without */
     const char *vm_resume_cmd;  /* blocking; the label flips on exit 0      */
+    const char *vm_upscaler_cmd;/* menu: Upscaler, run as `CMD WORD`        */
     bool        open_menu;      /* --open-menu: start with the menu open    */
 };
 
@@ -828,6 +829,16 @@ bool nb_vm_pause_ask(struct nb_vmpause *vp, struct nb_sink *sink,
                      size_t n);
 bool nb_vm_pause_reap(struct nb_vmpause *vp, struct nb_sink *sink, char *note,
                       size_t n);
+/*
+ * The menu's Upscaler row (struct nb_upscaler in nb_vmpause.h): _ask starts
+ * --vm-upscaler-cmd for `mode`; _reap, from the UI tick while it runs, true
+ * when it ended, with the outcome in `note`.
+ */
+struct nb_upscaler;
+bool nb_upscaler_ask(struct nb_upscaler *u, const struct nb_config *cfg,
+                     int mode, char *note, size_t n);
+bool nb_upscaler_reap(struct nb_upscaler *u, char *note, size_t n);
+
 /* The status line while paused (title bar / window name). */
 #define NB_VM_PAUSED_STATUS "PAUSED - CTRL+ALT+M TO RESUME"
 

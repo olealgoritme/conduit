@@ -1,0 +1,182 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Sat, 24 Oct 2026 14:02:25 +0200
+Subject: [PATCH] nvk: NVK_CUBIN_TRACE logs what a CUDA user (NGX) asks of
+ VK_NVX_binary_import
+
+NVK_CUBIN_TRACE=N (1 means 400) logs, through mesa_logi:
+
+- each vkCreateCuModuleNVX's pNext chain (the texturing mode NGX asks
+  for: VkCuModuleTexturingModeCreateInfoNVX::use64bitTexturing);
+- each vkCreateCuFunctionNVX: kernel, SM, GPRs, bank 0 parameter offset
+  and size, local (stack) and shared memory, barriers, code size and the
+  module constant banks it binds;
+- vkGetImageViewHandleNVX / vkGetImageViewHandle64NVX /
+  vkGetImageViewAddressNVX calls: descriptor type, sampler, view size,
+  format and type, and the handle or address returned;
+- the first N vkCmdCuLaunchKernelNVX calls: kernel, grid, block, dynamic
+  shared memory, how the parameters came (pParams or the packed
+  CU_LAUNCH_PARAM_BUFFER_POINTER) and up to 768 bytes of them in hex.
+
+That is how the black DLSS output on Blackwell was narrowed down (which
+kernels run, which have a stack, which samplers and handles they get);
+it is off by default and costs one branch per call.
+---
+ src/nouveau/vulkan/nvk_cubin.c      | 68 +++++++++++++++++++++++++++++
+ src/nouveau/vulkan/nvk_cubin.h      |  2 +
+ src/nouveau/vulkan/nvk_image_view.c | 15 +++++++
+ 3 files changed, 85 insertions(+)
+
+diff --git a/src/nouveau/vulkan/nvk_cubin.c b/src/nouveau/vulkan/nvk_cubin.c
+index 6f40006..1381bd0 100644
+--- a/src/nouveau/vulkan/nvk_cubin.c
++++ b/src/nouveau/vulkan/nvk_cubin.c
+@@ -25,6 +25,21 @@
+ #include <windows.h>
+ #endif
+ 
++/* NVK_CUBIN_TRACE=N: log module/function creation, image view handles and
++ * the first N kernel launches (N=1 means 400).
++ */
++uint32_t
++nvk_cubin_trace_launches(void)
++{
++   static int v = -1;
++   if (v < 0) {
++      v = debug_get_num_option("NVK_CUBIN_TRACE", 0);
++      if (v == 1)
++         v = 400;
++   }
++   return v;
++}
++
+ bool
+ nvk_cuda_sampler_via_header(const struct nvk_physical_device *pdev)
+ {
+@@ -763,6 +778,19 @@ nvk_cubin_module_init(struct nvk_device *dev, struct nvk_cubin_module *module,
+    /* a cubin from the SASS cache, freed once the module has its copy */
+    void *cached = NULL;
+ 
++   if (nvk_cubin_trace_launches()) {
++      for (const VkBaseInStructure *ext = pCreateInfo->pNext; ext;
++           ext = ext->pNext) {
++         if (ext->sType == VK_STRUCTURE_TYPE_CU_MODULE_TEXTURING_MODE_CREATE_INFO_NVX) {
++            const VkCuModuleTexturingModeCreateInfoNVX *tm = (const void *)ext;
++            mesa_logi("NVK-CU: module texturing mode use64bitTexturing=%u",
++                      tm->use64bitTexturing);
++         } else {
++            mesa_logi("NVK-CU: module pNext sType %d", ext->sType);
++         }
++      }
++   }
++
+    struct nv_fatbin fatbin;
+    if (nv_fatbin_init(&fatbin, pCreateInfo->pData, pCreateInfo->dataSize)) {
+       /* Must be a fatbin. */
+@@ -936,6 +964,24 @@ nvk_cubin_function_init(struct nvk_device *dev,
+    function->max_warps_per_sm = nak_max_warps_per_sm(function->info->gpr_count, nak);
+    nvk_cubin_function_init_cbufs(module, function, function->info->name);
+ 
++   if (nvk_cubin_trace_launches()) {
++      const struct nv_cubin_function *fi = function->info;
++      char banks[128] = "";
++      for (unsigned b = 1; b < NVK_CUBIN_MAX_CBUFS; b++) {
++         if (function->cbufs[b].size == 0)
++            continue;
++         size_t l = strlen(banks);
++         snprintf(banks + l, sizeof(banks) - l, " c%u:%u", b,
++                  (unsigned)function->cbufs[b].size);
++      }
++      mesa_logi("NVK-CU: function %s sm_%u gprs %u params 0x%x+0x%x (%u) "
++                "slm %u crs %u smem %u bars %u code %u off 0x%x banks%s",
++                fi->name, module->info->sm, fi->gpr_count, fi->params_offset,
++                fi->params_size, fi->param_info_count, fi->slm_size,
++                fi->crs_size, fi->static_smem_size, fi->num_control_barriers,
++                function->code_size, (unsigned)fi->func_offset, banks);
++   }
++
+    return VK_SUCCESS;
+ }
+ 
+@@ -1129,6 +1175,28 @@ nvk_CmdCuLaunchKernelNVX(VkCommandBuffer commandBuffer,
+       }
+    }
+ 
++   static uint32_t trace_count;
++   if (unlikely(nvk_cubin_trace_launches()) &&
++       trace_count < nvk_cubin_trace_launches()) {
++      trace_count++;
++      char hex[9 * 192 + 1] = "";
++      const uint8_t *pb = (const uint8_t *)root + function_info->params_offset;
++      const uint32_t n = MIN2(function_info->params_size, 768);
++      for (uint32_t i = 0; i < n; i += 4) {
++         uint32_t w;
++         memcpy(&w, pb + i, 4);
++         size_t l = strlen(hex);
++         snprintf(hex + l, sizeof(hex) - l, "%s%08x", i ? " " : "", w);
++      }
++      mesa_logi("NVK-CU: launch %s grid %ux%ux%u block %ux%ux%u dynsmem %u "
++                "params %u extra %u: %s", function_info->name,
++                pLaunchInfo->gridDimX, pLaunchInfo->gridDimY,
++                pLaunchInfo->gridDimZ, pLaunchInfo->blockDimX,
++                pLaunchInfo->blockDimY, pLaunchInfo->blockDimZ,
++                pLaunchInfo->sharedMemBytes, (unsigned)pLaunchInfo->paramCount,
++                (unsigned)pLaunchInfo->extraCount, hex);
++   }
++
+    struct nvk_shader shader;
+    memset(&shader, 0, sizeof(shader));
+    shader.upload_size = function->code_size;
+diff --git a/src/nouveau/vulkan/nvk_cubin.h b/src/nouveau/vulkan/nvk_cubin.h
+index e6d1381..d78f9e5 100644
+--- a/src/nouveau/vulkan/nvk_cubin.h
++++ b/src/nouveau/vulkan/nvk_cubin.h
+@@ -72,6 +72,8 @@ struct nvk_cubin_function {
+    uint32_t cbuf_count;
+ };
+ 
++uint32_t nvk_cubin_trace_launches(void);
++
+ struct nvk_physical_device;
+ 
+ /* CUDA kernels for sm_100 and later take the sampler at the texture
+diff --git a/src/nouveau/vulkan/nvk_image_view.c b/src/nouveau/vulkan/nvk_image_view.c
+index 31b18da..2ce92d5 100644
+--- a/src/nouveau/vulkan/nvk_image_view.c
++++ b/src/nouveau/vulkan/nvk_image_view.c
+@@ -497,6 +497,16 @@ nvk_GetImageViewHandleNVX(VkDevice _device,
+       memcpy(&handle, &desc, sizeof(uint32_t));
+    }
+ 
++   if (nvk_cubin_trace_launches()) {
++      mesa_logi("NVK-CU: image view handle type %d sampler %p view %ux%u "
++                "fmt %d viewtype %d mips %u+%u layers %u -> 0x%08x",
++                pInfo->descriptorType, (void *)sampler,
++                view->vk.extent.width, view->vk.extent.height,
++                view->vk.format, view->vk.view_type,
++                view->vk.base_mip_level, view->vk.level_count,
++                view->vk.layer_count, handle);
++   }
++
+    return handle;
+ }
+ 
+@@ -506,6 +516,8 @@ nvk_GetImageViewHandle64NVX(VkDevice _device,
+ {
+    /* NVK does not currently support 64-bit texture addressing,
+     * so this is the same as vkGetImageViewHandleNVX. */
++   if (nvk_cubin_trace_launches())
++      mesa_logi("NVK-CU: vkGetImageViewHandle64NVX");
+ 
+    return nvk_GetImageViewHandleNVX(_device, pInfo);
+ }
+@@ -520,6 +532,9 @@ nvk_GetImageViewAddressNVX(VkDevice _device, VkImageView _imageView,
+    const uint8_t plane = image_view->planes[0].image_plane;
+    pProperties->deviceAddress = nvk_image_base_address(image, plane);
+    pProperties->size = nvk_image_size_B(image, plane);
++   if (nvk_cubin_trace_launches())
++      mesa_logi("NVK-CU: image view address 0x%" PRIx64 " size %" PRIu64,
++                pProperties->deviceAddress, (uint64_t)pProperties->size);
+ 
+    return VK_SUCCESS;
+ }

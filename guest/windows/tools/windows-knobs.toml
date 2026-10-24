@@ -581,6 +581,24 @@ read = "once per process"
 effect = "What the D3D11.1 CheckDirectFlipSupport DDI answers, which DWM uses for independent flip: 0 never; 1 yes when the KMD reports DirectFlip and size and format are equal; 2 whenever size and format match (test lever); 3 as 1, only for formats the KMD scans out as is; 4 the same as 1; 5 as 1, and two different 8-bit scan-out formats (R8G8B8A8 on a B8G8R8A8 desktop) also pair. HELIOS_DIRECT_FLIP_SUPPORT overrides it per process."
 see = "[independent-flip.md](../guest/windows/docs/independent-flip.md)"
 
+[umd.CubinCache]
+class = "experiment"
+read = "each vkCreateCuModuleNVX whose module has no SASS for the GPU"
+effect = "Folder of the host-compiled SASS cache NVK takes CUDA modules from when their fatbin has no SASS for the GPU (DLSS on RTX 50): <key>.sm_<SM>.cubin files made by nvk-cubin-cache.py. Absent: %ProgramData%\\Helios\\ngx\\cubin. NVK_CUBIN_CACHE_DIR wins."
+see = "[dlss.md](../guest/nvk-rm/docs/dlss.md)"
+
+[umd.CubinCacheDump]
+class = "debug"
+read = "each CUDA module that misses the cubin cache"
+effect = "1 writes a CUDA module that has no SASS for the GPU and no cached cubin to %LOCALAPPDATA%\\Helios\\cubin-miss (or NVK_CUBIN_DUMP_DIR), as input for nvk-cubin-cache.py on the host. 0 or absent: only the log line."
+see = "[dlss.md](../guest/nvk-rm/docs/dlss.md)"
+
+[umd.Dlss]
+class = "experiment"
+read = "NVK instance creation; once per process in the bridge"
+effect = "1 turns on NVK's DLSS support: NVK exposes VK_NVX_binary_import (NGX imports its CUDA kernels with it) to native Vulkan apps and to vkd3d-proton, the bridge sets HELIOS_DXVK_NVX=1 so DXVK keeps the NVX extensions, and the D3D12 driver publishes two meta-commands through which Conduit's nvapi64 reaches vkd3d-proton's cubin entry points (NGX's D3D12 path). NGX also needs its runtime from the host driver and nvapi64; on RTX 50 the SASS comes from the host-built cubin cache (see dlss.md). The tray sets it with `conduit upscaler VM dlss`. 0 (default) leaves both off."
+see = "[dlss.md](../guest/nvk-rm/docs/dlss.md)"
+
 [umd.DwmIcd]
 class = "supported"
 read = "each DWM start (dwm.exe); other processes per process for the desktop-follows rule"
@@ -604,6 +622,72 @@ class = "supported"
 read = "each DWM start with DwmIcd=nvk"
 effect = "How many DWM starts on NVK within DwmNvkGuardSeconds that never got healthy (DwmNvkHealthySeconds) send the next start to Venus (the crash-loop guard; pending starts are kept in %ProgramData%\\Helios\\dwm-nvk-starts.txt; only starts of the installed driver build in other DWM processes count). If Venus then cannot create DWM's device, DWM runs on NVK after all. 0 disables the guard."
 see = "[dwm-on-nvk.md](dwm-on-nvk.md)"
+
+[umd.EnhanceD3D]
+class = "supported"
+read = "once per process (the DXGI hooks) and each D3D swap chain creation"
+effect = "1 (default): with Enhance settings on for the process, D3D11 and D3D12 swap chains of processes whose D3D driver runs on NVK are presented through NVK's composed present with upscaling and frame generation (NVK hooks DXGI's swap chain creation and hands the application a swap chain of its own); 0 leaves D3D swap chains to DXGI. A per-exe profile's D3D wins."
+see = "[enhance.md](../guest/nvk-rm/docs/enhance.md)"
+
+[umd.EnhanceFgQuality]
+class = "supported"
+read = "each swapchain creation and every registry change (composed present)"
+effect = "Optical flow of frame generation: fast (down to 1/4 of the frame) or quality (down to 1/2, one more coarse level, twice the reach and about twice the flow cost). A per-exe profile's FgQuality wins."
+see = "[enhance.md](../guest/nvk-rm/docs/enhance.md)"
+
+[umd.EnhanceFgTarget]
+class = "supported"
+read = "each swapchain creation and every registry change (composed present)"
+effect = "Adaptive frame generation fills to this many pictures per second; 0 or absent: the display's refresh. With LowLatency and a fixed multiplier, generation stops while the game reaches it. A per-exe profile's FgTarget wins."
+see = "[enhance.md](../guest/nvk-rm/docs/enhance.md)"
+
+[umd.EnhanceFit]
+class = "supported"
+read = "each swapchain creation and every registry change (composed present)"
+effect = "aspect (default): the upscaled picture keeps its aspect ratio with black bars; stretch fills the window. A change makes the application recreate its swapchain. A per-exe profile's Fit wins."
+see = "[enhance.md](../guest/nvk-rm/docs/enhance.md)"
+
+[umd.EnhanceFrameGen]
+class = "supported"
+read = "each swapchain creation and every registry change (composed present)"
+effect = "Frame generation in NVK's composed present: off (default), 2x, 3x, 4x or adaptive (fill to EnhanceFgTarget or the refresh, up to 8 pictures per frame). Generated pictures are interpolated from the last two frames by optical flow and presented between them, paced; Vulkan and Zink swapchains, and D3D11/D3D12 swap chains of processes on NVK (EnhanceD3D). A per-exe profile under HKLM\\SOFTWARE\\Helios\\Enhance\\<exe> (value FrameGen) wins; the tray sets it."
+see = "[enhance.md](../guest/nvk-rm/docs/enhance.md)"
+
+[umd.EnhanceLowLatency]
+class = "supported"
+read = "each swapchain creation and every registry change (composed present)"
+effect = "1: generated pictures one refresh apart, so the real frame is held back less (the cadence gets uneven); with a fixed multiplier and EnhanceFgTarget, no generation while the game reaches the target. A per-exe profile's LowLatency wins."
+see = "[enhance.md](../guest/nvk-rm/docs/enhance.md)"
+
+[umd.EnhanceOverlay]
+class = "supported"
+read = "each swapchain creation and every registry change (composed present)"
+effect = "1: an on-screen counter at the top left of every presented picture: the application's frames per second / pictures shown per second, the frame generation mode and the scaler (e.g. 80 / 160  FG 2x  FSR), updated twice a second; Vulkan, Zink, D3D11 and D3D12 (EnhanceD3D). On its own it turns the composed present's enhancement path on (a 1:1 copy with the counter). Default 0. A per-exe profile's Overlay wins; the tray sets both."
+see = "[enhance.md](../guest/nvk-rm/docs/enhance.md#on-screen-counter)"
+
+[umd.EnhanceScaler]
+class = "supported"
+read = "each swapchain creation and every registry change (composed present)"
+effect = "Upscaling in NVK's composed present: off (default), fsr (FidelityFX FSR 1), nis (NVIDIA Image Scaling), sgsr (Snapdragon GSR 1), cas (FidelityFX CAS), bicubic, bilinear, nearest, integer, xbr (pixel art), or a4k-3d, a4k, a4k-vl (Anime4K's learned upscalers, light to heavy). A Vulkan surface then reports no current extent and a D3D swap chain keeps its own size, so the application renders at its own size and the picture is scaled to the window. Vulkan and Zink swapchains, and D3D11/D3D12 swap chains of processes on NVK (EnhanceD3D). A per-exe profile under HKLM\\SOFTWARE\\Helios\\Enhance\\<exe> (value Scaler) wins; the tray sets it."
+see = "[enhance.md](../guest/nvk-rm/docs/enhance.md)"
+
+[umd.EnhanceSharpness]
+class = "supported"
+read = "each swapchain creation and every registry change (composed present)"
+effect = "0..100: FSR's RCAS sharpening (0: EASU alone), NIS's and CAS's sharpness; absent: 50. A per-exe profile's Sharpness wins."
+see = "[enhance.md](../guest/nvk-rm/docs/enhance.md)"
+
+[umd.EnhanceStats]
+class = "debug"
+read = "each swapchain creation and every registry change (composed present)"
+effect = "1: a CSV row per frame (pictures, interval, GPU time per pass) in %ProgramData%\\Helios\\enhance-<pid>-<id>.csv; the 5 s summary in helios-wsi-<pid>.log is always written while enhancement runs."
+see = "[enhance.md](../guest/nvk-rm/docs/enhance.md)"
+
+[umd.EnhanceWindows]
+class = "supported"
+read = "each swapchain creation and every registry change (composed present)"
+effect = "fullscreen (default): the global Enhance settings apply to windows that cover their monitor (borderless and fullscreen); all: to every window. Per-exe profiles always apply to every window of that executable."
+see = "[enhance.md](../guest/nvk-rm/docs/enhance.md)"
 
 [umd.FeatureLevel11]
 class = "debug"
@@ -1011,6 +1095,11 @@ class = "experiment"
 read = "DXVK device creation"
 effect = "Internal: the D3D11 bridge sets it to 1 from HKLM\\SOFTWARE\\Helios ForeignImport (else empty) before the device is created; 1 lets a Venus DXVK device import NVK-made (foreign) resources through explicit DRM-modifier images. A value set by hand is overwritten."
 
+[env.HELIOS_DXVK_NVX]
+class = "experiment"
+read = "DXVK device creation"
+effect = "1 keeps VK_NVX_binary_import and VK_NVX_image_view_handle on DXVK devices of 64-bit processes (upstream DXVK drops them outside Wine). The bridge sets it when the registry Dlss is 1."
+
 [env.HELIOS_DXVK_SPIN_US]
 class = "tuning"
 read = "once per process"
@@ -1336,6 +1425,78 @@ class = "tuning"
 read = "swapchain creation"
 effect = "1 hands composed presents to a WSI thread so the application's present call does not wait for the D3D11 flip; 0 presents on the calling thread."
 
+[env.MESA_WSI_ENHANCE_D3D]
+class = "supported"
+read = "once per process"
+effect = "0: D3D11/D3D12 swap chains are not enhanced (DXGI is not hooked); wins over EnhanceD3D."
+see = "[enhance.md](../guest/nvk-rm/docs/enhance.md)"
+
+[env.MESA_WSI_ENHANCE_FG]
+class = "supported"
+read = "each swapchain creation"
+effect = "Frame generation for this process (off, 2x, 3x, 4x, adaptive); wins over the registry EnhanceFrameGen and per-exe profiles, and applies to every window of the process."
+see = "[enhance.md](../guest/nvk-rm/docs/enhance.md)"
+
+[env.MESA_WSI_ENHANCE_FG_QUALITY]
+class = "supported"
+read = "each swapchain creation"
+effect = "fast or quality optical flow; wins over EnhanceFgQuality."
+see = "[enhance.md](../guest/nvk-rm/docs/enhance.md)"
+
+[env.MESA_WSI_ENHANCE_FG_TARGET]
+class = "supported"
+read = "each swapchain creation"
+effect = "Pictures per second adaptive generation fills to (0: the refresh); wins over EnhanceFgTarget."
+see = "[enhance.md](../guest/nvk-rm/docs/enhance.md)"
+
+[env.MESA_WSI_ENHANCE_FIT]
+class = "supported"
+read = "each swapchain creation"
+effect = "aspect or stretch; wins over EnhanceFit."
+see = "[enhance.md](../guest/nvk-rm/docs/enhance.md)"
+
+[env.MESA_WSI_ENHANCE_LOW_LATENCY]
+class = "supported"
+read = "each swapchain creation"
+effect = "1 or 0; wins over EnhanceLowLatency."
+see = "[enhance.md](../guest/nvk-rm/docs/enhance.md)"
+
+[env.MESA_WSI_ENHANCE_OVERLAY]
+class = "supported"
+read = "each swapchain creation"
+effect = "1: the on-screen counter for every window of the process, 0: none; wins over EnhanceOverlay and a profile's Overlay."
+see = "[enhance.md](../guest/nvk-rm/docs/enhance.md#on-screen-counter)"
+
+[env.MESA_WSI_ENHANCE_SCALER]
+class = "supported"
+read = "each swapchain creation"
+effect = "Upscaling for this process (off, fsr, nis, sgsr, cas, bicubic, bilinear, nearest, integer, xbr, a4k-3d, a4k, a4k-vl); wins over the registry EnhanceScaler and per-exe profiles, and applies to every window of the process."
+see = "[enhance.md](../guest/nvk-rm/docs/enhance.md)"
+
+[env.MESA_WSI_ENHANCE_SHARPNESS]
+class = "supported"
+read = "each swapchain creation"
+effect = "0..100 for FSR's RCAS, NIS and CAS; wins over EnhanceSharpness."
+see = "[enhance.md](../guest/nvk-rm/docs/enhance.md)"
+
+[env.MESA_WSI_ENHANCE_SHOW]
+class = "debug"
+read = "once per process"
+effect = "generated: only the generated pictures are presented (the real frames are dropped), to look at the interpolation."
+see = "[enhance.md](../guest/nvk-rm/docs/enhance.md)"
+
+[env.MESA_WSI_ENHANCE_STATS]
+class = "debug"
+read = "each swapchain creation"
+effect = "1: the per-frame CSV (as EnhanceStats)."
+see = "[enhance.md](../guest/nvk-rm/docs/enhance.md)"
+
+[env.MESA_WSI_ENHANCE_WINDOWS]
+class = "supported"
+read = "each swapchain creation"
+effect = "fullscreen or all; wins over EnhanceWindows."
+see = "[enhance.md](../guest/nvk-rm/docs/enhance.md)"
+
 [env.MESA_WSI_SCANOUT_HZ]
 class = "experiment"
 read = "swapchain creation"
@@ -1370,6 +1531,11 @@ effect = "NAK_GPR_CAP for fragment shaders only, overriding NAK_GPR_CAP; 0 leave
 class = "tuning"
 read = "device creation (once per process)"
 effect = "On by default (unset or 1); 0 turns it off. Rematerialization in NAK's GPR spiller (cheap values such as constants, constant-buffer and constant-memory loads, thread/CTA IDs and short ALU chains are recomputed at reloads instead of going to local memory; constant-memory loads through a constant-buffer address reload with one LDG from a UGPR copy of the address) and a per-shader register target: after scheduling, NAK estimates the cost of spilling down to each lower register count that gives more warps per SM (workgroup and shared memory limits included) and uses the one with the best estimated gain, never one that needs more than a few memory spills or any inside a loop. A NAK_GPR_CAP for a stage overrides the target of that stage and then spills with rematerialization. Part of the shader cache key."
+
+[env.NAK_SCHED_MLP]
+class = "tuning"
+read = "first shader compile (once per process)"
+effect = "0-3, default 3 on Windows and 0 elsewhere. 1-3: NAK's schedulers model global, local and texture latency as an L2 round trip instead of 32 cycles, so independent loads issue early and stay in flight together, and read-only accesses are not ordered against stores; 3 also hoists them as far as their operands allow. A unit that does not fit its register target keeps the plain schedule, so it never costs occupancy. Part of the shader cache key."
 
 [env.NAK_IMM_CSE]
 class = "tuning"
@@ -1469,7 +1635,7 @@ effect = "1 logs once a second (mesa_logi, MESA_LOG_FILE on Windows) how many id
 [env.NVK_DISPATCH_CAPTURE]
 class = "debug"
 read = "device creation"
-effect = "Comma-separated 16-digit source hashes (vkd3d-proton DXIL hashes, as NVK_DISPATCH_PROFILE prints them) of compute shaders to capture: one dispatch each is written with its SPIR-V, push constants, grid and the contents of every image, buffer, sampler and root buffer address it reads, for replaying it outside the game. Each capture is a directory <hash>-p<pid>-<n> with manifest.json, shader.spv, push.bin and one raw file per resource; events go to nvk-dcap.log there."
+effect = "Comma-separated 16-digit source hashes (vkd3d-proton DXIL hashes, as NVK_DISPATCH_PROFILE prints them) or 8-digit code hashes of shaders to capture: for a compute shader one dispatch each is written with its SPIR-V, push constants, grid and the contents of every image, buffer, sampler and root buffer address it reads; for a fragment shader one direct draw with it, with both shaders, their resources, the attachments and the pipeline state; for replaying it outside the game. Each capture is a directory <hash>-p<pid>-<n> with manifest.json, shader.spv (vs.spv too for a draw), push.bin and one raw file per resource; events go to nvk-dcap.log there."
 
 [env.NVK_DISPATCH_CAPTURE_COUNT]
 class = "debug"
@@ -1492,10 +1658,20 @@ class = "debug"
 read = "device creation"
 effect = "With NVK_DISPATCH_CAPTURE: largest staging buffer one capture may allocate, in MiB; a dispatch needing more is not captured (logged)."
 
+[env.NVK_DISPATCH_CAPTURE_SEQ_START]
+class = "debug"
+read = "device creation"
+effect = "Comma-separated 16-digit source hashes: a sequence (NVK_DISPATCH_CAPTURE_SEQ, 4096 when unset) starts only at the first dispatch of a command buffer whose shader is one of these, so that it holds the command buffer's whole run of dispatches; NVK_DISPATCH_CAPTURE then names a shader the sequence must contain to be written (others are dropped, logged in nvk-dcap.log), and NVK_DISPATCH_CAPTURE_COUNT limits the sequences written."
+
+[env.NVK_DISPATCH_CAPTURE_SEQ]
+class = "debug"
+read = "device creation"
+effect = "With NVK_DISPATCH_CAPTURE: N captures a dispatch of a listed shader and the next N - 1 dispatches recorded in the same command buffer, whatever their shaders, as one sequence (manifest \"sequence\": id, index, whether a pipeline barrier came before); a resource an earlier dispatch of the sequence captured is referred to (\"same_as\"), not copied again. dispatch-replay --seq replays the sequence in one command buffer."
+
 [env.NVK_DISPATCH_CAPTURE_POST]
 class = "debug"
 read = "device creation"
-effect = "With NVK_DISPATCH_CAPTURE: 1 also copies every resource the shader may write after the dispatch (r<N>.post.bin), NVK's result to compare a replay with."
+effect = "With NVK_DISPATCH_CAPTURE: 1 also copies every resource the shader may write after the dispatch or draw (r<N>.post.bin), NVK's result to compare a replay with; a capture whose staging with these outputs cannot be mapped is made without them."
 
 [env.NVK_DISPATCH_CAPTURE_SKIP]
 class = "debug"
@@ -1506,6 +1682,16 @@ effect = "With NVK_DISPATCH_CAPTURE: matching dispatches of each shader skipped 
 class = "debug"
 read = "device creation; the file is checked at most every 250 ms"
 effect = "With NVK_DISPATCH_CAPTURE: path of a file whose creation arms the capture (after the delay), to pick the moment in a running game; unset: armed by the delay alone."
+
+[env.NVK_PUSH_DUMP_WINDOW]
+class = "debug"
+read = "first submit (once per process)"
+effect = "START_S,DURATION_MS: every pushbuffer executed from START_S seconds after the first submit for DURATION_MS milliseconds is printed to NVK_PUSH_DUMP_FILE with its submit time and context: one or two frames of a game instead of NVK_DEBUG=push_dump for the whole run."
+
+[env.NVK_PUSH_DUMP_FILE]
+class = "debug"
+read = "when the NVK_PUSH_DUMP_WINDOW window opens"
+effect = "With NVK_PUSH_DUMP_WINDOW: the file the window's pushbuffers are printed to. Unset: nvk-push-<pid>.txt in the current directory."
 
 [env.NVK_DISPATCH_PROFILE]
 class = "debug"
@@ -1527,10 +1713,38 @@ class = "experiment"
 read = "device creation"
 effect = "1 (Turing and later) writes draw parameters into the root table only for the system values the bound shaders read; 0 writes all of them."
 
+[env.NVK_CUBIN_CACHE_DIR]
+class = "experiment"
+read = "each vkCreateCuModuleNVX whose module has no SASS for the GPU"
+effect = "Folder of the host-compiled SASS cache (wins over the registry CubinCache); elsewhere than Windows the default is $XDG_CACHE_HOME/nvk/cubin."
+see = "[dlss.md](../guest/nvk-rm/docs/dlss.md)"
+
+[env.NVK_CUBIN_TRACE]
+class = "debug"
+read = "once per process, at the first CUDA module, function, image view handle or launch"
+effect = "N > 0 logs (mesa_logi) each vkCreateCuModuleNVX's texturing mode, each vkCreateCuFunctionNVX (SM, GPRs, parameter layout, stack and shared memory, constant banks), every vkGetImageViewHandleNVX/Handle64NVX/AddressNVX result and the first N vkCmdCuLaunchKernelNVX calls with grid, block and parameters in hex; 1 means 400. 0 or absent: off."
+see = "[dlss.md](../guest/nvk-rm/docs/dlss.md)"
+
+[env.NVK_CUBIN_CACHE_DUMP]
+class = "debug"
+read = "each CUDA module that misses the cubin cache"
+effect = "1 writes a module that misses the cubin cache to NVK_CUBIN_DUMP_DIR for nvk-cubin-cache.py; wins over the registry CubinCacheDump."
+
+[env.NVK_CUBIN_DUMP_DIR]
+class = "debug"
+read = "when NVK_CUBIN_CACHE_DUMP or CubinCacheDump writes a module"
+effect = "Where missed CUDA modules are written. Default %LOCALAPPDATA%\\Helios\\cubin-miss on Windows, the cache folder with -miss appended elsewhere."
+
+[env.NVK_DLSS]
+class = "experiment"
+read = "instance creation"
+effect = "1 adds dlss to NVK_EXPERIMENTAL (VK_NVX_binary_import for NGX/DLSS), 0 removes it; unset defers to the registry Dlss."
+see = "[dlss.md](../guest/nvk-rm/docs/dlss.md)"
+
 [env.NVK_EXPERIMENTAL]
 class = "supported"
 read = "instance creation"
-effect = "Upstream NVK's list of experimental features; video makes NVK expose Vulkan Video decode. The ICD bridge sets it to video for NVK processes unless the registry VideoDdi is 0."
+effect = "Upstream NVK's list of experimental features; video makes NVK expose Vulkan Video decode, dlss VK_NVX_binary_import (see NVK_DLSS). The ICD bridge sets it to video for NVK processes unless the registry VideoDdi is 0."
 
 [env.NVK_FS_STATE_TRACKING]
 class = "debug"
@@ -1782,6 +1996,21 @@ class = "tuning"
 read = "device creation"
 effect = "Which command buffer upload memory lives in CPU-mapped VRAM written through BAR1 instead of system memory. compute (the default on Windows): the compute root descriptor tables, which every dispatch waits for (tiny dispatches cost 0.48 us each from VRAM against 2.5-3.7 us from system memory on an RTX 5090); 1: all upload memory; 0: none."
 default_note = "compute on Windows, 0 elsewhere"
+
+[env.NVK_QMD_LAT]
+class = "tuning"
+read = "first use (once per process)"
+effect = "QMDs (the compute dispatch descriptors) come from the compute root tables' latency-bound upload stream, which is CPU-mapped VRAM under NVK_RM_UPLOAD_VRAM=compute, so a dispatch after a barrier does not wait for a system memory read. 1 is the default on Windows; 0 (the default elsewhere) keeps them in the general upload stream in system memory."
+
+[env.NVK_DISPATCH_INDIRECT_PREFETCH]
+class = "experiment"
+read = "first use (once per process)"
+effect = "1: only the first indirect dispatch argument copy after a barrier is a no-prefetch pushbuffer entry; by default every copy is one (two per indirect dispatch). A/B knob, default 0."
+
+[env.NVK_BARRIER_DEDUP]
+class = "experiment"
+read = "first use (once per process)"
+effect = "1: a pipeline barrier whose storage-write flush already invalidated the shader data caches emits no second GLOBAL_DATA invalidate. A/B knob, default 0."
 
 [env.NVK_RM_VIDEO]
 class = "debug"

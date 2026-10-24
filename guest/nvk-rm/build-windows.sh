@@ -30,7 +30,8 @@
 #                 app-local use; Zink loads the NVK next to it (patch 0033)
 #
 # Needs: gcc-mingw-w64-x86-64, rustup target x86_64-pc-windows-gnu, bindgen,
-# cbindgen, and Mesa's usual Python build modules (mako, yaml).
+# cbindgen, glslangValidator (the Win32 WSI's enhancement shaders), and
+# Mesa's usual Python build modules (mako, yaml).
 #
 # Result in OUT_DIR: vulkan_nouveau.dll, librmclient.dll, nouveau_icd.json
 # (library_path relative to the manifest), imports.txt, exports.txt; with

@@ -1,0 +1,360 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Sat, 24 Oct 2026 01:03:19 +0200
+Subject: [PATCH] nvk: SASS from a host-built cubin cache for modules without
+ code for the GPU
+
+NVK runs only SASS built for the GPU's SM version and cannot compile
+PTX.  NVIDIA's driver JITs the PTX of a fatbin that has no SASS for the
+GPU, and the DLSS DLLs rely on it for Blackwell: nvngx_dlss.dll
+310.9.16 carries SASS for sm_75, sm_80, sm_86 and sm_89 and PTX for
+sm_80/sm_89, so on an RTX 50 (sm_120) every super resolution module
+failed with "Fatbin does not have compatible bytecode".
+
+When a fatbin has no SASS for the GPU, NVK now looks for a cubin that
+was compiled from its PTX on the host (Conduit's nvk-cubin-cache.py,
+with NVIDIA's own PTX compiler): <dir>/<key>.sm_<SM>.cubin, key the
+BLAKE3 of the PTX entry's bytes as stored in the fatbin (compressed or
+not), the newest PTX not newer than the GPU first.  A module passed as
+PTX text is looked up by the BLAKE3 of the text.  The shipped SASS
+always wins, so Turing to Ada never read the cache.
+
+<dir>: NVK_CUBIN_CACHE_DIR, else on Windows HKLM\SOFTWARE\Helios
+CubinCache (REG_SZ), else %ProgramData%\Helios\ngx\cubin; elsewhere
+$XDG_CACHE_HOME/nvk/cubin.  A miss is logged with the file it looked
+for; NVK_CUBIN_CACHE_DUMP=1 (Windows: CubinCacheDump = 1) also writes
+the module to NVK_CUBIN_DUMP_DIR (default %LOCALAPPDATA%\Helios\cubin-miss
+on Windows, <dir>-miss elsewhere) for the host tool.  The fatbin walk
+checks every header against the buffer.
+---
+ src/nouveau/vulkan/nvk_cubin.c | 281 ++++++++++++++++++++++++++++++++-
+ 1 file changed, 278 insertions(+), 3 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvk_cubin.c b/src/nouveau/vulkan/nvk_cubin.c
+index e05c61a..d665906 100644
+--- a/src/nouveau/vulkan/nvk_cubin.c
++++ b/src/nouveau/vulkan/nvk_cubin.c
+@@ -14,9 +14,17 @@
+ #include "nouveau/cubin/nv_fatbin.h"
+ 
+ #include "util/log.h"
++#include "util/mesa-blake3.h"
++#include "util/os_file.h"
++#include "util/os_misc.h"
++#include "util/u_debug.h"
+ #include "util/u_math.h"
+ #include "util/u_process.h"
+ 
++#ifdef _WIN32
++#include <windows.h>
++#endif
++
+ static void
+ nvk_cubin_dump(const char *extension, const void *data, size_t size)
+ {
+@@ -484,6 +492,255 @@ nvk_cubin_function_init_cbufs(struct nvk_cubin_module *module,
+    }
+ }
+ 
++/* SASS cache
++ *
++ * NVK runs only SASS built for the GPU's SM version and has no PTX
++ * compiler.  NVIDIA's driver JITs a module's PTX when its fatbin has no
++ * SASS for the GPU, which is what the DLSS DLLs rely on for Blackwell:
++ * nvngx_dlss.dll 310.9.16 has SASS for sm_75, sm_80, sm_86 and sm_89 and
++ * PTX for sm_80/sm_89 only.  So for a fatbin without SASS for the GPU (or
++ * a module passed as PTX text), NVK looks for a cubin the host compiled
++ * from that PTX (guest/nvk-rm/tools/cubin-cache/nvk-cubin-cache.py, with
++ * NVIDIA's PTX compiler on a Linux host):
++ *
++ *    <dir>/<key>.sm_<SM>.cubin
++ *
++ * key = BLAKE3 of the PTX entry's bytes as the fatbin stores them
++ * (compressed or not), newest PTX not newer than the GPU first; for PTX
++ * text, BLAKE3 of the text up to its first NUL.  <dir>: NVK_CUBIN_CACHE_DIR,
++ * else on Windows HKLM\SOFTWARE\Helios CubinCache (REG_SZ), else
++ * %ProgramData%\Helios\ngx\cubin; elsewhere $XDG_CACHE_HOME/nvk/cubin
++ * (~/.cache/nvk/cubin).  The shipped SASS always wins: on Turing to Ada the
++ * cache is never read.
++ *
++ * NVK_CUBIN_CACHE_DUMP=1 (Windows: HKLM\SOFTWARE\Helios CubinCacheDump = 1)
++ * writes a module that misses to NVK_CUBIN_DUMP_DIR, else
++ * %LOCALAPPDATA%\Helios\cubin-miss (Windows) or <dir>-miss, as
++ * <key>.fatbin (or .ptx), which the host tool takes as input.
++ */
++
++#define NVK_FATBIN_MAGIC 0xBA55ED50u
++#define NVK_FATBIN_KIND_PTX 1
++#define NVK_CUBIN_CACHE_MAX_PTX 16
++
++struct nvk_fatbin_ptx {
++   uint32_t sm;
++   const uint8_t *payload;
++   size_t size;
++};
++
++/* The PTX entries of a fatbin with an SM version up to max_sm, newest
++ * first.  Every header is checked against the buffer.
++ */
++static uint32_t
++nvk_fatbin_list_ptx(const void *data, size_t size, uint32_t max_sm,
++                    struct nvk_fatbin_ptx *out, uint32_t max_out)
++{
++   const uint8_t *d = data;
++   if (size < 16 || nvk_elf_u32(d) != NVK_FATBIN_MAGIC)
++      return 0;
++   const uint32_t header_size = nvk_elf_u16(d + 6);
++   const uint64_t body_size = nvk_elf_u64(d + 8);
++   if (header_size < 16 || header_size > size ||
++       body_size > size - header_size)
++      return 0;
++
++   uint32_t count = 0;
++   uint64_t pos = header_size;
++   const uint64_t end = header_size + body_size;
++   while (pos + 32 <= end) {
++      const uint8_t *e = d + pos;
++      const uint16_t kind = nvk_elf_u16(e);
++      const uint32_t ehs = nvk_elf_u32(e + 4);
++      const uint64_t esize = nvk_elf_u64(e + 8);
++      if (kind == 0 || ehs < 32 || ehs > end - pos ||
++          esize > end - pos - ehs)
++         break;
++      const uint32_t sm = nvk_elf_u32(e + 28);
++      if (kind == NVK_FATBIN_KIND_PTX && sm <= max_sm && count < max_out) {
++         /* insertion sort, newest first */
++         uint32_t i = count++;
++         while (i > 0 && out[i - 1].sm < sm) {
++            out[i] = out[i - 1];
++            i--;
++         }
++         out[i] = (struct nvk_fatbin_ptx) {
++            .sm = sm, .payload = e + ehs, .size = esize,
++         };
++      }
++      pos += ehs + esize;
++   }
++   return count;
++}
++
++/* PTX text: what is left when a module is neither a fatbin nor an ELF. */
++static bool
++nvk_cubin_is_ptx(const void *data, size_t size)
++{
++   const char *s = data;
++   size_t i = 0;
++   while (i < size && (s[i] == ' ' || s[i] == '\t' || s[i] == '\r' ||
++                       s[i] == '\n'))
++      i++;
++   return (size - i >= 2 && s[i] == '/' && s[i + 1] == '/') ||
++          (size - i >= 8 && !strncmp(s + i, ".version", 8));
++}
++
++static void
++nvk_cubin_cache_dir(char *buf, size_t size)
++{
++   const char *env = os_get_option("NVK_CUBIN_CACHE_DIR");
++   if (env != NULL && env[0] != '\0') {
++      snprintf(buf, size, "%s", env);
++      return;
++   }
++#ifdef _WIN32
++   DWORD reg_size = (DWORD)size;
++   if (RegGetValueA(HKEY_LOCAL_MACHINE, "SOFTWARE\\Helios", "CubinCache",
++                    RRF_RT_REG_SZ | RRF_SUBKEY_WOW6464KEY, NULL, buf,
++                    &reg_size) == ERROR_SUCCESS && buf[0] != '\0')
++      return;
++   const char *pd = getenv("ProgramData");
++   snprintf(buf, size, "%s\\Helios\\ngx\\cubin",
++            pd != NULL && pd[0] != '\0' ? pd : "C:\\ProgramData");
++#else
++   const char *xdg = getenv("XDG_CACHE_HOME");
++   const char *home = getenv("HOME");
++   if (xdg != NULL && xdg[0] != '\0')
++      snprintf(buf, size, "%s/nvk/cubin", xdg);
++   else
++      snprintf(buf, size, "%s/.cache/nvk/cubin", home ? home : ".");
++#endif
++}
++
++static bool
++nvk_cubin_cache_dump_on(void)
++{
++   const char *env = os_get_option("NVK_CUBIN_CACHE_DUMP");
++   if (env != NULL && env[0] != '\0')
++      return debug_parse_bool_option(env, false);
++#ifdef _WIN32
++   DWORD value = 0, value_size = sizeof(value);
++   return RegGetValueA(HKEY_LOCAL_MACHINE, "SOFTWARE\\Helios", "CubinCacheDump",
++                       RRF_RT_REG_DWORD | RRF_SUBKEY_WOW6464KEY, NULL, &value,
++                       &value_size) == ERROR_SUCCESS && value != 0;
++#else
++   return false;
++#endif
++}
++
++static void
++nvk_cubin_cache_dump(const char *cache_dir, const char *key, const char *ext,
++                     const void *data, size_t size)
++{
++   char dir[1024], path[1200];
++   const char *env = os_get_option("NVK_CUBIN_DUMP_DIR");
++   if (env != NULL && env[0] != '\0') {
++      snprintf(dir, sizeof(dir), "%s", env);
++   } else {
++#ifdef _WIN32
++      const char *la = getenv("LOCALAPPDATA");
++      if (la == NULL || la[0] == '\0')
++         return;
++      snprintf(path, sizeof(path), "%s\\Helios", la);
++      os_mkdir(path, 0755);
++      snprintf(dir, sizeof(dir), "%s\\Helios\\cubin-miss", la);
++#else
++      snprintf(dir, sizeof(dir), "%s-miss", cache_dir);
++#endif
++   }
++   os_mkdir(dir, 0755);
++   snprintf(path, sizeof(path), "%s/%s.%s", dir, key, ext);
++   FILE *f = fopen(path, "wb");
++   if (f == NULL) {
++      mesa_logw("NVK: cannot write %s", path);
++      return;
++   }
++   fwrite(data, 1, size, f);
++   fclose(f);
++   mesa_logi("NVK: wrote %s for nvk-cubin-cache.py", path);
++}
++
++/* A cubin for key from the cache (malloc'd), or NULL. */
++static void *
++nvk_cubin_cache_read(const char *dir, const char *key, uint32_t sm,
++                     size_t *size_out)
++{
++   char path[1200];
++   snprintf(path, sizeof(path), "%s/%s.sm_%u.cubin", dir, key, sm);
++   size_t size = 0;
++   char *buf = os_read_file(path, &size);
++   if (buf == NULL)
++      return NULL;
++   struct nvk_elf elf;
++   if (!nvk_elf_init(&elf, buf, size)) {
++      mesa_logw("NVK: %s is not a CUDA ELF, ignored", path);
++      free(buf);
++      return NULL;
++   }
++   *size_out = size;
++   return buf;
++}
++
++/* For a module without SASS for the GPU: the host-compiled cubin, or NULL
++ * (logged).  is_fatbin: pData is a fatbin, else PTX text.
++ */
++static void *
++nvk_cubin_cache_find(const struct nvk_physical_device *pdev,
++                     const void *data, size_t data_size, bool is_fatbin,
++                     size_t *size_out)
++{
++   const uint32_t sm = pdev->info.sm;
++   char dir[1024];
++   nvk_cubin_cache_dir(dir, sizeof(dir));
++
++   struct nvk_fatbin_ptx ptx[NVK_CUBIN_CACHE_MAX_PTX];
++   uint32_t ptx_count;
++   if (is_fatbin) {
++      ptx_count = nvk_fatbin_list_ptx(data, data_size, sm, ptx,
++                                      ARRAY_SIZE(ptx));
++   } else {
++      const char *nul = memchr(data, '\0', data_size);
++      ptx[0] = (struct nvk_fatbin_ptx) {
++         .sm = 0,
++         .payload = data,
++         .size = nul ? (size_t)(nul - (const char *)data) : data_size,
++      };
++      ptx_count = 1;
++   }
++
++   char first_key[BLAKE3_HEX_LEN] = "";
++   for (uint32_t i = 0; i < ptx_count; i++) {
++      blake3_hash hash;
++      char key[BLAKE3_HEX_LEN];
++      _mesa_blake3_compute(ptx[i].payload, ptx[i].size, hash);
++      _mesa_blake3_format(key, hash);
++      if (i == 0)
++         memcpy(first_key, key, sizeof(key));
++
++      void *cubin = nvk_cubin_cache_read(dir, key, sm, size_out);
++      if (cubin != NULL) {
++         mesa_logi("NVK: CUDA module sm_%u SASS from the cubin cache "
++                   "(%s, PTX sm_%u)", sm, key, ptx[i].sm);
++         return cubin;
++      }
++   }
++
++   if (ptx_count == 0) {
++      mesa_logw("NVK: CUDA module has neither SASS for sm_%u nor PTX", sm);
++      return NULL;
++   }
++   mesa_logw("NVK: CUDA module has no SASS for sm_%u and %s/%s.sm_%u.cubin "
++             "is missing: compile its PTX on the host with "
++             "nvk-cubin-cache.py (guest/nvk-rm/docs/dlss.md)",
++             sm, dir, first_key, sm);
++   if (nvk_cubin_cache_dump_on()) {
++      nvk_cubin_cache_dump(dir, first_key, is_fatbin ? "fatbin" : "ptx",
++                           data, data_size);
++   }
++   return NULL;
++}
++
+ /* nvk_cubin_module */
+ 
+ static VkResult
+@@ -497,6 +754,8 @@ nvk_cubin_module_init(struct nvk_device *dev, struct nvk_cubin_module *module,
+    size_t size;
+    bool backwards_compat =
+       instance->experimental_flags & NVK_EXPERIMENTAL_DLSS_BACK_COMPAT;
++   /* a cubin from the SASS cache, freed once the module has its copy */
++   void *cached = NULL;
+ 
+    struct nv_fatbin fatbin;
+    if (nv_fatbin_init(&fatbin, pCreateInfo->pData, pCreateInfo->dataSize)) {
+@@ -506,10 +765,23 @@ nvk_cubin_module_init(struct nvk_device *dev, struct nvk_cubin_module *module,
+          nvk_cubin_dump("fatbin", pCreateInfo->pData, pCreateInfo->dataSize);
+ #endif
+ 
++      /* SASS for the GPU in the fatbin first, else the host-compiled one */
+       if (!nv_fatbin_get_bytecode(&fatbin, pdev->info.sm,
+-                                  backwards_compat, &data, &size))
++                                  backwards_compat, &data, &size)) {
++         cached = nvk_cubin_cache_find(pdev, pCreateInfo->pData,
++                                       pCreateInfo->dataSize, true, &size);
++         if (cached == NULL)
++            return vk_errorf(dev, VK_ERROR_INITIALIZATION_FAILED,
++                            "Fatbin does not have compatible bytecode");
++         data = cached;
++      }
++   } else if (nvk_cubin_is_ptx(pCreateInfo->pData, pCreateInfo->dataSize)) {
++      cached = nvk_cubin_cache_find(pdev, pCreateInfo->pData,
++                                    pCreateInfo->dataSize, false, &size);
++      if (cached == NULL)
+          return vk_errorf(dev, VK_ERROR_INITIALIZATION_FAILED,
+-                         "Fatbin does not have compatible bytecode");
++                          "PTX module without a cached cubin");
++      data = cached;
+    } else {
+       /* Must be a cubin. */
+       data = pCreateInfo->pData;
+@@ -526,10 +798,13 @@ nvk_cubin_module_init(struct nvk_device *dev, struct nvk_cubin_module *module,
+     */
+    module->image = vk_alloc2(&dev->vk.alloc, pAllocator, MAX2(size, 1), 8,
+                              VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+-   if (module->image == NULL)
++   if (module->image == NULL) {
++      free(cached);
+       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
++   }
+    memcpy(module->image, data, size);
+    module->image_size = size;
++   free(cached);
+ 
+    module->info =
+       vk_zalloc2(&dev->vk.alloc, pAllocator, sizeof(struct nv_cubin_module), 8,
