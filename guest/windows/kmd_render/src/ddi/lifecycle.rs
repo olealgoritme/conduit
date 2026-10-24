@@ -534,13 +534,6 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     ) {
         Ok(mut gpu) => {
             let backend_limit_mb = gpu.vram_limit_mib();
-            // Smaller limits cannot be represented by the device-memory segment.
-            if backend_limit_mb != 0
-                && backend_limit_mb < u64::from(helios_kmd_logic::vidmm_vram::MIN_MB)
-            {
-                crate::diag::record_named_bytes(b"VidVBad", backend_limit_mb as u32);
-                return wdk_sys::STATUS_INSUFFICIENT_RESOURCES;
-            }
             let Some(generation) = adapter.producer.start_transport() else {
                 crate::diag::record_named_bytes(b"PrGenF", 1);
                 return STATUS_INSUFFICIENT_RESOURCES;

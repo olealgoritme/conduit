@@ -107,9 +107,12 @@ each allocation of host GPU memory against it, and the host GPU (or
 Windows' own half-of-RAM figure. A valid nonzero `VidMmVramMB` override can
 lower the reported size but cannot exceed the backend limit; 0 retains the
 legacy topology ([Registry knobs](#registry-knobs)). Limits below 256 MiB
-cannot be represented by the device-memory segment and fail device start
-with `VidVBad`. On older backends without the config field, the previous
-capacity selection is retained. `VidVram`, `VidVSrc`, `VidVHeap` and `VidVLmt`
+cannot be represented by the device-memory segment: the driver retains the
+otherwise selected capacity and records the unusable limit in `VidVBad`.
+Without a usable heap or window, auto mode retains the legacy topology even
+when a backend limit is available. An absent or unstable config field also
+preserves the previous capacity selection; config reads make at most eight
+attempts. `VidVram`, `VidVSrc`, `VidVHeap` and `VidVLmt`
 in the service key show the chosen capacity, its source, the host heap and
 the backend limit. `VidVSrc=4` means the backend limit supplied the capacity.
 

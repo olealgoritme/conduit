@@ -2912,17 +2912,15 @@ impl VirtioGpu {
     /// The backend's enforced VRAM limit, or 0 for an unlimited/older backend.
     pub(crate) fn vram_limit_mib(&self) -> u64 {
         // VirtIO config reads guarantee only 4-byte alignment, including u64 fields.
-        self.transport
-            .read_consistent(|| {
-                let lo: u32 = self
-                    .transport
-                    .read_config_space(CONDUIT_CFG_VRAM_LIMIT_OFFSET)?;
-                let hi: u32 = self
-                    .transport
-                    .read_config_space(CONDUIT_CFG_VRAM_LIMIT_OFFSET + 4)?;
-                Ok(u64::from(lo) | (u64::from(hi) << 32))
-            })
-            .unwrap_or(0)
+        helios_kmd_logic::vidmm_vram::read_backend_limit(
+            || self.transport.read_config_generation(),
+            |word| {
+                self.transport
+                    .read_config_space::<u32>(CONDUIT_CFG_VRAM_LIMIT_OFFSET + word * 4)
+                    .ok()
+            },
+        )
+        .unwrap_or(0)
     }
 
     /// Bring the virtio-gpu device online and prove it with `GET_DISPLAY_INFO`.

@@ -13,8 +13,8 @@
 //! `vkGetPhysicalDeviceMemoryProperties` lists the card's heaps, and the largest
 //! `DEVICE_LOCAL` one is its video memory. (A second `DEVICE_LOCAL` heap, the BAR-visible slice
 //! some drivers list, overlaps the first and is never added to it.)
-//! A backend VRAM limit bounds the reported capacity even when a larger registry
-//! override or host heap is available.
+//! A usable backend VRAM limit bounds the reported capacity even when a larger
+//! registry override or host heap is available.
 
 /// `VK_MEMORY_HEAP_DEVICE_LOCAL_BIT`.
 pub const MEMORY_HEAP_DEVICE_LOCAL: u32 = 0x1;
@@ -31,6 +31,23 @@ pub const MIN_MB: u32 = 256;
 pub const MAX_MB: u32 = 64 * 1024;
 
 const MIB: u64 = 1 << 20;
+
+/// Read the low/high words of the optional backend limit under one config generation.
+/// Missing fields or a continuously changing generation leave the limit unavailable.
+pub fn read_backend_limit(
+    generation: impl Fn() -> u32,
+    word: impl Fn(usize) -> Option<u32>,
+) -> Option<u64> {
+    for _ in 0..8 {
+        let before = generation();
+        let lo = word(0)?;
+        let hi = word(1)?;
+        if before == generation() {
+            return Some(u64::from(lo) | (u64::from(hi) << 32));
+        }
+    }
+    None
+}
 
 /// The video memory of the host GPU from the heaps `vkGetPhysicalDeviceMemoryProperties` reported:
 /// the largest `DEVICE_LOCAL` heap among the first `count`, in bytes. `None` when there is none
@@ -99,10 +116,17 @@ pub fn resolve(
     backend_limit_mb: u64,
 ) -> Resolved {
     let mut resolved = resolve_capacity(knob, device_local_heap, host_visible);
-    if backend_limit_mb == 0 || (knob != AUTO && !(MIN_MB..=MAX_MB).contains(&knob)) {
+    if backend_limit_mb != 0 && backend_limit_mb < u64::from(MIN_MB) {
+        resolved.bad_mb = Some(backend_limit_mb as u32);
         return resolved;
     }
-    if resolved.mb == 0 || u64::from(resolved.mb) > backend_limit_mb {
+    if backend_limit_mb == 0
+        || resolved.mb == 0
+        || (knob != AUTO && !(MIN_MB..=MAX_MB).contains(&knob))
+    {
+        return resolved;
+    }
+    if u64::from(resolved.mb) > backend_limit_mb {
         resolved.mb = backend_limit_mb.min(u64::from(MAX_MB)) as u32;
         resolved.source = Source::BackendLimit;
         resolved.clamped = backend_limit_mb > u64::from(MAX_MB);
@@ -356,10 +380,15 @@ mod tests {
     }
 
     #[test]
-    fn backend_limit_supplies_capacity_without_a_heap_or_window() {
-        let r = resolve(AUTO, None, None, 6144);
-        assert_eq!(r.mb, 6144);
-        assert_eq!(r.source, Source::BackendLimit);
+    fn backend_limit_preserves_legacy_topology_without_usable_capacity() {
+        for limit in [0, 6144, u64::MAX] {
+            for window in [None, Some(128 * MIB), Some(GIB + 1)] {
+                assert_eq!(
+                    resolve(AUTO, None, window, limit),
+                    resolve_capacity(AUTO, None, window),
+                );
+            }
+        }
     }
 
     #[test]
@@ -395,16 +424,87 @@ mod tests {
             assert_eq!(r.mb, 12 * 1024);
             assert_eq!(r.source, Source::DeviceLocalHeap);
         }
-        let r = resolve(AUTO, None, None, u64::MAX);
-        assert_eq!(r.mb, MAX_MB);
-        assert_eq!(r.source, Source::BackendLimit);
-        assert!(r.clamped);
     }
 
     #[test]
-    fn a_small_backend_limit_is_not_rounded_up() {
-        let r = resolve(AUTO, Some(12 * GIB), Some(8 * GIB), 128);
-        assert_eq!(r.mb, 128);
+    fn unusable_backend_limits_preserve_capacity_and_record_the_limit() {
+        for limit in 1..u64::from(MIN_MB) {
+            for (knob, heap, window) in [
+                (AUTO, Some(12 * GIB), Some(8 * GIB)),
+                (AUTO, None, Some(8 * GIB)),
+                (AUTO, None, None),
+                (4096, Some(12 * GIB), None),
+                (0, Some(12 * GIB), None),
+            ] {
+                let mut expected = resolve_capacity(knob, heap, window);
+                expected.bad_mb = Some(limit as u32);
+                assert_eq!(resolve(knob, heap, window, limit), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn minimum_backend_limit_is_usable() {
+        let r = resolve(AUTO, Some(12 * GIB), Some(8 * GIB), u64::from(MIN_MB));
+        assert_eq!(r.mb, MIN_MB);
         assert_eq!(r.source, Source::BackendLimit);
+        assert_eq!(r.bad_mb, None);
+    }
+
+    #[test]
+    fn backend_limit_reads_both_words() {
+        assert_eq!(
+            read_backend_limit(|| 7, |i| Some([0x89ab_cdef, 0x0123_4567][i])),
+            Some(0x0123_4567_89ab_cdef),
+        );
+        assert_eq!(read_backend_limit(|| 0, |_| Some(0)), Some(0));
+    }
+
+    #[test]
+    fn backend_limit_retries_a_torn_read() {
+        let reads = core::cell::Cell::new(0);
+        let result = read_backend_limit(
+            || {
+                let n = reads.get();
+                reads.set(n + 1);
+                [0, 1, 1, 1][n]
+            },
+            |i| {
+                Some(if reads.get() == 1 {
+                    u32::MAX
+                } else {
+                    [6144, 0][i]
+                })
+            },
+        );
+        assert_eq!(result, Some(6144));
+        assert_eq!(reads.get(), 4);
+    }
+
+    #[test]
+    fn backend_limit_gives_up_on_continuous_config_changes() {
+        let reads = core::cell::Cell::new(0);
+        assert_eq!(
+            read_backend_limit(
+                || {
+                    let n = reads.get();
+                    reads.set(n + 1);
+                    n
+                },
+                |_| Some(6144),
+            ),
+            None,
+        );
+        assert_eq!(reads.get(), 16);
+    }
+
+    #[test]
+    fn backend_limit_is_unavailable_when_either_word_is_missing() {
+        for missing in [0, 1] {
+            assert_eq!(
+                read_backend_limit(|| 0, |i| (i != missing).then_some(6144)),
+                None,
+            );
+        }
     }
 }
