@@ -209,6 +209,94 @@ def emit_tex():
          cpre + cd + ["return d <= tex_d(l, y, x == 63 ? 63 : x + 1) ? 1u : 0u;"])
 
 
+def emit_lat(name, init_g, init_c, body_g, body_c, out_g, out_c, kind="lat"):
+    # A loop of pc.u[2] iterations around a body of dependent operations of
+    # one class: with one workgroup per SM (naktest --time) the time per
+    # operation is the issue distance the compiler put between producer and
+    # consumer, the latency the hardware needs if the result is still right.
+    # The body is repeated LAT_REP times so that the loop's own compare and
+    # branch cost little per operation
+    body_g, body_c = body_g * LAT_REP, body_c * LAT_REP
+    glsl = init_g + ["for (uint k = 0u; k < pc.u[2]; k++) {"] + ["  " + x for x in body_g] + ["}"] + out_g
+    cc = init_c + ["for (uint32_t k = 0; k < pc[2]; k++) {"] + ["  " + x for x in body_c] + ["}"] + out_c
+    emit(name, kind, glsl, cc)
+    lat_ops[name] = len(body_g)
+
+
+LAT_REP = 32     # 512 dependent operations per iteration (128 small ifs): a lone warp pays
+                 # some 80 cycles per taken loop branch, 0.16 per operation here
+
+
+lat_ops = {}
+
+
+def lat_tests():
+    # FFMA chain: x*2+b then x*0.5-b/2 leaves x unchanged, exact forever
+    g, c = [], []
+    for j in range(8):
+        b = 2 * rnd.randint(-3, 3)
+        g += [f"x = fma(x, 2.0, {b}.0);", f"x = fma(x, 0.5, {-b // 2}.0);"]
+        c += [f"x = x * 2.0f + {b}.0f;", f"x = x * 0.5f + {-b // 2}.0f;"]
+    emit_lat("lat_ffma", ["float x = float(inp[i] % 1000u) + 1.0;"], ["float x = (float)(in[i] % 1000u) + 1.0f;"],
+             g, c, ["outp[i] = floatBitsToUint(x);"], ["return f2u(x);"])
+    # IMAD chain (FMA pipe, integer): y * y + c, which no compiler can fold
+    # (a chain of y * k + c composes into one multiply-add per iteration)
+    g = [f"y = y * y + {rnd.randint(1, 0x7fffffff) | 1}u;" for _ in range(16)]
+    emit_lat("lat_imad", ["uint y = inp[i];"], ["uint32_t y = in[i];"], g, list(g), ["outp[i] = y;"], ["return y;"])
+    # IADD3 / LOP3 alternation (ALU pipe -> ALU pipe)
+    g = []
+    for _ in range(8):
+        g += [f"y = y + {rnd.randint(1, 0x7fffffff) | 1}u;", f"y = y ^ {rnd.randint(1, 0x7fffffff)}u;"]
+    emit_lat("lat_alu", ["uint y = inp[i];"], ["uint32_t y = in[i];"], g, list(g), ["outp[i] = y;"], ["return y;"])
+    # FMNMX chain (dual-issue ALU -> dual-issue ALU): max(-x, a) with bounds
+    # from the input, so that range analysis cannot fold the chain.  All
+    # values are odd multiples of 0.5: never zero, so the sign of a zero
+    # result (which max() leaves open) never matters
+    ab_g = ["float a = float(inp[i] & 1023u) - 511.5; float b = float((inp[i] >> 10) & 1023u) - 511.5;"]
+    ab_c = ["float a = (float)(in[i] & 1023u) - 511.5f; float b = (float)((in[i] >> 10) & 1023u) - 511.5f;"]
+    g, c = [], []
+    for j in range(16):
+        v = "a" if j % 2 == 0 else "b"
+        g.append(f"x = max(-x, {v});"); c.append(f"x = fmx(-x, {v});")
+    emit_lat("lat_fmnmx", ab_g + ["float x = float(inp[i] % 1000u) - 499.5;"],
+             ab_c + ["float x = (float)(in[i] % 1000u) - 499.5f;"],
+             g, c, ["outp[i] = floatBitsToUint(x);"], ["return f2u(x);"])
+    # FFMA -> FMNMX -> FFMA (FMA <-> dual-issue ALU cross pairs)
+    g, c = [], []
+    for j in range(8):
+        v = "a" if j % 2 == 0 else "b"
+        g += ["x = fma(x, -1.0, 1.0);", f"x = max(x, {v});"]
+        c += ["x = x * -1.0f + 1.0f;", f"x = fmx(x, {v});"]
+    emit_lat("lat_fmaalu", ab_g + ["float x = float(inp[i] % 1000u) - 499.5;"],
+             ab_c + ["float x = (float)(in[i] % 1000u) - 499.5f;"],
+             g, c, ["outp[i] = floatBitsToUint(x);"], ["return f2u(x);"])
+    # Guards: small ifs (predicated SEL/IMAD after the comparison)
+    g = []
+    for _ in range(4):
+        m = rnd.randint(1, 7)
+        g.append(f"if ((y & {m}u) == {rnd.randint(0, m) & m}u) {{ y = y * 3u + {rnd.randint(1, 0xffff)}u; }} "
+                 f"else {{ y = y ^ {rnd.randint(1, 0xffff)}u; }}")
+    emit_lat("lat_guard", ["uint y = inp[i];"], ["uint32_t y = in[i];"], g, list(g), ["outp[i] = y;"], ["return y;"])
+    # Uniform datapath: a chain on push constants and the loop counter only
+    g = [f"u = (u ^ {rnd.randint(1, 0x7fffffff)}u) + k;" for _ in range(8)]
+    emit_lat("lat_uniform", ["uint u = pc.u[0];"], ["uint32_t u = pc[0];"], g, list(g),
+             ["outp[i] = u ^ inp[i];"], ["return u ^ in[i];"])
+    lat_ops["lat_uniform"] *= 2     # an XOR and an add per line
+    # HFMA2 chain (fp16 pipe): h*2+b then h*0.5-b/2 per lane pair, exact
+    g, c = [], []
+    for j in range(8):
+        b = 2 * rnd.randint(-3, 3)
+        g += [f"h = fma(h, f16vec2(2.0hf), f16vec2({b}.0hf, {-b}.0hf));",
+              f"h = fma(h, f16vec2(0.5hf), f16vec2({-b // 2}.0hf, {b // 2}.0hf));"]
+        c += [f"h0 = h0 * 2.0f + {b}.0f; h1 = h1 * 2.0f + {-b}.0f;",
+              f"h0 = h0 * 0.5f + {-b // 2}.0f; h1 = h1 * 0.5f + {b // 2}.0f;"]
+    emit_lat("lat_hfma2", ["f16vec2 h = f16vec2(float(inp[i] % 100u), float((inp[i] >> 8) % 100u));"],
+             ["float h0 = (float)(in[i] % 100u), h1 = (float)((in[i] >> 8) % 100u);"],
+             g, c, ["outp[i] = packFloat2x16(h);"], ["return h16(h0) | h16(h1) << 16;"], kind="lat16")
+
+
+lat_tests()
+
 for v in range(4):
     emit_float(f"fma{v}", 256)
 for v in range(3):
@@ -232,22 +320,30 @@ emit_tex()
 
 c = ["/* generated by gen.py: CPU references */", "#include <stdint.h>", "#include <string.h>",
      "static uint32_t f2u(float f) { uint32_t u; memcpy(&u, &f, 4); return u; }",
+     "static float fmx(float a, float b) { return b < a ? a : b; }",
+     "/* f16 bits of an integer-valued float below 2048 in magnitude */",
+     "static uint32_t h16(float f) { if (f == 0.0f) return 0; uint32_t s = f < 0 ? 0x8000u : 0; float a = f < 0 ? -f : f; int e = 0;",
+     "  while (a >= 2.0f) { a *= 0.5f; e++; } return s | (uint32_t)(e + 15) << 10 | (uint32_t)((a - 1.0f) * 1024.0f); }",
      "static uint32_t tex_u(uint32_t m, uint32_t l, uint32_t y, uint32_t x) { return m << 24 | l << 16 | y << 8 | x; }",
      "static float tex_d(uint32_t l, uint32_t y, uint32_t x) { return (float)((x * 7u + y * 13u + l * 29u) & 255u) / 256.0f; }"]
 for name, kind, glsl, cc in tests:
     hdr = HDR.replace("writeonly buffer", "buffer") if kind == "wgsync" else HDR_TEX if kind == "tex" else HDR
+    if kind == "lat16":
+        hdr = hdr.replace("#extension GL_ARB_gpu_shader_int64 : enable",
+                          "#extension GL_ARB_gpu_shader_int64 : enable\n"
+                          "#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require")
     with open(f"{out}/{name}.comp", "w") as f:
         f.write(hdr + "void main() {\n  uint i = gl_GlobalInvocationID.x;\n  " + "\n  ".join(glsl) + "\n}\n")
     c.append(f"static uint32_t ref_{name}(const uint32_t *in, uint32_t i, const uint32_t *pc) {{")
     c.append("  (void)pc;")
     c += ["  " + l for l in cc]
     c.append("}")
-c.append("struct test { const char *name, *kind; const uint32_t *spv; size_t spv_size; uint32_t (*ref)(const uint32_t *, uint32_t, const uint32_t *); };")
+c.append("struct test { const char *name, *kind; const uint32_t *spv; size_t spv_size; uint32_t (*ref)(const uint32_t *, uint32_t, const uint32_t *); uint32_t lat_ops; };")
 for name, *_ in tests:
     c.append(f'#include "{name}.h"')
 c.append("static const struct test tests[] = {")
 for name, kind, *_ in tests:
-    c.append(f'  {{ "{name}", "{kind}", spv_{name}, sizeof(spv_{name}), ref_{name} }},')
+    c.append(f'  {{ "{name}", "{kind}", spv_{name}, sizeof(spv_{name}), ref_{name}, {lat_ops.get(name, 0)}u }},')
 c.append("};")
 open(f"{out}/tests.h", "w").write("\n".join(c) + "\n")
 print(len(tests), "tests")
