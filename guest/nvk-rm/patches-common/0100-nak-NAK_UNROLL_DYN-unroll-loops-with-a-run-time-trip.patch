@@ -1,0 +1,584 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Sat, 24 Oct 2026 10:59:00 +0200
+Subject: [PATCH] nak: NAK_UNROLL_DYN, unroll loops with a run-time trip count
+
+Innermost loops of the shape "body; if (i + off == n) break" (or >=,
+signed or unsigned), with i a counter stepping by 1 and n defined before
+the loop, run N iterations per pass when a guard shows that none of the
+first N - 1 ends the loop, one otherwise.  Every iteration runs as before
+and in the same order; the N copies are one block, which the schedulers
+can interleave, and the loop branch is taken once per N iterations.  The
+reference compiler unrolls 88825d04's lighting loop 8 times.
+
+Bodies are limited to ALU instructions and reorderable loads.  A shader the
+pass changed is also compiled without it, and the unrolled variant is kept
+unless it has fewer warps per SM.  Off by default (0); 2-8 copies.
+---
+ src/nouveau/compiler/meson.build          |   1 +
+ src/nouveau/compiler/nak/api.rs           |  28 +-
+ src/nouveau/compiler/nak/knobs.rs         |  38 +++
+ src/nouveau/compiler/nak_nir.c            |  12 +
+ src/nouveau/compiler/nak_nir_unroll_dyn.c | 373 ++++++++++++++++++++++
+ src/nouveau/compiler/nak_private.h        |   3 +
+ 6 files changed, 447 insertions(+), 8 deletions(-)
+ create mode 100644 src/nouveau/compiler/nak_nir_unroll_dyn.c
+
+diff --git a/src/nouveau/compiler/meson.build b/src/nouveau/compiler/meson.build
+index 9697491..cddb5dc 100644
+--- a/src/nouveau/compiler/meson.build
++++ b/src/nouveau/compiler/meson.build
+@@ -20,6 +20,7 @@ libnak_c_files = files(
+   'nak_nir.c',
+   'nak_nir_lower_cf.c',
+   'nak_nir_lower_early_exit.c',
++  'nak_nir_unroll_dyn.c',
+   'nak_nir_lower_cmat.c',
+   'nak_nir_lower_fs_inputs.c',
+   'nak_nir_lower_gs_intrinsics.c',
+diff --git a/src/nouveau/compiler/nak/api.rs b/src/nouveau/compiler/nak/api.rs
+index 5b25ae2..6b0a225 100644
+--- a/src/nouveau/compiler/nak/api.rs
++++ b/src/nouveau/compiler/nak/api.rs
+@@ -517,8 +517,11 @@ fn nak_compile_shader_internal(
+     fs_key: *const nak_fs_key,
+     has_task_shader: bool,
+ ) -> *mut nak_shader_bin {
+-    if crate::knobs::uniform_hoist() == 0 {
++    let hoist = crate::knobs::uniform_hoist() != 0;
++    let unroll = crate::knobs::unroll_dyn() != 0;
++    if !hoist && !unroll {
+         crate::knobs::set_uniform_hoist_active(false);
++        crate::knobs::set_unroll_dyn_active(false);
+         return nak_compile_shader_once(
+             nir, dump_asm, nak, robust2_modes, fs_key, has_task_shader,
+         );
+@@ -527,30 +530,39 @@ fn nak_compile_shader_internal(
+     let plain_nir = unsafe {
+         nir_shader_clone(nir as *mut std::ffi::c_void, nir)
+     };
+-    crate::knobs::set_uniform_hoist_active(true);
++    crate::knobs::set_uniform_hoist_active(hoist);
++    crate::knobs::set_unroll_dyn_active(unroll);
+     let hoisted = nak_compile_shader_once(
+         nir, dump_asm, nak, robust2_modes, fs_key, has_task_shader,
+     );
+     let moved = crate::knobs::uniform_hoist_progress();
++    let unrolled = crate::knobs::unroll_dyn_progress();
+     crate::knobs::set_uniform_hoist_active(false);
+-    if !moved || plain_nir.is_null() {
++    crate::knobs::set_unroll_dyn_active(false);
++    if !(moved || unrolled) || plain_nir.is_null() {
+         return hoisted;
+     }
+     let plain = nak_compile_shader_once(
+         plain_nir, dump_asm, nak, robust2_modes, fs_key, has_task_shader,
+     );
+     let (hi, pi) = unsafe { (&(*hoisted).info, &(*plain).info) };
+-    let keep_hoisted = hi.max_warps_per_sm > pi.max_warps_per_sm
+-        || (hi.max_warps_per_sm == pi.max_warps_per_sm
+-            && hi.num_static_cycles < pi.num_static_cycles);
++    // NAK_UNROLL_DYN: static cycles count an unrolled loop body as one
++    // iteration, so only occupancy decides
++    let keep_hoisted = if unrolled {
++        hi.max_warps_per_sm >= pi.max_warps_per_sm
++    } else {
++        hi.max_warps_per_sm > pi.max_warps_per_sm
++            || (hi.max_warps_per_sm == pi.max_warps_per_sm
++                && hi.num_static_cycles < pi.num_static_cycles)
++    };
+     if DEBUG.print() {
+         eprintln!(
+-            "NAK_UNIFORM_HOIST: hoisted {} warps {} cycles, plain {} warps {} cycles: {}",
++            "NAK_UNIFORM_HOIST/NAK_UNROLL_DYN: changed {} warps {} cycles, plain {} warps {} cycles: {}",
+             hi.max_warps_per_sm,
+             hi.num_static_cycles,
+             pi.max_warps_per_sm,
+             pi.num_static_cycles,
+-            if keep_hoisted { "hoisted" } else { "plain" }
++            if keep_hoisted { "changed" } else { "plain" }
+         );
+     }
+     if keep_hoisted {
+diff --git a/src/nouveau/compiler/nak/knobs.rs b/src/nouveau/compiler/nak/knobs.rs
+index 51cf017..77f68e8 100644
+--- a/src/nouveau/compiler/nak/knobs.rs
++++ b/src/nouveau/compiler/nak/knobs.rs
+@@ -128,6 +128,7 @@ static LAT_NV: OnceLock<bool> = OnceLock::new();
+ static SCHED_SPILL_ROOM: OnceLock<bool> = OnceLock::new();
+ static SCHED_DELAY_WEIGHT: OnceLock<u32> = OnceLock::new();
+ static RA_VEC_EVICT: OnceLock<u32> = OnceLock::new();
++static UNROLL_DYN: OnceLock<u32> = OnceLock::new();
+ 
+ /// NAK_GCM (0-3, default 0): nir_opt_gcm with value numbering after NAK's
+ /// NIR optimization loop; 2 also sinks ALU instructions back towards their
+@@ -317,6 +318,42 @@ thread_local! {
+     static HOIST_PROGRESS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+ }
+ 
++thread_local! {
++    static UNROLL_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
++    static UNROLL_PROGRESS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
++}
++
++/// NAK_UNROLL_DYN (0 or 2-8, default 0): innermost loops whose trip count
++/// is only known at run time run that many iterations per pass of the loop
++/// (a guarded straight-line copy of the body; nak_nir_unroll_dyn.c).  A
++/// shader it changed is also compiled without it, and the unrolled variant
++/// is kept unless it has fewer warps per SM (api.rs)
++pub fn unroll_dyn() -> u32 {
++    *UNROLL_DYN.get_or_init(|| {
++        let v = parse_u32("NAK_UNROLL_DYN", 0, 8);
++        if v == 1 { 0 } else { v }
++    })
++}
++
++pub fn set_unroll_dyn_active(on: bool) {
++    UNROLL_ACTIVE.with(|c| c.set(on));
++    UNROLL_PROGRESS.with(|c| c.set(false));
++}
++
++pub fn unroll_dyn_progress() -> bool {
++    UNROLL_PROGRESS.with(|c| c.get())
++}
++
++#[unsafe(no_mangle)]
++pub extern "C" fn nak_unroll_dyn_active() -> u32 {
++    if UNROLL_ACTIVE.with(|c| c.get()) { unroll_dyn() } else { 0 }
++}
++
++#[unsafe(no_mangle)]
++pub extern "C" fn nak_unroll_dyn_note_progress() {
++    UNROLL_PROGRESS.with(|c| c.set(true));
++}
++
+ pub fn set_uniform_hoist_active(on: bool) {
+     HOIST_ACTIVE.with(|c| c.set(on));
+     HOIST_PROGRESS.with(|c| c.set(false));
+@@ -419,6 +456,7 @@ pub extern "C" fn nak_knobs_key2() -> u32 {
+         ^ if sched_spill_room() { 0x1656_67b1 } else { 0 }
+         ^ (sched_delay_weight() as u32 - 1).wrapping_mul(0x9e37_79b1)
+         ^ ra_vec_evict().wrapping_mul(0x7feb_352d)
++        ^ unroll_dyn().wrapping_mul(0x2545_f491)
+ }
+ 
+ /// NAK_YIELD (default off, experimental, SM120): control bit 109 set on
+diff --git a/src/nouveau/compiler/nak_nir.c b/src/nouveau/compiler/nak_nir.c
+index 1431e23..723a8c2 100644
+--- a/src/nouveau/compiler/nak_nir.c
++++ b/src/nouveau/compiler/nak_nir.c
+@@ -1976,6 +1976,18 @@ nak_postprocess_nir(nir_shader *nir,
+ 
+    nak_optimize_nir(nir, nak);
+ 
++   /* NAK_UNROLL_DYN: innermost loops with a run-time trip count, N
++    * iterations per pass (nak_nir_unroll_dyn.c); the shader is also
++    * compiled without it and the variant with fewer warps lost is kept
++    * (api.rs)
++    */
++   if (nak_unroll_dyn_active() >= 2) {
++      if (OPT(nir, nak_nir_unroll_dyn, nak_unroll_dyn_active())) {
++         nak_unroll_dyn_note_progress();
++         nak_optimize_nir(nir, nak);
++      }
++   }
++
+    /* NAK_GCM: global code motion with value numbering, in fragment
+     * shaders.  A read-only load repeated in sibling branches (the same
+     * matrix rows in each unrolled iteration's if) becomes one load in their
+diff --git a/src/nouveau/compiler/nak_nir_unroll_dyn.c b/src/nouveau/compiler/nak_nir_unroll_dyn.c
+new file mode 100644
+index 0000000..317d5e6
+--- /dev/null
++++ b/src/nouveau/compiler/nak_nir_unroll_dyn.c
+@@ -0,0 +1,373 @@
++/*
++ * Copyright © 2026 Conduit contributors
++ * SPDX-License-Identifier: MIT
++ */
++
++#include "nak_private.h"
++#include "nir_builder.h"
++#include "util/hash_table.h"
++
++/*
++ * NAK_UNROLL_DYN=N: unroll innermost loops whose trip count is only known at
++ * run time N times, as the reference compiler does (88825d04's lighting
++ * loop: 8 iterations per pass of the loop, a remainder after).  A loop of
++ * the shape
++ *
++ *    loop {
++ *       i = phi(i0, i + 1), ...
++ *       body                       (one block, straight-line)
++ *       if (i + off == n)  break;  (or i + off >= n, signed or unsigned)
++ *    }
++ *
++ * with n defined before the loop becomes
++ *
++ *    loop {
++ *       i = phi(...), ...
++ *       if (none of the next N - 1 iterations ends the loop) {
++ *          body (i); body (i + 1); ... body (i + N - 1)
++ *       } else {
++ *          body (i)
++ *       }
++ *       if (the last body's exit test)  break;
++ *    }
++ *
++ * Every iteration runs exactly as before and in the same order; the N
++ * copies are one block, so the schedulers can interleave their dependency
++ * chains (MUFU, texture and memory latencies), and the loop branch is taken
++ * once per N iterations.  Bodies are limited to ALU instructions and loads
++ * that can be reordered: no stores, barriers, subgroup operations or
++ * derivatives, whose behaviour could depend on how iterations are grouped
++ * when the guard is divergent.
++ */
++
++#define MAX_BODY_INSTRS 64
++
++
++static bool
++instr_ok(nir_instr *instr)
++{
++   switch (instr->type) {
++   case nir_instr_type_alu:
++   case nir_instr_type_load_const:
++   case nir_instr_type_undef:
++      return true;
++   case nir_instr_type_intrinsic: {
++      nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
++      const nir_intrinsic_info *info = &nir_intrinsic_infos[intr->intrinsic];
++      if (!(info->flags & NIR_INTRINSIC_CAN_REORDER) ||
++          !(info->flags & NIR_INTRINSIC_CAN_ELIMINATE))
++         return false;
++      /* No subgroup or derivative operations */
++      switch (intr->intrinsic) {
++      case nir_intrinsic_ldc_nv:
++      case nir_intrinsic_ldcx_nv:
++      case nir_intrinsic_load_ubo:
++      case nir_intrinsic_load_global_nv:
++      case nir_intrinsic_load_global_constant:
++         return true;
++      default:
++         return false;
++      }
++   }
++   default:
++      return false;
++   }
++}
++
++/* i + off, with off 0 or 1, where i is a header phi stepping by 1 */
++static bool
++match_induction(nir_block *header, nir_def *a, nir_phi_instr **phi_out,
++                unsigned *off_out)
++{
++   unsigned off = 0;
++   nir_def *i = a;
++   if (nir_def_instr_type(a) == nir_instr_type_alu) {
++      nir_alu_instr *alu = nir_def_as_alu(a);
++      if (alu->op == nir_op_iadd && alu->def.num_components == 1) {
++         for (unsigned s = 0; s < 2; s++) {
++            if (nir_src_is_const(alu->src[1 - s].src) &&
++                nir_alu_src_as_uint(alu->src[1 - s]) == 1 &&
++                alu->src[s].swizzle[0] == 0 &&
++                nir_def_instr_type(alu->src[s].src.ssa) == nir_instr_type_phi) {
++               i = alu->src[s].src.ssa;
++               off = 1;
++               break;
++            }
++         }
++      }
++   }
++   if (nir_def_instr_type(i) != nir_instr_type_phi ||
++       nir_def_block(i) != header || i->bit_size != 32)
++      return false;
++
++   nir_phi_instr *phi = nir_instr_as_phi(nir_def_instr(i));
++   /* The backedge source is i + 1 */
++   bool step_ok = false;
++   nir_foreach_phi_src(src, phi) {
++      if (src->pred->cf_node.parent == header->cf_node.parent) {
++         nir_def *s = src->src.ssa;
++         if (nir_def_instr_type(s) != nir_instr_type_alu)
++            return false;
++         nir_alu_instr *alu = nir_def_as_alu(s);
++         if (alu->op != nir_op_iadd)
++            return false;
++         for (unsigned k = 0; k < 2; k++) {
++            if (alu->src[k].src.ssa == i && alu->src[k].swizzle[0] == 0 &&
++                nir_src_is_const(alu->src[1 - k].src) &&
++                nir_alu_src_as_uint(alu->src[1 - k]) == 1)
++               step_ok = true;
++         }
++      }
++   }
++   if (!step_ok)
++      return false;
++   *phi_out = phi;
++   *off_out = off;
++   return true;
++}
++
++static bool
++def_outside_loop(nir_def *def, nir_loop *loop)
++{
++   nir_block *b = nir_def_block(def);
++   for (nir_cf_node *n = &b->cf_node; n != NULL; n = n->parent) {
++      if (n == &loop->cf_node)
++         return false;
++   }
++   return true;
++}
++
++struct use_rewrite {
++   nir_src *src;
++   nir_def *orig;
++};
++
++static bool
++unroll_loop(nir_builder *b, nir_loop *loop, unsigned N)
++{
++   if (nir_loop_has_continue_construct(loop))
++      return false;
++
++   /* body: [block H] [if X { break } else { }] [empty block C] */
++   nir_cf_node *n0 = exec_node_data(nir_cf_node,
++                                    exec_list_get_head(&loop->body), node);
++   if (n0->type != nir_cf_node_block)
++      return false;
++   nir_block *H = nir_cf_node_as_block(n0);
++   nir_cf_node *n1 = nir_cf_node_next(n0);
++   if (n1 == NULL || n1->type != nir_cf_node_if)
++      return false;
++   nir_if *X = nir_cf_node_as_if(n1);
++   nir_cf_node *n2 = nir_cf_node_next(n1);
++   if (n2 == NULL || n2->type != nir_cf_node_block ||
++       nir_cf_node_next(n2) != NULL)
++      return false;
++   nir_block *C = nir_cf_node_as_block(n2);
++   if (!exec_list_is_empty(&C->instr_list))
++      return false;
++   if (!exec_list_is_singular(&X->then_list) ||
++       !exec_list_is_singular(&X->else_list))
++      return false;
++   nir_block *T = nir_if_first_then_block(X);
++   nir_block *E = nir_if_first_else_block(X);
++   if (!nir_block_ends_in_break(T) || exec_list_length(&T->instr_list) != 1 ||
++       !exec_list_is_empty(&E->instr_list))
++      return false;
++
++   /* The exit test */
++   nir_def *c = X->condition.ssa;
++   if (nir_def_block(c) != H ||
++       nir_def_instr_type(c) != nir_instr_type_alu)
++      return false;
++   nir_alu_instr *cmp = nir_def_as_alu(c);
++   if (cmp->def.num_components != 1)
++      return false;
++   nir_op op = cmp->op;
++   unsigned ai = 0, ni = 1;
++   if (op == nir_op_ieq) {
++      if (def_outside_loop(cmp->src[0].src.ssa, loop)) {
++         ai = 1;
++         ni = 0;
++      }
++   } else if (op != nir_op_ige && op != nir_op_uge) {
++      return false;
++   }
++   nir_def *a = cmp->src[ai].src.ssa;
++   nir_def *n = cmp->src[ni].src.ssa;
++   const unsigned n_comp = cmp->src[ni].swizzle[0];
++   if (cmp->src[ai].swizzle[0] != 0 || a->num_components != 1 ||
++       a->bit_size != 32 || n->bit_size != 32 || !def_outside_loop(n, loop))
++      return false;
++
++   nir_phi_instr *iphi;
++   unsigned off;
++   if (!match_induction(H, a, &iphi, &off))
++      return false;
++
++   /* The body: everything in H but the phis */
++   nir_instr *body[MAX_BODY_INSTRS];
++   unsigned nbody = 0;
++   nir_foreach_instr(instr, H) {
++      if (instr->type == nir_instr_type_phi)
++         continue;
++      if (nbody == MAX_BODY_INSTRS || !instr_ok(instr))
++         return false;
++      body[nbody++] = instr;
++   }
++   if (nbody == 0)
++      return false;
++
++   /* Uses of body values outside the body (the exit test, the backedge
++    * phi sources, code after the loop) are rewritten to phis after the new
++    * if; collect them before the copies exist
++    */
++   struct set *body_set = _mesa_pointer_set_create(NULL);
++   for (unsigned k = 0; k < nbody; k++)
++      _mesa_set_add(body_set, body[k]);
++   struct use_rewrite *rw = NULL;
++   unsigned nrw = 0, rw_cap = 0;
++   for (unsigned k = 0; k < nbody; k++) {
++      nir_def *def = nir_instr_def(body[k]);
++      if (def == NULL)
++         continue;
++      nir_foreach_use_including_if(src, def) {
++         if (!nir_src_is_if(src) &&
++             _mesa_set_search(body_set, nir_src_use_instr(src)))
++            continue;
++         if (nrw == rw_cap) {
++            rw_cap = MAX2(16, rw_cap * 2);
++            rw = realloc(rw, rw_cap * sizeof(*rw));
++         }
++         rw[nrw++] = (struct use_rewrite){ src, def };
++      }
++   }
++
++   /* The guard: none of the first N - 1 iterations of this pass ends the
++    * loop
++    */
++   b->cursor = nir_after_block(H);
++   nir_def *base = off ? nir_iadd_imm(b, &iphi->def, 1) : &iphi->def;
++   n = nir_channel(b, n, n_comp);
++   nir_def *dist = nir_isub(b, n, base);
++   nir_def *guard;
++   if (op == nir_op_ieq) {
++      guard = nir_uge_imm(b, dist, N - 1);
++   } else if (op == nir_op_ige) {
++      guard = nir_iand(b, nir_ilt(b, base, n),
++                       nir_igt_imm(b, dist, N - 2));
++   } else {
++      guard = nir_iand(b, nir_ult(b, base, n),
++                       nir_ugt_imm(b, dist, N - 2));
++   }
++
++   /* The backedge source of every header phi */
++   struct hash_table *backedge = _mesa_pointer_hash_table_create(NULL);
++   nir_foreach_phi(phi, H) {
++      nir_foreach_phi_src(src, phi) {
++         if (src->pred == C)
++            _mesa_hash_table_insert(backedge, phi, src->src.ssa);
++      }
++   }
++
++   nir_if *nif = nir_push_if(b, guard);
++
++   /* N copies: copy k + 1 starts from copy k's backedge values */
++   struct hash_table *remap = _mesa_pointer_hash_table_create(NULL);
++   for (unsigned copy = 0; copy < N; copy++) {
++      struct hash_table *next = _mesa_pointer_hash_table_create(NULL);
++      if (copy > 0) {
++         nir_foreach_phi(phi, H) {
++            struct hash_entry *be = _mesa_hash_table_search(backedge, phi);
++            if (be == NULL)
++               continue;
++            nir_def *v = be->data;
++            struct hash_entry *m = _mesa_hash_table_search(remap, v);
++            _mesa_hash_table_insert(next, &phi->def, m ? m->data : v);
++         }
++      }
++      _mesa_hash_table_clear(remap, NULL);
++      hash_table_foreach(next, e)
++         _mesa_hash_table_insert(remap, e->key, e->data);
++      _mesa_hash_table_destroy(next, NULL);
++
++      for (unsigned k = 0; k < nbody; k++) {
++         nir_instr *clone = nir_instr_clone_deep(b->shader, body[k], remap);
++         nir_builder_instr_insert(b, clone);
++      }
++   }
++
++   nir_push_else(b, nif);
++   for (unsigned k = 0; k < nbody; k++) {
++      nir_instr_move(b->cursor, body[k]);
++      b->cursor = nir_after_instr(body[k]);
++   }
++   nir_pop_if(b, nif);
++
++   /* Phis for the body values used outside it */
++   struct hash_table *merged = _mesa_pointer_hash_table_create(NULL);
++   for (unsigned r = 0; r < nrw; r++) {
++      nir_def *orig = rw[r].orig;
++      struct hash_entry *m = _mesa_hash_table_search(merged, orig);
++      nir_def *phi_def;
++      if (m) {
++         phi_def = m->data;
++      } else {
++         struct hash_entry *cm = _mesa_hash_table_search(remap, orig);
++         assert(cm != NULL);
++         phi_def = nir_if_phi(b, cm->data, orig);
++         _mesa_hash_table_insert(merged, orig, phi_def);
++      }
++      nir_src_rewrite(rw[r].src, phi_def);
++   }
++
++   free(rw);
++   _mesa_set_destroy(body_set, NULL);
++   _mesa_hash_table_destroy(backedge, NULL);
++   _mesa_hash_table_destroy(remap, NULL);
++   _mesa_hash_table_destroy(merged, NULL);
++   return true;
++}
++
++static bool
++unroll_cf_list(nir_builder *b, struct exec_list *list, unsigned N)
++{
++   bool progress = false;
++   foreach_list_typed_safe(nir_cf_node, node, node, list) {
++      switch (node->type) {
++      case nir_cf_node_block:
++         break;
++      case nir_cf_node_if: {
++         nir_if *nif = nir_cf_node_as_if(node);
++         progress |= unroll_cf_list(b, &nif->then_list, N);
++         progress |= unroll_cf_list(b, &nif->else_list, N);
++         break;
++      }
++      case nir_cf_node_loop: {
++         nir_loop *loop = nir_cf_node_as_loop(node);
++         bool inner = unroll_cf_list(b, &loop->body, N);
++         progress |= inner;
++         if (!inner && unroll_loop(b, loop, N))
++            progress = true;
++         break;
++      }
++      default:
++         UNREACHABLE("Unknown CF node type");
++      }
++   }
++   return progress;
++}
++
++bool
++nak_nir_unroll_dyn(nir_shader *nir, unsigned N)
++{
++   if (N < 2)
++      return false;
++
++   bool progress = false;
++   nir_foreach_function_impl(impl, nir) {
++      nir_builder b = nir_builder_create(impl);
++      bool p = unroll_cf_list(&b, &impl->body, N);
++      progress |= nir_progress(p, impl, nir_metadata_none);
++   }
++   return progress;
++}
+diff --git a/src/nouveau/compiler/nak_private.h b/src/nouveau/compiler/nak_private.h
+index aa99be5..7c0a66b 100644
+--- a/src/nouveau/compiler/nak_private.h
++++ b/src/nouveau/compiler/nak_private.h
+@@ -456,6 +456,9 @@ bool nak_nir_pin_uniform_addresses(nir_shader *nir);
+ bool nak_nir_add_barriers(nir_shader *nir, const struct nak_compiler *nak);
+ bool nak_nir_lower_cf(nir_shader *nir);
+ bool nak_nir_lower_early_exit(nir_shader *nir);
++bool nak_nir_unroll_dyn(nir_shader *nir, unsigned N);
++unsigned nak_unroll_dyn_active(void);
++void nak_unroll_dyn_note_progress(void);
+ bool nak_nir_lower_cmat(nir_shader *shader, const struct nak_compiler *nak);
+ 
+ /**
+-- 
+2.43.0
+
