@@ -761,7 +761,13 @@ unsafe fn enhance_menu(apps: &[String]) -> HMENU {
     let m = CreatePopupMenu();
     let scaler = enhance::SCALER.index_of(sys::enhance_get(None, &enhance::SCALER).as_deref());
     let fg = enhance::FRAMEGEN.index_of(sys::enhance_get(None, &enhance::FRAMEGEN).as_deref());
-    let t = wide(&format!("All games: {}", enhance::summary(scaler, fg)));
+    let counter =
+        enhance::OVERLAY.index_of(sys::enhance_get(None, &enhance::OVERLAY).as_deref()) != 0;
+    let t = wide(&format!(
+        "All games: {}{}",
+        enhance::summary(scaler, fg),
+        if counter { ", FPS counter" } else { "" }
+    ));
     AppendMenuW(m, MF_STRING | MF_GRAYED, 0, t.as_ptr());
     for (si, s) in enhance::ALL.iter().enumerate() {
         let sub = enhance_choices(None, s, ID_ENH + si * 16);

@@ -128,13 +128,23 @@ pub const D3D: Setting = Setting {
     per_exe: true,
 };
 
+pub const OVERLAY: Setting = Setting {
+    name: "EnhanceOverlay",
+    dword: true,
+    title: "FPS counter",
+    choices: &[("0", "Off"), ("1", "On (base / shown fps, top left)")],
+    default: "0",
+    per_exe: true,
+};
+
 /// Menu order
-pub const ALL: [Setting; 8] = [
+pub const ALL: [Setting; 9] = [
     SCALER,
     SHARPNESS,
     FRAMEGEN,
     FG_QUALITY,
     LOW_LATENCY,
+    OVERLAY,
     FIT,
     WINDOWS,
     D3D,
@@ -287,6 +297,10 @@ mod tests {
         assert_eq!(D3D.profile_name(), "D3D");
         assert_eq!(D3D.index_of(None), 0);
         assert_eq!(D3D.index_of(Some("0")), 1);
+        assert_eq!(OVERLAY.profile_name(), "Overlay");
+        assert!(OVERLAY.per_exe);
+        assert_eq!(OVERLAY.index_of(None), 0);
+        assert_eq!(OVERLAY.index_of(Some("1")), 1);
     }
 
     #[test]
