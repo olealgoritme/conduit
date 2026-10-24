@@ -248,15 +248,17 @@ def lat_tests():
         g += [f"y = y + {rnd.randint(1, 0x7fffffff) | 1}u;", f"y = y ^ {rnd.randint(1, 0x7fffffff)}u;"]
     emit_lat("lat_alu", ["uint y = inp[i];"], ["uint32_t y = in[i];"], g, list(g), ["outp[i] = y;"], ["return y;"])
     # FMNMX chain (dual-issue ALU -> dual-issue ALU): max(-x, a) with bounds
-    # from the input, so that range analysis cannot fold the chain
-    ab_g = ["float a = float(inp[i] & 1023u) - 512.0; float b = float((inp[i] >> 10) & 1023u) - 512.0;"]
-    ab_c = ["float a = (float)(in[i] & 1023u) - 512.0f; float b = (float)((in[i] >> 10) & 1023u) - 512.0f;"]
+    # from the input, so that range analysis cannot fold the chain.  All
+    # values are odd multiples of 0.5: never zero, so the sign of a zero
+    # result (which max() leaves open) never matters
+    ab_g = ["float a = float(inp[i] & 1023u) - 511.5; float b = float((inp[i] >> 10) & 1023u) - 511.5;"]
+    ab_c = ["float a = (float)(in[i] & 1023u) - 511.5f; float b = (float)((in[i] >> 10) & 1023u) - 511.5f;"]
     g, c = [], []
     for j in range(16):
         v = "a" if j % 2 == 0 else "b"
         g.append(f"x = max(-x, {v});"); c.append(f"x = fmx(-x, {v});")
-    emit_lat("lat_fmnmx", ab_g + ["float x = float(inp[i] % 1000u) - 500.0;"],
-             ab_c + ["float x = (float)(in[i] % 1000u) - 500.0f;"],
+    emit_lat("lat_fmnmx", ab_g + ["float x = float(inp[i] % 1000u) - 499.5;"],
+             ab_c + ["float x = (float)(in[i] % 1000u) - 499.5f;"],
              g, c, ["outp[i] = floatBitsToUint(x);"], ["return f2u(x);"])
     # FFMA -> FMNMX -> FFMA (FMA <-> dual-issue ALU cross pairs)
     g, c = [], []
@@ -264,8 +266,8 @@ def lat_tests():
         v = "a" if j % 2 == 0 else "b"
         g += ["x = fma(x, -1.0, 1.0);", f"x = max(x, {v});"]
         c += ["x = x * -1.0f + 1.0f;", f"x = fmx(x, {v});"]
-    emit_lat("lat_fmaalu", ab_g + ["float x = float(inp[i] % 1000u) - 500.0;"],
-             ab_c + ["float x = (float)(in[i] % 1000u) - 500.0f;"],
+    emit_lat("lat_fmaalu", ab_g + ["float x = float(inp[i] % 1000u) - 499.5;"],
+             ab_c + ["float x = (float)(in[i] % 1000u) - 499.5f;"],
              g, c, ["outp[i] = floatBitsToUint(x);"], ["return f2u(x);"])
     # Guards: small ifs (predicated SEL/IMAD after the comparison)
     g = []
