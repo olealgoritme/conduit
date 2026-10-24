@@ -1,0 +1,172 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Sat, 24 Oct 2026 10:29:56 +0200
+Subject: [PATCH] nak, nvkmd/rm: Windows defaults for the scheduling knobs and
+ the perf boost
+
+On Windows: NAK_SCHED_SPILL_ROOM on, NAK_SCHED_DELAY_WEIGHT 16,
+NAK_RA_VEC_EVICT 1, and NVK_RM_PERF_BOOST on, as NVIDIA's driver boosts
+for every context.  NAK_RA_VEC_EVICT gains a level 2 (the lowest range
+that holds no recent memory, texture or MUFU result) for A/B; it evicts
+ranges with more values in them than 1 and measured slower.
+---
+ src/nouveau/compiler/nak/assign_regs.rs    | 12 +++++--
+ src/nouveau/compiler/nak/knobs.rs          | 37 ++++++++++++++--------
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c |  8 +++--
+ 3 files changed, 38 insertions(+), 19 deletions(-)
+
+diff --git a/src/nouveau/compiler/nak/assign_regs.rs b/src/nouveau/compiler/nak/assign_regs.rs
+index acb4a17..cc951de 100644
+--- a/src/nouveau/compiler/nak/assign_regs.rs
++++ b/src/nouveau/compiler/nak/assign_regs.rs
+@@ -723,7 +723,8 @@ impl<'a> VecRegAllocator<'a> {
+         // a time.  Evict the range whose occupants are cheapest to move
+         // instead: few of them, and none a recent memory, texture or MUFU
+         // result
+-        if crate::knobs::ra_vec_evict() {
++        if crate::knobs::ra_vec_evict() > 0 {
++            let level = crate::knobs::ra_vec_evict();
+             let cost = |s: &Self, r: u32| -> u32 {
+                 let mut c = 0;
+                 for i in 0..u32::from(comps) {
+@@ -743,7 +744,12 @@ impl<'a> VecRegAllocator<'a> {
+             while r + u32::from(comps) <= self.ra.num_regs {
+                 if self.reg_range_is_unpinned(r, comps) {
+                     let c = cost(self, r);
+-                    if c < best.0 {
++                    // 2: the lowest range without a recent result, else 1's
++                    if level >= 2 && best.0 >= 16 && c < 16 {
++                        best = (c, r);
++                        break;
++                    }
++                    if level == 1 && c < best.0 {
+                         best = (c, r);
+                     }
+                 }
+@@ -829,7 +835,7 @@ fn instr_assign_regs_file(
+     ra: &mut RegAllocator,
+ ) {
+     ra.cur_ip = u32::try_from(ip).unwrap();
+-    if crate::knobs::ra_vec_evict()
++    if crate::knobs::ra_vec_evict() > 0
+         && matches!(
+             instr.op,
+             Op::Ld(_)
+diff --git a/src/nouveau/compiler/nak/knobs.rs b/src/nouveau/compiler/nak/knobs.rs
+index 9def7bd..df4ed9a 100644
+--- a/src/nouveau/compiler/nak/knobs.rs
++++ b/src/nouveau/compiler/nak/knobs.rs
+@@ -118,7 +118,7 @@ static SCHED_MLP: OnceLock<u32> = OnceLock::new();
+ static LAT_NV: OnceLock<bool> = OnceLock::new();
+ static SCHED_SPILL_ROOM: OnceLock<bool> = OnceLock::new();
+ static SCHED_DELAY_WEIGHT: OnceLock<u32> = OnceLock::new();
+-static RA_VEC_EVICT: OnceLock<bool> = OnceLock::new();
++static RA_VEC_EVICT: OnceLock<u32> = OnceLock::new();
+ 
+ /// NAK_TEX_UHANDLE (0-2, default 2 on Windows, 0 elsewhere, SM100+): a
+ /// bindless texture handle that
+@@ -172,18 +172,23 @@ pub fn lat_nv() -> bool {
+     *LAT_NV.get_or_init(|| parse("NAK_LAT_NV", env::var("NAK_LAT_NV"), dflt))
+ }
+ 
+-/// NAK_SCHED_SPILL_ROOM (default off): in a shader where one block's
++/// NAK_SCHED_SPILL_ROOM (default on on Windows, off elsewhere): in a shader where one block's
+ /// schedule spills, the other blocks may use registers up to the limit in
+ /// the pre-RA schedule instead of staying at the peak of their original
+ /// order, so that the NAK_SCHED_MLP schedule (results of texture, memory and
+ /// MUFU instructions used later) fits there (opt_instr_sched_prepass.rs)
+ pub fn sched_spill_room() -> bool {
+     *SCHED_SPILL_ROOM.get_or_init(|| {
+-        parse("NAK_SCHED_SPILL_ROOM", env::var("NAK_SCHED_SPILL_ROOM"), false)
++        parse(
++            "NAK_SCHED_SPILL_ROOM",
++            env::var("NAK_SCHED_SPILL_ROOM"),
++            cfg!(target_os = "windows"),
++        )
+     })
+ }
+ 
+-/// NAK_SCHED_DELAY_WEIGHT (1-64, default 1): in the pre-RA schedule under
++/// NAK_SCHED_DELAY_WEIGHT (1-64, default 16 on Windows, 1 elsewhere): in
++/// the pre-RA schedule under
+ /// register pressure, the cost of a cycle that an instruction would wait for
+ /// a result, against 64 for a register over the limit
+ pub fn sched_delay_weight() -> i32 {
+@@ -192,18 +197,24 @@ pub fn sched_delay_weight() -> i32 {
+ 
+ fn sched_delay_weight_u32() -> u32 {
+     *SCHED_DELAY_WEIGHT.get_or_init(|| {
+-        let v = parse_u32("NAK_SCHED_DELAY_WEIGHT", 1, 64);
++        let dflt = if cfg!(target_os = "windows") { 16 } else { 1 };
++        let v = parse_u32("NAK_SCHED_DELAY_WEIGHT", dflt, 64);
+         if v == 0 { 1 } else { v }
+     })
+ }
+ 
+-/// NAK_RA_VEC_EVICT (default off): when register allocation has to evict
+-/// values to place a vector destination, it evicts the aligned range with
+-/// the fewest values and no recent memory, texture or MUFU result, instead
+-/// of the lowest one: there it is often the previous vector load's result,
+-/// whose copy then waits for that load (assign_regs.rs)
+-pub fn ra_vec_evict() -> bool {
+-    *RA_VEC_EVICT.get_or_init(|| parse("NAK_RA_VEC_EVICT", env::var("NAK_RA_VEC_EVICT"), false))
++/// NAK_RA_VEC_EVICT (0-2, default 1 on Windows, 0 elsewhere): when
++/// register allocation has to
++/// evict values to place a vector destination, 1 evicts the aligned range
++/// with the fewest values and no recent memory, texture or MUFU result, 2
++/// the lowest range without such a result, instead of the lowest range:
++/// there it is often the previous vector load's result, whose copy then
++/// waits for that load (assign_regs.rs)
++pub fn ra_vec_evict() -> u32 {
++    // 405.147: 1 beats 2 (37e478ea 788 vs 805 us, d2c045ea 1533 vs 1553
++    // us; 2 evicts ranges with more values in them and adds copies)
++    let dflt = if cfg!(target_os = "windows") { 1 } else { 0 };
++    *RA_VEC_EVICT.get_or_init(|| parse_u32("NAK_RA_VEC_EVICT", dflt, 2))
+ }
+ 
+ /// NAK_F16_PAIR (default off): independent scalar 32-to-16-bit float
+@@ -279,7 +290,7 @@ pub extern "C" fn nak_knobs_key2() -> u32 {
+         | (u32::from(sched_spill_room()) << 22)
+         // 1..64 as 0..63 in six bits
+         | ((sched_delay_weight() as u32 - 1) << 23)
+-        | (u32::from(ra_vec_evict()) << 29)
++        | (ra_vec_evict() << 29)
+ }
+ 
+ 
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c
+index f588bb5..cbcbda4 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c
+@@ -10,6 +10,7 @@
+ #include "util/u_math.h"
+ #include "util/u_atomic.h"
+ #include "util/u_debug.h"
++#include "util/detect_os.h"
+ #include "util/list.h"
+ #include "c11/threads.h"
+ #include "vk_log.h"
+@@ -1241,8 +1242,9 @@ nvkmd_rm_create_exec_ctx(struct nvkmd_rm_dev *dev,
+     * RM call trace of its Vulkan driver: GR_SET_CTXSW_PREEMPTION_MODE with
+     * compute CTA after the engine objects, PERF_BOOST to max for 2 s after
+     * the TSG).  For A/B: NVK_RM_PREEMPT=0/1/2 sets the compute mode
+-    * (WFI/CTA/CILP), NVK_RM_PERF_BOOST=1 boosts; unset leaves RM's
+-    * defaults.  Refusals are logged.
++    * (WFI/CTA/CILP), unset leaves RM's default; NVK_RM_PERF_BOOST=0/1
++    * (default on on Windows, as NVIDIA's driver does it) the boost.  The
++    * results are logged.
+     */
+    if (!vdec) {
+       const int64_t pm = debug_get_num_option("NVK_RM_PREEMPT", -1);
+@@ -1272,7 +1274,7 @@ nvkmd_rm_create_exec_ctx(struct nvkmd_rm_dev *dev,
+          mesa_logi("NVK: compute preemption mode %" PRId64 " (%s): ret %d",
+                    pm, async ? "async channel" : "TSG", ret);
+       }
+-      if (debug_get_bool_option("NVK_RM_PERF_BOOST", false)) {
++      if (debug_get_bool_option("NVK_RM_PERF_BOOST", DETECT_OS_WINDOWS)) {
+          struct { NvU32 flags; NvU32 duration; } pb = {
+             .flags = 2, /* CMD_BOOST_TO_MAX */
+             .duration = 2,
+-- 
+2.43.0
+
