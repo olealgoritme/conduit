@@ -432,6 +432,9 @@ backend. Numbers are file numbers (there is no 0016 or 0025).
 | 0090 | `NVK_PUSH_DUMP_WINDOW="START_S,DURATION_MS"`: the pushbuffers executed in that window after the first submit, with their submit times, to `NVK_PUSH_DUMP_FILE` (`nvk-push-<pid>.txt`): one or two frames of a game instead of `NVK_DEBUG=push_dump` for the whole run |
 | 0101 | `NVK_DISPATCH_CAPTURE_SEQ=N`: a captured dispatch and the next N - 1 dispatches of the command buffer, whatever their shaders, as one sequence (manifest `sequence`: id, index, barrier before); resources an earlier dispatch of the sequence captured are referred to (`same_as`), not copied again; `NVK_DISPATCH_CAPTURE_SEQ_START=<hashes>`: a sequence starts only at a command buffer's first dispatch with one of these shaders and is kept only if it contains a `NVK_DISPATCH_CAPTURE` shader; `tests/perf/dispatch-replay --seq` replays it in one command buffer |
 | 0104 | NAK: the post-RA scheduler orders an execution predicate's readers before a later write of that predicate (a zero-latency anti-dependency), so a guarded instruction cannot move past the write after if-conversion |
+| 0105 | The stencil copy plane of a depth/stencil image is aligned to the greater of NIL's and the backend's binding alignment, so `D32_SFLOAT_S8_UINT` images bind on RM with and without ZCULL (`tests/vk_depth_bind_test.c`, `tests/vk_depth_guard_test.c`) |
+| 0106 | Command buffers are allocated with `alignof(struct nvk_cmd_buffer)` (16 bytes) instead of 8 |
+| 0107 | The default Vulkan allocation callbacks on Windows use the CRT's aligned allocation, reallocation and free functions, so allocations honor the requested alignment on x86 (zero-size requests included) |
 
 ## Per-draw cost (common 0001-0007)
 
