@@ -62,7 +62,9 @@ The Conduit tray (`conduit-gpu-tray`, elevated) sets the global values from
 its menu **Upscaling and frame generation**, and a profile per application
 with an open window (**Profile for <exe>**; **Remove profile** goes back to
 the global settings). In a profile, a setting without a check mark follows
-the global one.
+the global one. A profile's **OptiScaler** submenu installs OptiScaler for
+that game and sets its upscaler and frame generation
+([optiscaler.md](../../windows/docs/optiscaler.md)).
 
 ## Upscaling
 
