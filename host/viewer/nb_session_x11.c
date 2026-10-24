@@ -331,6 +331,7 @@ static void x11_ui_do(struct nb_x11 *x, unsigned bits);
 static const struct nb_ui_env *x11_ui_env(struct nb_x11 *x);
 static void x11_fg_fire(struct nb_x11 *x);
 static void x11_fg_changed(struct nb_x11 *x);
+static void x11_gs_prio_follow(struct nb_x11 *x);
 static void x11_vk_changed(struct nb_x11 *x);
 static int  x11_vk_present(struct nb_x11 *x, struct nb_sink *sink);
 static void x11_menu_set(struct nb_x11 *x, bool open);
@@ -1046,11 +1047,20 @@ static void x11_stats_flush(struct nb_x11 *x)
             x11_scanout_blockers(x, why, sizeof(why));
             snprintf(blk, sizeof(blk), " | composited, blockers: %s", why);
         }
-        char gpu[96] = "";
+        char gpu[256] = "";
 
         if (x->st_gpu_n) {
-            snprintf(gpu, sizeof(gpu), " | GPU pass avg %.0fus max %uus",
+            snprintf(gpu, sizeof(gpu), " | %s avg %.0fus max %uus",
+                     x->vk_on ? "Smooth Motion swapchain blit" : "GPU pass",
                      (double)x->st_gpu_sum / x->st_gpu_n, x->st_gpu_max);
+        }
+        if (x->fg_live || x->st_fg) {
+            size_t k = strlen(gpu);
+
+            snprintf(gpu + k, sizeof(gpu) - k, " | framegen %ux: shown %.1f/s "
+                     "guest + %.1f/s generated, guest interval %.1fms",
+                     x->fg.eff > 1 ? x->fg.eff : 1, x->st_commits / secs,
+                     x->st_fg / secs, (double)x->fg.interval / 1e6);
         }
         nb_log("stats: commit %.1f fps (%u direct scanout, %.0f%%) | Present "
                "FLIP %u, COPY %u, XRender composites %u | path: %s, %s%s%s",
@@ -1065,6 +1075,7 @@ static void x11_stats_flush(struct nb_x11 *x)
     x->st_commits = x->st_flip = x->st_copy = x->st_comp = 0;
     x->st_gpu_n = x->st_gpu_max = 0;
     x->st_gpu_sum = 0;
+    x->st_fg = 0;
 }
 
 /*
@@ -1376,8 +1387,8 @@ static int x11_copy_present(struct nb_x11 *x, struct nb_sink *sink)
      * this draw is the first picture of the new cycle. */
     if (x11_fg_mult(x) > 1 && nb_gs_enhance_ok(x->gs, NULL)) {
         unsigned us = 0;
-        int pr = nb_gs_fg_push(x->gs, slot, d.sx, d.sy, d.sw, d.sh, 50000,
-                               &us);
+        /* No wait of its own: the draw below waits for both. */
+        int pr = nb_gs_fg_push(x->gs, slot, d.sx, d.sy, d.sw, d.sh, 0, &us);
 
         if (pr < 0) {
             x->fg_dead = true;
@@ -3129,6 +3140,7 @@ formats_done:
     /* Picture enhancement as saved for this VM (docs/VIEWER-ENHANCE.md). */
     x11_fg_changed(x);
     x11_vk_changed(x);
+    x11_gs_prio_follow(x);
     if (x->vst.upscale != NB_UPSCALE_OFF) {
         nb_log("upscaling: %s, sharpness %d (the GPU pass draws every frame)",
                nb_upscale_label(x->vst.upscale), x->vst.sharp);
@@ -3788,6 +3800,21 @@ static void x11_fg_fire(struct nb_x11 *x)
     x11_fg_arm(x);
 }
 
+/* The GPU pass's priority follows the mode (see the Wayland backend's
+ * wl_gs_prio_follow): LOW with upscaling or frame generation on. */
+static void x11_gs_prio_follow(struct nb_x11 *x)
+{
+    nb_gs_set_prio_default(x11_enh_on(x) ? NB_GS_PRIO_LOW : NB_GS_PRIO_HIGH);
+    if (x->gs && nb_gs_prio_requested(x->gs) != nb_gs_prio_wanted()) {
+        nb_log("GPU copy: reopening the GPU pass at context priority %s",
+               nb_gs_prio_name(nb_gs_prio_wanted()));
+        x11_gt_drop(x);
+        nb_gs_close(x->gs);
+        x->gs = NULL;
+        x->copy_n = 0;
+    }
+}
+
 static void x11_fg_changed(struct nb_x11 *x)
 {
     int m = x11_fg_mult(x);
@@ -4296,6 +4323,7 @@ static void x11_ui_do(struct nb_x11 *x, unsigned bits)
         x->enh_note[0] = '\0';
         x11_fg_changed(x);
         x11_vk_changed(x);
+        x11_gs_prio_follow(x);
         if (x->sink) {
             nb_sink_refresh(x->sink);   /* the next frame, re-imported */
         }

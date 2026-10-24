@@ -10,6 +10,6 @@ void main()
     // The constant setup is upstream's own (it "works on CPU or GPU").
     FsrEasuCon(c0, c1, c2, c3, u_io.x, u_io.y, u_io.x, u_io.y, u_io.z,
                u_io.w);
-    FsrEasuF(c, AU2(gl_FragCoord.xy), c0, c1, c2, c3);
+    FsrEasuF(c, AU2(ivec2(gl_FragCoord.xy) - u_org), c0, c1, c2, c3);
     o_col = vec4(mix(c, c.bgr, u_swap), 1.0);
 }

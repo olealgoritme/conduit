@@ -220,6 +220,10 @@ SHADER_SRC = \
   nb_sh_rcas_head shaders/rcas_head.glsl \
   nb_sh_rcas_main shaders/rcas_main.glsl \
   nb_sh_cas_head shaders/cas_head.glsl \
+  nb_sh_cas_noscale shaders/cas_noscale.glsl \
+  nb_sh_cas_scale shaders/cas_scale.glsl \
+  nb_sh_fsr1_head shaders/fsr1_head.glsl \
+  nb_sh_fsr1_main shaders/fsr1_main.glsl \
   nb_sh_cas_main shaders/cas_main.glsl \
   nb_sh_nis_head shaders/nis_head.glsl \
   nb_sh_nis_main shaders/nis_main.glsl \

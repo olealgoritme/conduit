@@ -228,136 +228,6 @@ static void test_enhance(struct nb_gs *g, struct gbm_device *dev)
     }
 }
 
-/*
- * TEST_ENH_BENCH=1: what the enhancement passes cost at real sizes, a
- * 1920x1080 guest frame drawn at 3840x2160 (median of 60 after a warm-up,
- * the pass waited for as the viewer does).  Numbers for
- * docs/VIEWER-ENHANCE.md; not a check.
- */
-static unsigned med(unsigned *v, int n)
-{
-    for (int i = 1; i < n; i++) {
-        unsigned k = v[i];
-        int j = i - 1;
-
-        while (j >= 0 && v[j] > k) {
-            v[j + 1] = v[j];
-            j--;
-        }
-        v[j + 1] = k;
-    }
-    return v[n / 2];
-}
-
-static unsigned wall_us(const struct timespec *a)
-{
-    struct timespec b;
-
-    clock_gettime(CLOCK_MONOTONIC, &b);
-    return (unsigned)((b.tv_sec - a->tv_sec) * 1000000 +
-                      (b.tv_nsec - a->tv_nsec) / 1000);
-}
-
-static void enh_bench(struct nb_gs *g, struct gbm_device *dev)
-{
-    enum { BW = 1920, BH = 1080, OW = 3840, OH = 2160, N = 60 };
-    struct gbm_bo *bo[2];
-    struct nb_gs_target tg[NB_GS_TARGETS];
-    char why[200] = "";
-    unsigned v[N];
-
-    for (int k = 0; k < 2; k++) {
-        void *map = NULL;
-        uint32_t stride;
-        uint8_t *p;
-
-        bo[k] = gbm_bo_create(dev, BW, BH, GBM_FORMAT_XRGB8888,
-                              GBM_BO_USE_LINEAR);
-        p = bo[k] ? gbm_bo_map(bo[k], 0, 0, BW, BH, GBM_BO_TRANSFER_WRITE,
-                               &stride, &map) : NULL;
-        if (!p) {
-            printf("test_gpuscale: bench SKIPPED (no 1080p buffer)\n");
-            return;
-        }
-        for (int y = 0; y < BH; y++) {
-            for (int x = 0; x < BW; x++) {
-                /* a texture moving 6 px per frame */
-                int u = x + 6 * k;
-
-                *(uint32_t *)(p + (size_t)y * stride + (size_t)x * 4) =
-                    (uint32_t)(((u * 7) ^ (y * 3)) & 0xff) << 16 |
-                    (uint32_t)((u + y) & 0xff) << 8 | (uint32_t)(y & 0xff);
-            }
-        }
-        gbm_bo_unmap(bo[k], map);
-        nb_gs_src(g, 10 + k, gbm_bo_get_fd(bo[k]), BW, BH,
-                  gbm_bo_get_stride(bo[k]), 0, GBM_FORMAT_XRGB8888, 0);
-    }
-    if (nb_gs_targets(g, OW, OH, NULL, NULL, NULL, NULL, 0, tg, why,
-                      sizeof(why)) != NB_GS_TARGETS) {
-        printf("test_gpuscale: bench SKIPPED (%s)\n", why);
-        return;
-    }
-    for (int up = NB_UPSCALE_OFF; up < NB_UPSCALE_COUNT; up++) {
-        struct nb_gs_draw d = {
-            .src_key = 10, .dw = OW, .dh = OH, .sw = BW, .sh = BH,
-            .upscale = up, .sharp = 50,
-        };
-
-        for (int i = 0; i < N + 5; i++) {
-            struct timespec a;
-
-            d.target = i % NB_GS_TARGETS;
-            clock_gettime(CLOCK_MONOTONIC, &a);
-            nb_gs_draw(g, &d, 1000000, NULL);
-            if (i >= 5) {
-                v[i - 5] = wall_us(&a);
-            }
-        }
-        printf("test_gpuscale: bench %dx%d -> %dx%d %-18s %5u us\n", BW, BH,
-               OW, OH, up ? nb_upscale_label(up) : "plain (bilinear)",
-               med(v, N));
-    }
-    for (int i = 0; i < N + 5; i++) {
-        struct timespec a;
-
-        clock_gettime(CLOCK_MONOTONIC, &a);
-        nb_gs_fg_push(g, 10 + (i & 1), 0, 0, BW, BH, 1000000, NULL);
-        if (i >= 5) {
-            v[i - 5] = wall_us(&a);
-        }
-    }
-    printf("test_gpuscale: bench frame generation: push %dx%d (copy, "
-           "pyramid, flow) %u us\n", BW, BH, med(v, N));
-    {
-        struct nb_gs_draw d = {
-            .src_key = NB_GS_SRC_FG, .dw = OW, .dh = OH, .fg_t = 0.5f,
-        };
-
-        for (int up = NB_UPSCALE_OFF; up <= NB_UPSCALE_FSR; up++) {
-            d.upscale = up;
-            d.sharp = 50;
-            for (int i = 0; i < N + 5; i++) {
-                struct timespec a;
-
-                d.target = i % NB_GS_TARGETS;
-                clock_gettime(CLOCK_MONOTONIC, &a);
-                nb_gs_draw(g, &d, 1000000, NULL);
-                if (i >= 5) {
-                    v[i - 5] = wall_us(&a);
-                }
-            }
-            printf("test_gpuscale: bench frame generation: generated "
-                   "picture at %dx%d, %s: %u us\n", OW, OH,
-                   up ? "FSR 1" : "plain", med(v, N));
-        }
-    }
-    nb_gs_src_drop(g, 10);
-    nb_gs_src_drop(g, 11);
-    gbm_bo_destroy(bo[0]);
-    gbm_bo_destroy(bo[1]);
-}
-
 int main(void)
 {
     char why[256] = "";
@@ -387,6 +257,14 @@ int main(void)
         CHECK(nb_gs_prio_parse("bogus", &bad) == NB_GS_PRIO_HIGH && bad,
               "unknown word -> high, reported");
         CHECK(!strcmp(nb_gs_prio_name(NB_GS_PRIO_UNKNOWN), "unknown"), "name");
+        CHECK(nb_gs_prio_parse("low", &bad) == NB_GS_PRIO_LOW && !bad, "low");
+        unsetenv("CONDUIT_VIEWER_GPU_PRIORITY");
+        nb_gs_set_prio_default(NB_GS_PRIO_LOW);
+        CHECK(nb_gs_prio_wanted() == NB_GS_PRIO_LOW, "default low");
+        setenv("CONDUIT_VIEWER_GPU_PRIORITY", "high", 1);
+        CHECK(nb_gs_prio_wanted() == NB_GS_PRIO_HIGH, "the variable wins");
+        unsetenv("CONDUIT_VIEWER_GPU_PRIORITY");
+        nb_gs_set_prio_default(NB_GS_PRIO_HIGH);
     }
     if (!node) {
         node = "/dev/dri/renderD128";
@@ -563,8 +441,12 @@ int main(void)
               "back to dma-buf targets after the cursor");
     }
     test_enhance(g, dev);
-    if (getenv("TEST_ENH_BENCH") && nb_gs_enhance_ok(g, NULL)) {
-        enh_bench(g, dev);
+    /* Every benchmark variant once (one-pass and two-pass FSR, sampled in
+     * place and after a copy, NIS, CAS, frame generation) at a small size:
+     * they all run, nothing fails. */
+    if (nb_gs_enhance_ok(g, NULL)) {
+        CHECK(nb_gs_bench(node, SW, SH, 2 * SW, 2 * SH, 5, stdout) == 0,
+              "every benchmark variant runs");
     }
     CHECK(nb_gs_targets(g, TW, TH, NULL, NULL, NULL, NULL, 0, tg, why,
                         sizeof(why)) == NB_GS_TARGETS,

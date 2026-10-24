@@ -177,6 +177,10 @@ struct nb_vkp {
     uint32_t n_img;
     VkImage img[NB_VKP_IMAGES];
     VkSemaphore done[NB_VKP_IMAGES];
+    /* Per swapchain image: presented before with black bars around this
+     * destination, so it is reused as it is (PRESENT_SRC, no clear). */
+    struct { bool ok; int x, y, w, h; } bars[NB_VKP_IMAGES];
+    bool low_prio;              /* the queue runs at LOW global priority */
     VkSemaphore acq;
     VkSemaphore guest_ready;    /* the guest buffer's implicit fence     */
     VkFence fence;
@@ -404,6 +408,10 @@ static bool dev_up(struct nb_vkp *v, char *why, size_t n)
         const char *want[8];
         uint32_t nw = 0;
         float prio = 1.0f;
+        VkDeviceQueueGlobalPriorityCreateInfoKHR gp = {
+            .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_GLOBAL_PRIORITY_CREATE_INFO_KHR,
+            .globalPriority = VK_QUEUE_GLOBAL_PRIORITY_LOW_KHR,
+        };
         VkDeviceQueueCreateInfo qci = {
             .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
             .queueFamilyIndex = v->qf, .queueCount = 1,
@@ -441,9 +449,32 @@ static bool dev_up(struct nb_vkp *v, char *why, size_t n)
             want[nw++] = VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME;
             v->sync_fd = true;
         }
+        /*
+         * LOW queue priority: the copy shares the GPU with the guest, and
+         * must wait for the guest's channels rather than preempt them.  LOW
+         * needs no privilege.
+         */
+        if (has_dev_ext(v, ex, nex, VK_KHR_GLOBAL_PRIORITY_EXTENSION_NAME)) {
+            want[nw++] = VK_KHR_GLOBAL_PRIORITY_EXTENSION_NAME;
+            v->low_prio = true;
+        } else if (has_dev_ext(v, ex, nex,
+                               VK_EXT_GLOBAL_PRIORITY_EXTENSION_NAME)) {
+            want[nw++] = VK_EXT_GLOBAL_PRIORITY_EXTENSION_NAME;
+            v->low_prio = true;
+        }
+        if (v->low_prio) {
+            qci.pNext = &gp;
+        }
         dci.enabledExtensionCount = nw;
         dci.ppEnabledExtensionNames = want;
         r = f->vkCreateDevice(v->pd, &dci, NULL, &v->dev);
+        if (r != VK_SUCCESS && v->low_prio) {
+            /* Without the priority rather than not at all. */
+            qci.pNext = NULL;
+            dci.enabledExtensionCount = nw - 1;
+            v->low_prio = false;
+            r = f->vkCreateDevice(v->pd, &dci, NULL, &v->dev);
+        }
         if (r != VK_SUCCESS) {
             say(why, n, "vkCreateDevice failed", r);
             return false;
@@ -580,6 +611,7 @@ static int sc_up(struct nb_vkp *v, uint32_t w, uint32_t h, int mode)
     if (old) {
         f->vkDestroySwapchainKHR(v->dev, old, NULL);
     }
+    memset(v->bars, 0, sizeof(v->bars));
     v->n_img = NB_VKP_IMAGES;
     if (f->vkGetSwapchainImagesKHR(v->dev, v->sc, &v->n_img, v->img) <
         VK_SUCCESS) {
@@ -939,6 +971,11 @@ int nb_vkp_present(struct nb_vkp *v, const struct nb_vkp_frame *fr,
     t0 = mono_ns();
     wait_guest = guest_fence(v, fr->fd);
     {
+        /* The bars are black already in an image presented with this
+         * destination: keep its contents, clear nothing. */
+        bool keep = idx < NB_VKP_IMAGES && v->bars[idx].ok &&
+                    v->bars[idx].x == fr->dx && v->bars[idx].y == fr->dy &&
+                    v->bars[idx].w == fr->dw && v->bars[idx].h == fr->dh;
         VkCommandBufferBeginInfo bi = {
             .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
             .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
@@ -965,7 +1002,8 @@ int nb_vkp_present(struct nb_vkp *v, const struct nb_vkp_frame *fr,
                 .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
                 .srcAccessMask = 0,
                 .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-                .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+                .oldLayout = keep ? VK_IMAGE_LAYOUT_PRESENT_SRC_KHR
+                                  : VK_IMAGE_LAYOUT_UNDEFINED,
                 .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                 .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
                 .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
@@ -1024,9 +1062,18 @@ int nb_vkp_present(struct nb_vkp *v, const struct nb_vkp_frame *fr,
         f->vkCmdPipelineBarrier(v->cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                                 VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0,
                                 NULL, 2, pre);
-        f->vkCmdClearColorImage(v->cb, v->img[idx],
-                                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1,
-                                &rng);
+        if (!keep) {
+            f->vkCmdClearColorImage(v->cb, v->img[idx],
+                                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                    &black, 1, &rng);
+            if (idx < NB_VKP_IMAGES) {
+                v->bars[idx].ok = true;
+                v->bars[idx].x = fr->dx;
+                v->bars[idx].y = fr->dy;
+                v->bars[idx].w = fr->dw;
+                v->bars[idx].h = fr->dh;
+            }
+        }
         {
             VkMemoryBarrier mb = {
                 .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,

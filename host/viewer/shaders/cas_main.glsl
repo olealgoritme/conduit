@@ -6,8 +6,9 @@ void main()
     AU4 c0, c1;
     AF1 r, g, b;
 
-    CasSetup(c0, c1, u_sharp, u_in.x, u_in.y, u_in.x, u_in.y);
-    CasFilter(r, g, b, AU2(gl_FragCoord.xy), c0, c1, true);
+    CasSetup(c0, c1, u_sharp, u_in.x, u_in.y, u_out.x, u_out.y);
+    CasFilter(r, g, b, AU2(ivec2(gl_FragCoord.xy) - u_org), c0, c1,
+              NB_CAS_NOSCALE);
     AF3 c = AF3(r, g, b);
     o_col = vec4(mix(c, c.bgr, u_swap), 1.0);
 }

@@ -758,6 +758,13 @@ struct nb_wl {
      * timer (nb_fg.h), into the same targets.
      */
     struct nb_fg    fg;
+    /* The outputs' current refresh (wl_output mode), and the one the window
+     * is on: frame generation's refresh when wp_presentation reports none
+     * (a headless output, a compositor without it). */
+#define NB_WL_OUTPUTS 8
+    struct { struct wl_output *o; unsigned mhz; } out[NB_WL_OUTPUTS];
+    int             n_out, out_on;
+    bool            enh_noviewport_told;
     int             fg_tfd;         /* -1 until first needed               */
     int             fg_pfd;         /* index in the pollfds, -1 none       */
     bool            fg_armed;
@@ -961,6 +968,7 @@ static int  bd_index(const struct nb_wl *w, const struct wl_surface *s);
 /* Forward: the idle placeholder is released by wl_commit once a real frame is
  * on screen; defined with the rest of the placeholder code. */
 static void wl_idle_drop(struct nb_wl *w);
+static int  wl_fg_mult(const struct nb_wl *w);
 /* Forward: presentation feedback is requested by wl_commit, defined below. */
 extern const struct wp_presentation_feedback_listener nb_pres_listener;
 /* Forward: virtio-nvgpu viewer pieces, defined after the registry. */
@@ -1182,15 +1190,25 @@ static void nb_stats_flush(struct nb_wl *w, uint64_t now)
         uint32_t cp50, cp99, pi50, pi99;
         double pi_mean = 0, pi_sd = 0;
         unsigned i;
-        char gs[200] = "";
+        char gs[512] = "";
 
-        if (w->st_gs_n || w->st_gs_drop) {
+        if (w->vk_on) {
+            snprintf(gs, sizeof(gs), " | smooth motion %u frames through the "
+                     "Vulkan swapchain, blit avg %.0fus max %lluus | path: "
+                     "Vulkan swapchain on %s (NVIDIA Smooth Motion)",
+                     w->st_gs_n,
+                     w->st_gs_n ? (double)w->st_gs_sum / w->st_gs_n : 0.0,
+                     (unsigned long long)w->st_gs_max, nb_vkp_device(w->vkp));
+        } else if (w->st_gs_n || w->st_gs_drop) {
             snprintf(gs, sizeof(gs), " | gpu-scale %u frames, pass avg %.0fus "
                      "max %lluus, %u dropped | path: %s on %s%s", w->st_gs_n,
                      w->st_gs_n ? (double)w->st_gs_sum / w->st_gs_n : 0.0,
                      (unsigned long long)w->st_gs_max, w->st_gs_drop,
                      w->st_copy ? "GPU copy (the compositor does not take "
                                   "the guest's format/modifier)"
+                     : w->vst.upscale ? nb_upscale_label(
+                                            nb_gs_enh_status(w->gs, NULL))
+                     : wl_fg_mult(w) > 1 ? "GPU pass (frame generation)"
                                 : "GPU pass (fullscreen scaler)",
                      w->gs ? nb_gs_node(w->gs) : "?",
                      w->gt_rb ? ", read back into shared memory" : "");
@@ -1200,9 +1218,16 @@ static void nb_stats_flush(struct nb_wl *w, uint64_t now)
         if (w->fg_live || w->st_fg) {
             size_t k = strlen(gs);
 
-            snprintf(gs + k, sizeof(gs) - k, " | framegen %ux: %u generated, "
-                     "%u retried, guest %.1fms", w->fg.eff > 1 ? w->fg.eff : 1,
-                     w->st_fg, w->st_fg_retry, (double)w->fg.interval / 1e6);
+            /* Committed pictures per second, the guest's and the generated
+             * ones apart (the commit figure above counts guest frames). */
+            snprintf(gs + k, sizeof(gs) - k, " | framegen %ux: shown %.1f/s "
+                     "guest + %.1f/s generated, %u retried, guest interval "
+                     "%.1fms, output %.0f Hz%s", w->fg.eff > 1 ? w->fg.eff : 1,
+                     w->st_gs_n / secs, w->st_fg / secs, w->st_fg_retry,
+                     (double)w->fg.interval / 1e6,
+                     w->fg.refresh ? 1e9 / (double)w->fg.refresh : 0.0,
+                     w->presentation && w->pres_clock != UINT32_MAX
+                         ? "" : " (no presentation feedback)");
         }
 
         for (i = 0; i < w->st_pi_k; i++) {
@@ -2880,7 +2905,9 @@ static int wl_gs_present(struct nb_wl *w, int slot, int pw, int ph,
     if (wl_fg_mult(w) > 1 && nb_gs_enhance_ok(w->gs, NULL)) {
         if (fresh) {
             unsigned us = 0;
-            int pr = nb_gs_fg_push(w->gs, slot, d.sx, d.sy, d.sw, d.sh, 50000,
+            /* Submitted without a wait: the draw below waits for both,
+             * one GPU submission per guest frame. */
+            int pr = nb_gs_fg_push(w->gs, slot, d.sx, d.sy, d.sw, d.sh, 0,
                                    &us);
 
             if (pr < 0) {
@@ -3330,7 +3357,12 @@ static int wl_commit(struct nb_session *s, struct nb_sink *sink)
             }
             w->current = w->pending;
             w->pending = -1;
-            w->st_commits++;
+            nb_stats_commit(w, sl);     /* the --stats line, as for others */
+            /* No frame callback comes from a surface the swapchain owns:
+             * the guest's frame token goes with the present. */
+            if (w->sink) {
+                nb_sink_frame(w->sink);
+            }
             if (w->idle_buf) {
                 wl_idle_drop(w);
             }
@@ -3977,6 +4009,55 @@ static void wl_fg_fire(struct nb_wl *w)
     wl_fg_arm(w);
 }
 
+/*
+ * THE GPU PASS'S PRIORITY FOLLOWS THE MODE.  With an upscaler or frame
+ * generation on, the pass does real work per frame on the GPU the guest
+ * renders on; at LOW context priority it waits for the guest's channels
+ * instead of preempting them.  The plain scaler keeps HIGH (it is a single
+ * cheap pass, and its latency is what that mode is for).  A context's
+ * priority is fixed at creation: on a change the pass is reopened at the
+ * next frame.  CONDUIT_VIEWER_GPU_PRIORITY, when set, wins.
+ */
+static void wl_gs_prio_follow(struct nb_wl *w)
+{
+    nb_gs_set_prio_default(wl_enh_on(w) ? NB_GS_PRIO_LOW : NB_GS_PRIO_HIGH);
+    if (w->gs && nb_gs_prio_requested(w->gs) != nb_gs_prio_wanted()) {
+        nb_log("gpu-scale: reopening the GPU pass at context priority %s "
+               "(%s)", nb_gs_prio_name(nb_gs_prio_wanted()),
+               wl_enh_on(w) ? "upscaling or frame generation on"
+                            : "plain scaling");
+        wl_gs_close(w);
+    }
+}
+
+/* Without wp_viewporter there is no GPU pass at all (the window is the
+ * guest's buffer): say so once instead of silently doing nothing. */
+static void wl_enh_viewport_note(struct nb_wl *w)
+{
+    if (!w->viewport && wl_enh_on(w) && !w->enh_noviewport_told) {
+        w->enh_noviewport_told = true;
+        nb_err("upscaling/frame generation off: no wp_viewporter (the "
+               "compositor does not offer it, so the window shows the "
+               "guest's buffer as it is)");
+        snprintf(w->enh_note, sizeof(w->enh_note),
+                 "Off here: the compositor has no wp_viewporter");
+    }
+}
+
+/* Frame generation's refresh: wp_presentation's, else the output's mode. */
+static void wl_fg_refresh(struct nb_wl *w)
+{
+    unsigned mhz = w->refresh_mhz;
+
+    if (!mhz && w->out_on >= 0 && w->out_on < w->n_out) {
+        mhz = w->out[w->out_on].mhz;
+    }
+    for (int i = 0; !mhz && i < w->n_out; i++) {
+        mhz = w->out[i].mhz > mhz ? w->out[i].mhz : mhz;
+    }
+    nb_fg_set_refresh(&w->fg, mhz ? 1000000000000ull / mhz : 0);
+}
+
 /* The frame-generation setting or the sync mode changed. */
 static void wl_fg_changed(struct nb_wl *w)
 {
@@ -3987,9 +4068,7 @@ static void wl_fg_changed(struct nb_wl *w)
     }
     w->fg_mult_was = m;
     nb_fg_init(&w->fg, m);
-    if (w->refresh_mhz) {
-        nb_fg_set_refresh(&w->fg, 1000000000000ull / w->refresh_mhz);
-    }
+    wl_fg_refresh(w);
     w->fg_live = false;
     if (w->gs) {
         nb_gs_fg_reset(w->gs);
@@ -7173,7 +7252,7 @@ static void pres_presented(void *d, struct wp_presentation_feedback *f,
 
         if (nb_hz_mode == NB_HZ_AUTO && mhz / 1000 != w->refresh_mhz / 1000) {
             w->refresh_mhz = mhz;
-            nb_fg_set_refresh(&w->fg, (uint64_t)refresh);
+            wl_fg_refresh(w);
             nb_log("host output refresh is %u.%03u Hz — telling the guest, so "
                    "it need not stay at its built-in default",
                    mhz / 1000, mhz % 1000);
@@ -7260,6 +7339,62 @@ static const struct wp_presentation_listener pres_clock_listener = {
 
 /* ── registry ────────────────────────────────────────────────────────────── */
 
+static void out_geometry(void *d, struct wl_output *o, int32_t x, int32_t y,
+                         int32_t pw, int32_t ph, int32_t sp, const char *mk,
+                         const char *md, int32_t tr)
+{
+    (void)d; (void)o; (void)x; (void)y; (void)pw; (void)ph; (void)sp;
+    (void)mk; (void)md; (void)tr;
+}
+
+static void out_mode(void *data, struct wl_output *o, uint32_t flags,
+                     int32_t wd, int32_t ht, int32_t refresh)
+{
+    struct nb_wl *w = data;
+
+    (void)wd; (void)ht;
+    if (!(flags & WL_OUTPUT_MODE_CURRENT) || refresh <= 0) {
+        return;
+    }
+    for (int i = 0; i < w->n_out; i++) {
+        if (w->out[i].o == o) {
+            w->out[i].mhz = (unsigned)refresh;
+            wl_fg_refresh(w);
+        }
+    }
+}
+
+static void out_done(void *d, struct wl_output *o) { (void)d; (void)o; }
+static void out_scale(void *d, struct wl_output *o, int32_t f)
+{
+    (void)d; (void)o; (void)f;
+}
+static const struct wl_output_listener out_listener = {
+    .geometry = out_geometry, .mode = out_mode, .done = out_done,
+    .scale = out_scale,
+};
+
+static void surf_enter(void *data, struct wl_surface *sf, struct wl_output *o)
+{
+    struct nb_wl *w = data;
+
+    (void)sf;
+    for (int i = 0; i < w->n_out; i++) {
+        if (w->out[i].o == o) {
+            w->out_on = i;
+            wl_fg_refresh(w);
+        }
+    }
+}
+
+static void surf_leave(void *data, struct wl_surface *sf, struct wl_output *o)
+{
+    (void)data; (void)sf; (void)o;
+}
+static const struct wl_surface_listener surf_listener = {
+    .enter = surf_enter, .leave = surf_leave,
+};
+
 static void reg_global(void *data, struct wl_registry *r, uint32_t name,
                        const char *iface, uint32_t ver)
 {
@@ -7275,6 +7410,13 @@ static void reg_global(void *data, struct wl_registry *r, uint32_t name,
         w->deco_mgr = BIND(zxdg_decoration_manager_v1_interface, 1);
     } else if (!strcmp(iface, wl_subcompositor_interface.name)) {
         w->subcomp = BIND(wl_subcompositor_interface, 1);
+    } else if (!strcmp(iface, wl_output_interface.name) &&
+               w->n_out < NB_WL_OUTPUTS) {
+        w->out[w->n_out].o = BIND(wl_output_interface, 2);
+        if (w->out[w->n_out].o) {
+            wl_output_add_listener(w->out[w->n_out].o, &out_listener, w);
+            w->n_out++;
+        }
     } else if (!strcmp(iface, wp_presentation_interface.name)) {
         w->presentation = BIND(wp_presentation_interface, 1);
         w->pres_clock = UINT32_MAX;
@@ -8802,6 +8944,8 @@ static void wl_ui_do(struct nb_wl *w, unsigned bits)
         w->enh_logged = -1;
         wl_fg_changed(w);
         wl_vk_changed(w);
+        wl_gs_prio_follow(w);
+        wl_enh_viewport_note(w);
         wl_relayout(w);         /* the next picture with the new passes */
     }
     if ((bits & NB_UI_FULLSCREEN) && w->sink) {
@@ -9871,6 +10015,10 @@ static int wl_open(struct nb_session *s, const struct nb_config *cfg)
     w->scale_120 = 120;         /* until the compositor says otherwise */
     w->fetch_fd = -1;
     w->surf = wl_compositor_create_surface(w->comp);
+    if (w->surf) {
+        /* Which output the window is on (frame generation's refresh). */
+        wl_surface_add_listener(w->surf, &surf_listener, w);
+    }
     if (w->surf && w->frac_mgr) {
         w->frac = wp_fractional_scale_manager_v1_get_fractional_scale(
                       w->frac_mgr, w->surf);
@@ -10070,6 +10218,8 @@ static int wl_open(struct nb_session *s, const struct nb_config *cfg)
     /* Picture enhancement as saved for this VM (docs/VIEWER-ENHANCE.md). */
     wl_fg_changed(w);
     wl_vk_changed(w);
+    wl_gs_prio_follow(w);
+    wl_enh_viewport_note(w);
     if (w->vst.upscale != NB_UPSCALE_OFF) {
         nb_log("upscaling: %s, sharpness %d (the GPU pass draws every frame)",
                nb_upscale_label(w->vst.upscale), w->vst.sharp);
@@ -10225,6 +10375,7 @@ struct nb_session *nb_session_wayland(const struct nb_config *cfg)
     w->fg_tfd = -1;
     w->fg_pfd = -1;
     w->fg_mult_was = -1;
+    w->out_on = -1;
     w->enh_logged = -1;
     w->xs_pfd = -1;
     nb_latch_init(&w->latch);

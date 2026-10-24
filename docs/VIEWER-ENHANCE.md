@@ -27,25 +27,43 @@ upscaler. In Windows, set the game to fullscreen or borderless at that
 resolution; the guest's desktop then runs at it too. Moderate factors work
 best: 1.33x to 2x per axis.
 
-| Mode | What it does | Passes |
+| Mode | What it does | Passes at window size |
 |---|---|---|
-| FSR 1 | AMD FidelityFX Super Resolution 1: EASU (edge-adaptive upscaling), then RCAS (sharpening). Sharpness 0 skips RCAS. | 3 |
-| NIS | NVIDIA Image Scaling: a 6-tap scaler with directional filters and adaptive sharpening, in one compute pass. For 1x to 2x per axis; above 2x FSR 1 is used instead. | 3 |
-| Sharpen only (CAS) | AMD FidelityFX Contrast Adaptive Sharpening at the guest's resolution, then the plain scale. Useful at 1:1 or for downscaling. | 3 |
+| FSR 1 | AMD FidelityFX Super Resolution 1: EASU (edge-adaptive upscaling), then RCAS (sharpening). Sharpness 0 is EASU alone, straight into the output. `CONDUIT_VIEWER_FSR_PASSES=1` runs both in one pass (RCAS over EASU computed where it reads it: no intermediate in memory, but five EASU evaluations per pixel; 4x slower on an AMD iGPU, so not the default). | 2 (1) |
+| NIS | NVIDIA Image Scaling: a 6-tap scaler with directional filters and adaptive sharpening, one compute pass, then a 1:1 copy into the output buffer (a compute pass cannot write it). For 1x to 2x per axis; above 2x FSR 1 is used instead. | 2 |
+| Sharpen only (CAS) | AMD FidelityFX Contrast Adaptive Sharpening, sharpening and scaling in one pass up to 4x the area; above that, or drawn smaller, sharpened at the guest's resolution, then the plain scale. | 1 |
 
-Every mode first copies the guest's frame into a texture (the passes need a
-normal texture, and the guest gets its buffer back at once). When the window
-is smaller than the guest's picture, FSR and NIS step aside for the plain
-pass; CAS still runs. The log line `upscaling: X asked, Y runs: why` and the
-menu say when a different pass runs.
+The passes read the guest's buffer in place, as an ordinary texture, when the
+driver allows it for the buffer's layout (it says so per modifier); otherwise
+the frame is first copied into a texture at the guest's size. The black bars
+around a letterboxed picture are cleared once per output buffer, not per
+frame. When the window is smaller than the guest's picture, FSR and NIS step
+aside for the plain pass; CAS still runs. The log line `upscaling: X asked, Y
+runs: why` and the menu say when a different pass runs.
+
+**Priority.** With an upscaler or frame generation on, the viewer's GPU work
+runs at the lowest context priority the driver offers
+(`EGL_IMG_context_priority` LOW; the Smooth Motion swapchain's queue at
+`VK_KHR_global_priority` LOW), so it waits for the guest's GPU work instead of
+preempting it; the plain scaler keeps its high priority.
+`CONDUIT_VIEWER_GPU_PRIORITY=low|medium|high|realtime` overrides both, to
+compare. The log says what was asked and what the driver granted.
+
+Without `wp_viewporter` (some headless compositors) there is no GPU pass:
+the viewer logs `upscaling/frame generation off: no wp_viewporter` and the
+menu says so.
 
 **Cost.** With an upscaler on, every frame goes through the viewer's GPU pass
 (also in a window), so the frame is no longer handed to the compositor as it
-is. The pass is one copy at guest size plus one or two passes at window size.
-The time per frame is in the `--stats` line (`gpu-scale ... pass avg`).
-`TEST_ENH_BENCH=1 make -C host/viewer test-gpuscale` measures each pass at
-1920x1080 to 3840x2160 on a render node (`TEST_RENDER_NODE`). Shaders are
-compiled the first time a mode is used, which takes up to about 100 ms once.
+is. The GPU pass runs on the same GPU as the guest, so its time is time the
+guest's frames wait. The time per frame is in the `--stats` line (`gpu-scale
+... pass avg`). `conduit-viewer --bench-enhance=1920x1080:3840x2160 --gpu
+/dev/dri/renderD128` times every pass and variant on a GPU without a window or
+a VM (GPU time from timer queries, and the wall time to the fence); compare
+`CONDUIT_VIEWER_FSR_PASSES=1` (FSR in one pass) and
+`CONDUIT_VIEWER_ENH_DIRECT=0` (always copy first) in a session the same way.
+Shaders are compiled the first time a mode is used, which takes up to about
+100 ms once.
 
 **Latency.** The passes run when the frame arrives and are waited for before
 the frame is committed, so they add their GPU time, no queueing.
@@ -107,10 +125,15 @@ drawn by the compositor over the picture, so it is never interpolated. On X11
 the guest draws its cursor into the frame, and it is interpolated with the
 rest.
 
-**Cost.** Per guest frame, the copy, the pyramid and the flow at guest
-resolution. Per shown picture, the interpolation at guest resolution and the
-upscaler, if any. The `--stats` line adds `framegen Nx: generated, retried,
-guest interval`.
+**Cost.** Per guest frame, one copy, the pyramid and one flow estimate, all
+at guest resolution, submitted together with the first picture (one GPU
+submission). Per shown picture, the interpolation at guest resolution (only
+for pictures that are shown) and the upscaler, if any; the newest frame
+itself needs no interpolation. The `--stats` line adds `framegen Nx: shown
+G/s guest + N/s generated`, the guest interval, and the output refresh the
+pacing assumes: wp_presentation's, else the output's current mode
+(`wl_output`), so an output without presentation feedback (a headless one)
+still caps generation at its refresh.
 
 **Known artifacts.**
 
@@ -145,6 +168,9 @@ starts at once.
 
 **Trade-offs.**
 
+- The `--stats` line reads `smooth motion N frames through the Vulkan
+  swapchain` with the copy's time; what the driver generates is not visible
+  to the viewer.
 - An extra copy per guest frame into the swapchain image, instead of handing
   the guest's buffer to the compositor. The upscalers do not apply in this
   mode (the copy is a plain bilinear or nearest scale).

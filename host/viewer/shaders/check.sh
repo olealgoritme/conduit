@@ -44,7 +44,9 @@ prog quad      vert shaders/quad.vert
 prog copy      frag shaders/es_frag.glsl shaders/copy.frag
 prog easu      frag shaders/es_frag.glsl shaders/easu_head.glsl $A third_party/fsr1/ffx_fsr1.h shaders/easu_main.glsl
 prog rcas      frag shaders/es_frag.glsl shaders/rcas_head.glsl $A third_party/fsr1/ffx_fsr1.h shaders/rcas_main.glsl
-prog cas       frag shaders/es_frag.glsl shaders/cas_head.glsl $A third_party/cas/ffx_cas.h shaders/cas_main.glsl
+prog fsr1     frag shaders/es_frag.glsl shaders/fsr1_head.glsl $A third_party/fsr1/ffx_fsr1.h shaders/fsr1_main.glsl
+prog cas       frag shaders/es_frag.glsl shaders/cas_noscale.glsl shaders/cas_head.glsl $A third_party/cas/ffx_cas.h shaders/cas_main.glsl
+prog cas_scale frag shaders/es_frag.glsl shaders/cas_scale.glsl shaders/cas_head.glsl $A third_party/cas/ffx_cas.h shaders/cas_main.glsl
 prog nis       comp shaders/es_comp.glsl shaders/nis_head.glsl shaders/nis_scaler_gles.glsl shaders/nis_main.glsl
 prog fg_down   comp shaders/es_comp.glsl shaders/fg_down.comp
 prog fg_flow   comp shaders/es_comp.glsl shaders/fg_flow.comp

@@ -146,8 +146,20 @@ int  nb_gs_fg_push(struct nb_gs *g, int src_key, double sx, double sy,
                    double sw, double sh, unsigned timeout_us,
                    unsigned *gpu_us);
 void nb_gs_fg_reset(struct nb_gs *g);
+/* timeout_us 0: submit without waiting; the next nb_gs_draw's wait covers
+ * it (one GPU submission per guest frame instead of two). */
 /* Whether the history holds a frame to draw. */
 bool nb_gs_fg_ready(const struct nb_gs *g);
+
+/*
+ * BENCHMARK (conduit-viewer --bench-enhance): every enhancement pass on the
+ * GPU at node (NULL: the first that works), an iw x ih source drawn at
+ * ow x oh, `iters` times each; the GPU time per pass (timer queries, when
+ * the driver has them) and the wall time to the fence, medians, to `out`.
+ * No display, no VM.  0, or -1 with the reason printed.
+ */
+int nb_gs_bench(const char *node, uint32_t iw, uint32_t ih, uint32_t ow,
+                uint32_t oh, int iters, void *out_file);
 
 /*
  * GPU PRIORITY OF THE PASS.  The pass sits between the guest's frame and the
@@ -158,8 +170,13 @@ bool nb_gs_fg_ready(const struct nb_gs *g);
  * MAKE_REALTIME check RS_ACCESS_NICE), and the granted level is read back
  * with eglQueryContext and reported.
  *
- * CONDUIT_VIEWER_GPU_PRIORITY = off | medium | high (default) | realtime.
- * off and medium both create a context without the attribute.
+ * CONDUIT_VIEWER_GPU_PRIORITY = low | off | medium | high (default) |
+ * realtime.  off and medium both create a context without the attribute.
+ *
+ * With picture enhancement on (docs/VIEWER-ENHANCE.md) the sessions ask for
+ * LOW instead (nb_gs_set_prio_default): those passes do more work per frame,
+ * and run on the GPU the guest renders on; at LOW they wait for the guest's
+ * channels rather than preempt them.  The variable, when set, wins.
  */
 enum nb_gs_prio {
     NB_GS_PRIO_UNKNOWN = -1,    /* not reported by the driver               */
@@ -172,6 +189,11 @@ enum nb_gs_prio {
 /* The env value (NULL or empty: the default, HIGH); an unknown word is
  * reported through *bad and gives the default. */
 enum nb_gs_prio nb_gs_prio_parse(const char *s, bool *bad);
+/* The priority asked for when CONDUIT_VIEWER_GPU_PRIORITY is not set, for
+ * the next nb_gs_open (HIGH until changed). */
+void nb_gs_set_prio_default(enum nb_gs_prio p);
+/* What the next nb_gs_open will ask for: the variable, else the default. */
+enum nb_gs_prio nb_gs_prio_wanted(void);
 const char *nb_gs_prio_name(enum nb_gs_prio p);
 /* What was asked for and what the driver says it granted. */
 enum nb_gs_prio nb_gs_prio_requested(const struct nb_gs *g);
