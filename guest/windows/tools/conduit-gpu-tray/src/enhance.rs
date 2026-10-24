@@ -112,8 +112,17 @@ pub const WINDOWS: Setting = Setting {
     per_exe: false,
 };
 
+pub const D3D: Setting = Setting {
+    name: "EnhanceD3D",
+    dword: true,
+    title: "D3D11 and D3D12 games",
+    choices: &[("1", "On"), ("0", "Off (Vulkan and OpenGL only)")],
+    default: "1",
+    per_exe: true,
+};
+
 /// Menu order
-pub const ALL: [Setting; 7] = [
+pub const ALL: [Setting; 8] = [
     SCALER,
     SHARPNESS,
     FRAMEGEN,
@@ -121,6 +130,7 @@ pub const ALL: [Setting; 7] = [
     LOW_LATENCY,
     FIT,
     WINDOWS,
+    D3D,
 ];
 
 impl Setting {
@@ -259,6 +269,9 @@ mod tests {
         assert_eq!(FRAMEGEN.profile_name(), "FrameGen");
         assert_eq!(FG_QUALITY.profile_name(), "FgQuality");
         assert!(!WINDOWS.per_exe);
+        assert_eq!(D3D.profile_name(), "D3D");
+        assert_eq!(D3D.index_of(None), 0);
+        assert_eq!(D3D.index_of(Some("0")), 1);
     }
 
     #[test]

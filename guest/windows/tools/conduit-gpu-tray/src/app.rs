@@ -761,10 +761,7 @@ unsafe fn enhance_menu(apps: &[String]) -> HMENU {
     let m = CreatePopupMenu();
     let scaler = enhance::SCALER.index_of(sys::enhance_get(None, &enhance::SCALER).as_deref());
     let fg = enhance::FRAMEGEN.index_of(sys::enhance_get(None, &enhance::FRAMEGEN).as_deref());
-    let t = wide(&format!(
-        "Vulkan and OpenGL games: {}",
-        enhance::summary(scaler, fg)
-    ));
+    let t = wide(&format!("All games: {}", enhance::summary(scaler, fg)));
     AppendMenuW(m, MF_STRING | MF_GRAYED, 0, t.as_ptr());
     for (si, s) in enhance::ALL.iter().enumerate() {
         let sub = enhance_choices(None, s, ID_ENH + si * 16);
@@ -798,7 +795,9 @@ unsafe fn enhance_menu(apps: &[String]) -> HMENU {
         AppendMenuW(m, MF_POPUP, pm as usize, t.as_ptr());
     }
     AppendMenuW(m, MF_SEPARATOR, 0, null());
-    let t = wide("Changes apply within a second; D3D11 and D3D12 games are not covered yet");
+    let t = wide(
+        "Filters apply at once; turning on or off: at the game's next swap chain (D3D: next start)",
+    );
     AppendMenuW(m, MF_STRING | MF_GRAYED, 0, t.as_ptr());
     m
 }
