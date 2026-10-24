@@ -1,0 +1,467 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Sat, 24 Oct 2026 02:46:19 +0200
+Subject: [PATCH] nak: issue-efficiency knobs from the SM120 SASS comparison
+ (NAK_RA_LRU, NAK_YIELD, NAK_REUSE)
+
+NAK's code for the heaviest Steel Nomad shaders, compared with the
+reference compiler's code for the same SPIR-V on SM120:
+
+- Dependent instructions back to back. In 2a040240 (19k instructions),
+  26% of NAK's instructions read the result of the one right before them,
+  against 2% in the reference code, and the static stall cycles are 47k
+  against 23.5k. In the fullscreen lighting FS (d2c045ea) the figures are
+  29.5% against 7.4%, and 11.4k against 8.2k cycles. The post-RA
+  scheduler is boxed in by register reuse: the allocator gives a new value
+  the lowest free register, usually the one that was just freed.
+- No operand reuse bits and no bit 109 on SM120 (the encoder leaves both
+  clear). The reference code sets bit 109 on 76-92% of its instructions,
+  those followed by a 1-2 cycle stall, and clears it where the warp waits
+  longer. It sets reuse bits on 10-15% of its instructions, always
+  together with bit 109.
+
+Knobs (default off):
+
+- NAK_RA_LRU=1: a new scalar GPR value gets the free register that was
+  freed longest ago, and the GPR budget grows to the occupancy cliff (the
+  same warp count). 2a040240: static stall 54.9k -> 44.4k cycles, and the
+  previous-result reads go from 26% to 13%. 88825d04 and 37e478ea: -2 to -5%.
+- NAK_YIELD=1 (SM120): bit 109 is set on instructions followed by a stall
+  of at most 2 cycles that are not barriers.
+- NAK_REUSE=1 (needs NAK_YIELD): when consecutive, unpredicated ALU
+  instructions of a block read the same GPR as the same operand, and the
+  first one does not write it, the first one marks that operand for the
+  reuse cache. Only the opcode/operand combinations the reference code
+  uses are marked, with the reference mapping (FADD's second operand is
+  operand C for these bits), and more than one bit only on FFMA. All 251
+  compute and fragment binaries of the Steel Nomad corpus disassemble
+  without errors with NAK_YIELD=1 NAK_REUSE=1 NAK_RA_LRU=1
+  NAK_SCHED_MLP=3. Before this goes on by default it needs a hardware run
+  of guest/nvk-rm/tools/naktest.
+- NAK_SCHED_FREE (0-31, default 4): how far below its register target the
+  prepass switches to scheduling for register pressure. It makes no
+  measurable difference on the shaders above.
+
+The four are packed into nak_knobs_key2(), which NVK adds to the pipeline
+cache UUID and to the disk cache's identity.
+---
+ src/nouveau/compiler/nak.h                    |   4 +
+ src/nouveau/compiler/nak/assign_regs.rs       |  60 +++++++++-
+ src/nouveau/compiler/nak/knobs.rs             |  54 +++++++++
+ .../compiler/nak/opt_instr_sched_prepass.rs   |  10 +-
+ src/nouveau/compiler/nak/sm70_encode.rs       | 109 ++++++++++++++++++
+ src/nouveau/vulkan/nvk_physical_device.c      |  14 ++-
+ 6 files changed, 246 insertions(+), 5 deletions(-)
+
+diff --git a/src/nouveau/compiler/nak.h b/src/nouveau/compiler/nak.h
+index f5303dd..0409e32 100644
+--- a/src/nouveau/compiler/nak.h
++++ b/src/nouveau/compiler/nak.h
+@@ -33,6 +33,10 @@ uint64_t nak_debug_flags(const struct nak_compiler *nak);
+  */
+ uint32_t nak_gpr_cap_key(void);
+ uint32_t nak_knobs_key(void);
++/* The NAK_* knobs that fit in neither (NAK_RA_LRU, NAK_REUSE, NAK_YIELD,
++ * NAK_SCHED_FREE), for a second word of the cache keys
++ */
++uint32_t nak_knobs_key2(void);
+ 
+ const struct nir_shader_compiler_options *
+ nak_nir_options(const struct nak_compiler *nak);
+diff --git a/src/nouveau/compiler/nak/assign_regs.rs b/src/nouveau/compiler/nak/assign_regs.rs
+index 195dd88..b8a9168 100644
+--- a/src/nouveau/compiler/nak/assign_regs.rs
++++ b/src/nouveau/compiler/nak/assign_regs.rs
+@@ -268,6 +268,9 @@ struct RegAllocator {
+     /// Registers that the phi copies at the end of the current block want
+     /// for other values: new values without a preference avoid them
+     avoid: BitSet,
++    /// NAK_RA_LRU: when each register was last freed (a counter)
++    freed_at: Vec<u32>,
++    free_clock: u32,
+ }
+ 
+ impl RegAllocator {
+@@ -280,9 +283,30 @@ impl RegAllocator {
+             reg_ssa: Vec::new(),
+             ssa_reg: Default::default(),
+             avoid: Default::default(),
++            freed_at: Vec::new(),
++            free_clock: 0,
+         }
+     }
+ 
++    /// NAK_RA_LRU: of the free registers (outside `busy`), the one freed
++    /// longest ago.  Taking the lowest free register reuses the one just
++    /// freed, and the post-RA scheduler then cannot move the new value's
++    /// producer above the old value's last reader
++    fn try_find_lru_reg(&self, busy: &BitSet) -> Option<u32> {
++        let mut best: Option<(u32, u32)> = None;
++        for r in 0..self.num_regs {
++            let ru = usize::try_from(r).unwrap();
++            if busy.contains(ru) {
++                continue;
++            }
++            let t = self.freed_at.get(ru).copied().unwrap_or(0);
++            if best.map_or(true, |(bt, _)| t < bt) {
++                best = Some((t, r));
++            }
++        }
++        best.map(|(_, r)| r)
++    }
++
+     fn file(&self) -> RegFile {
+         self.file
+     }
+@@ -337,6 +361,11 @@ impl RegAllocator {
+         assert!(self.reg_ssa[reg_usize] == Some(ssa));
+         self.used.remove(reg_usize);
+         self.pinned.remove(reg_usize);
++        self.free_clock += 1;
++        if reg_usize >= self.freed_at.len() {
++            self.freed_at.resize(reg_usize + 1, 0);
++        }
++        self.freed_at[reg_usize] = self.free_clock;
+         reg
+     }
+ 
+@@ -478,6 +507,20 @@ impl RegAllocator {
+             }
+         }
+ 
++        if self.file == RegFile::GPR && crate::knobs::ra_lru() {
++            let mut busy = self.used.clone();
++            for r in self.avoid.iter() {
++                busy.insert(r);
++            }
++            if let Some(reg) = self
++                .try_find_lru_reg(&busy)
++                .or_else(|| self.try_find_lru_reg(&self.used))
++            {
++                self.assign_reg(ssa, reg);
++                return reg;
++            }
++        }
++
+         // Keep out of the registers this block's phi copies want, if there
+         // is room elsewhere (NAK_PHI_AVOID)
+         if !self.avoid.is_empty() {
+@@ -1567,7 +1610,22 @@ impl Shader<'_> {
+             let next_multiple_gprs = (total_gprs + hw_reserved_gprs)
+                 .next_multiple_of(8)
+                 - hw_reserved_gprs;
+-            let free_gprs = next_multiple_gprs.min(max_gprs) - total_gprs;
++            let mut free_gprs =
++                next_multiple_gprs.min(max_gprs) - total_gprs;
++
++            // NAK_RA_LRU: every register up to the occupancy cliff costs no
++            // warps; with them, values the allocator spreads out leave the
++            // post-RA scheduler fewer false dependencies
++            if crate::knobs::ra_lru() {
++                let warps = max_warps_per_sm(self.sm, total_gprs + hw_reserved_gprs);
++                let mut g = total_gprs + free_gprs;
++                while g + 1 <= max_gprs
++                    && max_warps_per_sm(self.sm, g + 1 + hw_reserved_gprs) == warps
++                {
++                    g += 1;
++                }
++                free_gprs = g - total_gprs;
++            }
+ 
+             total_gprs += free_gprs;
+             gpr_limit += free_gprs;
+diff --git a/src/nouveau/compiler/nak/knobs.rs b/src/nouveau/compiler/nak/knobs.rs
+index 8216ee5..87d4d91 100644
+--- a/src/nouveau/compiler/nak/knobs.rs
++++ b/src/nouveau/compiler/nak/knobs.rs
+@@ -109,6 +109,60 @@ static F16_CVT: OnceLock<bool> = OnceLock::new();
+ static LOOP_CONT_SYNC: OnceLock<bool> = OnceLock::new();
+ static EARLY_EXIT: OnceLock<bool> = OnceLock::new();
+ static SCHED_MLP: OnceLock<u32> = OnceLock::new();
++static RA_LRU: OnceLock<bool> = OnceLock::new();
++static REUSE: OnceLock<bool> = OnceLock::new();
++static SM120_YIELD: OnceLock<bool> = OnceLock::new();
++static SCHED_FREE: OnceLock<i32> = OnceLock::new();
++
++/// NAK_SCHED_FREE (0-31, default 4, experimental): how many GPRs below its
++/// register target the prepass scheduler switches from scheduling for
++/// latency to scheduling for register pressure
++pub fn sched_free() -> i32 {
++    *SCHED_FREE.get_or_init(|| match env::var("NAK_SCHED_FREE") {
++        Ok(s) => match s.trim().parse::<i32>() {
++            Ok(v) if (0..=31).contains(&v) => v,
++            _ => {
++                eprintln!("NAK: ignoring NAK_SCHED_FREE=\"{}\" (not 0-31)", s);
++                4
++            }
++        },
++        Err(_) => 4,
++    })
++}
++
++/// The knobs that do not fit in nak_knobs_key(), for a second word of
++/// NVK's cache keys: NAK_RA_LRU, NAK_REUSE, NAK_YIELD, NAK_SCHED_FREE
++#[unsafe(no_mangle)]
++pub extern "C" fn nak_knobs_key2() -> u32 {
++    u32::from(ra_lru())
++        | (u32::from(reuse()) << 1)
++        | (u32::from(sm120_yield()) << 2)
++        | ((sched_free() as u32) << 3)
++}
++
++/// NAK_YIELD (default off, experimental, SM120): control bit 109 set on
++/// instructions followed by a stall of 1-2 cycles (the warp keeps issuing),
++/// clear elsewhere, as in the reference compiler's code; NAK leaves it clear
++/// everywhere on SM120.  NAK_REUSE needs it
++pub fn sm120_yield() -> bool {
++    *SM120_YIELD
++        .get_or_init(|| parse("NAK_YIELD", env::var("NAK_YIELD"), false))
++}
++
++/// NAK_REUSE (default off, experimental): consecutive ALU instructions of a
++/// block that read the same GPR in the same operand field (A, B or C) mark
++/// it for the operand reuse cache, as the reference compiler's code does;
++/// NAK sets no reuse bits otherwise.  Needs NAK_YIELD
++pub fn reuse() -> bool {
++    *REUSE.get_or_init(|| parse("NAK_REUSE", env::var("NAK_REUSE"), false))
++}
++
++/// NAK_RA_LRU (default off): register allocation gives a new scalar GPR
++/// value the free register freed longest ago instead of the lowest one, and
++/// the GPR budget grows to the occupancy cliff (experimental)
++pub fn ra_lru() -> bool {
++    *RA_LRU.get_or_init(|| parse("NAK_RA_LRU", env::var("NAK_RA_LRU"), false))
++}
+ 
+ /// NAK_SCHED_MLP (0-3, default 0): memory-level
+ /// parallelism in the instruction schedulers.  Without it the prepass never
+diff --git a/src/nouveau/compiler/nak/opt_instr_sched_prepass.rs b/src/nouveau/compiler/nak/opt_instr_sched_prepass.rs
+index 9a24167..649a022 100644
+--- a/src/nouveau/compiler/nak/opt_instr_sched_prepass.rs
++++ b/src/nouveau/compiler/nak/opt_instr_sched_prepass.rs
+@@ -21,7 +21,11 @@ const SW_RESERVED_GPRS_SPILL: i32 = 2;
+ 
+ /// Target number of free GPRs. This is used for the threshold to switch to
+ /// scheduling for register pressure
+-const TARGET_FREE: i32 = 4;
++/// NAK_SCHED_FREE (default 4) overrides it
++#[allow(non_snake_case)]
++fn TARGET_FREE() -> i32 {
++    crate::knobs::sched_free()
++}
+ 
+ /// Typically using an extra register is free... until you hit a threshold where
+ /// one more register causes occupancy to plummet. This function figures out how
+@@ -851,13 +855,13 @@ impl ScheduleType {
+     ) -> ScheduleThresholds {
+         match self {
+             ScheduleType::RegLimit(gpr_target) => ScheduleThresholds {
+-                heuristic_threshold: i32::from(*gpr_target) - TARGET_FREE,
++                heuristic_threshold: i32::from(*gpr_target) - TARGET_FREE(),
+                 quit_threshold: i32::from(*gpr_target),
+             },
+             ScheduleType::Spill => ScheduleThresholds {
+                 heuristic_threshold: max_regs[RegFile::GPR]
+                     - SW_RESERVED_GPRS_SPILL
+-                    - TARGET_FREE,
++                    - TARGET_FREE(),
+                 quit_threshold: schedule_unit.peak_gpr_count,
+             },
+         }
+diff --git a/src/nouveau/compiler/nak/sm70_encode.rs b/src/nouveau/compiler/nak/sm70_encode.rs
+index 9f430ca..f0af793 100644
+--- a/src/nouveau/compiler/nak/sm70_encode.rs
++++ b/src/nouveau/compiler/nak/sm70_encode.rs
+@@ -24,6 +24,9 @@ struct SM70Encoder<'a> {
+     ip: usize,
+     labels: &'a FxHashMap<Label, usize>,
+     inst: [u32; 4],
++    /// NAK_REUSE: the GPR of each of an ALU instruction's operands A, B
++    /// and C (single 32-bit registers only)
++    reuse_slots: [Option<u32>; 3],
+ }
+ 
+ impl BitViewable for SM70Encoder<'_> {
+@@ -329,6 +332,11 @@ impl SM70Encoder<'_> {
+         if self.sm < 120 {
+             self.set_bit(109, deps.yld);
+             self.set_field(122..126, deps.reuse_mask);
++        } else if crate::knobs::sm120_yield() {
++            // NAK_YIELD: the reference compiler's SM120 code sets bit 109 on
++            // instructions followed by a short stall (1-2 cycles) and clears
++            // it where the warp waits longer or at barriers
++            self.set_bit(109, !deps.yld && deps.delay <= 2);
+         }
+     }
+ }
+@@ -627,6 +635,26 @@ impl SM70Encoder<'_> {
+         let src1 = ALUSrc::from_src(self, src1, false);
+         let src2 = ALUSrc::from_src(self, src2, false);
+ 
++        // NAK_REUSE: which GPR each operand field reads
++        {
++            let gpr = |s: &ALUSrc| -> Option<u32> {
++                match s {
++                    ALUSrc::Reg(r)
++                        if r.reg.file() == RegFile::GPR
++                            && r.reg.comps() == 1
++                            && r.reg.base_idx() != 255 =>
++                    {
++                        Some(r.reg.base_idx())
++                    }
++                    _ => None,
++                }
++            };
++            // The reuse bits name the operand (src0-2 here), not the field
++            // it is encoded in (src1 is in the C field when src2 is not a
++            // GPR)
++            self.reuse_slots = [gpr(&src0), gpr(&src1), gpr(&src2)];
++        }
++
+         self.encode_alu_src0(&src0, RegFile::GPR, src_type);
+ 
+         let form = match &src2 {
+@@ -4817,6 +4845,23 @@ pub fn legalize_sm70_op(
+     op.legalize(b);
+ }
+ 
++/// NAK_REUSE: for operand 0-2 of an ALU instruction, the reuse bit that
++/// names it, for the opcodes and operands the reference compiler's SM120 code
++/// marks (others are left alone: not every combination has an encoding)
++fn reuse_bit_map(op: &Op) -> [Option<u8>; 3] {
++    match op {
++        Op::FFma(_) => [Some(0), Some(1), Some(2)],
++        Op::FMul(_) | Op::FSet(_) => [Some(0), Some(1), None],
++        // FADD's second operand is operand C for the reuse bits
++        Op::FAdd(_) => [Some(0), Some(2), None],
++        Op::FSetP(_) | Op::Lea(_) | Op::HFma2(_) => [Some(0), None, None],
++        Op::ISetP(_) => [None, Some(1), None],
++        Op::Mov(_) => [None, Some(1), None],
++        Op::Lop3(_) => [Some(0), None, Some(2)],
++        _ => [None, None, None],
++    }
++}
++
+ pub fn encode_sm70_shader(sm: &ShaderModel70, s: &Shader<'_>) -> Vec<u32> {
+     assert!(s.functions.len() == 1);
+     let func = &s.functions[0];
+@@ -4835,19 +4880,83 @@ pub fn encode_sm70_shader(sm: &ShaderModel70, s: &Shader<'_>) -> Vec<u32> {
+         }
+     }
+ 
++    let reuse = crate::knobs::reuse();
+     let mut encoded = Vec::new();
+     for b in &func.blocks {
++        // NAK_REUSE: the previous ALU instruction of this block: its word
++        // index, operand-field GPRs and the GPRs it writes
++        #[allow(clippy::type_complexity)]
++        let mut prev: Option<(
++            usize,
++            [Option<u32>; 3],
++            Vec<u32>,
++            bool,
++            [Option<u8>; 3],
++        )> = None;
+         for instr in &b.instrs {
+             let mut e = SM70Encoder {
+                 sm: sm.sm(),
+                 ip: encoded.len(),
+                 labels: &labels,
+                 inst: [0_u32; 4],
++                reuse_slots: [None; 3],
+             };
+             instr.op.encode(&mut e);
+             e.set_pred(&instr.pred);
+             e.set_instr_deps(&instr.deps);
++            let at = encoded.len();
+             encoded.extend_from_slice(&e.inst[..]);
++
++            if !reuse {
++                continue;
++            }
++            let is_alu = e.reuse_slots.iter().any(|s| s.is_some())
++                && instr.pred.is_true();
++            if let Some((p_at, p_slots, p_writes, p_multi, p_map)) = &prev {
++                // only after an instruction that keeps the warp issuing
++                // (bit 109, NAK_YIELD), as in the reference compiler's code
++                let p_keeps = (encoded[p_at + 3] >> 13) & 1 != 0;
++                if is_alu && p_keeps {
++                    for s in 0..3 {
++                        let Some(bit) = p_map[s] else {
++                            continue;
++                        };
++                        if let (Some(a), Some(b)) = (p_slots[s], e.reuse_slots[s])
++                        {
++                            if a == b && !p_writes.contains(&a) {
++                                // bits 122-124: reuse operand A, B, C.  Only
++                                // FFMA takes more than one (other opcodes
++                                // have no encoding for some combinations)
++                                let bits = (encoded[p_at + 3] >> 26) & 0x7;
++                                if bits == 0 || *p_multi {
++                                    encoded[p_at + 3] |= 1 << (26 + bit);
++                                }
++                            }
++                        }
++                    }
++                }
++            }
++            prev = if is_alu {
++                let mut writes = Vec::new();
++                for dst in instr.dsts() {
++                    if let Dst::Reg(r) = dst {
++                        if r.file() == RegFile::GPR {
++                            for c in 0..u32::from(r.comps()) {
++                                writes.push(r.base_idx() + c);
++                            }
++                        }
++                    }
++                }
++                Some((
++                    at,
++                    e.reuse_slots,
++                    writes,
++                    matches!(instr.op, Op::FFma(_)),
++                    reuse_bit_map(&instr.op),
++                ))
++            } else {
++                None
++            };
+         }
+     }
+     encoded
+diff --git a/src/nouveau/vulkan/nvk_physical_device.c b/src/nouveau/vulkan/nvk_physical_device.c
+index 3a3f290..04a5c04 100644
+--- a/src/nouveau/vulkan/nvk_physical_device.c
++++ b/src/nouveau/vulkan/nvk_physical_device.c
+@@ -1485,6 +1485,9 @@ nvk_physical_device_init_pipeline_cache(struct nvk_physical_device *pdev)
+ 
+    const uint64_t compiler_flags = nvk_physical_device_compiler_flags(pdev);
+    _mesa_blake3_update(&blake3_ctx, &compiler_flags, sizeof(compiler_flags));
++   /* NAK knobs that do not fit in the compiler flags */
++   const uint32_t nak_knobs2 = nak_knobs_key2();
++   _mesa_blake3_update(&blake3_ctx, &nak_knobs2, sizeof(nak_knobs2));
+ 
+    unsigned char blake3[BLAKE3_KEY_LEN];
+    _mesa_blake3_final(&blake3_ctx, blake3);
+@@ -1499,8 +1502,17 @@ nvk_physical_device_init_pipeline_cache(struct nvk_physical_device *pdev)
+                                pdev->info.chipset);
+    assert(len == sizeof(renderer) - 2);
+ 
+-   char timestamp[BLAKE3_HEX_LEN];
++   char timestamp[BLAKE3_HEX_LEN + 9];
+    _mesa_blake3_format(timestamp, instance->driver_build_sha);
++   /* The NAK knobs beyond the compiler flags' bits are part of the disk
++    * cache's identity too (they change the binaries)
++    */
++   const uint32_t nak_knobs2_dc = nak_knobs_key2();
++   if (nak_knobs2_dc != 0) {
++      const size_t len = strlen(timestamp);
++      snprintf(timestamp + len, sizeof(timestamp) - len, "-%08x",
++               nak_knobs2_dc);
++   }
+ 
+    const uint64_t driver_flags = nvk_physical_device_compiler_flags(pdev);
+    pdev->vk.disk_cache = disk_cache_create(renderer, timestamp, driver_flags);
+-- 
+2.43.0
+
