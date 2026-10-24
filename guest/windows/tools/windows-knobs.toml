@@ -1487,6 +1487,11 @@ class = "debug"
 read = "device creation"
 effect = "With NVK_DISPATCH_CAPTURE: largest staging buffer one capture may allocate, in MiB; a dispatch needing more is not captured (logged)."
 
+[env.NVK_DISPATCH_CAPTURE_SEQ]
+class = "debug"
+read = "device creation"
+effect = "With NVK_DISPATCH_CAPTURE: N captures a dispatch of a listed shader and the next N - 1 dispatches recorded in the same command buffer, whatever their shaders, as one sequence (manifest \"sequence\": id, index, whether a pipeline barrier came before); a resource an earlier dispatch of the sequence captured is referred to (\"same_as\"), not copied again. dispatch-replay --seq replays the sequence in one command buffer."
+
 [env.NVK_DISPATCH_CAPTURE_POST]
 class = "debug"
 read = "device creation"

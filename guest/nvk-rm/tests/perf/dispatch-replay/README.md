@@ -167,3 +167,20 @@ contents after NVK ran the dispatch.
 - Timing: one dispatch at a time with warm caches (the reset copies); a game overlaps dispatches, so a
   replay time is the shader alone, not its cost in a frame.
 - A capture larger than `NVK_DISPATCH_CAPTURE_MAX_MB` of staging is not made (logged in `nvk-dcap.log`).
+
+## Sequences
+
+`NVK_DISPATCH_CAPTURE_SEQ=N` (with `NVK_DISPATCH_CAPTURE` naming the shader that starts the sequence)
+captures that dispatch and the next N - 1 dispatches recorded in the same command buffer, each in its
+own directory, with `"sequence": {"id", "index", "barrier_before"}` in the manifest. A buffer range or
+image that an earlier dispatch of the sequence captured is referred to (`"same_as"`) instead of copied
+again.
+
+```
+dispatch-replay --seq [-n N] [--csv FILE --label STR] [--seq-barriers captured|all|none] DIR...
+```
+
+replays the dispatches in their order in one command buffer: one resource for every `same_as` chain (so
+what a dispatch writes reaches the ones after it), a compute-to-compute barrier where the game recorded a
+pipeline barrier (`all`: between every two dispatches, `none`: no barriers), and a timestamp pair around
+the whole sequence. Dispatches without a barrier between them may run concurrently, as in the game.

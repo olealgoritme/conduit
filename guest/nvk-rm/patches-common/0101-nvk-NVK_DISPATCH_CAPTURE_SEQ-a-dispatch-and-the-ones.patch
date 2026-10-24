@@ -1,0 +1,376 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Sat, 24 Oct 2026 11:40:01 +0200
+Subject: [PATCH] nvk: NVK_DISPATCH_CAPTURE_SEQ, a dispatch and the ones after
+ it
+
+NVK_DISPATCH_CAPTURE_SEQ=N: a captured dispatch of a listed shader and the
+next N - 1 dispatches recorded in the same command buffer, whatever their
+shaders, are each captured as usual (every compute pipeline then gets a
+recipe).  Their manifests carry a "sequence" section: the id (the first
+capture's serial), the index, and whether a pipeline barrier was recorded
+before the dispatch, so that a replay can run the whole sequence in one
+command buffer with the game's barriers (dispatch-replay --seq).
+
+A resource an earlier dispatch of the sequence captured (the same buffer
+range, or the same image subresources) is not copied again: the manifest
+refers to it ("same_as"), and the replay shares the one resource, so that
+what a dispatch writes reaches the dispatches after it, as in the game.
+---
+ src/nouveau/vulkan/nvk_cmd_buffer.c       |   2 +
+ src/nouveau/vulkan/nvk_cmd_buffer.h       |   9 +
+ src/nouveau/vulkan/nvk_dispatch_capture.c | 220 +++++++++++++++++-----
+ 3 files changed, 189 insertions(+), 42 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvk_cmd_buffer.c b/src/nouveau/vulkan/nvk_cmd_buffer.c
+index eb28075..9e94514 100644
+--- a/src/nouveau/vulkan/nvk_cmd_buffer.c
++++ b/src/nouveau/vulkan/nvk_cmd_buffer.c
+@@ -1199,6 +1199,8 @@ nvk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
+    VK_FROM_HANDLE(nvk_cmd_buffer, cmd, commandBuffer);
+ 
+    nvk_cmd_profile_count_barrier(cmd);
++   if (unlikely(cmd->dcap_seq_left > 0))
++      cmd->dcap_seq_barrier = true;
+    cmd->indirect_push_synced = false;
+    cmd->barrier_data_invalidated = false;
+    nvk_cmd_flush_wait_dep(cmd, pDependencyInfo, true);
+diff --git a/src/nouveau/vulkan/nvk_cmd_buffer.h b/src/nouveau/vulkan/nvk_cmd_buffer.h
+index ecb2ef3..ff8ffe7 100644
+--- a/src/nouveau/vulkan/nvk_cmd_buffer.h
++++ b/src/nouveau/vulkan/nvk_cmd_buffer.h
+@@ -384,6 +384,15 @@ struct nvk_cmd_buffer {
+    struct list_head owned_mem;
+    /* NVK_DISPATCH_CAPTURE: captures recorded (struct nvk_dcap) */
+    struct list_head dcaps;
++   /* NVK_DISPATCH_CAPTURE_SEQ: dispatches still to capture in the sequence
++    * this command buffer started, its id, the next index, and whether a
++    * pipeline barrier was recorded since the last captured dispatch
++    */
++   uint32_t dcap_seq_left, dcap_seq_id, dcap_seq_index;
++   bool dcap_seq_barrier;
++   /* the resources captured so far in the sequence (struct dcap_seq_res) */
++   struct dcap_seq_res *dcap_seq_res;
++   uint32_t dcap_seq_nres, dcap_seq_cap;
+    struct list_head owned_gart_mem;
+    struct list_head owned_qmd;
+ 
+diff --git a/src/nouveau/vulkan/nvk_dispatch_capture.c b/src/nouveau/vulkan/nvk_dispatch_capture.c
+index 21c9039..6f593bd 100644
+--- a/src/nouveau/vulkan/nvk_dispatch_capture.c
++++ b/src/nouveau/vulkan/nvk_dispatch_capture.c
+@@ -24,6 +24,13 @@
+  *   NVK_DISPATCH_CAPTURE_POST=1   also copies what the shader may write after
+  *       the dispatch (the NVK result, for comparing a replay against)
+  *   NVK_DISPATCH_CAPTURE_MAX_MB   staging limit per capture (default 2048)
++ *   NVK_DISPATCH_CAPTURE_SEQ=N    a sequence: a captured dispatch of a listed
++ *       shader and the next N - 1 dispatches recorded in the same command
++ *       buffer, whatever their shaders (every compute pipeline then gets a
++ *       recipe), each captured as usual; their manifests carry the
++ *       sequence id, their index in it and whether a pipeline barrier came
++ *       before them, for a replay of the whole sequence in one command
++ *       buffer (dispatch-replay --seq)
+  *
+  * The SPIR-V of every compute pipeline whose shader has a listed hash is
+  * scanned when the pipeline is created (vk_device::compute_spirv_hook): the
+@@ -152,6 +159,8 @@ struct nvk_dcap_dev {
+    bool post;
+    uint64_t max_B;
+    uint32_t serial;
++   /* NVK_DISPATCH_CAPTURE_SEQ: dispatches per sequence (0: off) */
++   uint32_t seq;
+    char dir[512];
+    FILE *log;
+    /* image table index -> tagged nvk_image_view / nvk_buffer_view */
+@@ -259,6 +268,23 @@ struct dcap_res {
+    /* Staging */
+    uint64_t off_B, size_B, post_off_B;
+    char note[160];
++
++   /* NVK_DISPATCH_CAPTURE_SEQ: the same resource as resource same_id of
++    * capture same_serial of the sequence (not copied again)
++    */
++   uint32_t same_serial, same_id;
++   uint64_t same_size_B;
++};
++
++/* NVK_DISPATCH_CAPTURE_SEQ: a resource captured earlier in the sequence */
++struct dcap_seq_res {
++   enum dcap_res_kind kind;
++   uint64_t addr, size_B;
++   const struct nvk_image *img;
++   uint32_t base_mip, mips, base_layer, layers;
++   VkImageAspectFlags aspect;
++   VkFormat copy_format;
++   uint32_t serial, id;
+ };
+ 
+ enum dcap_role {
+@@ -321,6 +347,9 @@ struct nvk_dcap {
+    bool post;
+    bool compute_only;
+    double t_s;
++   /* NVK_DISPATCH_CAPTURE_SEQ: sequence id (0: none), index, barrier */
++   uint32_t seq_id, seq_index;
++   bool seq_barrier;
+    uint8_t push[NVK_MAX_PUSH_SIZE];
+    uint32_t push_size;
+    uint32_t *spirv;
+@@ -1120,7 +1149,8 @@ nvk_dcap_compute_spirv_hook(struct vk_device *vk_dev,
+ {
+    struct nvk_device *dev = container_of(vk_dev, struct nvk_device, vk);
+    struct nvk_dcap_dev *dcap = dev->dcap;
+-   if (dcap == NULL || dcap_hash_slot(dcap, vk_shader->src_hash) < 0)
++   if (dcap == NULL ||
++       (dcap->seq == 0 && dcap_hash_slot(dcap, vk_shader->src_hash) < 0))
+       return;
+    struct nvk_shader *shader = container_of(vk_shader, struct nvk_shader, vk);
+ 
+@@ -2289,48 +2319,14 @@ nvk_dcap_draw_end(struct nvk_cmd_buffer *cmd, struct nvk_dcap *cap)
+    dcap_wait_copies(cmd);
+ }
+ 
+-struct nvk_dcap *
+-nvk_dcap_begin(struct nvk_cmd_buffer *cmd, const uint32_t base_group[3],
+-               const uint32_t groups[3], uint64_t indirect_addr)
++static struct nvk_dcap *
++dcap_begin_take(struct nvk_cmd_buffer *cmd, const struct nvk_dcap_recipe *rc,
++                struct nvk_shader *shader, const uint32_t base_group[3],
++                const uint32_t groups[3], uint64_t indirect_addr,
++                uint32_t call_index, uint32_t serial, int64_t now)
+ {
+    struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
+    struct nvk_dcap_dev *dcap = dev->dcap;
+-   struct nvk_shader *shader = cmd->state.cs.shader;
+-   if (shader == NULL || shader->dcap_recipe == NULL)
+-      return NULL;
+-   const struct nvk_dcap_recipe *rc = shader->dcap_recipe;
+-   const int slot = dcap_hash_slot(dcap, rc->src_hash);
+-   if (slot < 0)
+-      return NULL;
+-   const int64_t now = os_time_get_nano();
+-   if (now < dcap->arm_ns)
+-      return NULL;
+-
+-   simple_mtx_lock(&dcap->mutex);
+-   if (!dcap->triggered) {
+-      if (now < dcap->trigger_check_ns) {
+-         simple_mtx_unlock(&dcap->mutex);
+-         return NULL;
+-      }
+-      dcap->trigger_check_ns = now + 250000000ll;
+-      dcap->triggered = dcap_file_exists(dcap->trigger);
+-      if (!dcap->triggered) {
+-         simple_mtx_unlock(&dcap->mutex);
+-         return NULL;
+-      }
+-      dcap_log(dcap, "trigger file %s found: armed", dcap->trigger);
+-   }
+-   const bool take = dcap->taken[slot] < dcap->count &&
+-                     dcap->seen[slot]++ >= dcap->skip;
+-   uint32_t call_index = dcap->seen[slot] - 1, serial = 0;
+-   if (take) {
+-      dcap->taken[slot]++;
+-      serial = ++dcap->serial;
+-   }
+-   simple_mtx_unlock(&dcap->mutex);
+-   if (!take)
+-      return NULL;
+-
+    struct nvk_dcap *cap = calloc(1, sizeof(*cap));
+    if (cap == NULL)
+       return NULL;
+@@ -2414,6 +2410,53 @@ nvk_dcap_begin(struct nvk_cmd_buffer *cmd, const uint32_t base_group[3],
+                        DCAP_BDA_RUNTIME_MAX);
+    }
+ 
++   /* NVK_DISPATCH_CAPTURE_SEQ: a resource an earlier dispatch of the
++    * sequence captured is referred to, not copied again (its contents as of
++    * that dispatch: the replay shares one resource, so writes flow on)
++    */
++   if (cmd->dcap_seq_left > 0 || dcap->seq > 1) {
++      for (uint32_t i = 0; i < cap->nres; i++) {
++         struct dcap_res *r = &cap->res[i];
++         if (r->size_B == 0)
++            continue;
++         struct dcap_seq_res key = {
++            .kind = r->kind, .addr = r->kind == DCAP_RES_IMAGE ? 0 : r->addr,
++            .size_B = r->size_B, .img = r->img, .base_mip = r->base_mip,
++            .mips = r->mips, .base_layer = r->base_layer, .layers = r->layers,
++            .aspect = r->aspect, .copy_format = r->copy_format,
++            .serial = serial, .id = i,
++         };
++         bool found = false;
++         for (uint32_t k = 0; k < cmd->dcap_seq_nres; k++) {
++            const struct dcap_seq_res *e = &cmd->dcap_seq_res[k];
++            if (e->kind == key.kind && e->addr == key.addr &&
++                e->size_B == key.size_B && e->img == key.img &&
++                e->base_mip == key.base_mip && e->mips == key.mips &&
++                e->base_layer == key.base_layer && e->layers == key.layers &&
++                e->aspect == key.aspect && e->copy_format == key.copy_format) {
++               r->same_serial = e->serial;
++               r->same_id = e->id;
++               r->same_size_B = r->size_B;
++               r->size_B = 0;
++               found = true;
++               break;
++            }
++         }
++         if (!found) {
++            if (cmd->dcap_seq_nres == cmd->dcap_seq_cap) {
++               uint32_t ncap = MAX2(64, cmd->dcap_seq_cap * 2);
++               struct dcap_seq_res *n =
++                  realloc(cmd->dcap_seq_res, ncap * sizeof(*n));
++               if (n == NULL)
++                  continue;
++               cmd->dcap_seq_res = n;
++               cmd->dcap_seq_cap = ncap;
++            }
++            cmd->dcap_seq_res[cmd->dcap_seq_nres++] = key;
++         }
++      }
++   }
++
+    /* Staging: header (marker, indirect arguments), inputs, outputs */
+    if (!dcap_alloc_staging(dev, cap)) {
+       dcap_free(cap);
+@@ -2448,6 +2491,86 @@ nvk_dcap_begin(struct nvk_cmd_buffer *cmd, const uint32_t base_group[3],
+    return cap;
+ }
+ 
++struct nvk_dcap *
++nvk_dcap_begin(struct nvk_cmd_buffer *cmd, const uint32_t base_group[3],
++               const uint32_t groups[3], uint64_t indirect_addr)
++{
++   struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
++   struct nvk_dcap_dev *dcap = dev->dcap;
++   struct nvk_shader *shader = cmd->state.cs.shader;
++   if (shader == NULL || shader->dcap_recipe == NULL)
++      return NULL;
++   const struct nvk_dcap_recipe *rc = shader->dcap_recipe;
++   const int64_t now = os_time_get_nano();
++
++   /* NVK_DISPATCH_CAPTURE_SEQ: the rest of a sequence this command buffer
++    * started
++    */
++   if (cmd->dcap_seq_left > 0) {
++      uint32_t serial;
++      simple_mtx_lock(&dcap->mutex);
++      serial = ++dcap->serial;
++      simple_mtx_unlock(&dcap->mutex);
++      struct nvk_dcap *cap = dcap_begin_take(cmd, rc, shader, base_group, groups,
++                                             indirect_addr, 0, serial, now);
++      if (cap != NULL) {
++         cap->seq_id = cmd->dcap_seq_id;
++         cap->seq_index = cmd->dcap_seq_index++;
++         cap->seq_barrier = cmd->dcap_seq_barrier;
++      }
++      cmd->dcap_seq_barrier = false;
++      cmd->dcap_seq_left--;
++      return cap;
++   }
++
++   const int slot = dcap_hash_slot(dcap, rc->src_hash);
++   if (slot < 0)
++      return NULL;
++   if (now < dcap->arm_ns)
++      return NULL;
++
++   simple_mtx_lock(&dcap->mutex);
++   if (!dcap->triggered) {
++      if (now < dcap->trigger_check_ns) {
++         simple_mtx_unlock(&dcap->mutex);
++         return NULL;
++      }
++      dcap->trigger_check_ns = now + 250000000ll;
++      dcap->triggered = dcap_file_exists(dcap->trigger);
++      if (!dcap->triggered) {
++         simple_mtx_unlock(&dcap->mutex);
++         return NULL;
++      }
++      dcap_log(dcap, "trigger file %s found: armed", dcap->trigger);
++   }
++   const bool take = dcap->taken[slot] < dcap->count &&
++                     dcap->seen[slot]++ >= dcap->skip;
++   uint32_t call_index = dcap->seen[slot] - 1, serial = 0;
++   if (take && dcap->seq > 1)
++      cmd->dcap_seq_nres = 0;
++   if (take) {
++      dcap->taken[slot]++;
++      serial = ++dcap->serial;
++   }
++   simple_mtx_unlock(&dcap->mutex);
++   if (!take)
++      return NULL;
++
++   struct nvk_dcap *cap = dcap_begin_take(cmd, rc, shader, base_group, groups,
++                                          indirect_addr, call_index, serial,
++                                          now);
++   /* NVK_DISPATCH_CAPTURE_SEQ: this dispatch starts a sequence */
++   if (cap != NULL && dcap->seq > 1) {
++      cap->seq_id = serial;
++      cap->seq_index = 0;
++      cmd->dcap_seq_id = serial;
++      cmd->dcap_seq_index = 1;
++      cmd->dcap_seq_left = dcap->seq - 1;
++      cmd->dcap_seq_barrier = false;
++   }
++   return cap;
++}
++
+ void
+ nvk_dcap_end(struct nvk_cmd_buffer *cmd, struct nvk_dcap *cap)
+ {
+@@ -2691,13 +2814,16 @@ dcap_write(struct nvk_dcap_dev *dcap, struct nvk_dcap *cap)
+            "  \"grid\": [%u, %u, %u],\n  \"indirect\": %s,\n"
+            "  \"spirv\": \"shader.spv\",\n  \"entry_point\": \"main\",\n"
+            "  \"push\": \"push.bin\",\n  \"push_size\": %u,\n"
+-           "  \"post\": %s,\n  \"unsupported\": ",
++           "  \"post\": %s,\n"
++           "  \"sequence\": {\"id\": %u, \"index\": %u, \"barrier_before\": %s},\n"
++           "  \"unsupported\": ",
+            cap->src_hash, cap->code_hash, cap->serial, cap->call_index,
+            cap->t_s, dcap_pid(), cap->compute_only ? "true" : "false",
+            cap->local[0], cap->local[1], cap->local[2],
+            cap->base_group[0], cap->base_group[1], cap->base_group[2],
+            groups[0], groups[1], groups[2], cap->indirect ? "true" : "false",
+-           cap->push_size, cap->post ? "true" : "false");
++           cap->push_size, cap->post ? "true" : "false",
++           cap->seq_id, cap->seq_index, cap->seq_barrier ? "true" : "false");
+    dcap_json_str(f, cap->unsupported);
+    if (cap->draw)
+       dcap_json_draw(f, cap);
+@@ -2738,6 +2864,10 @@ dcap_write(struct nvk_dcap_dev *dcap, struct nvk_dcap *cap)
+                  "\"attachment_format\": %u", roles[r->role], r->attachment,
+                  r->att_format);
+       }
++      if (r->same_serial != 0)
++         fprintf(f, ", \"same_as\": {\"capture\": %u, \"resource\": %u}, "
++                 "\"size\": %" PRIu64, r->same_serial, r->same_id,
++                 r->same_size_B);
+       if (r->size_B != 0) {
+          fprintf(f, ", \"file\": \"r%03u.bin\", \"size\": %" PRIu64, i,
+                  r->size_B);
+@@ -2816,6 +2946,11 @@ dcap_write(struct nvk_dcap_dev *dcap, struct nvk_dcap *cap)
+ void
+ nvk_dcap_cmd_reset(struct nvk_cmd_buffer *cmd)
+ {
++   cmd->dcap_seq_left = 0;
++   cmd->dcap_seq_barrier = false;
++   free(cmd->dcap_seq_res);
++   cmd->dcap_seq_res = NULL;
++   cmd->dcap_seq_nres = cmd->dcap_seq_cap = 0;
+    if (cmd->dcaps.next == NULL)
+       return;
+    struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
+@@ -2875,6 +3010,7 @@ nvk_dcap_init(struct nvk_device *dev)
+    dcap->skip = debug_get_num_option("NVK_DISPATCH_CAPTURE_SKIP", 0);
+    dcap->count = debug_get_num_option("NVK_DISPATCH_CAPTURE_COUNT", 1);
+    dcap->post = debug_get_bool_option("NVK_DISPATCH_CAPTURE_POST", false);
++   dcap->seq = debug_get_num_option("NVK_DISPATCH_CAPTURE_SEQ", 0);
+    dcap->max_B = (uint64_t)debug_get_num_option("NVK_DISPATCH_CAPTURE_MAX_MB",
+                                                 2048) << 20;
+ 
+-- 
+2.43.0
+

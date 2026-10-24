@@ -22,6 +22,7 @@
 #include <direct.h>
 #else
 #include <dlfcn.h>
+#include <dirent.h>
 #include <sys/stat.h>
 #include <time.h>
 #endif
@@ -116,9 +117,9 @@ static uint64_t fnv64(const void *data, uint64_t n, uint64_t h)
 /* ------------------------------------------------------------------------------------------- options */
 static struct {
     int n, warm, reset, compile_only, list, robust, verbose, no_draw, split, ts_only, seq, seq_barriers;
-    const char *dev, *dump, *csv, *label, *dump_cache;
+    const char *dev, *dump, *csv, *label, *dump_cache, *seq_dir; int seq_id;
     int grid_override; uint32_t grid[3];
-} O = { 15, 5, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, NULL, NULL, NULL, NULL, NULL, 0, { 0, 0, 0 } };
+} O = { 15, 5, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, NULL, NULL, NULL, NULL, NULL, NULL, 0, 0, { 0, 0, 0 } };
 
 static void usage(void)
 {
@@ -143,6 +144,8 @@ static void usage(void)
         "  --seq           replay several dispatch captures of one sequence (manifest \"sequence\") in their order in one\n"
         "                  command buffer, a compute barrier where the game had a pipeline barrier; the time is per sequence\n"
         "  --seq-barriers M  with --seq: captured (default), all (a barrier between every two dispatches) or none\n"
+        "  --seq-dir PARENT  with --seq: every capture directory under PARENT that belongs to a sequence (instead of\n"
+        "                  listing them); --seq-id ID picks one sequence when PARENT holds several (default: the largest)\n"
         "  -v              print every resource\n");
     exit(2);
 }
@@ -974,8 +977,96 @@ static void compute_barrier(VkCommandBuffer cb)
                          0, NULL);
 }
 
+/* --seq-dir: the subdirectories of parent whose manifest has a "sequence" section, of the sequence --seq-id
+ * names or, by default, of the sequence with the most of them */
+static char **seq_dir_list(const char *parent, int *n_out)
+{
+    int cap = 64, n = 0; char **names = malloc(sizeof(char *) * (size_t)cap);
+#ifdef _WIN32
+    char pat[1024]; snprintf(pat, sizeof pat, "%s\\*", parent);
+    WIN32_FIND_DATAA fd; HANDLE h = FindFirstFileA(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE) die("cannot list %s", parent);
+    do {
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || fd.cFileName[0] == '.') continue;
+        if (n == cap) { cap *= 2; names = realloc(names, sizeof(char *) * (size_t)cap); }
+        names[n++] = strdup(fd.cFileName);
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+#else
+    DIR *dp = opendir(parent); if (!dp) die("cannot list %s", parent);
+    struct dirent *e;
+    while ((e = readdir(dp))) {
+        if (e->d_name[0] == '.') continue;
+        if (n == cap) { cap *= 2; names = realloc(names, sizeof(char *) * (size_t)cap); }
+        names[n++] = strdup(e->d_name);
+    }
+    closedir(dp);
+#endif
+    char **paths = malloc(sizeof(char *) * (size_t)(n ? n : 1)); uint32_t *ids = calloc((size_t)(n ? n : 1), sizeof *ids);
+    int np = 0;
+    for (int k = 0; k < n; k++) {
+        char path[1024]; snprintf(path, sizeof path, "%s/%s/manifest.json", parent, names[k]);
+        FILE *f = fopen(path, "rb"); if (!f) continue;
+        fseek(f, 0, SEEK_END); long len = ftell(f); fseek(f, 0, SEEK_SET);
+        char *t = malloc((size_t)len + 1); size_t got = fread(t, 1, (size_t)len, f); t[got] = 0; fclose(f);
+        struct json *m = json_parse(t);
+        const struct json *sq = m ? jget(m, "sequence") : NULL;
+        uint32_t id = sq ? (uint32_t)jnum(sq, "id", 0) : 0;
+        if (!id) continue;
+        char *d = malloc(strlen(parent) + strlen(names[k]) + 2); sprintf(d, "%s/%s", parent, names[k]);
+        paths[np] = d; ids[np] = id; np++;
+    }
+    uint32_t want = (uint32_t)O.seq_id;
+    if (!want) {
+        int best = 0;
+        for (int k = 0; k < np; k++) {
+            int c = 0; for (int q = 0; q < np; q++) c += ids[q] == ids[k];
+            if (c > best) { best = c; want = ids[k]; }
+        }
+    }
+    int nseq = 0; uint32_t seen[64]; int ns = 0;
+    for (int k = 0; k < np; k++) {
+        int dup = 0; for (int q = 0; q < ns; q++) dup |= seen[q] == ids[k];
+        if (!dup && ns < 64) seen[ns++] = ids[k];
+    }
+    if (ns > 1) {
+        fprintf(stderr, "%s holds %d sequences:", parent, ns);
+        for (int q = 0; q < ns; q++) {
+            int c = 0; for (int k = 0; k < np; k++) c += ids[k] == seen[q];
+            fprintf(stderr, " %u (%d dispatches)", seen[q], c);
+        }
+        fprintf(stderr, "; replaying %u (--seq-id picks another)\n", want);
+    }
+    char **out = malloc(sizeof(char *) * (size_t)(np ? np : 1));
+    for (int k = 0; k < np; k++) if (ids[k] == want) out[nseq++] = paths[k];
+    if (!nseq) die("no sequence capture under %s", parent);
+    *n_out = nseq;
+    return out;
+}
+
+struct dir_index { char *dir; uint32_t index; };
+static int cmp_dir_index(const void *a, const void *b)
+{
+    const struct dir_index *x = a, *y = b;
+    return x->index < y->index ? -1 : x->index > y->index;
+}
+
 static int run_seq(int ndirs, char **dirs)
 {
+    /* In sequence order, so that a "same_as" always refers to a capture loaded before */
+    {
+        struct dir_index *di = calloc((size_t)ndirs, sizeof *di);
+        for (int d = 0; d < ndirs; d++) {
+            g_dir = dirs[d];
+            char *t = read_file("manifest.json", NULL, 1);
+            struct json *m = json_parse(t);
+            di[d].dir = dirs[d];
+            di[d].index = m && jget(m, "sequence") ? (uint32_t)jnum(jget(m, "sequence"), "index", 0) : 0;
+        }
+        qsort(di, (size_t)ndirs, sizeof *di, cmp_dir_index);
+        for (int d = 0; d < ndirs; d++) dirs[d] = di[d].dir;
+        free(di);
+    }
     struct seq_item *S = calloc((size_t)ndirs, sizeof *S);
     uint32_t seq_id = 0;
     create_device();
@@ -1119,6 +1210,8 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--dump-cache") && i + 1 < argc) O.dump_cache = argv[++i];
         else if (!strcmp(a, "-v")) O.verbose = 1;
         else if (!strcmp(a, "--seq")) O.seq = 1;
+        else if (!strcmp(a, "--seq-dir") && i + 1 < argc) { O.seq = 1; O.seq_dir = argv[++i]; }
+        else if (!strcmp(a, "--seq-id") && i + 1 < argc) O.seq_id = atoi(argv[++i]);
         else if (!strcmp(a, "--seq-barriers") && i + 1 < argc) {
             const char *v = argv[++i];
             O.seq_barriers = !strcmp(v, "all") ? 1 : !strcmp(v, "none") ? 2 : 0;
@@ -1126,6 +1219,10 @@ int main(int argc, char **argv)
         else usage();
     }
     if (O.list) { create_device(); return 0; }
+    if (O.seq && O.seq_dir) {
+        int n = 0; char **dirs = seq_dir_list(O.seq_dir, &n);
+        return run_seq(n, dirs);
+    }
     if (O.seq) {
         if (i >= argc) usage();
         if (O.n < 1) O.n = 1;
