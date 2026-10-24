@@ -59,10 +59,10 @@ spills 8 -> 2 (compute) and 14 -> 30 (fragment); average warps per SM
  src/nouveau/compiler/nak/api.rs               |  20 ++-
  src/nouveau/compiler/nak/calc_instr_deps.rs   |   8 +-
  src/nouveau/compiler/nak/knobs.rs             |  36 +++++
- .../compiler/nak/opt_instr_sched_common.rs    |  77 +++++++++-
+ .../compiler/nak/opt_instr_sched_common.rs    |  77 ++++++++++-
  .../compiler/nak/opt_instr_sched_postpass.rs  |  20 +++
- .../compiler/nak/opt_instr_sched_prepass.rs   | 131 +++++++++++++++---
- 6 files changed, 270 insertions(+), 22 deletions(-)
+ .../compiler/nak/opt_instr_sched_prepass.rs   | 130 +++++++++++++++---
+ 6 files changed, 267 insertions(+), 24 deletions(-)
 
 diff --git a/src/nouveau/compiler/nak/api.rs b/src/nouveau/compiler/nak/api.rs
 index 2b1e57e..58ada35 100644
@@ -340,7 +340,7 @@ index 8f5ce6b..71f5b5d 100644
          let next_idx = match ready_instrs.pop() {
              None => match future_ready_instrs.peek() {
 diff --git a/src/nouveau/compiler/nak/opt_instr_sched_prepass.rs b/src/nouveau/compiler/nak/opt_instr_sched_prepass.rs
-index d2d7904..c654e44 100644
+index d2d7904..9a24167 100644
 --- a/src/nouveau/compiler/nak/opt_instr_sched_prepass.rs
 +++ b/src/nouveau/compiler/nak/opt_instr_sched_prepass.rs
 @@ -5,8 +5,9 @@ use crate::api::{GetDebugFlags, DEBUG};
@@ -596,15 +596,14 @@ index d2d7904..c654e44 100644
              }
  
              block.instrs = u.to_instrs();
-@@ -1044,6 +1131,16 @@ impl Shader<'_> {
+@@ -1042,8 +1129,13 @@ impl Shader<'_> {
+     ///
+     /// The schedule is for at most @gpr_target GPRs (not counting the
      /// hardware-reserved ones), as for NAK_GPR_CAP or the occupancy target;
-     /// None schedules for the hardware maximum.
-     pub fn opt_instr_sched_prepass_target(&mut self, gpr_target: Option<u32>) {
-+        let mlp = crate::knobs::sched_mlp();
-+        self.opt_instr_sched_prepass_target_mlp(gpr_target, mlp);
-+    }
-+
-+    /// opt_instr_sched_prepass_target() at a given NAK_SCHED_MLP level
+-    /// None schedules for the hardware maximum.
+-    pub fn opt_instr_sched_prepass_target(&mut self, gpr_target: Option<u32>) {
++    /// None schedules for the hardware maximum.  `mlp` is the
++    /// NAK_SCHED_MLP level of the schedule.
 +    pub fn opt_instr_sched_prepass_target_mlp(
 +        &mut self,
 +        gpr_target: Option<u32>,
@@ -613,7 +612,7 @@ index d2d7904..c654e44 100644
          if DEBUG.annotate() {
              self.remove_annotations();
          }
-@@ -1069,7 +1166,7 @@ impl Shader<'_> {
+@@ -1069,7 +1161,7 @@ impl Shader<'_> {
          max_regs[RegFile::GPR] -= SW_RESERVED_GPRS;
  
          for f in &mut self.functions {
