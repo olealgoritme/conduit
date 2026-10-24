@@ -97,17 +97,21 @@ the version is set). The adapter shows as "Conduit Helios", the monitor as
 "Conduit".
 
 **Video memory the guest sees.** The adapter's dedicated video memory (dxdiag,
-Task Manager, DXGI `DedicatedVideoMemory`, the budgets games size textures
-from) is the host GPU's video memory: the largest device-local heap the
-host's Vulkan driver lists, read when the driver starts, up to 64 GiB. An
-RTX 5090 shows about 32 GB. It does not depend on `--venus-hostmem-mib`, which
-sizes only the CPU-visible blob window, and `--vram-limit-mib` does not lower
-it. The figure is accounting: VidMm charges
+Task Manager, DXGI `DedicatedVideoMemory`) comes from the largest device-local
+heap the host's Vulkan driver lists, read when the driver starts, up to 64 GiB.
+`--vram-limit-mib` caps this figure: a 12 GiB card with a 6 GiB backend limit
+reports at most 6 GiB to Windows. It does not depend on `--venus-hostmem-mib`,
+which sizes only the CPU-visible blob window. The figure is accounting: VidMm charges
 each allocation of host GPU memory against it, and the host GPU (or
 `--vram-limit-mib`) decides what can actually be allocated. "Shared memory" is
-Windows' own half-of-RAM figure. `VidMmVramMB` overrides the size
-([Registry knobs](#registry-knobs)); `VidVram`, `VidVSrc` and `VidVHeap` in the
-service key show what the driver chose and from where.
+Windows' own half-of-RAM figure. A valid nonzero `VidMmVramMB` override can
+lower the reported size but cannot exceed the backend limit; 0 retains the
+legacy topology ([Registry knobs](#registry-knobs)). Limits below 256 MiB
+cannot be represented by the device-memory segment and fail device start
+with `VidVBad`. On older backends without the config field, the previous
+capacity selection is retained. `VidVram`, `VidVSrc`, `VidVHeap` and `VidVLmt`
+in the service key show the chosen capacity, its source, the host heap and
+the backend limit. `VidVSrc=4` means the backend limit supplied the capacity.
 
 **Install from a release.** Every release carries
 `conduit-windows-gpu-driver-<version>.zip` (built and test-signed by
