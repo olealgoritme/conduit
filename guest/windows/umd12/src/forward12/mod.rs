@@ -74,3 +74,5 @@ pub(crate) mod identity12;
 pub(crate) mod nvk12;
 // `Nvk12CompletionHint`: finished batches named to the KMD from the engine worker.
 pub(crate) mod ecl_hint;
+// `Dlss`: meta-commands that hand dxvk-nvapi the engine objects (NGX's D3D12 path).
+pub(crate) mod dlss12;

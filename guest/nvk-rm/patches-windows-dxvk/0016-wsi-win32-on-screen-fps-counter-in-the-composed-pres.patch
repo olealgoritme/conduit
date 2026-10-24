@@ -1,0 +1,364 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <ole@solgt.no>
+Date: Sat, 24 Oct 2026 16:18:54 +0200
+Subject: [PATCH] wsi/win32: on-screen fps counter in the composed present
+
+EnhanceOverlay (DWORD, HKLM\SOFTWARE\Helios), Overlay in a per-exe
+profile (it overrides the global value) or MESA_WSI_ENHANCE_OVERLAY=1
+draw a counter at the top left of every presented picture:
+
+  80 / 160  FG 2x  FSR
+
+the application's frames per second, the pictures shown per second
+(real and generated), the frame generation mode and the scaler.  The
+line is rebuilt every half second.  enh_text.comp draws it with a 5x7
+font of its own (space, / . - :, digits, capitals and a small x) on a
+dark box, one dispatch per output slot over the box only; the glyph
+size is the picture's height / 360 (at least 2), so it reads the same
+at 1080p and 1440p.
+
+The overlay alone turns the enhancement path on: scaler off and frame
+generation off are a 1:1 copy into the output slot with the counter.
+Default off.
+---
+ src/vulkan/wsi/enhance/enh_text.comp      |  87 +++++++++++++++++++
+ src/vulkan/wsi/meson.build                |   2 +-
+ src/vulkan/wsi/wsi_common_win32_enhance.c | 101 +++++++++++++++++++++-
+ src/vulkan/wsi/wsi_common_win32_enhance.h |   4 +-
+ 4 files changed, 188 insertions(+), 6 deletions(-)
+ create mode 100644 src/vulkan/wsi/enhance/enh_text.comp
+
+diff --git a/src/vulkan/wsi/enhance/enh_text.comp b/src/vulkan/wsi/enhance/enh_text.comp
+new file mode 100644
+index 0000000..6287340
+--- /dev/null
++++ b/src/vulkan/wsi/enhance/enh_text.comp
+@@ -0,0 +1,87 @@
++#version 450
++/*
++ * Copyright © 2026 Ole Algoritme
++ * SPDX-License-Identifier: MIT
++ *
++ * The on-screen counter (EnhanceOverlay): a line of text in a dark box
++ * drawn into an output slot, one invocation per pixel of the box.  A 5x7
++ * font of its own, each font pixel `scale` pixels wide; glyph codes four
++ * per uint in `text` (wsi_common_win32_enhance.c enh_overlay_text).
++ */
++layout(local_size_x = 8, local_size_y = 8) in;
++layout(set = 0, binding = 3) writeonly uniform image2D o_dst;
++
++layout(push_constant) uniform text_push {
++   ivec2 origin;     /* the box's top left in o_dst */
++   int scale;
++   int count;        /* glyphs */
++   uint text[12];    /* up to 48 glyph codes, 8 bits each */
++} pc;
++
++/* 5x7 glyphs, bit r * 5 + c (row r from the top, column c from the left)
++ * in .x (bits 0..31) and .y (32..34); codes: " /.-:0-9A-Zx" in that order */
++const uvec2 font5x7[42] = uvec2[42](
++   uvec2(0x00000000u, 0x0u),
++   uvec2(0x42222210u, 0x0u),
++   uvec2(0x8c000000u, 0x1u),
++   uvec2(0x000f8000u, 0x0u),
++   uvec2(0x0c6018c0u, 0x0u),
++   uvec2(0xa33ae62eu, 0x3u),
++   uvec2(0x884210c4u, 0x3u),
++   uvec2(0xc444422eu, 0x7u),
++   uvec2(0xa304111fu, 0x3u),
++   uvec2(0x11f4a988u, 0x2u),
++   uvec2(0xa3083c3fu, 0x3u),
++   uvec2(0xa317844cu, 0x3u),
++   uvec2(0x8422221fu, 0x0u),
++   uvec2(0xa317462eu, 0x3u),
++   uvec2(0x910f462eu, 0x1u),
++   uvec2(0x631fc62eu, 0x4u),
++   uvec2(0xe317c62fu, 0x3u),
++   uvec2(0xa210862eu, 0x3u),
++   uvec2(0xe318c62fu, 0x3u),
++   uvec2(0xc217843fu, 0x7u),
++   uvec2(0x4217843fu, 0x0u),
++   uvec2(0xa31e862eu, 0x7u),
++   uvec2(0x631fc631u, 0x4u),
++   uvec2(0x8842108eu, 0x3u),
++   uvec2(0x9284211cu, 0x1u),
++   uvec2(0x52519531u, 0x4u),
++   uvec2(0xc2108421u, 0x7u),
++   uvec2(0x631ad771u, 0x4u),
++   uvec2(0x639ace31u, 0x4u),
++   uvec2(0xa318c62eu, 0x3u),
++   uvec2(0x4217c62fu, 0x0u),
++   uvec2(0x9358c62eu, 0x5u),
++   uvec2(0x5257c62fu, 0x4u),
++   uvec2(0xe107043eu, 0x3u),
++   uvec2(0x0842109fu, 0x1u),
++   uvec2(0xa318c631u, 0x3u),
++   uvec2(0x1518c631u, 0x1u),
++   uvec2(0xab5ac631u, 0x2u),
++   uvec2(0x62a22a31u, 0x4u),
++   uvec2(0x08422a31u, 0x1u),
++   uvec2(0xc222221fu, 0x7u),
++   uvec2(0x54454400u, 0x4u)
++);
++
++void main()
++{
++   ivec2 p = ivec2(gl_GlobalInvocationID.xy);
++   /* one font pixel of margin, 6 per glyph, 9 rows */
++   const ivec2 box = ivec2(pc.count * 6 + 1, 9) * pc.scale;
++   if (p.x >= box.x || p.y >= box.y)
++      return;
++   ivec2 f = p / pc.scale - ivec2(1, 1);
++   bool on = false;
++   if (f.x >= 0 && f.y >= 0 && f.y < 7) {
++      const int g = f.x / 6, c = f.x % 6;
++      if (g < pc.count && c < 5) {
++         const uint code = (pc.text[g / 4] >> (8u * uint(g % 4))) & 0xffu;
++         const uvec2 bits = font5x7[min(code, 41u)];
++         const int bit = f.y * 5 + c;
++         on = ((bit < 32 ? bits.x >> uint(bit) : bits.y >> uint(bit - 32)) & 1u) != 0u;
++      }
++   }
++   imageStore(o_dst, pc.origin + p, on ? vec4(1.0, 0.95, 0.55, 1.0) : vec4(0.02, 0.02, 0.03, 1.0));
++}
+diff --git a/src/vulkan/wsi/meson.build b/src/vulkan/wsi/meson.build
+index fe3c795..a76f7dc 100644
+--- a/src/vulkan/wsi/meson.build
++++ b/src/vulkan/wsi/meson.build
+@@ -78,7 +78,7 @@ if with_platform_windows
+   endforeach
+   enh_third_party = meson.current_source_dir() / 'enhance' / 'third_party'
+   foreach s : ['enh_scale', 'enh_easu', 'enh_rcas', 'enh_nis', 'enh_cas', 'enh_sgsr',
+-               'enh_xbr', 'fg_down', 'fg_flow', 'fg_interp']
++               'enh_xbr', 'enh_text', 'fg_down', 'fg_flow', 'fg_interp']
+     files_vulkan_wsi += custom_target(
+       s + '_spv.h',
+       input : 'enhance' / s + '.comp',
+diff --git a/src/vulkan/wsi/wsi_common_win32_enhance.c b/src/vulkan/wsi/wsi_common_win32_enhance.c
+index b8fc224..5db773d 100644
+--- a/src/vulkan/wsi/wsi_common_win32_enhance.c
++++ b/src/vulkan/wsi/wsi_common_win32_enhance.c
+@@ -36,6 +36,7 @@
+ #include "wsi_common_win32_enhance.h"
+ 
+ #include <windows.h>
++#include <ctype.h>
+ #include <inttypes.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -55,6 +56,7 @@
+ #include "enh_cas_spv.h"
+ #include "enh_sgsr_spv.h"
+ #include "enh_xbr_spv.h"
++#include "enh_text_spv.h"
+ 
+ /* Anime4K's CNN x2 upscalers (enhance/third_party/anime4k, MIT): passes
+  * and tables generated by enhance/adapt.py.  Texture 0 is the source,
+@@ -218,6 +220,9 @@ read_global(struct wsi_enh_config *c)
+    size = sizeof(d);
+    if (RegGetValueA(HKEY_LOCAL_MACHINE, "SOFTWARE\\Helios", "EnhanceD3D", RRF_RT_REG_DWORD, NULL, &d, &size) == ERROR_SUCCESS)
+       c->d3d = d != 0;
++   size = sizeof(d);
++   if (RegGetValueA(HKEY_LOCAL_MACHINE, "SOFTWARE\\Helios", "EnhanceOverlay", RRF_RT_REG_DWORD, NULL, &d, &size) == ERROR_SUCCESS)
++      c->overlay = d != 0;
+ }
+ 
+ /* A per-exe profile, HKLM\SOFTWARE\Helios\Enhance\<exe name>: the same
+@@ -256,6 +261,8 @@ read_profile(struct wsi_enh_config *c)
+       parse_fit(c, s);
+    if (reg_dw(sub, "D3D", &d))
+       c->d3d = d != 0;
++   if (reg_dw(sub, "Overlay", &d))
++      c->overlay = d != 0;
+ }
+ 
+ static void
+@@ -289,6 +296,10 @@ read_env(struct wsi_enh_config *c)
+       c->stats = atoi(v) != 0;
+    if ((v = os_get_option("MESA_WSI_ENHANCE_D3D")))
+       c->d3d = atoi(v) != 0;
++   if ((v = os_get_option("MESA_WSI_ENHANCE_OVERLAY"))) {
++      c->overlay = atoi(v) != 0;
++      any = true;
++   }
+    /* Set for this process: every window of it */
+    if (any)
+       c->from_profile = true;
+@@ -342,8 +353,8 @@ wsi_enh_config_get(struct wsi_enh_config *out)
+       read_env(&c);
+       if (conf.loaded && memcmp(&c, &conf.cfg, sizeof(c)) != 0)
+          LOGI("settings changed: scaler %s, sharpness %u, frame generation %s%ux, "
+-              "%s windows", wsi_enh_scaler_name(c.scaler), c.sharpness,
+-              c.fg_adaptive ? "adaptive " : "", c.fg_mult,
++              "overlay %s, %s windows", wsi_enh_scaler_name(c.scaler), c.sharpness,
++              c.fg_adaptive ? "adaptive " : "", c.fg_mult, c.overlay ? "on" : "off",
+               c.from_profile || c.all_windows ? "all" : "fullscreen");
+       conf.cfg = c;
+       conf.loaded = true;
+@@ -387,6 +398,7 @@ enum enh_pipe {
+    P_CAS,
+    P_SGSR,
+    P_XBR,
++   P_TEXT,
+    P_COUNT,
+ };
+ 
+@@ -406,6 +418,7 @@ static const struct {
+    SPV(P_CAS, enh_cas),
+    SPV(P_SGSR, enh_sgsr),
+    SPV(P_XBR, enh_xbr),
++   SPV(P_TEXT, enh_text),
+ #undef SPV
+ };
+ 
+@@ -516,6 +529,12 @@ struct wsi_enh {
+    uint64_t stat_gpu_frames;
+    double stat_gpu_us[TS_COUNT];
+    FILE *csv;
++
++   /* the on-screen counter: frames in and pictures shown since ov_t0,
++    * its line every half second (glyph codes, enh_text.comp) */
++   uint64_t ov_t0, ov_frames, ov_shown;
++   uint32_t ov_text[12];
++   int ov_count;
+ };
+ 
+ static bool a4k_prepare(struct wsi_enh *e, int v);
+@@ -851,13 +870,13 @@ wsi_enh_create(const struct wsi_enh_create_info *info, struct wsi_enh **out)
+ 
+    stats_open_csv(e);
+    LOGI("%ux%u -> %ux%u (picture %ux%u at %d,%d), scaler %s, sharpness %u, "
+-        "frame generation %s%ux (%s), %u output slots",
++        "frame generation %s%ux (%s), %u output slots%s",
+         e->src.width, e->src.height, e->dst.width, e->dst.height,
+         e->rect.extent.width, e->rect.extent.height, e->rect.offset.x,
+         e->rect.offset.y, wsi_enh_scaler_name(e->cfg.scaler), e->cfg.sharpness,
+         e->cfg.fg_adaptive ? "adaptive " : "", e->cfg.fg_mult,
+         e->cfg.fg_quality == WSI_ENH_FG_QUALITY ? "quality" : "fast",
+-        e->slot_count);
++        e->slot_count, e->cfg.overlay ? ", overlay" : "");
+    *out = e;
+    return VK_SUCCESS;
+ 
+@@ -1522,6 +1541,75 @@ frame_cmd(struct wsi_enh *e, uint32_t qfi, struct enh_frame *f)
+    return f->cmd;
+ }
+ 
++/* The counter's line, "base / shown  FG 2x  FSR", as enh_text.comp's
++ * glyph codes (its font: " /.-:0-9A-Z" and a small x) */
++static void
++enh_overlay_text(struct wsi_enh *e, uint64_t now)
++{
++   static const char glyphs[] = " /.-:0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZx";
++   AcquireSRWLockExclusive(&e->stat_lock);
++   const double secs = (now - e->ov_t0) / 1e9;
++   if (e->ov_count && secs < 0.5) {
++      ReleaseSRWLockExclusive(&e->stat_lock);
++      return;
++   }
++   const unsigned base = secs > 0.0 ? (unsigned)(e->ov_frames / secs + 0.5) : 0;
++   const unsigned shown = secs > 0.0 ? (unsigned)(e->ov_shown / secs + 0.5) : 0;
++   e->ov_t0 = now;
++   e->ov_frames = e->ov_shown = 0;
++   ReleaseSRWLockExclusive(&e->stat_lock);
++
++   char line[64], fg[16] = "";
++   if (e->cfg.fg_adaptive)
++      snprintf(fg, sizeof(fg), "  FG AUTO");
++   else if (e->cfg.fg_mult > 1)
++      snprintf(fg, sizeof(fg), "  FG %ux", e->cfg.fg_mult);
++   char sc[16] = "";
++   if (e->cfg.scaler != WSI_ENH_SCALER_OFF) {
++      snprintf(sc, sizeof(sc), "  %s", wsi_enh_scaler_name(e->cfg.scaler));
++      for (char *q = sc; *q; q++)
++         *q = (char)toupper((unsigned char)*q);
++   }
++   snprintf(line, sizeof(line), "%u / %u%s%s", base, shown, fg, sc);
++   memset(e->ov_text, 0, sizeof(e->ov_text));
++   int n = 0;
++   for (const char *q = line; *q && n < 48; q++, n++) {
++      const char *g = strchr(glyphs, *q);
++      const uint32_t code = g && *q ? (uint32_t)(g - glyphs) : 0;
++      e->ov_text[n / 4] |= code << (8 * (n % 4));
++   }
++   e->ov_count = n;
++}
++
++/* The counter into every slot of the plan, top left of the picture */
++static void
++record_overlay(struct wsi_enh *e, VkCommandBuffer cmd, const struct wsi_enh_plan *plan)
++{
++   enh_overlay_text(e, os_time_get_nano());
++   if (!e->ov_count)
++      return;
++   struct {
++      int32_t origin[2];
++      int32_t scale;
++      int32_t count;
++      uint32_t text[12];
++   } push;
++   push.scale = (int32_t)MAX2(2u, e->rect.extent.height / 360);
++   push.origin[0] = e->rect.offset.x + 4 * push.scale;
++   push.origin[1] = e->rect.offset.y + 4 * push.scale;
++   push.count = e->ov_count;
++   memcpy(push.text, e->ov_text, sizeof(push.text));
++   const uint32_t w = (uint32_t)(push.count * 6 + 1) * (uint32_t)push.scale;
++   const uint32_t h = 9u * (uint32_t)push.scale;
++   if (push.origin[0] + w > e->dst.width || push.origin[1] + h > e->dst.height)
++      return;
++   compute_barrier(e->wsi, cmd);
++   for (uint32_t k = 0; k < plan->count; k++)
++      dispatch_raw(e, cmd, P_TEXT, e->tmp.view, e->linear, VK_NULL_HANDLE, VK_NULL_HANDLE,
++                   e->slot_views[plan->slot[k]], &push, sizeof(push),
++                   DIV_ROUND_UP(w, 8), DIV_ROUND_UP(h, 8));
++}
++
+ VkCommandBuffer
+ wsi_enh_record(struct wsi_enh *e, uint32_t qfi, uint32_t src_index,
+                struct wsi_enh_plan *plan)
+@@ -1718,6 +1806,9 @@ wsi_enh_record(struct wsi_enh *e, uint32_t qfi, uint32_t src_index,
+       e->have_prev = true;
+    }
+ 
++   if (e->cfg.overlay)
++      record_overlay(e, cmd, plan);
++
+    /* Every query of the range is written (the results come back only when
+     * all of them are available); the stages that did not run are not
+     * counted (f->passes) */
+@@ -1757,5 +1848,7 @@ wsi_enh_note_shown(struct wsi_enh *e, uint32_t real, uint32_t generated,
+    e->stat_real += real;
+    e->stat_gen += generated;
+    e->stat_skipped += skipped;
++   e->ov_frames += real;
++   e->ov_shown += real + generated;
+    ReleaseSRWLockExclusive(&e->stat_lock);
+ }
+diff --git a/src/vulkan/wsi/wsi_common_win32_enhance.h b/src/vulkan/wsi/wsi_common_win32_enhance.h
+index ab2bb34..7861810 100644
+--- a/src/vulkan/wsi/wsi_common_win32_enhance.h
++++ b/src/vulkan/wsi/wsi_common_win32_enhance.h
+@@ -68,6 +68,7 @@ struct wsi_enh_config {
+    bool all_windows;           /* false: borderless/fullscreen windows only */
+    bool stats;                 /* per-present CSV */
+    bool d3d;                   /* D3D11 / D3D12 swap chains too */
++   bool overlay;               /* on-screen counter: base / shown fps, mode */
+    bool from_profile;          /* a per-exe profile set it */
+ };
+ 
+@@ -77,10 +78,11 @@ wsi_enh_config_fg(const struct wsi_enh_config *c)
+    return c->fg_mult > 1 || c->fg_adaptive;
+ }
+ 
++/* The overlay alone turns the path on too: a 1:1 copy with the counter */
+ static inline bool
+ wsi_enh_config_on(const struct wsi_enh_config *c)
+ {
+-   return c->scaler != WSI_ENH_SCALER_OFF || wsi_enh_config_fg(c);
++   return c->scaler != WSI_ENH_SCALER_OFF || wsi_enh_config_fg(c) || c->overlay;
+ }
+ 
+ /* The settings for this process (env > per-exe profile > global), read
+-- 
+2.43.0
+

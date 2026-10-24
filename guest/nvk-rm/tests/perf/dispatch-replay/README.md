@@ -1,7 +1,7 @@
 # dispatch-replay
 
-Replays one compute dispatch captured in a game by NVK's `NVK_DISPATCH_CAPTURE` (common patch 0072), with
-the game's real inputs, on any Vulkan driver: NVK in the Windows guest, NVIDIA's driver on a Linux host, NVK
+Replays one compute dispatch or one draw captured in a game by NVK's `NVK_DISPATCH_CAPTURE` (common
+patches 0072 and 0088), with the game's real inputs, on any Vulkan driver: NVK in the Windows guest, NVIDIA's driver on a Linux host, NVK
 under the nouveau drm-shim (compile only). It reports GPU time per dispatch and a checksum of everything
 the shader may write, and `compare.py` compares what two drivers wrote.
 
@@ -16,13 +16,13 @@ Find the shader's hash with `NVK_DISPATCH_PROFILE=1` (the `src` column, see "Dis
 
 | Variable | Meaning | Default |
 |---|---|---|
-| `NVK_DISPATCH_CAPTURE` | comma-separated 16-digit DXIL hashes (the `src` column of the profile) | off |
+| `NVK_DISPATCH_CAPTURE` | comma-separated hashes: 16-digit DXIL source hashes (the `src` column of the profile) or 8-digit code hashes (what `NVK_SHADER_STATS` prints); a fragment shader's hash captures a draw with it | off |
 | `NVK_DISPATCH_CAPTURE_DIR` | output directory | `%ProgramData%\Helios\dcap` (Windows), `/tmp/nvk-dcap` elsewhere |
 | `NVK_DISPATCH_CAPTURE_DELAY_S` | seconds after device creation before dispatches count | 20 |
 | `NVK_DISPATCH_CAPTURE_TRIGGER` | path of a file whose creation arms the capture (after the delay), checked every 250 ms | none |
 | `NVK_DISPATCH_CAPTURE_SKIP` | matching dispatches skipped per shader once armed | 0 |
 | `NVK_DISPATCH_CAPTURE_COUNT` | captures per shader | 1 |
-| `NVK_DISPATCH_CAPTURE_POST` | 1: also save what NVK wrote (`r<N>.post.bin`) | 0 |
+| `NVK_DISPATCH_CAPTURE_POST` | 1: also save what NVK wrote (`r<N>.post.bin`); dropped for a capture whose staging with the outputs cannot be mapped | 0 |
 | `NVK_DISPATCH_CAPTURE_MAX_MB` | staging limit per capture, in MiB; a dispatch needing more is not captured | 2048 |
 
 Set `VKD3D_SHADER_CACHE_PATH=0` as well: the SPIR-V is read when the pipeline is created, and vkd3d-proton
@@ -33,6 +33,16 @@ For example, in a Steam game's launch options:
 ```
 VKD3D_SHADER_CACHE_PATH=0 NVK_DISPATCH_CAPTURE=88825d04f9c554c6,94b6df807719aaad NVK_DISPATCH_CAPTURE_DELAY_S=40 NVK_DISPATCH_CAPTURE_POST=1 %command%
 ```
+
+A draw is captured when the bound fragment shader matches: `vkCmdDraw`, `vkCmdDrawIndexed` or their
+indirect and indirect-count forms (vkd3d-proton's `ExecuteIndirect` without state changes), with a vertex
+and a fragment shader, single sample, inside dynamic rendering (vkd3d-proton's render passes). The capture
+holds both shaders, their resources, the attachments' contents, the indices the draw reads (the whole bound
+index buffer for an indirect draw), every vertex buffer an attribute reads (as bound, up to 256 MiB each),
+for an indirect draw its records and count as they were when it ran, and the pipeline state with the vertex
+input layout. Hashes: use the DXIL source hash; a code hash changes with every NAK change. `nvk-dcap.log`
+lists the first draw with every fragment shader (`drawn: fragment shader <source hash> (code <hash>) by
+<call>`), so a run with any hash listed shows which shaders a pass draws with and how.
 
 Each capture goes to `<dir>\<hash>-p<pid>-<n>\` once the command buffer that recorded it is reset (a few
 frames after the dispatch). `<dir>\nvk-dcap.log` lists the scanned shaders, the recorded and written
@@ -55,12 +65,21 @@ capture in `captures\` on the first NVIDIA-vendor device (NVK) and writes `guest
 
 Options: `-n N` timed dispatches (median reported, default 15), `-w N` warm-up dispatches (5),
 `--no-reset` (do not restore writable resources before each dispatch), `--grid X,Y,Z` (another grid),
-`--no-robust` (without the robustness features), `--compile-only` (create the pipeline and stop),
+`--no-robust` (without the robustness features), `--no-draw` (a draw capture: the render pass alone, its
+attachment loads and stores, without the draw), `--split` (draws: timestamps after the pass begins and before
+it ends too; begin, inside and end are reported apart), `--ts-only` (draws: two timestamps with nothing between
+them, after an untimed empty pass: the cost of the timestamps themselves), `--compile-only` (create the pipeline and stop),
 `--csv FILE`, `--label STR`, `--dump DIR`, `--dump-cache FILE` (write the pipeline cache data), `-v`.
 
 Output per capture: `gpu_us median/min/mean/max/first`, the pipeline creation time, `checksum r<N>` per
-writable resource and `checksum all`. CSV columns: hash, label, grid, median, min, mean, max, n, reset,
-checksum, compile ms.
+writable resource and `checksum all`. CSV columns: hash, label, grid (`draw.WxH` for a draw: its render
+area), median, min, mean, max, n, reset, checksum, compile ms.
+
+A draw capture is replayed as that draw: a graphics pipeline from the captured shaders and state (topology,
+rasterization, depth bias, depth and stencil tests, blending, color write masks; viewport and scissor
+dynamic), dynamic rendering into attachments of the captured formats with load and store, and the captured
+viewport, scissor and render area. The timed span is the render pass with the draw; the attachments are
+restored to the captured contents before each one.
 
 The replay device enables what vkd3d-proton enables that changes code generation: robustBufferAccess,
 robustBufferAccess2, robustImageAccess2 and nullDescriptor (not robustImageAccess), plus every other
@@ -96,7 +115,14 @@ A capture is a directory: `manifest.json`, `shader.spv` (the SPIR-V the pipeline
 
 `manifest.json` (`format` `nvk-dispatch-capture`, `version` 1): `src_hash`, `code_hash` (what
 `NVK_SHADER_STATS` prints), `local_size`, `base_group`, `grid` (indirect arguments read back), `indirect`,
-`push_size`, `post`, `unsupported` (index or address expressions the scan could not follow), `bindings`
+`push_size`, `post`, `unsupported` (index or address expressions the scan could not follow), for draws
+`kind` (`draw`), `vs_spirv` (`vs.spv`), `vs_src_hash`, `vs_code_hash` and `draw` (vertex and instance
+counts, first vertex and instance, topology, rasterization, depth bias, viewport, scissor, render area,
+layers, sample mask, alpha to coverage, `depth`, `stencil` and `blend` state with the attachments' formats,
+`indexed`, `index_count`, `first_index`, `vertex_offset`, `index_type`, `indirect`, `indirect_count`,
+`draw_count` (records, or at most that many with a count), `stride`, `vertex_input` with the bindings'
+strides, input rates and divisors and the attributes' locations, bindings, formats and offsets),
+`bindings`
 (every resource variable: set, binding, descriptor type, array, writable, image dimension, NVK's binding
 layout) and `resources`:
 
@@ -109,6 +135,13 @@ layout) and `resources`:
 | `sampler` | set, binding, index, sampler_index, sampler (filters, address modes, lod, anisotropy, compare, border, reduction, unnormalized) | none |
 | `null`, `error` | note | none |
 
+An attachment of a draw is an `image` with `role` (`color`, `depth` or `stencil`), `attachment` (the color
+attachment index) and `attachment_format`, without set and binding. The index buffer is a `buffer` with
+`role` `index` that starts at the draw's first index (the replay draws from index 0); a vertex buffer is a
+`buffer` with `role` `vertex` and `attachment` = its binding, from its bound offset. An indirect draw's
+records are a `buffer` with `role` `indirect`, its count one with `role` `count`; its index buffer starts
+at the bound offset (the records hold the first indices).
+
 `push_offset` and `add` on a descriptor say where its index came from (push constant word plus constant).
 With `NVK_DISPATCH_CAPTURE_POST=1`, every resource the shader may write also has `r<N>.post.bin`, its
 contents after NVK ran the dispatch.
@@ -116,6 +149,9 @@ contents after NVK ran the dispatch.
 ## Limits
 
 - Direct and indirect `vkCmdDispatch`; not device-generated commands (ExecuteIndirect on DGC).
+- Draws: `vkCmdDraw[Indexed]`, `vkCmdDraw[Indexed]Indirect[Count]` (not multi-draws or device-generated
+  commands, which are logged), no tessellation,
+  geometry or mesh shaders, single sample, no multiview; one viewport and scissor.
 - Descriptor indices must be a push constant word plus a constant (vkd3d-proton's heap indexing) or
   constant; root buffer addresses must be loaded straight from a push constant. What the scan could not
   follow is listed in `unsupported`.
@@ -131,3 +167,26 @@ contents after NVK ran the dispatch.
 - Timing: one dispatch at a time with warm caches (the reset copies); a game overlaps dispatches, so a
   replay time is the shader alone, not its cost in a frame.
 - A capture larger than `NVK_DISPATCH_CAPTURE_MAX_MB` of staging is not made (logged in `nvk-dcap.log`).
+
+## Sequences
+
+`NVK_DISPATCH_CAPTURE_SEQ=N` (with `NVK_DISPATCH_CAPTURE` naming the shader that starts the sequence)
+captures that dispatch and the next N - 1 dispatches recorded in the same command buffer, each in its
+own directory, with `"sequence": {"id", "index", "barrier_before"}` in the manifest. A buffer range or
+image that an earlier dispatch of the sequence captured is referred to (`"same_as"`) instead of copied
+again.
+
+`NVK_DISPATCH_CAPTURE_SEQ_START=<hash>[,...]` captures whole command buffers instead: a sequence starts
+only at the first dispatch of a command buffer whose shader is one of these hashes and runs to the end of
+the command buffer (up to `NVK_DISPATCH_CAPTURE_SEQ`, 4096 by default). It is written only if one of its
+dispatches has a shader named in `NVK_DISPATCH_CAPTURE`; `NVK_DISPATCH_CAPTURE_COUNT` limits the
+sequences written.
+
+```
+dispatch-replay --seq [-n N] [--csv FILE --label STR] [--seq-barriers captured|all|none] DIR...
+```
+
+replays the dispatches in their order in one command buffer: one resource for every `same_as` chain (so
+what a dispatch writes reaches the ones after it), a compute-to-compute barrier where the game recorded a
+pipeline barrier (`all`: between every two dispatches, `none`: no barriers), and a timestamp pair around
+the whole sequence. Dispatches without a barrier between them may run concurrently, as in the game.

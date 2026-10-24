@@ -15,6 +15,7 @@
 #include <linux/input-event-codes.h>
 
 #include "nvkvm_broker.h"
+#include "nb_ui.h"
 #include "nb_vmpause.h"
 
 /*
@@ -527,6 +528,42 @@ bool nb_vm_pause_ask(struct nb_vmpause *vp, struct nb_sink *sink,
         nb_sink_hold_input(sink, true);
     }
     return true;
+}
+
+bool nb_upscaler_ask(struct nb_upscaler *u, const struct nb_config *cfg,
+                     int mode, char *note, size_t n)
+{
+    const char *cmd = cfg ? cfg->vm_upscaler_cmd : NULL;
+
+    if (u->pid > 0) {
+        return true;            /* the one in flight decides */
+    }
+    if (nb_upscaler_start(u, cmd, nb_upscaler_word(mode), mode) != 0) {
+        nb_err("menu: cannot set the upscaler: %s",
+               cmd && *cmd ? strerror(errno) : "no command");
+        snprintf(note, n, "Cannot set the upscaler");
+        return false;
+    }
+    nb_log("menu: upscaler %s: `%s %s`", nb_upscaler_word(mode), cmd,
+           nb_upscaler_word(mode));
+    return true;
+}
+
+bool nb_upscaler_reap(struct nb_upscaler *u, char *note, size_t n)
+{
+    switch (nb_upscaler_poll(u)) {
+    case NB_VMPAUSE_DONE:
+        nb_log("menu: upscaler is %s", nb_upscaler_word(u->mode));
+        snprintf(note, n, "Upscaler: %s (games started next)",
+                 nb_upscaler_label(u->mode));
+        return true;
+    case NB_VMPAUSE_FAILED:
+        nb_err("menu: setting the upscaler failed (exit %d)", u->status);
+        snprintf(note, n, "Upscaler not set (exit %d)", u->status);
+        return true;
+    default:
+        return false;
+    }
 }
 
 bool nb_vm_pause_reap(struct nb_vmpause *vp, struct nb_sink *sink, char *note,

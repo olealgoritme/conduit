@@ -94,6 +94,7 @@ struct nb_ov_info {
     bool     guest_resize;      /* --resize=guest                           */
     bool     flip_known;
     bool     host_cursor;       /* the guest cursor is the host pointer     */
+    bool     viewer_cursor;     /* ...drawn by the viewer (under grab)     */
     const char *path;           /* "DIRECT", "GPU COPY", "GPU SCALE"; NULL - */
     const char *gpu;            /* the viewer's GPU (render node), NULL -   */
 };

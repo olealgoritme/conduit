@@ -554,6 +554,14 @@ if (Test-Path -LiteralPath $trayPayload -PathType Leaf) {
             ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
         New-Item -ItemType Directory -Force -Path $trayDir | Out-Null
         Copy-Item -LiteralPath $trayPayload -Destination $trayExe -Force
+        # The tray runs Install-OptiScaler.ps1 (elevated) for its per-game
+        # OptiScaler menu, only from this folder (administrators only).
+        foreach ($name in @("Install-OptiScaler.ps1", "optiscaler-manifest.txt")) {
+            $from = Join-Path $payloadRoot "tray\$name"
+            if (Test-Path -LiteralPath $from -PathType Leaf) {
+                Copy-Item -LiteralPath $from -Destination (Join-Path $trayDir $name) -Force
+            }
+        }
         Protect-ConduitDataDirectory
         Remove-ItemProperty -LiteralPath "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run" -Name "ConduitGpuTray" -ErrorAction SilentlyContinue
         $action = New-ScheduledTaskAction -Execute $trayExe

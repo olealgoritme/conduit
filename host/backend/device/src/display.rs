@@ -422,6 +422,11 @@ pub mod wire {
     /// list's generation, seq = [`MODE_F_NATIVE`] | [`MODE_F_CUSTOM`]. A
     /// whole list is sent at once, index 0 (native) first.
     pub const CMD_MODES: u16 = 8;
+    /// CMD_CURSOR_POS (Conduit): the guest's pointer position, x and y as
+    /// int32 in `width` / `height`, `seq` a counter, no fd; only to a client
+    /// with [`CAP_CURSOR_POS`] while it is grabbed (it draws the guest
+    /// cursor there itself).
+    pub const CMD_CURSOR_POS: u16 = 9;
     pub const MODE_F_NATIVE: u32 = 1 << 0;
     pub const MODE_F_CUSTOM: u32 = 1 << 1;
 
@@ -499,6 +504,9 @@ pub mod wire {
     pub const CAP_PRESENTED: u32 = 1 << 16;
     /// Conduit: the broker takes [`CMD_MODES`] and may send [`EV_MODE_EDIT`].
     pub const CAP_MODE_LIST: u32 = 1 << 17;
+    /// The broker takes `CMD_CURSOR_POS` (and draws the guest cursor at the
+    /// guest's position while grabbed).
+    pub const CAP_CURSOR_POS: u32 = 1 << 18;
     /// CMD_CAPS bit: a clipboard agent is behind this client.
     pub const CLIENT_CLIPBOARD: u32 = 1 << 0;
     /// CMD_CAPS bit: ATTACH/COMMIT `seq` is our CLOCK_MONOTONIC microseconds.
@@ -1502,6 +1510,10 @@ struct Client {
     active: bool,
     /// The guest's cursor is owed to this connection.
     cursor_dirty: bool,
+    /// The client said `EV_GRAB` on (and not off since) on this connection.
+    grabbed: bool,
+    /// The newest guest pointer position did not fit in the socket.
+    pos_owed: Option<(i32, i32)>,
     /// The newest frame did not fit in the socket: re-sent when it drains.
     frame_owed: bool,
     /// The guest's clipboard on its way to this client.
@@ -1515,6 +1527,11 @@ struct Client {
 impl Client {
     fn wants_frames(&self) -> bool {
         self.sock.is_some() && self.active
+    }
+
+    /// The client draws the guest cursor at the guest's position now.
+    fn wants_cursor_pos(&self) -> bool {
+        self.wants_frames() && self.grabbed && self.broker_caps & wire::CAP_CURSOR_POS != 0
     }
 
     /// Forget the connection, keep the path.
@@ -1533,6 +1550,8 @@ struct LinkState {
     clients: Vec<Client>,
     /// The guest's cursor, kept across connections.
     cursor: Option<SentCursor>,
+    /// `CMD_CURSOR_POS` records sent or owed (their `seq`).
+    pos_seq: u32,
     /// The last frame the guest flipped (a dup of its dma-buf), kept across
     /// connections so a viewer that (re)attaches shows it at once instead of
     /// a black window until the guest's next flip.
@@ -2576,9 +2595,10 @@ impl DisplayLink {
     /// broker said HELLO).
     fn cursor_owed(&self) -> bool {
         let st = self.state.lock().unwrap();
-        st.clients
-            .iter()
-            .any(|c| c.cursor_dirty && c.wants_frames() && c.broker_caps & wire::CAP_CURSOR != 0)
+        st.clients.iter().any(|c| {
+            (c.cursor_dirty && c.wants_frames() && c.broker_caps & wire::CAP_CURSOR != 0)
+                || (c.pos_owed.is_some() && c.wants_cursor_pos())
+        })
     }
 
     fn retry_cursor(&self) {
@@ -2586,6 +2606,76 @@ impl DisplayLink {
         for i in 0..st.clients.len() {
             if st.clients[i].sock.is_some() {
                 let _ = self.send_cursor_locked(&mut st, i);
+            }
+            if let Some((x, y)) = st.clients[i].pos_owed {
+                let _ = self.send_pos_locked(&mut st, i, x, y);
+            }
+        }
+    }
+
+    /// The guest's pointer is at (`x`, `y`) (`CMD_MOVE_CURSOR`): to every
+    /// client that draws the guest cursor itself now (grabbed, with
+    /// [`wire::CAP_CURSOR_POS`]). Never blocks: a full socket keeps only the
+    /// newest position owed, for the link thread. True when at least one
+    /// such client exists, i.e. the guest should keep sending moves.
+    pub fn cursor_pos(&self, x: i32, y: i32) -> bool {
+        let mut st = self.state.lock().unwrap();
+        let mut wanted = false;
+        for i in 0..st.clients.len() {
+            if st.clients[i].wants_cursor_pos() {
+                wanted = true;
+                let _ = self.send_pos_locked(&mut st, i, x, y);
+            }
+        }
+        wanted
+    }
+
+    /// Send one `CMD_CURSOR_POS` to client `i`, or keep it owed.
+    fn send_pos_locked(&self, st: &mut LinkState, i: usize, x: i32, y: i32) -> FlipOutcome {
+        let cl = &mut st.clients[i];
+        if !cl.wants_cursor_pos() {
+            cl.pos_owed = None;
+            return FlipOutcome::NoBroker;
+        }
+        let Some(sock) = cl.sock.clone() else {
+            return FlipOutcome::NoBroker;
+        };
+        st.pos_seq = st.pos_seq.wrapping_add(1);
+        let cmd = wire::Cmd {
+            ty: wire::CMD_CURSOR_POS,
+            width: x as u32,
+            height: y as u32,
+            seq: st.pos_seq,
+            ..Default::default()
+        };
+        match send_records(sock.as_raw_fd(), &cmd.encode(), None) {
+            Ok(()) => {
+                st.clients[i].pos_owed = None;
+                FlipOutcome::Sent
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                st.clients[i].pos_owed = Some((x, y));
+                FlipOutcome::Busy
+            }
+            Err(e) => {
+                log::warn!("display: send to client {i} failed: {e}; reconnecting");
+                st.clients[i].pos_owed = None;
+                // SAFETY: shutdown on a live descriptor; the link thread
+                // notices and reconnects.
+                unsafe { libc::shutdown(sock.as_raw_fd(), libc::SHUT_RDWR) };
+                FlipOutcome::Broken
+            }
+        }
+    }
+
+    /// EV_GRAB from client `i`: whether it draws the guest cursor at the
+    /// guest's position from now on. Off drops a position still owed.
+    fn set_grabbed(&self, i: usize, on: bool) {
+        let mut st = self.state.lock().unwrap();
+        if let Some(c) = st.clients.get_mut(i) {
+            c.grabbed = on;
+            if !on {
+                c.pos_owed = None;
             }
         }
     }
@@ -2779,6 +2869,12 @@ impl DisplayLink {
     #[cfg(test)]
     pub(crate) fn hello_for_test(&self, caps: u32) {
         self.hello(caps);
+    }
+
+    /// EV_GRAB from the first client (tests).
+    #[cfg(test)]
+    pub(crate) fn grab_for_test(&self, on: bool) {
+        self.set_grabbed(0, on);
     }
 
     #[cfg(test)]
@@ -3660,6 +3756,7 @@ impl DisplayLink {
                 self.hello_at(i, p.w1);
             }
             EV_ACTIVE => self.set_active(i, p.x != 0),
+            EV_GRAB => self.set_grabbed(i, p.x != 0),
             EV_REFRESH => self.refresh(i),
             EV_RELEASE => {
                 self.client_released(i, (p.w0 as u64) | ((p.w1 as u64) << 32), p.x as u32)
@@ -5104,6 +5201,119 @@ mod tests {
         }
         stop.store(true, Ordering::Relaxed);
         drain.join().unwrap();
+    }
+
+    /// The next record that is not CMD_CAPS.
+    fn recv_skip_caps(fd: RawFd) -> wire::Cmd {
+        loop {
+            let (c, f) = broker_recv(fd);
+            assert!(f.is_none());
+            if c.ty != wire::CMD_CAPS {
+                return c;
+            }
+        }
+    }
+
+    /// CMD_CURSOR_POS goes to a client that draws the guest cursor itself:
+    /// grabbed (EV_GRAB) and with CAP_CURSOR_POS. Nobody else gets one, and
+    /// the answer says whether anyone wanted it.
+    #[test]
+    fn guest_cursor_positions_reach_only_a_grabbed_capable_client() {
+        let (link, a, b) = two_clients();
+        link.hello_at(0, wire::CAP_CURSOR | wire::CAP_CURSOR_POS);
+        link.hello_at(1, wire::CAP_CURSOR);
+        assert_eq!(recv_skip_caps_or_none(a.as_raw_fd()), None);
+        assert_eq!(recv_skip_caps_or_none(b.as_raw_fd()), None);
+        // Not grabbed: not wanted, nothing sent.
+        assert!(!link.cursor_pos(10, 20));
+        assert_eq!(pending_bytes(a.as_raw_fd()), 0);
+        // The client without the cap grabs: still not wanted (a record it
+        // cannot parse would end its connection).
+        link.note_packet(1, &pkt(wire::EV_GRAB, 0, 1, 0, 0, 0));
+        assert!(!link.cursor_pos(10, 20));
+        assert_eq!(pending_bytes(b.as_raw_fd()), 0);
+        // The capable one grabs: wanted, and the position as int32.
+        link.note_packet(0, &pkt(wire::EV_GRAB, 0, 1, 0, 0, 0));
+        assert!(link.cursor_pos(-5, 1439));
+        let c = recv_skip_caps(a.as_raw_fd());
+        assert_eq!(c.ty, wire::CMD_CURSOR_POS);
+        assert_eq!((c.width as i32, c.height as i32), (-5, 1439));
+        assert_eq!(
+            (c.stride, c.offset, c.fourcc, c.modifier, c.flags),
+            (0, 0, 0, 0, 0)
+        );
+        assert!(c.seq != 0);
+        assert!(link.cursor_pos(6, 7));
+        let c2 = recv_skip_caps(a.as_raw_fd());
+        assert_eq!((c2.width, c2.height), (6, 7));
+        assert!(c2.seq != c.seq);
+        assert_eq!(pending_bytes(b.as_raw_fd()), 0);
+        // Released: not wanted again.
+        link.note_packet(0, &pkt(wire::EV_GRAB, 0, 0, 0, 0, 0));
+        assert!(!link.cursor_pos(8, 9));
+        assert_eq!(pending_bytes(a.as_raw_fd()), 0);
+    }
+
+    fn recv_skip_caps_or_none(fd: RawFd) -> Option<u16> {
+        while pending_bytes(fd) > 0 {
+            let (c, _) = broker_recv(fd);
+            if c.ty != wire::CMD_CAPS {
+                return Some(c.ty);
+            }
+        }
+        None
+    }
+
+    /// A full socket keeps only the newest position owed, sent once it drains;
+    /// a grab that ends drops it.
+    #[test]
+    fn a_full_socket_owes_only_the_newest_guest_cursor_position() {
+        let (ours, broker) = socketpair();
+        let small: libc::c_int = 4096;
+        // SAFETY: setsockopt on a live descriptor with a c_int.
+        unsafe {
+            libc::setsockopt(
+                ours.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                (&small as *const libc::c_int).cast(),
+                size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        let link = DisplayLink::new(None);
+        link.adopt(ours);
+        link.hello(wire::CAP_CURSOR | wire::CAP_CURSOR_POS);
+        link.grab_for_test(true);
+        let mut n = 0;
+        while !link.cursor_owed() {
+            assert!(link.cursor_pos(n, n));
+            n += 1;
+            assert!(n < 1_000_000, "the socket never filled");
+        }
+        assert!(link.cursor_pos(-1, -2));
+        assert!(link.cursor_pos(7, 8));
+        // Whatever went first, once it drains the newest is what arrives last
+        // and nothing stays owed.
+        let drain = |last: &mut Option<(i32, i32)>| {
+            while pending_bytes(broker.as_raw_fd()) > 0 {
+                let (c, _) = broker_recv(broker.as_raw_fd());
+                if c.ty == wire::CMD_CURSOR_POS {
+                    *last = Some((c.width as i32, c.height as i32));
+                }
+            }
+        };
+        let mut last = None;
+        drain(&mut last);
+        link.retry_cursor();
+        drain(&mut last);
+        assert_eq!(last, Some((7, 8)));
+        assert!(!link.cursor_owed());
+        // Owed again, then the grab ends: dropped, nothing sent.
+        while !link.cursor_owed() {
+            link.cursor_pos(1, 1);
+        }
+        link.grab_for_test(false);
+        assert!(!link.cursor_owed());
     }
 
     #[test]

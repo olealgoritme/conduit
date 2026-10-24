@@ -476,9 +476,7 @@ def extract_umd(inv: Inventory, kmd_names: set[str]) -> None:
         r'\b(reg_sz|reg_dword|reg_wsz|helios_policy_reg_sz|helios_policy_reg_dword|helios_reg_dword)'
         r'\(\s*L?"([A-Za-z0-9_]+)"\s*,\s*([^,)]*)'
     )
-    c_direct = re.compile(
-        r'RegGetValue[AW]\(\s*HKEY_LOCAL_MACHINE\s*,\s*L?"SOFTWARE\\\\Helios"\s*,\s*L?"([A-Za-z0-9_]+)"\s*,\s*([A-Z_| ]+)'
-    )
+    c_direct = C_REG_DIRECT
     for f in c_files(*BRIDGE_DIRS):
         code = strip_line_comments(f.read_text(errors="replace"))
         for m in c_reader.finditer(code):
@@ -610,8 +608,15 @@ def series_from_file(d: Path) -> list[Path]:
     return sorted(d.glob("*.patch"))
 
 
+# A direct HKLM\SOFTWARE\Helios read in C (the bridges, and our patch series).
+C_REG_DIRECT = re.compile(
+    r'RegGetValue[AW]\(\s*HKEY_LOCAL_MACHINE\s*,\s*L?"SOFTWARE\\\\Helios"\s*,\s*L?"([A-Za-z0-9_]+)"\s*,\s*([A-Z_| ]+)'
+)
+
+
 def extract_env_patches(inv: Inventory, label: str, patches: list[Path]) -> None:
-    """Apply the series' +/- lines in order; what stays added is the code."""
+    """Apply the series' +/- lines in order; what stays added is the code.
+    Direct HKLM\\SOFTWARE\\Helios reads in the added code count too."""
     live: dict[str, list[tuple[str, str]]] = {}  # line text -> [(patch, line no)]
     for p in patches:
         lines = p.read_text(errors="replace").split("\n")
@@ -661,6 +666,10 @@ def extract_env_patches(inv: Inventory, label: str, patches: list[Path]) -> None
                 if pos < len(t):
                     d = fmt_env_default(default)
                     inv.get(ENV_SECTION, name, "env").add(resolve_define(d), f"{rel(p)}:{idx + 1}")
+            for m in C_REG_DIRECT.finditer(ctx):
+                if m.start() < len(t):
+                    type_ = "REG_SZ" if "REG_SZ" in m.group(2) else "REG_DWORD"
+                    inv.get(UMD_SECTION, m.group(1), type_).add("absent", f"{rel(p)}:{idx + 1}")
 
 
 def mesa_pin() -> str:

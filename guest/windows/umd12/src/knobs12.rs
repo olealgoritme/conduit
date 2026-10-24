@@ -291,7 +291,7 @@ pub(crate) fn log_knob_inventory() {
 /// are the evidence contract `tools/capture-knob-inventory.ps1` parses and that
 /// S2 proved the crate split byte-identical against; reordering makes two
 /// captures differ for a reason that is not a behaviour change.
-pub(crate) fn resolved_inventory() -> [(&'static str, u32); 25] {
+pub(crate) fn resolved_inventory() -> [(&'static str, u32); 26] {
     [
         ("Umd12Trace", UMD12_TRACE.get() as u32),
         ("UmdD3D12", UMD_D3D12.get() as u32),
@@ -338,6 +338,8 @@ pub(crate) fn resolved_inventory() -> [(&'static str, u32); 25] {
         ("Nvk12AdmitBeforeRender", nvk12_admit_before_render() as u32),
         // Appended.
         ("Nvk12CompletionHint", nvk12_completion_hint_us()),
+        // Appended.
+        ("Dlss", dlss() as u32),
     ]
 }
 
@@ -621,4 +623,15 @@ pub(crate) static UMD12_PIPELINE_LIBRARY: BoolKnob = BoolKnob::new(c"Umd12Pipeli
 
 pub(crate) fn umd12_pipeline_library() -> bool {
     UMD12_PIPELINE_LIBRARY.get()
+}
+
+/// `Dlss` (shared with NVK and the D3D11 bridge): with 1 the driver publishes
+/// the two engine-object meta-commands of `forward12::dlss12`, through which
+/// Conduit's dxvk-nvapi reaches vkd3d-proton's cubin entry points for NGX.
+/// Absent or 0: none are published (the behaviour before). Read once per
+/// process.
+pub(crate) static DLSS: BoolKnob = BoolKnob::new(c"Dlss", false);
+
+pub(crate) fn dlss() -> bool {
+    DLSS.get()
 }
