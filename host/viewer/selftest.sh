@@ -492,6 +492,19 @@ check   "a hotspot outside the image is refused" 'CURSOR: 64x64 AR24 hotspot 64,
 nocheck "and nothing is shown for it"           'TEST cursor: id='       "$CASE_LOG"
 nocheck "and the connection survives it"        'protocol violation'     "$CASE_LOG"
 
+echo
+echo "-- guest cursor position (CMD_CURSOR_POS)"
+run_case '' --present 64x64 --cursor-pos
+check   "HELLO advertises the position capability" 'cursor-pos=1'        "$CASE_OUT"
+check   "the position reaches the display, x and y signed" \
+        'TEST cursor pos: -5,700' "$CASE_LOG"
+nocheck "a position is not a protocol violation" 'protocol violation'    "$CASE_LOG"
+
+run_case '' --present 64x64 --bad-cursor-pos
+check   "a position with a buffer field is a violation" \
+        'CURSOR_POS carried an fd or buffer fields' "$CASE_LOG"
+nocheck "and is not shown"                        'TEST cursor pos:'     "$CASE_LOG"
+
 # CTRL+ALT+O / CTRL+ALT+D belong to a backend that draws an overlay; the test
 # backend draws none, so the chord must reach the guest like any other key.
 run_case 'f 1

@@ -1,0 +1,65 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: SR_team <me@sr.team>
+Date: Sat, 24 Oct 2026 03:00:00 +0500
+Subject: [PATCH] vulkan: honor allocation alignment on Windows
+
+The Windows CRT malloc guarantee is 8 bytes on x86. Driver objects can
+require 16-byte alignment. Use the matching aligned allocation,
+reallocation and free functions so the default callbacks satisfy the
+alignment requested by the driver.
+
+---
+diff --git a/src/vulkan/util/vk_alloc.c b/src/vulkan/util/vk_alloc.c
+index 8ab116656c2..1de5d77e949 100644
+--- a/src/vulkan/util/vk_alloc.c
++++ b/src/vulkan/util/vk_alloc.c
+@@ -6,6 +6,9 @@
+ #include "vk_alloc.h"
+
+ #include <stdlib.h>
++#ifdef _WIN32
++#include <malloc.h>
++#endif
+
+ #ifndef _MSC_VER
+ #include <stddef.h>
+@@ -22,8 +25,12 @@ vk_default_alloc(void *pUserData,
+                  size_t alignment,
+                  VkSystemAllocationScope allocationScope)
+ {
++#ifdef _WIN32
++   return size ? _aligned_malloc(size, alignment) : NULL;
++#else
+    assert(MAX_ALIGN % alignment == 0);
+    return malloc(size);
++#endif
+ }
+
+ static VKAPI_ATTR void * VKAPI_CALL
+@@ -33,14 +40,26 @@ vk_default_realloc(void *pUserData,
+                    size_t alignment,
+                    VkSystemAllocationScope allocationScope)
+ {
++#ifdef _WIN32
++   if (size == 0) {
++      _aligned_free(pOriginal);
++      return NULL;
++   }
++   return _aligned_realloc(pOriginal, size, alignment);
++#else
+    assert(MAX_ALIGN % alignment == 0);
+    return realloc(pOriginal, size);
++#endif
+ }
+
+ static VKAPI_ATTR void VKAPI_CALL
+ vk_default_free(void *pUserData, void *pMemory)
+ {
++#ifdef _WIN32
++   _aligned_free(pMemory);
++#else
+    free(pMemory);
++#endif
+ }
+
+ const VkAllocationCallbacks *

@@ -42,6 +42,21 @@
 #define NB_UI_SYNC      (1u << 13)  /* st->sync changed: re-apply presentation */
 #define NB_UI_VM_PAUSE  (1u << 14)  /* run the VM pause command              */
 #define NB_UI_VM_RESUME (1u << 15)  /* run the VM resume command             */
+#define NB_UI_UPSCALER  (1u << 16)  /* run the upscaler command for ui->upscaler */
+
+/* The guest's upscaler override (Windows guests: HKLM\SOFTWARE\Helios
+ * Upscaler), what the menu's Upscaler row sets. */
+enum {
+    NB_UPSCALER_DEFAULT = 0,    /* the game's own choice, no override        */
+    NB_UPSCALER_DLSS,           /* DLSS, newest model (preset override)      */
+    NB_UPSCALER_FSR,            /* FSR through OptiScaler                    */
+    NB_UPSCALER_XESS,           /* XeSS through OptiScaler                   */
+    NB_UPSCALER_COUNT
+};
+/* The word the command takes ("default", "dlss", "fsr", "xess"), and the
+ * chip's label. */
+const char *nb_upscaler_word(int mode);
+const char *nb_upscaler_label(int mode);
 
 /* Pointer shapes the area editor asks for. */
 enum {
@@ -68,6 +83,9 @@ struct nb_ui_env {
     bool     translucent;       /* the panel layer can blend (Wayland: yes) */
     bool     no_stats;          /* this backend has no stats overlay (X11)  */
     bool     immediate;         /* frames are presented immediately now     */
+    bool     upscaler;          /* the upscaler command is available        */
+    int      upscaler_mode;     /* NB_UPSCALER_* last set, -1 not known     */
+    bool     upscaler_busy;     /* its command is still running             */
     /* The display's mode list from the backend (CMD_MODES); NULL or empty
      * with an older backend, which leaves the old presets. */
     const struct nb_modes *modes;
@@ -102,6 +120,7 @@ enum {
     NB_UI_ID_RULE_DEFAULT,      /* the current layout becomes the default    */
     NB_UI_ID_SYNC,              /* arg: NB_SYNC_*                            */
     NB_UI_ID_VM_PAUSE,          /* Pause, or Resume while paused             */
+    NB_UI_ID_UPSCALER,          /* arg: NB_UPSCALER_*                        */
 };
 
 /* One clickable thing on the panel, panel CONTENT coordinates (logical; the
@@ -137,6 +156,7 @@ struct nb_ui {
 
     char   notice[64];          /* text for NB_UI_NOTICE                     */
     unsigned mode_w, mode_h;    /* the mode for NB_UI_MODE_ADD / _DEL        */
+    int    upscaler;            /* the mode for NB_UI_UPSCALER               */
 };
 
 void nb_ui_init(struct nb_ui *ui, struct nb_vstore *st);

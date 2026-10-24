@@ -7,12 +7,15 @@
 # vk_offscreen_test.exe, vk_scanout_present.exe, vk_bar_test.exe,
 # vk_coherence_test.exe, vk_bl_readback.exe, vk_video_probe.exe,
 # helios_icd_test.exe, vk_rmfence_test.exe and helios_share_test.exe plus their
-# SPIR-V (glslangValidator), the self-checking correctness tests
+# SPIR-V (glslangValidator), vk_depth_bind_test.exe and
+# vk_depth_guard_test.exe (image bindings, depth/stencil readback and memory
+# guards), and the self-checking correctness tests
 # vk_zero_page_test.exe, vk_draw_fetch_test.exe, vk_submit_order_test.exe,
 # vk_texture_roundtrip.exe, vk_vertex_formats.exe and vk_mixed_samples_test.exe
 # (SPIR-V built in), vk_gpu_bound.exe (tests/perf: GPU-bound throughput per
 # stage, the Vulkan twin of guest/windows/tools/d3d12_gpu_bound.cpp), and
-# vk_loader_list.exe (what the system Vulkan
+# vk_enhance_pattern.exe (a test pattern for the composed present's
+# upscaling and frame generation, docs/enhance.md), vk_loader_list.exe (what the system Vulkan
 # loader enumerates) and wgl_test.exe (OpenGL through WGL: Zink with app-local
 # opengl32.dll + libgallium_wgl.dll, or the adapter's ICD). MinGW ships no
 # Vulkan import library: one for
@@ -72,9 +75,10 @@ done
 
 for t in vk_summary vk_compute_test vk_offscreen_test vk_scanout_present vk_bar_test vk_coherence_test vk_bl_readback vk_video_probe \
          vk_zero_page_test vk_draw_fetch_test vk_submit_order_test vk_texture_roundtrip vk_vertex_formats \
-         vk_mixed_samples_test; do
+         vk_mixed_samples_test vk_depth_guard_test; do
   "$CC" -O1 -Wall -I"$OUT_DIR/include" "$tests/$t.c" -L"$OUT_DIR" -lvulkan-1 -lm -o "$OUT_DIR/$t.exe"
 done
+"$CC" -O1 -Wall -I"$OUT_DIR/include" "$tests/vk_depth_bind_test.c" -o "$OUT_DIR/vk_depth_bind_test.exe"
 python3 "$tests/perf/gen_gpu_bound_shaders.py" >/dev/null
 "$CC" -O2 -Wall -I"$OUT_DIR/include" "$tests/perf/vk_gpu_bound.c" -L"$OUT_DIR" -lvulkan-1 -lm -static \
   -o "$OUT_DIR/vk_gpu_bound.exe"
@@ -83,6 +87,7 @@ python3 "$tests/perf/gen_gpu_bound_shaders.py" >/dev/null
 "$CC" -O1 -Wall -I"$OUT_DIR/include" "$here/vk_rmfence_test.c" -o "$OUT_DIR/vk_rmfence_test.exe"
 "$CC" -O1 -Wall -I"$OUT_DIR/include" "$here/helios_share_test.c" -o "$OUT_DIR/helios_share_test.exe"
 "$CC" -O1 -Wall -I"$OUT_DIR/include" "$here/vk_lost_test.c" -L"$OUT_DIR" -lvulkan-1 -o "$OUT_DIR/vk_lost_test.exe"
+"$CC" -O2 -Wall -I"$OUT_DIR/include" "$here/vk_enhance_pattern.c" -L"$OUT_DIR" -lvulkan-1 -lwinmm -lgdi32 -luser32 -static-libgcc -o "$OUT_DIR/vk_enhance_pattern.exe"
 "$CC" -O1 -Wall -I"$OUT_DIR/include" "$here/vk_loader_list.c" -static-libgcc -o "$OUT_DIR/vk_loader_list.exe"
 "$CC" -O1 -Wall "$here/wgl_test.c" -lopengl32 -lgdi32 -luser32 -lm -static-libgcc -o "$OUT_DIR/wgl_test.exe"
 

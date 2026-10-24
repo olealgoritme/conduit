@@ -1,0 +1,671 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Sat, 24 Oct 2026 15:43:03 +0200
+Subject: [PATCH] wsi/win32: NIS, CAS, SGSR 1 and xBR-lv2 scalers in the
+ composed present
+
+EnhanceScaler / MESA_WSI_ENHANCE_SCALER take nis, cas, sgsr and xbr
+(also "pixel"):
+
+  nis   NVIDIA Image Scaling, its GLSL path as it is; the coefficient
+        textures are constant arrays generated from NIS_Config.h; 1x to
+        2x per axis (FSR 1 outside that, and for sRGB views); sharpness
+        is NIS's slider; a 32x24 block per group of 128
+  cas   FidelityFX CAS, sharpening and scaling in one pass
+  sgsr  Snapdragon Game Super Resolution 1 with edge direction (upscaling)
+  xbr   Hyllian's xBR-lv2, edge-directed scaling for pixel art, any factor
+
+SGSR 1 and xBR-lv2 are fragment shaders: enhance/adapt.py turns copies of
+them into functions the compute shaders call, at build time.  The push
+constant range is 128 bytes (NIS's constants).
+---
+ src/vulkan/wsi/enhance/adapt.py           |  88 ++++++++++++++
+ src/vulkan/wsi/enhance/enh_cas.comp       |  31 +++++
+ src/vulkan/wsi/enhance/enh_nis.comp       | 104 ++++++++++++++++
+ src/vulkan/wsi/enhance/enh_sgsr.comp      |  30 +++++
+ src/vulkan/wsi/enhance/enh_xbr.comp       |  59 +++++++++
+ src/vulkan/wsi/meson.build                |  22 +++-
+ src/vulkan/wsi/wsi_common_win32_enhance.c | 141 ++++++++++++++++++++--
+ src/vulkan/wsi/wsi_common_win32_enhance.h |   4 +
+ 8 files changed, 464 insertions(+), 15 deletions(-)
+ create mode 100644 src/vulkan/wsi/enhance/adapt.py
+ create mode 100644 src/vulkan/wsi/enhance/enh_cas.comp
+ create mode 100644 src/vulkan/wsi/enhance/enh_nis.comp
+ create mode 100644 src/vulkan/wsi/enhance/enh_sgsr.comp
+ create mode 100644 src/vulkan/wsi/enhance/enh_xbr.comp
+
+diff --git a/src/vulkan/wsi/enhance/adapt.py b/src/vulkan/wsi/enhance/adapt.py
+new file mode 100644
+index 0000000..5342d9e
+--- /dev/null
++++ b/src/vulkan/wsi/enhance/adapt.py
+@@ -0,0 +1,88 @@
++#!/usr/bin/env python3
++# Copyright © 2026 Ole Algoritme
++# SPDX-License-Identifier: MIT
++"""Build-time adaptation of vendored shaders for the enhancement passes.
++
++  adapt.py sgsr  IN OUT   SGSR 1 fragment shader -> sgsr_main() for compute
++                          (also without GLSL ES precision qualifiers)
++  adapt.py xbr   IN OUT   xBR-lv2 slang (fragment stage) -> xbr_main()
++  adapt.py nis-coef IN OUT  NIS_Config.h coef_scale / coef_usm -> GLSL
++                            constant arrays (2 x 64 vec4 each)
++
++The vendored files are not changed; OUT is generated in the build tree.
++"""
++import re
++import sys
++
++
++def sgsr(text):
++    out = []
++    for line in text.splitlines():
++        s = line.strip()
++        if s.startswith('#version') or s.startswith('precision ') or \
++           s.startswith('layout(location') or \
++           re.match(r'uniform\s+(highp\s+)?vec4\s+ViewportInfo', s) or \
++           re.match(r'uniform\s+(mediump\s+)?sampler2D\s+ps0', s):
++            continue
++        # precision qualifiers in expressions are GLSL ES only
++        line = re.sub(r'\b(highp|mediump|lowp)\s+', '', line)
++        out.append(line.replace('void main()', 'void sgsr_main()'))
++    return '\n'.join(out) + '\n'
++
++
++def xbr(text):
++    head, _, rest = text.partition('#pragma stage vertex')
++    _, _, frag = rest.partition('#pragma stage fragment')
++    if not frag:
++        raise SystemExit('xbr: no fragment stage')
++    # the prefix: helpers and #defines, without the version, the push and
++    # uniform blocks and the parameter pragmas
++    head = re.sub(r'#version[^\n]*\n', '', head)
++    head = re.sub(r'layout\(push_constant\)\s*uniform\s+Push\s*\{.*?\}\s*params;', '', head,
++                  flags=re.S)
++    head = re.sub(r'layout\(std140[^)]*\)\s*uniform\s+UBO\s*\{.*?\}\s*global;', '', head,
++                  flags=re.S)
++    head = re.sub(r'#pragma parameter[^\n]*\n', '', head)
++    lines = []
++    for line in frag.splitlines():
++        s = line.strip()
++        if s.startswith('layout('):
++            continue
++        lines.append(line.replace('void main()', 'void xbr_main()'))
++    return head + '\n' + '\n'.join(lines) + '\n'
++
++
++def nis_coef(text):
++    def table(name):
++        m = re.search(r'\b' + name + r'\s*\[kPhaseCount\]\s*\[kFilterSize\]\s*=\s*\{(.*?)\};', text, re.S)
++        if not m:
++            raise SystemExit('nis-coef: no ' + name)
++        vals = [float(v.rstrip('f')) for v in re.findall(r'-?\d+\.\d*(?:e-?\d+)?f?', m.group(1))]
++        if len(vals) != 64 * 8:
++            raise SystemExit('nis-coef: %s has %d values' % (name, len(vals)))
++        return vals
++
++    def glsl(name, vals):
++        # texel (x, phase) of the SDK's 2 x 64 RGBA texture: vals[phase][4x .. 4x+3]
++        vecs = []
++        for phase in range(64):
++            for x in range(2):
++                v = vals[phase * 8 + x * 4: phase * 8 + x * 4 + 4]
++                vecs.append('vec4(%s)' % ', '.join('%.9g' % f for f in v))
++        return 'const vec4 %s[128] = vec4[128](\n   %s);\n' % (name, ',\n   '.join(vecs))
++
++    return ('/* Generated by adapt.py from NIS_Config.h; do not edit. */\n' +
++            glsl('nis_coef_scaler', table('coef_scale')) +
++            glsl('nis_coef_usm', table('coef_usm')))
++
++
++def main():
++    mode, src, dst = sys.argv[1:4]
++    text = open(src, encoding='utf-8').read()
++    out = {'sgsr': sgsr, 'xbr': xbr, 'nis-coef': nis_coef}[mode](text)
++    with open(dst, 'w', encoding='utf-8') as f:
++        f.write(out)
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/src/vulkan/wsi/enhance/enh_cas.comp b/src/vulkan/wsi/enhance/enh_cas.comp
+new file mode 100644
+index 0000000..44336ff
+--- /dev/null
++++ b/src/vulkan/wsi/enhance/enh_cas.comp
+@@ -0,0 +1,31 @@
++#version 450
++#extension GL_GOOGLE_include_directive : require
++/*
++ * Copyright © 2026 Ole Algoritme
++ * SPDX-License-Identifier: MIT
++ *
++ * AMD FidelityFX CAS (third_party/cas, MIT, unmodified): sharpening, and
++ * scaling up to 4x the area in the same pass, of s_src into the dst_size
++ * region.  p0.x: sharpness 0..1.
++ */
++#include "enh_common.glsl"
++
++#define A_GPU 1
++#define A_GLSL 1
++#include "ffx_a.h"
++AF3 CasLoad(ASU2 p) { return texelFetch(s_src, clamp(p, ASU2(0), pc.src_size - 1), 0).rgb; }
++void CasInput(inout AF1 r, inout AF1 g, inout AF1 b) {}
++#include "ffx_cas.h"
++
++void main()
++{
++   ivec2 p = ivec2(gl_GlobalInvocationID.xy);
++   if (p.x >= pc.dst_size.x || p.y >= pc.dst_size.y)
++      return;
++   AU4 c0, c1;
++   CasSetup(c0, c1, pc.p0.x, AF1(pc.src_size.x), AF1(pc.src_size.y),
++            AF1(pc.dst_size.x), AF1(pc.dst_size.y));
++   AF1 r, g, b;
++   CasFilter(r, g, b, AU2(p), c0, c1, pc.src_size == pc.dst_size);
++   imageStore(o_dst, p + pc.dst_off, vec4(enh_out(vec3(r, g, b)), 1.0));
++}
+diff --git a/src/vulkan/wsi/enhance/enh_nis.comp b/src/vulkan/wsi/enhance/enh_nis.comp
+new file mode 100644
+index 0000000..b316d56
+--- /dev/null
++++ b/src/vulkan/wsi/enhance/enh_nis.comp
+@@ -0,0 +1,104 @@
++#version 450
++#extension GL_GOOGLE_include_directive : require
++/*
++ * Copyright © 2026 Ole Algoritme
++ * SPDX-License-Identifier: MIT
++ *
++ * NVIDIA Image Scaling (third_party/nis, MIT, unmodified): the whole of
++ * in_texture scaled into the output viewport of out_texture, one 32x24
++ * block per work group.  NISConfig in push constants
++ * (wsi_common_win32_enhance.c nis_config); the coefficient textures are
++ * constant arrays generated from NIS_Config.h (adapt.py nis-coef).  The
++ * descriptor layout is the other passes': binding 0 the source (linear),
++ * binding 3 the destination.
++ */
++layout(set = 0, binding = 0) uniform sampler2D in_texture;
++layout(set = 0, binding = 3) writeonly uniform image2D out_texture;
++
++layout(push_constant) uniform nis_push {
++   float kDetectRatio;
++   float kDetectThres;
++   float kMinContrastRatio;
++   float kRatioNorm;
++   float kContrastBoost;
++   float kEps;
++   float kSharpStartY;
++   float kSharpScaleY;
++   float kSharpStrengthMin;
++   float kSharpStrengthScale;
++   float kSharpLimitMin;
++   float kSharpLimitScale;
++   float kScaleX;
++   float kScaleY;
++   float kDstNormX;
++   float kDstNormY;
++   float kSrcNormX;
++   float kSrcNormY;
++   uint kInputViewportOriginX;
++   uint kInputViewportOriginY;
++   uint kInputViewportWidth;
++   uint kInputViewportHeight;
++   uint kOutputViewportOriginX;
++   uint kOutputViewportOriginY;
++   uint kOutputViewportWidth;
++   uint kOutputViewportHeight;
++} nis;
++#define kDetectRatio nis.kDetectRatio
++#define kDetectThres nis.kDetectThres
++#define kMinContrastRatio nis.kMinContrastRatio
++#define kRatioNorm nis.kRatioNorm
++#define kContrastBoost nis.kContrastBoost
++#define kEps nis.kEps
++#define kSharpStartY nis.kSharpStartY
++#define kSharpScaleY nis.kSharpScaleY
++#define kSharpStrengthMin nis.kSharpStrengthMin
++#define kSharpStrengthScale nis.kSharpStrengthScale
++#define kSharpLimitMin nis.kSharpLimitMin
++#define kSharpLimitScale nis.kSharpLimitScale
++#define kScaleX nis.kScaleX
++#define kScaleY nis.kScaleY
++#define kDstNormX nis.kDstNormX
++#define kDstNormY nis.kDstNormY
++#define kSrcNormX nis.kSrcNormX
++#define kSrcNormY nis.kSrcNormY
++#define kInputViewportOriginX nis.kInputViewportOriginX
++#define kInputViewportOriginY nis.kInputViewportOriginY
++#define kInputViewportWidth nis.kInputViewportWidth
++#define kInputViewportHeight nis.kInputViewportHeight
++#define kOutputViewportOriginX nis.kOutputViewportOriginX
++#define kOutputViewportOriginY nis.kOutputViewportOriginY
++#define kOutputViewportWidth nis.kOutputViewportWidth
++#define kOutputViewportHeight nis.kOutputViewportHeight
++
++#define NIS_GLSL 1
++#define NIS_HLSL 0
++#define NIS_HLSL_6_2 0
++#define NIS_SCALER 1
++#define NIS_USE_HALF_PRECISION 0
++#define NIS_CLAMP_OUTPUT 1
++#define NIS_NV12_SUPPORT 0
++#define NIS_VIEWPORT_SUPPORT 1
++#define NIS_TEXTURE_GATHER 0
++#define NIS_BLOCK_WIDTH 32
++#define NIS_BLOCK_HEIGHT 24
++#define NIS_THREAD_GROUP_SIZE 128   /* the SDK's choice for NVIDIA (NISOptimizer) */
++
++#include "nis_coef.glsl"
++const int coef_scaler = 0;
++const int coef_usm = 1;
++vec4 nis_coef(int which, ivec2 p)
++{
++   return which == coef_scaler ? nis_coef_scaler[p.y * 2 + p.x] : nis_coef_usm[p.y * 2 + p.x];
++}
++/* The SDK's GLSL reads textures as sampler2D(texture, sampler): here the
++ * source is a combined sampler, and the coefficients (the only texelFetch)
++ * are the arrays above */
++#define sampler2D(x, s) x
++#define texelFetch(t, p, l) nis_coef(t, p)
++#include "NIS_Scaler.h"
++
++layout(local_size_x = NIS_THREAD_GROUP_SIZE) in;
++void main()
++{
++   NVScaler(gl_WorkGroupID.xy, gl_LocalInvocationID.x);
++}
+diff --git a/src/vulkan/wsi/enhance/enh_sgsr.comp b/src/vulkan/wsi/enhance/enh_sgsr.comp
+new file mode 100644
+index 0000000..c10b57f
+--- /dev/null
++++ b/src/vulkan/wsi/enhance/enh_sgsr.comp
+@@ -0,0 +1,30 @@
++#version 450
++#extension GL_GOOGLE_include_directive : require
++/*
++ * Copyright © 2026 Ole Algoritme
++ * SPDX-License-Identifier: MIT
++ *
++ * Snapdragon Game Super Resolution 1 (third_party/sgsr, BSD-3-Clause; the
++ * fragment shader made a function by adapt.py at build time), edge
++ * direction on: s_src upscaled into the dst_size region, one pixel per
++ * invocation.  s_src is sampled through a linear sampler.
++ */
++#include "enh_common.glsl"
++
++#define UseEdgeDirection
++vec4 ViewportInfo[1];
++vec4 in_TEXCOORD0;
++vec4 out_Target0;
++#define ps0 s_src
++#include "sgsr1_adapted.glsl"
++
++void main()
++{
++   ivec2 p = ivec2(gl_GlobalInvocationID.xy);
++   if (p.x >= pc.dst_size.x || p.y >= pc.dst_size.y)
++      return;
++   ViewportInfo[0] = vec4(1.0 / vec2(pc.src_size), vec2(pc.src_size));
++   in_TEXCOORD0 = vec4((vec2(p) + 0.5) / vec2(pc.dst_size), 0.0, 0.0);
++   sgsr_main();
++   imageStore(o_dst, p + pc.dst_off, vec4(enh_out(out_Target0.rgb), 1.0));
++}
+diff --git a/src/vulkan/wsi/enhance/enh_xbr.comp b/src/vulkan/wsi/enhance/enh_xbr.comp
+new file mode 100644
+index 0000000..ce02c76
+--- /dev/null
++++ b/src/vulkan/wsi/enhance/enh_xbr.comp
+@@ -0,0 +1,59 @@
++#version 450
++#extension GL_GOOGLE_include_directive : require
++/*
++ * Copyright © 2026 Ole Algoritme
++ * SPDX-License-Identifier: MIT
++ *
++ * Hyllian's xBR-lv2 (third_party/xbr, MIT; the fragment stage made a
++ * function by adapt.py at build time, its vertex stage's taps computed
++ * here): edge-directed scaling for pixel art, s_src into the dst_size
++ * region at any factor.  s_src is sampled through a nearest sampler.
++ */
++#include "enh_common.glsl"
++
++struct xbr_params {
++   vec4 SourceSize;
++   vec4 OriginalSize;
++   vec4 OutputSize;
++   uint FrameCount;
++   float XBR_EQ_THRESHOLD;
++   float XBR_LV2_COEFFICIENT;
++   float XBR_BLENDING;
++};
++xbr_params params;
++vec2 texCoord;
++vec4 t1, t2, t3, t4, t5, t6, t7;
++float aa_factor;
++vec4 FragColor;
++#define Source s_src
++#include "xbr_lv2_adapted.glsl"
++
++void main()
++{
++   ivec2 p = ivec2(gl_GlobalInvocationID.xy);
++   if (p.x >= pc.dst_size.x || p.y >= pc.dst_size.y)
++      return;
++   const vec2 src = vec2(pc.src_size), dst = vec2(pc.dst_size);
++   params.SourceSize = vec4(src, 1.0 / src);
++   params.OriginalSize = params.SourceSize;
++   params.OutputSize = vec4(dst, 1.0 / dst);
++   params.FrameCount = 0u;
++   /* the upstream preset's defaults */
++   XBR_EQ_THRESHOLD = 0.32;      /* params.XBR_EQ_THRESHOLD, by the file's macros */
++   XBR_LV2_COEFFICIENT = 0.30;
++   XBR_BLENDING = 1.0;
++
++   /* the vertex stage, per pixel */
++   texCoord = (vec2(p) + 0.5) / dst * 1.0001;
++   aa_factor = 2.0 * params.OutputSize.z * params.SourceSize.x;
++   const float dx = params.SourceSize.z, dy = params.SourceSize.w;
++   t1 = texCoord.xxxy + vec4(-dx, 0, dx, -2.0 * dy);
++   t2 = texCoord.xxxy + vec4(-dx, 0, dx, -dy);
++   t3 = texCoord.xxxy + vec4(-dx, 0, dx, 0);
++   t4 = texCoord.xxxy + vec4(-dx, 0, dx, dy);
++   t5 = texCoord.xxxy + vec4(-dx, 0, dx, 2.0 * dy);
++   t6 = texCoord.xyyy + vec4(-2.0 * dx, -dy, 0, dy);
++   t7 = texCoord.xyyy + vec4(2.0 * dx, -dy, 0, dy);
++   xbr_main();
++   imageStore(o_dst, p + pc.dst_off, vec4(enh_out(FragColor.rgb), 1.0));
++}
+diff --git a/src/vulkan/wsi/meson.build b/src/vulkan/wsi/meson.build
+index 5b34f7c..5cadd4a 100644
+--- a/src/vulkan/wsi/meson.build
++++ b/src/vulkan/wsi/meson.build
+@@ -38,7 +38,22 @@ if with_platform_windows
+   if not prog_glslang.found()
+     error('glslangValidator is needed for the Win32 WSI enhancement shaders')
+   endif
+-  foreach s : ['enh_scale', 'enh_easu', 'enh_rcas', 'fg_down', 'fg_flow', 'fg_interp']
++  # SGSR 1 and xBR-lv2 made functions, NIS's coefficients as constants
++  # (enhance/adapt.py; the vendored files stay as they are)
++  enh_adapted = []
++  foreach a : [['sgsr', 'sgsr/sgsr1_shader_mobile_edge_direction.frag', 'sgsr1_adapted.glsl'],
++               ['xbr', 'xbr/xbr-lv2-standalone.slang', 'xbr_lv2_adapted.glsl'],
++               ['nis-coef', 'nis/NIS_Config.h', 'nis_coef.glsl']]
++    enh_adapted += custom_target(
++      a[2],
++      input : ['enhance/adapt.py', 'enhance/third_party' / a[1]],
++      output : a[2],
++      command : [prog_python, '@INPUT0@', a[0], '@INPUT1@', '@OUTPUT@'],
++    )
++  endforeach
++  enh_third_party = meson.current_source_dir() / 'enhance' / 'third_party'
++  foreach s : ['enh_scale', 'enh_easu', 'enh_rcas', 'enh_nis', 'enh_cas', 'enh_sgsr',
++               'enh_xbr', 'fg_down', 'fg_flow', 'fg_interp']
+     files_vulkan_wsi += custom_target(
+       s + '_spv.h',
+       input : 'enhance' / s + '.comp',
+@@ -46,11 +61,14 @@ if with_platform_windows
+       command : [
+         prog_glslang, '-V', '--target-env', 'vulkan1.1', '-S', 'comp',
+         '-I' + (meson.current_source_dir() / 'enhance'),
+-        '-I' + (meson.current_source_dir() / 'enhance' / 'third_party' / 'fsr1'),
++        '-I' + meson.current_build_dir(),
++        '-I' + (enh_third_party / 'fsr1'), '-I' + (enh_third_party / 'cas'),
++        '-I' + (enh_third_party / 'nis'),
+         '--vn', s + '_spv', '-o', '@OUTPUT@', '@INPUT@',
+         glslang_quiet, glslang_depfile,
+       ],
+       depfile : s + '_spv.h.d',
++      depends : enh_adapted,
+     )
+   endforeach
+ else
+diff --git a/src/vulkan/wsi/wsi_common_win32_enhance.c b/src/vulkan/wsi/wsi_common_win32_enhance.c
+index 0e4ad5c..99cf668 100644
+--- a/src/vulkan/wsi/wsi_common_win32_enhance.c
++++ b/src/vulkan/wsi/wsi_common_win32_enhance.c
+@@ -51,6 +51,10 @@
+ #include "fg_down_spv.h"
+ #include "fg_flow_spv.h"
+ #include "fg_interp_spv.h"
++#include "enh_nis_spv.h"
++#include "enh_cas_spv.h"
++#include "enh_sgsr_spv.h"
++#include "enh_xbr_spv.h"
+ 
+ #define LOGI(...) wsi_win32_compose_log(false, "enhance: " __VA_ARGS__)
+ #define LOGE(...) wsi_win32_compose_log(true, "enhance: " __VA_ARGS__)
+@@ -64,6 +68,10 @@ static const char *const scaler_names[WSI_ENH_SCALER_COUNT] = {
+    [WSI_ENH_SCALER_BICUBIC] = "bicubic",
+    [WSI_ENH_SCALER_INTEGER] = "integer",
+    [WSI_ENH_SCALER_FSR] = "fsr",
++   [WSI_ENH_SCALER_NIS] = "nis",
++   [WSI_ENH_SCALER_CAS] = "cas",
++   [WSI_ENH_SCALER_SGSR] = "sgsr",
++   [WSI_ENH_SCALER_XBR] = "xbr",
+ };
+ 
+ const char *
+@@ -91,6 +99,8 @@ parse_scaler(struct wsi_enh_config *c, const char *v)
+    }
+    if (word_is(v, "fsr1"))
+       c->scaler = WSI_ENH_SCALER_FSR;
++   else if (word_is(v, "pixel") || word_is(v, "xbr-lv2"))
++      c->scaler = WSI_ENH_SCALER_XBR;
+ }
+ 
+ static void
+@@ -345,6 +355,10 @@ enum enh_pipe {
+    P_DOWN,
+    P_FLOW,
+    P_INTERP,
++   P_NIS,
++   P_CAS,
++   P_SGSR,
++   P_XBR,
+    P_COUNT,
+ };
+ 
+@@ -360,6 +374,10 @@ static const struct {
+    SPV(P_DOWN, fg_down),
+    SPV(P_FLOW, fg_flow),
+    SPV(P_INTERP, fg_interp),
++   SPV(P_NIS, enh_nis),
++   SPV(P_CAS, enh_cas),
++   SPV(P_SGSR, enh_sgsr),
++   SPV(P_XBR, enh_xbr),
+ #undef SPV
+ };
+ 
+@@ -375,6 +393,20 @@ struct enh_push {
+ };
+ #define ENH_FLAG_SRGB_ENCODE 1u
+ 
++/* enh_nis.comp's push constants: NISConfig (third_party/nis/NIS_Config.h)
++ * without its reserved tail */
++struct nis_push {
++   float kDetectRatio, kDetectThres, kMinContrastRatio, kRatioNorm;
++   float kContrastBoost, kEps, kSharpStartY, kSharpScaleY;
++   float kSharpStrengthMin, kSharpStrengthScale, kSharpLimitMin, kSharpLimitScale;
++   float kScaleX, kScaleY, kDstNormX, kDstNormY, kSrcNormX, kSrcNormY;
++   uint32_t kInputViewportOriginX, kInputViewportOriginY;
++   uint32_t kInputViewportWidth, kInputViewportHeight;
++   uint32_t kOutputViewportOriginX, kOutputViewportOriginY;
++   uint32_t kOutputViewportWidth, kOutputViewportHeight;
++};
++#define ENH_PUSH_SIZE 128
++
+ #define ENH_LEVELS 6     /* pyramid levels 1..5 (1/2 .. 1/32) */
+ #define ENH_FAMILIES 8
+ 
+@@ -596,8 +628,10 @@ enh_pipelines(struct wsi_enh *e)
+    r = wsi->CreateDescriptorSetLayout(e->dev, &dci, &e->alloc, &e->dsl);
+    if (r != VK_SUCCESS)
+       return r;
++   STATIC_ASSERT(sizeof(struct enh_push) <= ENH_PUSH_SIZE);
++   STATIC_ASSERT(sizeof(struct nis_push) <= ENH_PUSH_SIZE);
+    const VkPushConstantRange pcr = {
+-      VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(struct enh_push)
++      VK_SHADER_STAGE_COMPUTE_BIT, 0, ENH_PUSH_SIZE
+    };
+    const VkPipelineLayoutCreateInfo lci = {
+       .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+@@ -999,11 +1033,13 @@ image_barrier(const struct wsi_device *wsi, VkCommandBuffer cmd, VkImage image,
+    wsi->CmdPipelineBarrier(cmd, src, dst, 0, 0, NULL, 0, NULL, 1, &ib);
+ }
+ 
+-/* One dispatch: samplers 0..2 (view, sampler), storage 3, constants */
++/* One dispatch: samplers 0..2 (view, sampler), storage 3, constants
++ * (`push_size` bytes) and a grid of groups */
+ static void
+-dispatch(struct wsi_enh *e, VkCommandBuffer cmd, enum enh_pipe p,
+-         VkImageView s0, VkSampler sm0, VkImageView s1, VkImageView s2,
+-         VkImageView dst, const struct enh_push *push)
++dispatch_raw(struct wsi_enh *e, VkCommandBuffer cmd, enum enh_pipe p,
++             VkImageView s0, VkSampler sm0, VkImageView s1, VkImageView s2,
++             VkImageView dst, const void *push, uint32_t push_size,
++             uint32_t gx, uint32_t gy)
+ {
+    const struct wsi_device *wsi = e->wsi;
+    const VkDescriptorImageInfo ii[4] = {
+@@ -1027,9 +1063,64 @@ dispatch(struct wsi_enh *e, VkCommandBuffer cmd, enum enh_pipe p,
+    wsi->CmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, e->layout,
+                                 0, 4, w);
+    wsi->CmdPushConstants(cmd, e->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+-                         sizeof(*push), push);
+-   wsi->CmdDispatch(cmd, DIV_ROUND_UP(push->dst_size[0], 8),
+-                    DIV_ROUND_UP(push->dst_size[1], 8), 1);
++                         push_size, push);
++   wsi->CmdDispatch(cmd, gx, gy, 1);
++}
++
++/* The 8x8 passes: one invocation per pixel of the dst_size region */
++static void
++dispatch(struct wsi_enh *e, VkCommandBuffer cmd, enum enh_pipe p,
++         VkImageView s0, VkSampler sm0, VkImageView s1, VkImageView s2,
++         VkImageView dst, const struct enh_push *push)
++{
++   dispatch_raw(e, cmd, p, s0, sm0, s1, s2, dst, push, sizeof(*push),
++                DIV_ROUND_UP(push->dst_size[0], 8), DIV_ROUND_UP(push->dst_size[1], 8));
++}
++
++/* NVScalerUpdateConfig (NIS_Config.h) for SDR: the whole source into the
++ * out region at `off` of a dst_w x dst_h target.  false outside 1x..2x. */
++static bool
++nis_config(struct nis_push *c, float sharpness, VkExtent2D src, VkExtent2D out,
++           VkOffset2D off, uint32_t dst_w, uint32_t dst_h)
++{
++   sharpness = CLAMP(sharpness, 0.0f, 1.0f);
++   const float s = sharpness - 0.5f;
++   const float max_scale = s >= 0.0f ? 1.25f : 1.75f;
++   const float min_scale = s >= 0.0f ? 1.25f : 1.0f;
++   const float limit_scale = s >= 0.0f ? 1.25f : 1.0f;
++   const float min_contrast = 2.0f, max_contrast = 10.0f;
++   const float start_y = 0.45f, end_y = 0.9f;
++   const float strength_min = MAX2(0.0f, 0.4f + s * min_scale * 1.2f);
++   const float strength_max = 1.6f + s * max_scale * 1.8f;
++   const float limit_min = MAX2(0.1f, 0.14f + s * limit_scale * 0.32f);
++   const float limit_max = 0.5f + s * limit_scale * 0.6f;
++   memset(c, 0, sizeof(*c));
++   c->kDetectRatio = 2 * 1127.f / 1024.f;
++   c->kDetectThres = 64.0f / 1024.0f;
++   c->kMinContrastRatio = min_contrast;
++   c->kRatioNorm = 1.0f / (max_contrast - min_contrast);
++   c->kContrastBoost = 1.0f;
++   c->kEps = 1.0f / 255.0f;
++   c->kSharpStartY = start_y;
++   c->kSharpScaleY = 1.0f / (end_y - start_y);
++   c->kSharpStrengthMin = strength_min;
++   c->kSharpStrengthScale = strength_max - strength_min;
++   c->kSharpLimitMin = limit_min;
++   c->kSharpLimitScale = limit_max - limit_min;
++   c->kInputViewportWidth = src.width;
++   c->kInputViewportHeight = src.height;
++   c->kOutputViewportOriginX = (uint32_t)off.x;
++   c->kOutputViewportOriginY = (uint32_t)off.y;
++   c->kOutputViewportWidth = out.width;
++   c->kOutputViewportHeight = out.height;
++   c->kSrcNormX = 1.0f / src.width;
++   c->kSrcNormY = 1.0f / src.height;
++   c->kDstNormX = 1.0f / dst_w;
++   c->kDstNormY = 1.0f / dst_h;
++   c->kScaleX = (float)src.width / (float)out.width;
++   c->kScaleY = (float)src.height / (float)out.height;
++   return c->kScaleX >= 0.5f && c->kScaleX <= 1.0f &&
++          c->kScaleY >= 0.5f && c->kScaleY <= 1.0f;
+ }
+ 
+ static void
+@@ -1047,16 +1138,38 @@ push_sizes(struct enh_push *p, VkExtent2D src, VkExtent2D dst, VkOffset2D off)
+ /* The scaler: the application's image into `dst` (rect size at `off`) */
+ static void
+ record_scale(struct wsi_enh *e, VkCommandBuffer cmd, VkImageView src,
+-             VkImageView dst, VkOffset2D off)
++             VkImageView dst, VkOffset2D off, uint32_t dst_w, uint32_t dst_h)
+ {
+    struct enh_push p;
+    const VkExtent2D out = e->rect.extent;
+    const uint32_t srgb = e->src_srgb ? ENH_FLAG_SRGB_ENCODE : 0;
+    enum wsi_enh_scaler s = e->cfg.scaler;
+    const bool upscale = out.width >= e->src.width && out.height >= e->src.height;
+-   /* EASU only enlarges */
+-   if (s == WSI_ENH_SCALER_FSR && !upscale)
++   /* EASU, NIS and SGSR only enlarge; NIS from 1x to 2x per axis (FSR
++    * above), and without an sRGB view of its own */
++   struct nis_push nis;
++   if (s == WSI_ENH_SCALER_NIS &&
++       (e->src_srgb || !nis_config(&nis, (float)e->cfg.sharpness / 100.0f, e->src, out,
++                                   off, dst_w, dst_h)))
++      s = WSI_ENH_SCALER_FSR;
++   if ((s == WSI_ENH_SCALER_FSR || s == WSI_ENH_SCALER_SGSR) && !upscale)
+       s = WSI_ENH_SCALER_BILINEAR;
++   if (s == WSI_ENH_SCALER_NIS) {
++      dispatch_raw(e, cmd, P_NIS, src, e->linear, VK_NULL_HANDLE, VK_NULL_HANDLE, dst,
++                   &nis, sizeof(nis), DIV_ROUND_UP(out.width, 32),
++                   DIV_ROUND_UP(out.height, 24));
++      return;
++   }
++   if (s == WSI_ENH_SCALER_CAS || s == WSI_ENH_SCALER_SGSR || s == WSI_ENH_SCALER_XBR) {
++      push_sizes(&p, e->src, out, off);
++      p.flags = srgb;
++      p.p0[0] = (float)e->cfg.sharpness / 100.0f;
++      const enum enh_pipe pipe = s == WSI_ENH_SCALER_CAS ? P_CAS :
++                                 s == WSI_ENH_SCALER_SGSR ? P_SGSR : P_XBR;
++      dispatch(e, cmd, pipe, src, s == WSI_ENH_SCALER_XBR ? e->nearest : e->linear,
++               VK_NULL_HANDLE, VK_NULL_HANDLE, dst, &p);
++      return;
++   }
+    if (s == WSI_ENH_SCALER_FSR) {
+       const bool rcas = e->cfg.sharpness > 0;
+       push_sizes(&p, e->src, out, rcas ? (VkOffset2D){ 0, 0 } : off);
+@@ -1281,11 +1394,13 @@ wsi_enh_record(struct wsi_enh *e, uint32_t qfi, uint32_t src_index,
+    const uint32_t real_slot = plan->slot[plan->count - 1];
+ 
+    if (!fg) {
+-      record_scale(e, cmd, src, e->slot_views[real_slot], e->rect.offset);
++      record_scale(e, cmd, src, e->slot_views[real_slot], e->rect.offset,
++                   e->dst.width, e->dst.height);
+       timestamp(e, cmd, f, src_index, TS_SCALE);
+    } else {
+       const int cur = e->cur, prev = cur ^ 1;
+-      record_scale(e, cmd, src, e->hist[cur].view, zero);
++      record_scale(e, cmd, src, e->hist[cur].view, zero, e->rect.extent.width,
++                   e->rect.extent.height);
+       timestamp(e, cmd, f, src_index, TS_SCALE);
+ 
+       /* the luma pyramid of this frame, from the application's image */
+diff --git a/src/vulkan/wsi/wsi_common_win32_enhance.h b/src/vulkan/wsi/wsi_common_win32_enhance.h
+index cc523c0..85a7cc9 100644
+--- a/src/vulkan/wsi/wsi_common_win32_enhance.h
++++ b/src/vulkan/wsi/wsi_common_win32_enhance.h
+@@ -33,6 +33,10 @@ enum wsi_enh_scaler {
+    WSI_ENH_SCALER_BICUBIC,
+    WSI_ENH_SCALER_INTEGER,     /* largest whole factor that fits, nearest */
+    WSI_ENH_SCALER_FSR,         /* FSR 1: EASU, then RCAS */
++   WSI_ENH_SCALER_NIS,         /* NVIDIA Image Scaling, 1x..2x per axis */
++   WSI_ENH_SCALER_CAS,         /* FidelityFX CAS: sharpen, scale to 4x area */
++   WSI_ENH_SCALER_SGSR,        /* Snapdragon Game Super Resolution 1 */
++   WSI_ENH_SCALER_XBR,         /* xBR-lv2: pixel art */
+    WSI_ENH_SCALER_COUNT,
+ };
+ 

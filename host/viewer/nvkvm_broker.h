@@ -193,6 +193,7 @@ struct nb_config {
     const char *vm_reboot_cmd;
     const char *vm_pause_cmd;   /* menu: Pause / Resume, waited for without */
     const char *vm_resume_cmd;  /* blocking; the label flips on exit 0      */
+    const char *vm_upscaler_cmd;/* menu: Upscaler, run as `CMD WORD`        */
     bool        open_menu;      /* --open-menu: start with the menu open    */
 };
 
@@ -389,6 +390,8 @@ struct nb_sink {
      * CMD_CURSOR received -- read by the stats overlay, never reset. */
     uint64_t n_input;
     uint64_t n_cursor;
+    /* CMD_CURSOR_POS received (the guest's pointer position, under grab). */
+    uint64_t n_cursor_pos;
 
 };
 
@@ -634,6 +637,14 @@ struct nb_session_ops {
     int  (*cursor)(struct nb_session *s, const struct nb_buf_desc *d,
                    unsigned hot_x, unsigned hot_y);
     /*
+     * Conduit: the guest's pointer position (CMD_CURSOR_POS), guest pixels,
+     * the hotspot's.  OPTIONAL; a backend that sets it must also advertise
+     * NVKVM_BROKER_CAP_CURSOR_POS.  Arrives only while grabbed (give or take
+     * one in flight when the grab ends), when the backend draws the guest
+     * cursor itself because the host pointer is locked.
+     */
+    void (*cursor_pos)(struct nb_session *s, int x, int y);
+    /*
      * virtio-nvgpu: a broker-owned CTRL+ALT+<key> chord other than G and F
      * (O overlay, D direct mode).  OPTIONAL; when NULL those chords are not
      * consumed and reach the guest like any other key.  Returns true if the
@@ -818,6 +829,16 @@ bool nb_vm_pause_ask(struct nb_vmpause *vp, struct nb_sink *sink,
                      size_t n);
 bool nb_vm_pause_reap(struct nb_vmpause *vp, struct nb_sink *sink, char *note,
                       size_t n);
+/*
+ * The menu's Upscaler row (struct nb_upscaler in nb_vmpause.h): _ask starts
+ * --vm-upscaler-cmd for `mode`; _reap, from the UI tick while it runs, true
+ * when it ended, with the outcome in `note`.
+ */
+struct nb_upscaler;
+bool nb_upscaler_ask(struct nb_upscaler *u, const struct nb_config *cfg,
+                     int mode, char *note, size_t n);
+bool nb_upscaler_reap(struct nb_upscaler *u, char *note, size_t n);
+
 /* The status line while paused (title bar / window name). */
 #define NB_VM_PAUSED_STATUS "PAUSED - CTRL+ALT+M TO RESUME"
 

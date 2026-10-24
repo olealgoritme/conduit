@@ -224,5 +224,8 @@ if ($driverRemovalFailed) {
 Remove-Item -LiteralPath $statePath -Force
 Remove-Item -LiteralPath (Join-Path $stateRoot "provisioning") -Recurse -Force -ErrorAction SilentlyContinue
 Remove-Item -LiteralPath (Join-Path $stateRoot "provisioning-status.json") -Force -ErrorAction SilentlyContinue
+# The OptiScaler releases Install-OptiScaler.ps1 downloaded (games keep the
+# copies it put next to them).
+Remove-Item -LiteralPath (Join-Path $stateRoot "optiscaler") -Recurse -Force -ErrorAction SilentlyContinue
 Write-HeliosProgress 100 "Helios was removed"
 Write-Host "Helios runtime registrations were removed. Reboot Windows to finish unloading the driver."

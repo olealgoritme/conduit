@@ -710,6 +710,13 @@ fn vm_action_args(me: &str, name: &str, help: &str) -> Vec<String> {
             format!("{me} resume {vm}"),
         ]);
     }
+    // The viewer appends the mode word (default, dlss, fsr, xess).
+    if help.contains("--vm-upscaler-cmd") {
+        args.extend([
+            "--vm-upscaler-cmd".to_string(),
+            format!("{me} upscaler {vm}"),
+        ]);
+    }
     args
 }
 
@@ -1767,6 +1774,13 @@ mod clipboard_tests {
         let q = vm_action_args("/opt/my conduit/conduit", "my vm", help);
         assert_eq!(q[5], "'/opt/my conduit/conduit' pause 'my vm'");
         assert_eq!(q[7], "'/opt/my conduit/conduit' resume 'my vm'");
+        // A viewer with the Upscaler row gets the command without the mode.
+        let help = "  --vm-pause-cmd CMD, --vm-resume-cmd CMD\n  --vm-upscaler-cmd CMD\n";
+        let up = vm_action_args("/usr/bin/conduit", "win11", help);
+        assert_eq!(
+            up[8..],
+            ["--vm-upscaler-cmd", "/usr/bin/conduit upscaler win11"]
+        );
     }
 
     #[test]

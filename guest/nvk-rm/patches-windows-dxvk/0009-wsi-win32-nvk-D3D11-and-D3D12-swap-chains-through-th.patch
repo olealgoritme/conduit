@@ -1,0 +1,2152 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Sat, 24 Oct 2026 15:03:45 +0200
+Subject: [PATCH] wsi/win32, nvk: D3D11 and D3D12 swap chains through the
+ enhanced composed present
+
+D3D presents in a Helios guest go through DXGI, the Helios UMDs and the
+KMD, never through a Vulkan swapchain.  Where a Helios D3D driver runs on
+this NVK and enhancement is on for the process, NVK hooks DXGI's
+IDXGIFactory::CreateSwapChain and IDXGIFactory2::CreateSwapChainForHwnd
+(after the UMD's FlipUpgrade hooks, which chains not taken still go
+through) and gives the application a swap chain of its own
+(IDXGISwapChain4):
+
+  - its back buffers are textures of the application's size on its
+    device; Present copies the current one into a ring of three shared
+    textures on the application's queue (D3D11: CopyResource and an event
+    query, the immediate context made multithread-protected; D3D12: a
+    command list and a fence) and returns;
+  - a thread per swap chain waits for the copy, runs the enhancement
+    passes on an NVK device of its own in the process (the ring textures
+    imported by their Helios resource ids, KMT handles for D3D11, NT
+    handles for D3D12) into output slots of the window's size, and presents
+    them paced through the composed present's D3D11 device and DXGI flip
+    swap chain on the window.
+
+ResizeBuffers rebuilds everything at the new size; exclusive fullscreen
+is not entered (SetFullscreenState is recorded, the window stays as it
+is).  Formats other than 8-bit BGRA/RGBA and multisampled chains go to
+DXGI as before.  MESA_WSI_ENHANCE_D3D=0 or EnhanceD3D=0 leaves D3D
+swap chains alone; with enhancement off nothing is hooked.
+---
+ src/nouveau/vulkan/nvk_wsi.c                |    5 +
+ src/vulkan/wsi/meson.build                  |    3 +-
+ src/vulkan/wsi/wsi_common_private.h         |   11 +
+ src/vulkan/wsi/wsi_common_win32.cpp         |   10 +-
+ src/vulkan/wsi/wsi_common_win32_compose.cpp |  153 +-
+ src/vulkan/wsi/wsi_common_win32_dxgi.cpp    | 1440 +++++++++++++++++++
+ src/vulkan/wsi/wsi_common_win32_dxgi.h      |   45 +
+ src/vulkan/wsi/wsi_common_win32_dxgi12.cpp  |  252 ++++
+ src/vulkan/wsi/wsi_common_win32_enhance.c   |    8 +
+ src/vulkan/wsi/wsi_common_win32_enhance.h   |    1 +
+ 10 files changed, 1917 insertions(+), 11 deletions(-)
+ create mode 100644 src/vulkan/wsi/wsi_common_win32_dxgi.cpp
+ create mode 100644 src/vulkan/wsi/wsi_common_win32_dxgi.h
+ create mode 100644 src/vulkan/wsi/wsi_common_win32_dxgi12.cpp
+
+diff --git a/src/nouveau/vulkan/nvk_wsi.c b/src/nouveau/vulkan/nvk_wsi.c
+index 0684b78..341a571 100644
+--- a/src/nouveau/vulkan/nvk_wsi.c
++++ b/src/nouveau/vulkan/nvk_wsi.c
+@@ -7,6 +7,9 @@
+ #include "nvk_instance.h"
+ #include "nvkmd/nvkmd.h"
+ #include "wsi_common.h"
++#ifdef _WIN32
++#include "wsi_common_win32_dxgi.h"
++#endif
+ 
+ #ifdef _WIN32
+ #include "nvk_device.h"
+@@ -283,6 +286,8 @@ nvk_init_wsi(struct nvk_physical_device *pdev)
+          pdev->wsi_device.win32.compose_import = nvk_wsi_compose_import;
+          wsi_win32_compose_log(false, "NVK: window swap chains present through a D3D11 flip swap "
+                    "chain (NVK_HELIOS_WSI_COMPOSE=0 turns it off)");
++         /* D3D swap chains through the same present, where enhancement is on */
++         wsi_win32_dxgi_install();
+       } else {
+          wsi_win32_compose_log(true, "NVK: composed present wanted, but the KMD or librmclient "
+                    "has no shared-surface import: not composing");
+diff --git a/src/vulkan/wsi/meson.build b/src/vulkan/wsi/meson.build
+index 8259a40..5b34f7c 100644
+--- a/src/vulkan/wsi/meson.build
++++ b/src/vulkan/wsi/meson.build
+@@ -29,7 +29,8 @@ endif
+ 
+ if with_platform_windows
+   files_vulkan_wsi += files('wsi_common_win32.cpp', 'wsi_common_win32_frametime.c', 'wsi_common_win32_compose.cpp',
+-                            'wsi_common_win32_enhance.c')
++                            'wsi_common_win32_enhance.c', 'wsi_common_win32_dxgi.cpp',
++                            'wsi_common_win32_dxgi12.cpp')
+   platform_deps += dep_dxheaders
+   # The composed present's upscaling and frame-generation passes, compiled
+   # to SPIR-V here and embedded (enhance/; FidelityFX FSR 1 in
+diff --git a/src/vulkan/wsi/wsi_common_private.h b/src/vulkan/wsi/wsi_common_private.h
+index 5d0b93f..29abcb2 100644
+--- a/src/vulkan/wsi/wsi_common_private.h
++++ b/src/vulkan/wsi/wsi_common_private.h
+@@ -452,7 +452,18 @@ void wsi_win32_compose_image_destroy(struct wsi_win32_compose *compose,
+ VkResult wsi_win32_compose_present(struct wsi_win32_compose *compose,
+                                    struct wsi_win32_compose_image *image,
+                                    uint32_t sync_interval);
++VkResult wsi_win32_compose_wrap_texture(struct wsi_win32_compose *compose,
++                                        void *d3d11_texture,
++                                        struct wsi_win32_compose_image *image,
++                                        struct wsi_win32_compose_import *import);
++VkResult wsi_win32_compose_wrap_nt_handle(struct wsi_win32_compose *compose,
++                                          void *nt_handle,
++                                          struct wsi_win32_compose_image *image,
++                                          struct wsi_win32_compose_import *import);
+ bool wsi_win32_compose_in_use(void);
++/* The window's refresh period (0: unknown) and client size (wsi_common_win32.cpp) */
++uint64_t wsi_win32_refresh_ns(void *hwnd);
++VkExtent2D wsi_win32_client_extent(void *hwnd);
+ VkResult wsi_win32_compose_image_wait(struct wsi_win32_compose *compose,
+                                       struct wsi_win32_compose_image *image,
+                                       uint64_t timeout_ns);
+diff --git a/src/vulkan/wsi/wsi_common_win32.cpp b/src/vulkan/wsi/wsi_common_win32.cpp
+index e0b9796..f98e82f 100644
+--- a/src/vulkan/wsi/wsi_common_win32.cpp
++++ b/src/vulkan/wsi/wsi_common_win32.cpp
+@@ -1030,9 +1030,10 @@ wsi_win32_compose_present_now(struct wsi_win32_swapchain *chain,
+  * (its real frame is shown at once).  Only this thread ever waits for a
+  * picture's time; the application's thread never does.
+  */
+-static uint64_t
+-wsi_win32_refresh_ns(HWND hwnd)
++uint64_t
++wsi_win32_refresh_ns(void *window)
+ {
++   HWND hwnd = (HWND)window;
+    MONITORINFOEXA mi = {};
+    mi.cbSize = sizeof(mi);
+    if (!GetMonitorInfoA(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mi))
+@@ -1045,9 +1046,10 @@ wsi_win32_refresh_ns(HWND hwnd)
+    return 1000000000ull / dm.dmDisplayFrequency;
+ }
+ 
+-static VkExtent2D
+-wsi_win32_client_extent(HWND hwnd)
++VkExtent2D
++wsi_win32_client_extent(void *window)
+ {
++   HWND hwnd = (HWND)window;
+    RECT r;
+    if (!GetClientRect(hwnd, &r))
+       return { 0, 0 };
+diff --git a/src/vulkan/wsi/wsi_common_win32_compose.cpp b/src/vulkan/wsi/wsi_common_win32_compose.cpp
+index dc13a6a..892b49c 100644
+--- a/src/vulkan/wsi/wsi_common_win32_compose.cpp
++++ b/src/vulkan/wsi/wsi_common_win32_compose.cpp
+@@ -114,6 +114,40 @@ struct wsi_kmt_close_adapter {
+    WSI_D3DKMT_HANDLE hAdapter;
+ };
+ 
++struct wsi_kmt_open_allocation_info2 {
++   WSI_D3DKMT_HANDLE hAllocation;
++   CONST VOID *pPrivateDriverData;
++   UINT PrivateDriverDataSize;
++   UINT64 GpuVirtualAddress;
++   ULONG_PTR Reserved[6];
++};
++struct wsi_kmt_query_resource_info_nt {
++   WSI_D3DKMT_HANDLE hDevice;
++   HANDLE hNtHandle;
++   VOID *pPrivateRuntimeData;
++   UINT PrivateRuntimeDataSize;
++   UINT TotalPrivateDriverDataSize;
++   UINT ResourcePrivateDriverDataSize;
++   UINT NumAllocations;
++};
++struct wsi_kmt_open_resource_nt {
++   WSI_D3DKMT_HANDLE hDevice;
++   HANDLE hNtHandle;
++   UINT NumAllocations;
++   struct wsi_kmt_open_allocation_info2 *pOpenAllocationInfo;
++   UINT PrivateRuntimeDataSize;
++   VOID *pPrivateRuntimeData;
++   UINT ResourcePrivateDriverDataSize;
++   VOID *pResourcePrivateDriverData;
++   UINT TotalPrivateDriverDataBufferSize;
++   VOID *pTotalPrivateDriverDataBuffer;
++   WSI_D3DKMT_HANDLE hResource;
++   WSI_D3DKMT_HANDLE hKeyedMutex;
++   VOID *pKeyedMutexPrivateRuntimeData;
++   UINT KeyedMutexPrivateRuntimeDataSize;
++   WSI_D3DKMT_HANDLE hSyncObject;
++};
++
+ typedef WSI_NTSTATUS (APIENTRY *PFN_kmt_open_adapter_from_luid)(struct wsi_kmt_open_adapter_from_luid *);
+ typedef WSI_NTSTATUS (APIENTRY *PFN_kmt_create_device)(struct wsi_kmt_create_device *);
+ typedef WSI_NTSTATUS (APIENTRY *PFN_kmt_query_resource_info)(struct wsi_kmt_query_resource_info *);
+@@ -184,6 +218,8 @@ static struct {
+    PFN_kmt_destroy_allocation destroy_allocation;
+    PFN_kmt_destroy_device destroy_device;
+    PFN_kmt_close_adapter close_adapter;
++   WSI_NTSTATUS (APIENTRY *query_from_nt)(struct wsi_kmt_query_resource_info_nt *);
++   WSI_NTSTATUS (APIENTRY *open_from_nt)(struct wsi_kmt_open_resource_nt *);
+ } fn;
+ 
+ /* helios-wsi-<pid>.log: the composed path's milestones and failures, in
+@@ -298,6 +334,8 @@ compose_load(void)
+    GET(gdi, destroy_allocation, "D3DKMTDestroyAllocation");
+    GET(gdi, destroy_device, "D3DKMTDestroyDevice");
+    GET(gdi, close_adapter, "D3DKMTCloseAdapter");
++   GET(gdi, query_from_nt, "D3DKMTQueryResourceInfoFromNtHandle");
++   GET(gdi, open_from_nt, "D3DKMTOpenResourceFromNtHandle");
+ #undef GET
+    if (!fn.create_device || !fn.create_factory1 || !fn.open_adapter_from_luid ||
+        !fn.kmt_create_device || !fn.query_resource_info || !fn.open_resource ||
+@@ -525,6 +563,10 @@ wsi_win32_compose_destroy(struct wsi_win32_compose *c)
+    free(c);
+ }
+ 
++struct wsi_kmt_open_allocation_info;
++static VkResult compose_parse_record(const struct wsi_kmt_open_allocation_info *a,
++                                     struct wsi_win32_compose_import *imp);
++
+ /* Reads the Helios KMD's record of a shared allocation by opening it */
+ static VkResult
+ compose_read_record(struct wsi_win32_compose *c, HANDLE share,
+@@ -569,8 +611,24 @@ compose_read_record(struct wsi_win32_compose *c, HANDLE share,
+          goto out;
+       }
+       img->kmt_resource = o.hResource;
++      result = compose_parse_record(&allocs[0], imp);
++   }
+ 
+-      const struct wsi_kmt_open_allocation_info *a = &allocs[0];
++out:
++   free(runtime);
++   free(resdata);
++   free(total);
++   free(allocs);
++   return result;
++}
++
++/* The Helios KMD's identity and layout in an open's allocation data */
++static VkResult
++compose_parse_record(const struct wsi_kmt_open_allocation_info *a,
++                     struct wsi_win32_compose_import *imp)
++{
++   VkResult result = VK_ERROR_INITIALIZATION_FAILED;
++   {
+       if (a->pPrivateDriverData == NULL ||
+           a->PrivateDriverDataSize < WSI_HELIOS_PRIVATE_BYTES) {
+          LOGE("allocation data of %u bytes: not a Helios record with a layout",
+@@ -603,12 +661,7 @@ compose_read_record(struct wsi_win32_compose *c, HANDLE share,
+       imp->offset = lay.plane_offset;
+       result = VK_SUCCESS;
+    }
+-
+ out:
+-   free(runtime);
+-   free(resdata);
+-   free(total);
+-   free(allocs);
+    return result;
+ }
+ 
+@@ -669,6 +722,94 @@ wsi_win32_compose_image_create(struct wsi_win32_compose *c, uint32_t width,
+    return VK_SUCCESS;
+ }
+ 
++/* Another device's D3D11 texture (created with D3D11_RESOURCE_MISC_SHARED on
++ * the Helios adapter): its record, for an import into a Vulkan device, and a
++ * reference to it.  No copy query (the caller synchronises). */
++VkResult
++wsi_win32_compose_wrap_texture(struct wsi_win32_compose *c, void *texture,
++                               struct wsi_win32_compose_image *img,
++                               struct wsi_win32_compose_import *imp)
++{
++   memset(img, 0, sizeof(*img));
++   ID3D11Texture2D *tex = (ID3D11Texture2D *)texture;
++   IDXGIResource *res = NULL;
++   HANDLE share = NULL;
++   HRESULT hr = tex->QueryInterface(__uuidof(IDXGIResource), (void **)&res);
++   if (SUCCEEDED(hr)) {
++      hr = res->GetSharedHandle(&share);
++      res->Release();
++   }
++   if (FAILED(hr) || share == NULL) {
++      LOGE("no shared handle for an application texture: 0x%08lx", (unsigned long)hr);
++      return VK_ERROR_INITIALIZATION_FAILED;
++   }
++   tex->AddRef();
++   img->texture = tex;
++   VkResult result = compose_read_record(c, share, img, imp);
++   if (result != VK_SUCCESS)
++      wsi_win32_compose_image_destroy(c, img);
++   return result;
++}
++
++/* The same for a resource shared by an NT handle (D3D12) */
++VkResult
++wsi_win32_compose_wrap_nt_handle(struct wsi_win32_compose *c, void *nt_handle,
++                                 struct wsi_win32_compose_image *img,
++                                 struct wsi_win32_compose_import *imp)
++{
++   memset(img, 0, sizeof(*img));
++   if (!fn.query_from_nt || !fn.open_from_nt) {
++      LOGE("no D3DKMTOpenResourceFromNtHandle");
++      return VK_ERROR_INITIALIZATION_FAILED;
++   }
++   struct wsi_kmt_query_resource_info_nt q = {};
++   q.hDevice = c->kmt_device;
++   q.hNtHandle = nt_handle;
++   WSI_NTSTATUS st = fn.query_from_nt(&q);
++   if (st < 0 || q.NumAllocations == 0) {
++      LOGE("D3DKMTQueryResourceInfoFromNtHandle failed: 0x%08lx, %u allocations",
++           (unsigned long)st, q.NumAllocations);
++      return VK_ERROR_INITIALIZATION_FAILED;
++   }
++   void *runtime = calloc(1, q.PrivateRuntimeDataSize ? q.PrivateRuntimeDataSize : 1);
++   void *total = calloc(1, q.TotalPrivateDriverDataSize ? q.TotalPrivateDriverDataSize : 1);
++   void *resdata = calloc(1, q.ResourcePrivateDriverDataSize ? q.ResourcePrivateDriverDataSize : 1);
++   struct wsi_kmt_open_allocation_info2 *allocs =
++      (struct wsi_kmt_open_allocation_info2 *)calloc(q.NumAllocations, sizeof(*allocs));
++   VkResult result = VK_ERROR_INITIALIZATION_FAILED;
++   if (runtime && total && resdata && allocs) {
++      struct wsi_kmt_open_resource_nt o = {};
++      o.hDevice = c->kmt_device;
++      o.hNtHandle = nt_handle;
++      o.NumAllocations = q.NumAllocations;
++      o.pOpenAllocationInfo = allocs;
++      o.pPrivateRuntimeData = runtime;
++      o.PrivateRuntimeDataSize = q.PrivateRuntimeDataSize;
++      o.pResourcePrivateDriverData = resdata;
++      o.ResourcePrivateDriverDataSize = q.ResourcePrivateDriverDataSize;
++      o.pTotalPrivateDriverDataBuffer = total;
++      o.TotalPrivateDriverDataBufferSize = q.TotalPrivateDriverDataSize;
++      st = fn.open_from_nt(&o);
++      if (st < 0) {
++         LOGE("D3DKMTOpenResourceFromNtHandle failed: 0x%08lx", (unsigned long)st);
++      } else {
++         img->kmt_resource = o.hResource;
++         struct wsi_kmt_open_allocation_info a = {};
++         a.hAllocation = allocs[0].hAllocation;
++         a.pPrivateDriverData = allocs[0].pPrivateDriverData;
++         a.PrivateDriverDataSize = allocs[0].PrivateDriverDataSize;
++         result = compose_parse_record(&a, imp);
++      }
++   }
++   free(runtime);
++   free(total);
++   free(resdata);
++   free(allocs);
++   if (result != VK_SUCCESS)
++      wsi_win32_compose_image_destroy(c, img);
++   return result;
++}
++
+ void
+ wsi_win32_compose_image_destroy(struct wsi_win32_compose *c,
+                                 struct wsi_win32_compose_image *img)
+diff --git a/src/vulkan/wsi/wsi_common_win32_dxgi.cpp b/src/vulkan/wsi/wsi_common_win32_dxgi.cpp
+new file mode 100644
+index 0000000..3b74cb2
+--- /dev/null
++++ b/src/vulkan/wsi/wsi_common_win32_dxgi.cpp
+@@ -0,0 +1,1440 @@
++/*
++ * Copyright © 2026 Ole Algoritme
++ * SPDX-License-Identifier: MIT
++ */
++
++/*
++ * Upscaling and frame generation for D3D11 and D3D12 applications (Conduit
++ * Helios).
++ *
++ * Their presents never reach a Vulkan swapchain: DXGI hands the back buffer
++ * to the Helios UMD, the KMD and DWM.  So, in processes whose D3D driver
++ * runs on NVK and where the settings are on, NVK hooks DXGI's swap chain
++ * creation (IDXGIFactory::CreateSwapChain, IDXGIFactory2::
++ * CreateSwapChainForHwnd; after the UMD's own FlipUpgrade hooks, which a
++ * chain not taken here still goes through) and gives the application a
++ * swap chain of its own:
++ *
++ *   - the application's back buffers are ordinary textures of its own size
++ *     on its own device; Present copies the current one into a ring of
++ *     shared textures (on the application's device, its queue) and returns;
++ *   - a thread per swap chain waits for that copy, runs the enhancement
++ *     passes (wsi_common_win32_enhance.c) on NVK's own Vulkan device in this
++ *     process, into output slots of the window's size, and presents them,
++ *     paced, through the composed present's D3D11 device and DXGI flip swap
++ *     chain on the window (wsi_common_win32_compose.cpp), as a Vulkan
++ *     swapchain with enhancement does.
++ *
++ * The application's thread never waits for a picture's time; it waits only
++ * when every ring texture is still being read (the passes take well under a
++ * frame).  Exclusive fullscreen is not entered: the window stays as it is
++ * (borderless at the desktop's mode), as for any frame-generation layer.
++ */
++
++#include "wsi_common_private.h"
++#include "wsi_common_win32_enhance.h"
++
++#include <windows.h>
++#include <d3d11_4.h>
++#include <dxgi1_6.h>
++#include <stdio.h>
++#include <string.h>
++
++#include "util/os_misc.h"
++#include "util/os_time.h"
++#include "util/u_debug.h"
++#include "util/u_thread.h"
++#include "util/u_atomic.h"
++#include "vk_alloc.h"
++#include "vk_physical_device.h"
++
++#include "wsi_common_win32_dxgi.h"
++
++#define LOGI(...) wsi_win32_compose_log(false, "dxgi: " __VA_ARGS__)
++#define LOGE(...) wsi_win32_compose_log(true, "dxgi: " __VA_ARGS__)
++
++#define RING 3
++#define MAX_SLOTS (WSI_ENH_MAX_PICS + 3)
++
++/* ---- NVK's own Vulkan device in this process --------------------------- */
++
++static struct {
++   INIT_ONCE once;
++   bool ok;
++   VkInstance instance;
++   VkPhysicalDevice pdev;
++   VkDevice device;
++   VkQueue queue;
++   uint32_t qfi;
++   const struct wsi_device *wsi;
++   SRWLOCK queue_lock;
++   PFN_vkDestroyDevice destroy_device;
++} pvk = { INIT_ONCE_STATIC_INIT, false, NULL, NULL, NULL, NULL, 0, NULL, SRWLOCK_INIT, NULL };
++
++static BOOL CALLBACK
++pvk_init(PINIT_ONCE once, PVOID param, PVOID *ctx)
++{
++   (void)once; (void)param; (void)ctx;
++   HMODULE self = NULL;
++   if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
++                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
++                           (LPCSTR)(void *)&pvk_init, &self))
++      return TRUE;
++   PFN_vkGetInstanceProcAddr gipa = (PFN_vkGetInstanceProcAddr)(void *)
++      GetProcAddress(self, "vk_icdGetInstanceProcAddr");
++   if (!gipa) {
++      LOGE("this driver exports no vk_icdGetInstanceProcAddr");
++      return TRUE;
++   }
++#define I(name) PFN_vk##name name = (PFN_vk##name)(void *)gipa(pvk.instance, "vk" #name)
++   PFN_vkCreateInstance CreateInstance =
++      (PFN_vkCreateInstance)(void *)gipa(NULL, "vkCreateInstance");
++   VkApplicationInfo app = {};
++   app.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
++   app.pApplicationName = "helios-dxgi-enhance";
++   app.apiVersion = VK_API_VERSION_1_3;
++   VkInstanceCreateInfo ici = {};
++   ici.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
++   ici.pApplicationInfo = &app;
++   VkResult r = CreateInstance ? CreateInstance(&ici, NULL, &pvk.instance) :
++                                 VK_ERROR_INITIALIZATION_FAILED;
++   if (r != VK_SUCCESS) {
++      LOGE("vkCreateInstance: %d", (int)r);
++      return TRUE;
++   }
++   I(EnumeratePhysicalDevices);
++   I(GetPhysicalDeviceQueueFamilyProperties);
++   I(EnumerateDeviceExtensionProperties);
++   I(CreateDevice);
++   I(GetDeviceQueue);
++   pvk.destroy_device = (PFN_vkDestroyDevice)(void *)gipa(pvk.instance, "vkDestroyDevice");
++   uint32_t n = 1;
++   r = EnumeratePhysicalDevices(pvk.instance, &n, &pvk.pdev);
++   if ((r != VK_SUCCESS && r != VK_INCOMPLETE) || n == 0) {
++      LOGE("no physical device: %d", (int)r);
++      return TRUE;
++   }
++   VkQueueFamilyProperties qf[8];
++   uint32_t nqf = 8;
++   GetPhysicalDeviceQueueFamilyProperties(pvk.pdev, &nqf, qf);
++   pvk.qfi = UINT32_MAX;
++   for (uint32_t i = 0; i < nqf; i++) {
++      if ((qf[i].queueFlags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT)) ==
++          (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT)) {
++         pvk.qfi = i;
++         break;
++      }
++   }
++   if (pvk.qfi == UINT32_MAX)
++      return TRUE;
++   const char *exts[1];
++   uint32_t next = 0;
++   VkExtensionProperties ep[512];
++   uint32_t nep = 512;
++   if (EnumerateDeviceExtensionProperties(pvk.pdev, NULL, &nep, ep) >= 0) {
++      for (uint32_t i = 0; i < nep; i++) {
++         if (!strcmp(ep[i].extensionName, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME))
++            exts[next++] = VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME;
++      }
++   }
++   const float prio = 1.0f;
++   VkDeviceQueueCreateInfo qci = {};
++   qci.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
++   qci.queueFamilyIndex = pvk.qfi;
++   qci.queueCount = 1;
++   qci.pQueuePriorities = &prio;
++   VkDeviceCreateInfo dci = {};
++   dci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
++   dci.queueCreateInfoCount = 1;
++   dci.pQueueCreateInfos = &qci;
++   dci.enabledExtensionCount = next;
++   dci.ppEnabledExtensionNames = exts;
++   r = CreateDevice(pvk.pdev, &dci, NULL, &pvk.device);
++   if (r != VK_SUCCESS) {
++      LOGE("vkCreateDevice: %d", (int)r);
++      return TRUE;
++   }
++   GetDeviceQueue(pvk.device, pvk.qfi, 0, &pvk.queue);
++#undef I
++   VK_FROM_HANDLE(vk_physical_device, vpdev, pvk.pdev);
++   pvk.wsi = vpdev->wsi_device;
++   pvk.ok = pvk.wsi != NULL && pvk.wsi->win32.compose_import != NULL;
++   if (!pvk.ok)
++      LOGE("the driver's composed-present import is not available here");
++   return TRUE;
++}
++
++static bool
++pvk_get(void)
++{
++   InitOnceExecuteOnce(&pvk.once, pvk_init, NULL, NULL);
++   return pvk.ok;
++}
++
++/* A shared D3D11 texture (its record in `imp`) as a VkImage of NVK's device */
++static VkResult
++pvk_import(const struct wsi_win32_compose_import *imp, VkFormat format,
++           uint32_t w, uint32_t h, VkImageUsageFlags usage,
++           VkImage *image, VkDeviceMemory *mem)
++{
++   const struct wsi_device *wsi = pvk.wsi;
++   struct wsi_image_create_info wci = {};
++   wci.sType = VK_STRUCTURE_TYPE_WSI_IMAGE_CREATE_INFO_MESA;
++   VkImageCreateInfo ici = {};
++   ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
++   ici.pNext = &wci;
++   ici.imageType = VK_IMAGE_TYPE_2D;
++   ici.format = format;
++   ici.extent = { w, h, 1 };
++   ici.mipLevels = 1;
++   ici.arrayLayers = 1;
++   ici.samples = VK_SAMPLE_COUNT_1_BIT;
++   ici.tiling = VK_IMAGE_TILING_OPTIMAL;
++   ici.usage = usage;
++   ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
++   ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++   VkResult r = wsi->CreateImage(pvk.device, &ici, NULL, image);
++   if (r != VK_SUCCESS)
++      return r;
++   r = wsi->win32.compose_import(pvk.device, *image, imp, mem);
++   if (r == VK_SUCCESS)
++      r = wsi->BindImageMemory(pvk.device, *image, *mem, 0);
++   if (r != VK_SUCCESS) {
++      if (*mem)
++         wsi->FreeMemory(pvk.device, *mem, NULL);
++      wsi->DestroyImage(pvk.device, *image, NULL);
++      *image = VK_NULL_HANDLE;
++      *mem = VK_NULL_HANDLE;
++   }
++   return r;
++}
++
++/* ---- the application's API ---------------------------------------------- */
++
++/* One ring texture: written by the application's queue, read by the passes */
++enum ring_state { RING_FREE, RING_COPYING, RING_PASSES };
++
++struct ring_entry {
++   struct wsi_win32_compose_image wrap;  /* the texture (record, reference) */
++   VkImage image;
++   VkDeviceMemory mem;
++   ID3D11Query *query;                   /* D3D11: the copy's completion */
++   void *d3d12;                          /* D3D12: wsi_dxgi12 ring entry */
++   enum ring_state state;
++};
++
++struct slot_entry {
++   struct wsi_win32_compose_image wrap;
++   VkImage image;
++   VkDeviceMemory mem;
++};
++
++struct frame_req {
++   uint32_t ring;
++   uint64_t present_ns;
++   uint64_t value;         /* D3D12: the fence value of the copy */
++   UINT sync_interval;
++};
++
++static bool
++vk_format_of(DXGI_FORMAT f, VkFormat *out, DXGI_FORMAT *copy_fmt)
++{
++   switch (f) {
++   case DXGI_FORMAT_B8G8R8A8_UNORM:
++   case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
++      *out = VK_FORMAT_B8G8R8A8_UNORM;
++      *copy_fmt = DXGI_FORMAT_B8G8R8A8_UNORM;
++      return true;
++   case DXGI_FORMAT_R8G8B8A8_UNORM:
++   case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
++      *out = VK_FORMAT_R8G8B8A8_UNORM;
++      *copy_fmt = DXGI_FORMAT_R8G8B8A8_UNORM;
++      return true;
++   default:
++      return false;
++   }
++}
++
++/* ---- the swap chain ------------------------------------------------------ */
++
++struct wsi_dxgi_proxy;
++static DWORD WINAPI proxy_thread(LPVOID p);
++
++struct priv_data {
++   GUID guid;
++   UINT size;
++   void *data;
++   IUnknown *iface;
++};
++
++struct wsi_dxgi_proxy final : public IDXGISwapChain4 {
++   LONG refs = 1;
++   IDXGIFactory2 *factory = NULL;
++   IUnknown *device = NULL;           /* what the application passed */
++   HWND hwnd = NULL;
++   DXGI_SWAP_CHAIN_DESC1 desc = {};
++   DXGI_SWAP_CHAIN_FULLSCREEN_DESC fs = {};
++   bool fullscreen = false;
++   UINT max_latency = 1;
++   HANDLE latency_sem = NULL;
++   UINT present_count = 0;
++   DXGI_COLOR_SPACE_TYPE color_space = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
++   DXGI_RGBA background = {};
++   DXGI_MODE_ROTATION rotation = DXGI_MODE_ROTATION_IDENTITY;
++   struct priv_data priv[16] = {};
++   UINT npriv = 0;
++
++   /* D3D11 */
++   ID3D11Device *d3d11 = NULL;
++   ID3D11DeviceContext *ctx = NULL;
++   ID3D11Texture2D *bb = NULL;
++   /* D3D12 (wsi_common_win32_dxgi12.cpp) */
++   struct wsi_dxgi12 *d12 = NULL;
++
++   VkFormat vk_format = VK_FORMAT_UNDEFINED;
++   DXGI_FORMAT copy_format = DXGI_FORMAT_UNKNOWN;
++   struct wsi_enh_config cfg = {};
++   VkExtent2D out = {};
++   struct wsi_win32_compose *compose = NULL;
++   struct ring_entry ring[RING] = {};
++   struct slot_entry slots[MAX_SLOTS] = {};
++   uint32_t nslots = 0, slot_next = 0;
++   struct wsi_enh *enh = NULL;
++   VkFence fence = VK_NULL_HANDLE;
++
++   /* the thread */
++   HANDLE thread = NULL;
++   SRWLOCK lock = SRWLOCK_INIT;
++   CONDITION_VARIABLE cond = CONDITION_VARIABLE_INIT;
++   HANDLE wake = NULL, timer = NULL;
++   struct frame_req q[RING] = {};
++   uint32_t qn = 0;
++   bool stop = false;
++   uint64_t dropped = 0;
++
++   /* IUnknown */
++   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **out) override;
++   ULONG STDMETHODCALLTYPE AddRef() override { return InterlockedIncrement(&refs); }
++   ULONG STDMETHODCALLTYPE Release() override;
++   /* IDXGIObject */
++   HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID g, UINT size, const void *data) override;
++   HRESULT STDMETHODCALLTYPE SetPrivateDataInterface(REFGUID g, const IUnknown *u) override;
++   HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID g, UINT *size, void *data) override;
++   HRESULT STDMETHODCALLTYPE GetParent(REFIID riid, void **out) override
++   {
++      return factory->QueryInterface(riid, out);
++   }
++   /* IDXGIDeviceSubObject */
++   HRESULT STDMETHODCALLTYPE GetDevice(REFIID riid, void **out) override
++   {
++      return device->QueryInterface(riid, out);
++   }
++   /* IDXGISwapChain */
++   HRESULT STDMETHODCALLTYPE Present(UINT sync, UINT flags) override;
++   HRESULT STDMETHODCALLTYPE GetBuffer(UINT i, REFIID riid, void **out) override;
++   HRESULT STDMETHODCALLTYPE SetFullscreenState(WINBOOL f, IDXGIOutput *o) override
++   {
++      (void)o;
++      fullscreen = f != 0;
++      return S_OK;
++   }
++   HRESULT STDMETHODCALLTYPE GetFullscreenState(WINBOOL *f, IDXGIOutput **o) override
++   {
++      if (f)
++         *f = fullscreen;
++      if (o)
++         *o = NULL;
++      if (o && fullscreen)
++         GetContainingOutput(o);
++      return S_OK;
++   }
++   HRESULT STDMETHODCALLTYPE GetDesc(DXGI_SWAP_CHAIN_DESC *d) override;
++   HRESULT STDMETHODCALLTYPE ResizeBuffers(UINT n, UINT w, UINT h, DXGI_FORMAT f, UINT flags) override;
++   HRESULT STDMETHODCALLTYPE ResizeTarget(const DXGI_MODE_DESC *m) override;
++   HRESULT STDMETHODCALLTYPE GetContainingOutput(IDXGIOutput **o) override;
++   HRESULT STDMETHODCALLTYPE GetFrameStatistics(DXGI_FRAME_STATISTICS *s) override
++   {
++      (void)s;
++      return DXGI_ERROR_FRAME_STATISTICS_DISJOINT;
++   }
++   HRESULT STDMETHODCALLTYPE GetLastPresentCount(UINT *c) override
++   {
++      *c = present_count;
++      return S_OK;
++   }
++   /* IDXGISwapChain1 */
++   HRESULT STDMETHODCALLTYPE GetDesc1(DXGI_SWAP_CHAIN_DESC1 *d) override
++   {
++      *d = desc;
++      return S_OK;
++   }
++   HRESULT STDMETHODCALLTYPE GetFullscreenDesc(DXGI_SWAP_CHAIN_FULLSCREEN_DESC *d) override
++   {
++      *d = fs;
++      d->Windowed = !fullscreen;
++      return S_OK;
++   }
++   HRESULT STDMETHODCALLTYPE GetHwnd(HWND *h) override
++   {
++      *h = hwnd;
++      return S_OK;
++   }
++   HRESULT STDMETHODCALLTYPE GetCoreWindow(REFIID riid, void **out) override
++   {
++      (void)riid;
++      *out = NULL;
++      return DXGI_ERROR_INVALID_CALL;
++   }
++   HRESULT STDMETHODCALLTYPE Present1(UINT sync, UINT flags,
++                                      const DXGI_PRESENT_PARAMETERS *p) override
++   {
++      (void)p;
++      return Present(sync, flags);
++   }
++   WINBOOL STDMETHODCALLTYPE IsTemporaryMonoSupported() override { return FALSE; }
++   HRESULT STDMETHODCALLTYPE GetRestrictToOutput(IDXGIOutput **o) override
++   {
++      *o = NULL;
++      return S_OK;
++   }
++   HRESULT STDMETHODCALLTYPE SetBackgroundColor(const DXGI_RGBA *c) override
++   {
++      background = *c;
++      return S_OK;
++   }
++   HRESULT STDMETHODCALLTYPE GetBackgroundColor(DXGI_RGBA *c) override
++   {
++      *c = background;
++      return S_OK;
++   }
++   HRESULT STDMETHODCALLTYPE SetRotation(DXGI_MODE_ROTATION r) override
++   {
++      rotation = r;
++      return r == DXGI_MODE_ROTATION_IDENTITY ? S_OK : DXGI_ERROR_INVALID_CALL;
++   }
++   HRESULT STDMETHODCALLTYPE GetRotation(DXGI_MODE_ROTATION *r) override
++   {
++      *r = rotation;
++      return S_OK;
++   }
++   /* IDXGISwapChain2 */
++   HRESULT STDMETHODCALLTYPE SetSourceSize(UINT w, UINT h) override
++   {
++      (void)w; (void)h;
++      return DXGI_ERROR_INVALID_CALL;
++   }
++   HRESULT STDMETHODCALLTYPE GetSourceSize(UINT *w, UINT *h) override
++   {
++      *w = desc.Width;
++      *h = desc.Height;
++      return S_OK;
++   }
++   HRESULT STDMETHODCALLTYPE SetMaximumFrameLatency(UINT n) override
++   {
++      if (n < 1 || n > 16)
++         return DXGI_ERROR_INVALID_CALL;
++      if (latency_sem && n > max_latency)
++         ReleaseSemaphore(latency_sem, n - max_latency, NULL);
++      max_latency = n;
++      return S_OK;
++   }
++   HRESULT STDMETHODCALLTYPE GetMaximumFrameLatency(UINT *n) override
++   {
++      *n = max_latency;
++      return S_OK;
++   }
++   HANDLE STDMETHODCALLTYPE GetFrameLatencyWaitableObject() override
++   {
++      HANDLE h = NULL;
++      if (latency_sem)
++         DuplicateHandle(GetCurrentProcess(), latency_sem, GetCurrentProcess(), &h,
++                         0, FALSE, DUPLICATE_SAME_ACCESS);
++      return h;
++   }
++   HRESULT STDMETHODCALLTYPE SetMatrixTransform(const DXGI_MATRIX_3X2_F *m) override
++   {
++      (void)m;
++      return DXGI_ERROR_INVALID_CALL;
++   }
++   HRESULT STDMETHODCALLTYPE GetMatrixTransform(DXGI_MATRIX_3X2_F *m) override
++   {
++      (void)m;
++      return DXGI_ERROR_INVALID_CALL;
++   }
++   /* IDXGISwapChain3 */
++   UINT STDMETHODCALLTYPE GetCurrentBackBufferIndex() override;
++   HRESULT STDMETHODCALLTYPE CheckColorSpaceSupport(DXGI_COLOR_SPACE_TYPE cs, UINT *s) override
++   {
++      *s = cs == DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709 ?
++           DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT : 0;
++      return S_OK;
++   }
++   HRESULT STDMETHODCALLTYPE SetColorSpace1(DXGI_COLOR_SPACE_TYPE cs) override
++   {
++      if (cs != DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709)
++         return DXGI_ERROR_UNSUPPORTED;
++      color_space = cs;
++      return S_OK;
++   }
++   HRESULT STDMETHODCALLTYPE ResizeBuffers1(UINT n, UINT w, UINT h, DXGI_FORMAT f,
++                                            UINT flags, const UINT *mask,
++                                            IUnknown *const *queues) override
++   {
++      (void)mask; (void)queues;
++      return ResizeBuffers(n, w, h, f, flags);
++   }
++   /* IDXGISwapChain4 */
++   HRESULT STDMETHODCALLTYPE SetHDRMetaData(DXGI_HDR_METADATA_TYPE t, UINT size,
++                                            void *data) override
++   {
++      (void)size; (void)data;
++      return t == DXGI_HDR_METADATA_TYPE_NONE ? S_OK : DXGI_ERROR_UNSUPPORTED;
++   }
++
++   /* internal */
++   VkResult build();
++   void teardown();
++   void start_thread();
++   void stop_thread();
++   void run();
++   bool copy_done(uint32_t k, uint64_t value);
++};
++
++/* ---- set-up -------------------------------------------------------------- */
++
++static thread_local bool internal_create;
++
++VkResult
++wsi_dxgi_proxy::build()
++{
++   const struct wsi_device *wsi = pvk.wsi;
++   VkResult r;
++
++   /* The output: the window's size with a scaler, else the buffers' */
++   out = { desc.Width, desc.Height };
++   if (cfg.scaler != WSI_ENH_SCALER_OFF) {
++      const VkExtent2D client = wsi_win32_client_extent(hwnd);
++      if (client.width && client.height)
++         out = client;
++   }
++   internal_create = true;
++   r = wsi_win32_compose_open(&compose, hwnd, out.width, out.height, vk_format, 3);
++   internal_create = false;
++   if (r != VK_SUCCESS)
++      return r;
++
++   /* The ring, on the application's device */
++   for (uint32_t k = 0; k < RING; k++) {
++      struct ring_entry *e = &ring[k];
++      struct wsi_win32_compose_import imp = {};
++      if (d3d11) {
++         D3D11_TEXTURE2D_DESC td = {};
++         td.Width = desc.Width;
++         td.Height = desc.Height;
++         td.MipLevels = 1;
++         td.ArraySize = 1;
++         td.Format = copy_format;
++         td.SampleDesc.Count = 1;
++         td.Usage = D3D11_USAGE_DEFAULT;
++         td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
++         td.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
++         ID3D11Texture2D *tex = NULL;
++         HRESULT hr = d3d11->CreateTexture2D(&td, NULL, &tex);
++         if (FAILED(hr)) {
++            LOGE("ring texture %ux%u: 0x%08lx", desc.Width, desc.Height, (unsigned long)hr);
++            return VK_ERROR_OUT_OF_DEVICE_MEMORY;
++         }
++         r = wsi_win32_compose_wrap_texture(compose, tex, &e->wrap, &imp);
++         tex->Release();
++         if (r != VK_SUCCESS)
++            return r;
++         D3D11_QUERY_DESC qd = { D3D11_QUERY_EVENT, 0 };
++         if (FAILED(d3d11->CreateQuery(&qd, &e->query)))
++            return VK_ERROR_INITIALIZATION_FAILED;
++      } else {
++         void *nt = NULL;
++         if (!wsi_dxgi12_ring_create(d12, k, desc.Width, desc.Height, copy_format, &nt))
++            return VK_ERROR_OUT_OF_DEVICE_MEMORY;
++         r = wsi_win32_compose_wrap_nt_handle(compose, nt, &e->wrap, &imp);
++         CloseHandle((HANDLE)nt);
++         if (r != VK_SUCCESS)
++            return r;
++      }
++      r = pvk_import(&imp, vk_format, desc.Width, desc.Height,
++                     VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
++                     VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
++                     &e->image, &e->mem);
++      if (r != VK_SUCCESS) {
++         LOGE("ring texture %u: import into NVK failed: %d", k, (int)r);
++         return r;
++      }
++      e->state = RING_FREE;
++   }
++
++   /* The output slots, on the composed present's device */
++   nslots = !wsi_enh_config_fg(&cfg) ? 3 :
++            (cfg.fg_adaptive ? WSI_ENH_MAX_PICS : MAX2(cfg.fg_mult, 2u)) + 3;
++   for (uint32_t i = 0; i < nslots; i++) {
++      struct wsi_win32_compose_import imp = {};
++      r = wsi_win32_compose_image_create(compose, out.width, out.height,
++                                         &slots[i].wrap, &imp);
++      if (r != VK_SUCCESS)
++         return r;
++      r = pvk_import(&imp, vk_format, out.width, out.height,
++                     VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
++                     VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
++                     VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
++                     &slots[i].image, &slots[i].mem);
++      if (r != VK_SUCCESS) {
++         LOGE("output slot %u: import into NVK failed: %d", i, (int)r);
++         return r;
++      }
++   }
++
++   VkImage src[RING], dst[MAX_SLOTS];
++   for (uint32_t k = 0; k < RING; k++)
++      src[k] = ring[k].image;
++   for (uint32_t i = 0; i < nslots; i++)
++      dst[i] = slots[i].image;
++   struct wsi_enh_create_info ci = {};
++   ci.device = pvk.device;
++   ci.wsi = wsi;
++   ci.alloc = vk_default_allocator();
++   ci.config = cfg;
++   ci.src_format = vk_format;
++   ci.src_extent = { desc.Width, desc.Height };
++   ci.src_count = RING;
++   ci.src_images = src;
++   ci.dst_format = vk_format;
++   ci.dst_extent = out;
++   ci.slot_count = nslots;
++   ci.slot_images = dst;
++   r = wsi_enh_create(&ci, &enh);
++   if (r != VK_SUCCESS)
++      return r;
++   wsi_enh_set_refresh(enh, wsi_win32_refresh_ns(hwnd));
++   VkFenceCreateInfo fci = {};
++   fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
++   r = wsi->CreateFence(pvk.device, &fci, NULL, &fence);
++   if (r != VK_SUCCESS)
++      return r;
++
++   /* The application's back buffers */
++   if (d3d11) {
++      D3D11_TEXTURE2D_DESC td = {};
++      td.Width = desc.Width;
++      td.Height = desc.Height;
++      td.MipLevels = 1;
++      td.ArraySize = 1;
++      td.Format = desc.Format;
++      td.SampleDesc.Count = 1;
++      td.Usage = D3D11_USAGE_DEFAULT;
++      td.BindFlags = D3D11_BIND_RENDER_TARGET;
++      if (desc.BufferUsage & DXGI_USAGE_SHADER_INPUT)
++         td.BindFlags |= D3D11_BIND_SHADER_RESOURCE;
++      if (desc.BufferUsage & DXGI_USAGE_UNORDERED_ACCESS)
++         td.BindFlags |= D3D11_BIND_UNORDERED_ACCESS;
++      HRESULT hr = d3d11->CreateTexture2D(&td, NULL, &bb);
++      if (FAILED(hr)) {
++         LOGE("back buffer %ux%u format %d: 0x%08lx", desc.Width, desc.Height,
++              (int)desc.Format, (unsigned long)hr);
++         return VK_ERROR_OUT_OF_DEVICE_MEMORY;
++      }
++   } else if (!wsi_dxgi12_buffers_create(d12, desc.BufferCount, desc.Width,
++                                         desc.Height, desc.Format, desc.BufferUsage)) {
++      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
++   }
++   LOGI("%s swap chain %ux%u (format %d, %u buffers) on window %p: presented "
++        "through NVK at %ux%u, scaler %s, frame generation %s%ux",
++        d3d11 ? "D3D11" : "D3D12", desc.Width, desc.Height, (int)desc.Format,
++        desc.BufferCount, (void *)hwnd, out.width, out.height,
++        wsi_enh_scaler_name(cfg.scaler), cfg.fg_adaptive ? "adaptive " : "",
++        cfg.fg_mult);
++   return VK_SUCCESS;
++}
++
++void
++wsi_dxgi_proxy::teardown()
++{
++   const struct wsi_device *wsi = pvk.wsi;
++   if (fence) {
++      wsi->DestroyFence(pvk.device, fence, NULL);
++      fence = VK_NULL_HANDLE;
++   }
++   if (enh) {
++      wsi_enh_destroy(enh);
++      enh = NULL;
++   }
++   for (uint32_t i = 0; i < MAX_SLOTS; i++) {
++      if (slots[i].image)
++         wsi->DestroyImage(pvk.device, slots[i].image, NULL);
++      if (slots[i].mem)
++         wsi->FreeMemory(pvk.device, slots[i].mem, NULL);
++      if (slots[i].wrap.texture || slots[i].wrap.kmt_resource)
++         wsi_win32_compose_image_destroy(compose, &slots[i].wrap);
++      memset(&slots[i], 0, sizeof(slots[i]));
++   }
++   nslots = 0;
++   for (uint32_t k = 0; k < RING; k++) {
++      struct ring_entry *e = &ring[k];
++      if (e->image)
++         wsi->DestroyImage(pvk.device, e->image, NULL);
++      if (e->mem)
++         wsi->FreeMemory(pvk.device, e->mem, NULL);
++      if (e->query)
++         e->query->Release();
++      if (e->wrap.texture || e->wrap.kmt_resource)
++         wsi_win32_compose_image_destroy(compose, &e->wrap);
++      memset(e, 0, sizeof(*e));
++   }
++   if (d12)
++      wsi_dxgi12_release_buffers(d12);
++   if (bb) {
++      bb->Release();
++      bb = NULL;
++   }
++}
++
++static struct wsi_dxgi_proxy *
++proxy_create(IDXGIFactory2 *factory, IUnknown *dev, HWND hwnd,
++             const DXGI_SWAP_CHAIN_DESC1 *d, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *fs)
++{
++   if (!hwnd || !d || d->SampleDesc.Count > 1 ||
++       (d->SwapEffect != DXGI_SWAP_EFFECT_FLIP_DISCARD &&
++        d->SwapEffect != DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL &&
++        d->SwapEffect != DXGI_SWAP_EFFECT_DISCARD &&
++        d->SwapEffect != DXGI_SWAP_EFFECT_SEQUENTIAL))
++      return NULL;
++   struct wsi_enh_config cfg;
++   wsi_enh_config_get(&cfg);
++   if (!cfg.d3d || !wsi_enh_config_applies(&cfg, hwnd))
++      return NULL;
++   VkFormat vkf;
++   DXGI_FORMAT copy_fmt;
++   if (!vk_format_of(d->Format, &vkf, &copy_fmt)) {
++      LOGI("format %d is not enhanced", (int)d->Format);
++      return NULL;
++   }
++   if (!pvk_get())
++      return NULL;
++
++   ID3D11Device *d3d11 = NULL;
++   struct wsi_dxgi12 *d12 = NULL;
++   if (FAILED(dev->QueryInterface(__uuidof(ID3D11Device), (void **)&d3d11))) {
++      d3d11 = NULL;
++      d12 = wsi_dxgi12_create(dev);
++      if (!d12)
++         return NULL;
++   }
++
++   wsi_dxgi_proxy *p = new wsi_dxgi_proxy();
++   p->factory = factory;
++   factory->AddRef();
++   p->device = dev;
++   dev->AddRef();
++   p->hwnd = hwnd;
++   p->desc = *d;
++   if (p->desc.Width == 0 || p->desc.Height == 0) {
++      const VkExtent2D c = wsi_win32_client_extent(hwnd);
++      p->desc.Width = MAX2(c.width, 1u);
++      p->desc.Height = MAX2(c.height, 1u);
++   }
++   p->desc.BufferCount = CLAMP(p->desc.BufferCount, 1u, 16u);
++   if (fs)
++      p->fs = *fs;
++   else
++      p->fs.Windowed = TRUE;
++   p->vk_format = vkf;
++   p->copy_format = copy_fmt;
++   p->cfg = cfg;
++   p->d3d11 = d3d11;
++   p->d12 = d12;
++   if (d3d11) {
++      d3d11->GetImmediateContext(&p->ctx);
++      /* The present thread asks the immediate context whether a copy is
++       * done: the runtime then serialises it with the application's calls */
++      ID3D11Multithread *mt = NULL;
++      if (SUCCEEDED(p->ctx->QueryInterface(__uuidof(ID3D11Multithread), (void **)&mt))) {
++         mt->SetMultithreadProtected(TRUE);
++         mt->Release();
++      }
++   }
++   if (d->Flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT)
++      p->latency_sem = CreateSemaphoreA(NULL, 1, 16, NULL);
++   p->wake = CreateEventA(NULL, FALSE, FALSE, NULL);
++   p->timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
++                                     TIMER_ALL_ACCESS);
++
++   VkResult r = p->build();
++   if (r != VK_SUCCESS) {
++      LOGE("swap chain on window %p not enhanced (%d): DXGI's own instead",
++           (void *)hwnd, (int)r);
++      p->Release();
++      return NULL;
++   }
++   p->start_thread();
++   return p;
++}
++
++/* ---- COM ------------------------------------------------------------------ */
++
++HRESULT STDMETHODCALLTYPE
++wsi_dxgi_proxy::QueryInterface(REFIID riid, void **out)
++{
++   if (!out)
++      return E_POINTER;
++   if (riid == __uuidof(IUnknown) || riid == __uuidof(IDXGIObject) ||
++       riid == __uuidof(IDXGIDeviceSubObject) || riid == __uuidof(IDXGISwapChain) ||
++       riid == __uuidof(IDXGISwapChain1) || riid == __uuidof(IDXGISwapChain2) ||
++       riid == __uuidof(IDXGISwapChain3) || riid == __uuidof(IDXGISwapChain4)) {
++      *out = static_cast<IDXGISwapChain4 *>(this);
++      AddRef();
++      return S_OK;
++   }
++   *out = NULL;
++   return E_NOINTERFACE;
++}
++
++ULONG STDMETHODCALLTYPE
++wsi_dxgi_proxy::Release()
++{
++   const LONG n = InterlockedDecrement(&refs);
++   if (n != 0)
++      return n;
++   stop_thread();
++   if (pvk.ok) {
++      AcquireSRWLockExclusive(&pvk.queue_lock);
++      pvk.wsi->WaitForFences(pvk.device, 1, &fence, true, 2000ull * 1000 * 1000);
++      ReleaseSRWLockExclusive(&pvk.queue_lock);
++   }
++   teardown();
++   for (UINT i = 0; i < npriv; i++) {
++      free(priv[i].data);
++      if (priv[i].iface)
++         priv[i].iface->Release();
++   }
++   if (compose)
++      wsi_win32_compose_destroy(compose);
++   if (d12)
++      wsi_dxgi12_destroy(d12);
++   if (ctx)
++      ctx->Release();
++   if (d3d11)
++      d3d11->Release();
++   if (device)
++      device->Release();
++   if (factory)
++      factory->Release();
++   if (latency_sem)
++      CloseHandle(latency_sem);
++   if (wake)
++      CloseHandle(wake);
++   if (timer)
++      CloseHandle(timer);
++   delete this;
++   return 0;
++}
++
++HRESULT STDMETHODCALLTYPE
++wsi_dxgi_proxy::SetPrivateData(REFGUID g, UINT size, const void *data)
++{
++   for (UINT i = 0; i < npriv; i++) {
++      if (priv[i].guid == g) {
++         free(priv[i].data);
++         if (priv[i].iface)
++            priv[i].iface->Release();
++         priv[i] = priv[--npriv];
++         break;
++      }
++   }
++   if (!data || !size)
++      return S_OK;
++   if (npriv == ARRAY_SIZE(priv))
++      return E_OUTOFMEMORY;
++   priv[npriv].guid = g;
++   priv[npriv].size = size;
++   priv[npriv].data = malloc(size);
++   priv[npriv].iface = NULL;
++   memcpy(priv[npriv].data, data, size);
++   npriv++;
++   return S_OK;
++}
++
++HRESULT STDMETHODCALLTYPE
++wsi_dxgi_proxy::SetPrivateDataInterface(REFGUID g, const IUnknown *u)
++{
++   SetPrivateData(g, 0, NULL);
++   if (!u)
++      return S_OK;
++   if (npriv == ARRAY_SIZE(priv))
++      return E_OUTOFMEMORY;
++   IUnknown *iu = const_cast<IUnknown *>(u);
++   iu->AddRef();
++   priv[npriv].guid = g;
++   priv[npriv].size = sizeof(IUnknown *);
++   priv[npriv].data = NULL;
++   priv[npriv].iface = iu;
++   npriv++;
++   return S_OK;
++}
++
++HRESULT STDMETHODCALLTYPE
++wsi_dxgi_proxy::GetPrivateData(REFGUID g, UINT *size, void *data)
++{
++   for (UINT i = 0; i < npriv; i++) {
++      if (priv[i].guid != g)
++         continue;
++      if (!data) {
++         *size = priv[i].size;
++         return S_OK;
++      }
++      if (*size < priv[i].size)
++         return DXGI_ERROR_MORE_DATA;
++      *size = priv[i].size;
++      if (priv[i].iface) {
++         priv[i].iface->AddRef();
++         memcpy(data, &priv[i].iface, sizeof(IUnknown *));
++      } else {
++         memcpy(data, priv[i].data, priv[i].size);
++      }
++      return S_OK;
++   }
++   *size = 0;
++   return DXGI_ERROR_NOT_FOUND;
++}
++
++HRESULT STDMETHODCALLTYPE
++wsi_dxgi_proxy::GetBuffer(UINT i, REFIID riid, void **out)
++{
++   if (d3d11) {
++      /* Flip-model D3D11 chains expose buffer 0, always the one to draw */
++      if (i != 0 || !bb)
++         return DXGI_ERROR_INVALID_CALL;
++      return bb->QueryInterface(riid, out);
++   }
++   return wsi_dxgi12_get_buffer(d12, i, &riid, out) ? S_OK : DXGI_ERROR_INVALID_CALL;
++}
++
++UINT STDMETHODCALLTYPE
++wsi_dxgi_proxy::GetCurrentBackBufferIndex()
++{
++   return d3d11 ? 0 : present_count % desc.BufferCount;
++}
++
++HRESULT STDMETHODCALLTYPE
++wsi_dxgi_proxy::GetDesc(DXGI_SWAP_CHAIN_DESC *d)
++{
++   memset(d, 0, sizeof(*d));
++   d->BufferDesc.Width = desc.Width;
++   d->BufferDesc.Height = desc.Height;
++   d->BufferDesc.RefreshRate = fs.RefreshRate;
++   d->BufferDesc.Format = desc.Format;
++   d->BufferDesc.ScanlineOrdering = fs.ScanlineOrdering;
++   d->BufferDesc.Scaling = fs.Scaling;
++   d->SampleDesc = desc.SampleDesc;
++   d->BufferUsage = desc.BufferUsage;
++   d->BufferCount = desc.BufferCount;
++   d->OutputWindow = hwnd;
++   d->Windowed = !fullscreen;
++   d->SwapEffect = desc.SwapEffect;
++   d->Flags = desc.Flags;
++   return S_OK;
++}
++
++HRESULT STDMETHODCALLTYPE
++wsi_dxgi_proxy::ResizeBuffers(UINT n, UINT w, UINT h, DXGI_FORMAT f, UINT flags)
++{
++   (void)flags;
++   stop_thread();
++   AcquireSRWLockExclusive(&pvk.queue_lock);
++   pvk.wsi->WaitForFences(pvk.device, 1, &fence, true, 2000ull * 1000 * 1000);
++   ReleaseSRWLockExclusive(&pvk.queue_lock);
++   if (ctx)
++      ctx->Flush();
++   if (d12)
++      wsi_dxgi12_idle(d12);
++   teardown();
++   if (n)
++      desc.BufferCount = CLAMP(n, 1u, 16u);
++   if (f != DXGI_FORMAT_UNKNOWN) {
++      if (!vk_format_of(f, &vk_format, &copy_format))
++         return DXGI_ERROR_INVALID_CALL;
++      desc.Format = f;
++   }
++   if (w == 0 || h == 0) {
++      const VkExtent2D c = wsi_win32_client_extent(hwnd);
++      w = MAX2(c.width, 1u);
++      h = MAX2(c.height, 1u);
++   }
++   desc.Width = w;
++   desc.Height = h;
++   present_count = 0;
++   wsi_enh_config_get(&cfg);
++   const VkResult r = build();
++   if (r != VK_SUCCESS) {
++      LOGE("ResizeBuffers(%u, %ux%u): %d", n, w, h, (int)r);
++      teardown();
++      return DXGI_ERROR_DEVICE_REMOVED;
++   }
++   start_thread();
++   return S_OK;
++}
++
++HRESULT STDMETHODCALLTYPE
++wsi_dxgi_proxy::ResizeTarget(const DXGI_MODE_DESC *m)
++{
++   if (!m || fullscreen || !m->Width || !m->Height)
++      return S_OK;
++   RECT r = { 0, 0, (LONG)m->Width, (LONG)m->Height };
++   AdjustWindowRectEx(&r, (DWORD)GetWindowLongW(hwnd, GWL_STYLE), FALSE,
++                      (DWORD)GetWindowLongW(hwnd, GWL_EXSTYLE));
++   SetWindowPos(hwnd, NULL, 0, 0, r.right - r.left, r.bottom - r.top,
++                SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
++   return S_OK;
++}
++
++HRESULT STDMETHODCALLTYPE
++wsi_dxgi_proxy::GetContainingOutput(IDXGIOutput **o)
++{
++   *o = NULL;
++   HMONITOR mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
++   IDXGIAdapter1 *a = NULL;
++   IDXGIFactory1 *f1 = NULL;
++   if (FAILED(factory->QueryInterface(__uuidof(IDXGIFactory1), (void **)&f1)))
++      return DXGI_ERROR_NOT_FOUND;
++   HRESULT result = DXGI_ERROR_NOT_FOUND;
++   for (UINT i = 0; result != S_OK && f1->EnumAdapters1(i, &a) != DXGI_ERROR_NOT_FOUND; i++) {
++      IDXGIOutput *out_ = NULL;
++      for (UINT j = 0; a->EnumOutputs(j, &out_) != DXGI_ERROR_NOT_FOUND; j++) {
++         DXGI_OUTPUT_DESC od;
++         if (SUCCEEDED(out_->GetDesc(&od)) && od.Monitor == mon) {
++            *o = out_;
++            result = S_OK;
++            break;
++         }
++         out_->Release();
++      }
++      a->Release();
++   }
++   f1->Release();
++   return result;
++}
++
++/* ---- present ------------------------------------------------------------- */
++
++HRESULT STDMETHODCALLTYPE
++wsi_dxgi_proxy::Present(UINT sync, UINT flags)
++{
++   if (flags & DXGI_PRESENT_TEST)
++      return IsIconic(hwnd) ? DXGI_STATUS_OCCLUDED : S_OK;
++   if (!enh)
++      return DXGI_ERROR_DEVICE_REMOVED;
++
++   /* A free ring texture: the passes of an earlier frame may still read
++    * it, never for long */
++   const uint64_t start = os_time_get_nano();
++   uint32_t k = UINT32_MAX;
++   AcquireSRWLockExclusive(&lock);
++   for (;;) {
++      for (uint32_t i = 0; i < RING; i++) {
++         const uint32_t c = (present_count + i) % RING;
++         if (ring[c].state == RING_FREE) {
++            k = c;
++            break;
++         }
++      }
++      if (k != UINT32_MAX || os_time_get_nano() - start > 100ull * 1000 * 1000)
++         break;
++      SleepConditionVariableSRW(&cond, &lock, 1, 0);
++   }
++   if (k != UINT32_MAX)
++      ring[k].state = RING_COPYING;
++   ReleaseSRWLockExclusive(&lock);
++
++   const UINT index = GetCurrentBackBufferIndex();
++   present_count++;
++   if (k == UINT32_MAX) {
++      dropped++;
++      return S_OK;
++   }
++
++   uint64_t value = 0;
++   if (d3d11) {
++      ctx->CopyResource((ID3D11Resource *)ring[k].wrap.texture, bb);
++      ctx->End(ring[k].query);
++      ctx->Flush();
++   } else if (!wsi_dxgi12_copy(d12, index, k, &value)) {
++      AcquireSRWLockExclusive(&lock);
++      ring[k].state = RING_FREE;
++      ReleaseSRWLockExclusive(&lock);
++      return DXGI_ERROR_DEVICE_REMOVED;
++   }
++
++   AcquireSRWLockExclusive(&lock);
++   /* Newest first; an older frame still waiting goes when the thread sees
++    * this one (as MAILBOX) */
++   if (qn == RING) {
++      ring[q[0].ring].state = RING_FREE;
++      memmove(q, q + 1, sizeof(q[0]) * (RING - 1));
++      qn--;
++      dropped++;
++   }
++   q[qn].ring = k;
++   q[qn].present_ns = start;
++   q[qn].value = value;
++   q[qn].sync_interval = sync;
++   qn++;
++   ReleaseSRWLockExclusive(&lock);
++   WakeAllConditionVariable(&cond);
++   SetEvent(wake);
++   return IsIconic(hwnd) ? DXGI_STATUS_OCCLUDED : S_OK;
++}
++
++/* ---- the present thread -------------------------------------------------- */
++
++void
++wsi_dxgi_proxy::start_thread()
++{
++   stop = false;
++   qn = 0;
++   thread = CreateThread(NULL, 0, proxy_thread, this, 0, NULL);
++}
++
++void
++wsi_dxgi_proxy::stop_thread()
++{
++   if (!thread)
++      return;
++   AcquireSRWLockExclusive(&lock);
++   stop = true;
++   ReleaseSRWLockExclusive(&lock);
++   WakeAllConditionVariable(&cond);
++   SetEvent(wake);
++   if (WaitForSingleObject(thread, 5000) != WAIT_OBJECT_0)
++      LOGE("the present thread did not stop in 5 s");
++   CloseHandle(thread);
++   thread = NULL;
++   for (uint32_t k = 0; k < RING; k++)
++      ring[k].state = RING_FREE;
++   qn = 0;
++}
++
++static DWORD WINAPI
++proxy_thread(LPVOID param)
++{
++   wsi_dxgi_proxy *p = (wsi_dxgi_proxy *)param;
++   /* No reference of its own: the last Release stops and joins it */
++   p->run();
++   return 0;
++}
++
++bool
++wsi_dxgi_proxy::copy_done(uint32_t k, uint64_t value)
++{
++   if (d12)
++      return wsi_dxgi12_copy_done(d12, value, 2000);
++   const uint64_t start = os_time_get_nano();
++   for (;;) {
++      BOOL done = FALSE;
++      HRESULT hr = ctx->GetData(ring[k].query, &done, sizeof(done),
++                                D3D11_ASYNC_GETDATA_DONOTFLUSH);
++      if (hr == S_OK && done)
++         return true;
++      if (FAILED(hr))
++         return false;
++      const uint64_t spent = os_time_get_nano() - start;
++      if (spent > 2000ull * 1000 * 1000)
++         return false;
++      if (spent > 2ull * 1000 * 1000)
++         Sleep(1);
++      else
++         SwitchToThread();
++   }
++}
++
++/* Until `due`; true when a newer frame (or the end) came first */
++static bool
++pace_wait(wsi_dxgi_proxy *p, uint64_t due)
++{
++   for (;;) {
++      if (p_atomic_read(&p->qn) > 0 || p_atomic_read(&p->stop))
++         return true;
++      const uint64_t now = os_time_get_nano();
++      if (now >= due)
++         return false;
++      const uint64_t left = due - now;
++      if (left > 1500 * 1000 && p->timer) {
++         LARGE_INTEGER t;
++         t.QuadPart = -(LONGLONG)((left - 700 * 1000) / 100);
++         HANDLE h[2] = { p->timer, p->wake };
++         if (SetWaitableTimer(p->timer, &t, 0, NULL, NULL, FALSE))
++            WaitForMultipleObjects(2, h, FALSE, INFINITE);
++         else
++            Sleep(1);
++      } else {
++         SwitchToThread();
++      }
++   }
++}
++
++void
++wsi_dxgi_proxy::run()
++{
++   const struct wsi_device *wsi = pvk.wsi;
++   u_thread_setname("wsi-dxgi-enh");
++   uint64_t next_check = 0;
++   for (;;) {
++      AcquireSRWLockExclusive(&lock);
++      while (!stop && qn == 0)
++         SleepConditionVariableSRW(&cond, &lock, INFINITE, 0);
++      if (stop) {
++         ReleaseSRWLockExclusive(&lock);
++         break;
++      }
++      /* the newest frame; older ones are dropped unshown */
++      while (qn > 1) {
++         ring[q[0].ring].state = RING_FREE;
++         memmove(q, q + 1, sizeof(q[0]) * (qn - 1));
++         qn--;
++         dropped++;
++      }
++      const struct frame_req f = q[0];
++      qn = 0;
++      ReleaseSRWLockExclusive(&lock);
++      WakeAllConditionVariable(&cond);
++
++      const uint64_t now = os_time_get_nano();
++      if (now > next_check) {
++         next_check = now + 250ull * 1000 * 1000;
++         struct wsi_enh_config c;
++         wsi_enh_config_get(&c);
++         wsi_enh_update_config(enh, &c);
++         wsi_enh_set_refresh(enh, wsi_win32_refresh_ns(hwnd));
++      }
++
++      bool ok = copy_done(f.ring, f.value);
++      struct wsi_enh_plan plan = {};
++      if (ok) {
++         const uint32_t want = wsi_enh_pictures(enh, f.present_ns);
++         /* slots whose copy into the DXGI back buffer is done */
++         for (uint32_t i = 0; i < nslots && plan.count < want; i++) {
++            const uint32_t s = (slot_next + i) % nslots;
++            if (wsi_win32_compose_image_wait(compose, &slots[s].wrap, 0) == VK_SUCCESS)
++               plan.slot[plan.count++] = s;
++         }
++         if (plan.count == 0) {
++            /* all being copied: wait for the oldest */
++            wsi_win32_compose_image_wait(compose, &slots[slot_next].wrap, 100ull * 1000 * 1000);
++            plan.slot[plan.count++] = slot_next;
++         }
++         slot_next = (plan.slot[plan.count - 1] + 1) % nslots;
++         VkCommandBuffer cmd = wsi_enh_record(enh, pvk.qfi, f.ring, &plan);
++         ok = cmd != VK_NULL_HANDLE;
++         if (ok) {
++            VkCommandBufferSubmitInfo cbi = {};
++            cbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
++            cbi.commandBuffer = cmd;
++            VkSubmitInfo2 si = {};
++            si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
++            si.commandBufferInfoCount = 1;
++            si.pCommandBufferInfos = &cbi;
++            AcquireSRWLockExclusive(&pvk.queue_lock);
++            wsi->ResetFences(pvk.device, 1, &fence);
++            ok = wsi->QueueSubmit2(pvk.queue, 1, &si, fence) == VK_SUCCESS;
++            ReleaseSRWLockExclusive(&pvk.queue_lock);
++            ok = ok && wsi->WaitForFences(pvk.device, 1, &fence, true,
++                                          2000ull * 1000 * 1000) == VK_SUCCESS;
++         }
++      }
++      /* the ring texture has been read */
++      AcquireSRWLockExclusive(&lock);
++      ring[f.ring].state = RING_FREE;
++      ReleaseSRWLockExclusive(&lock);
++      WakeAllConditionVariable(&cond);
++      if (latency_sem)
++         ReleaseSemaphore(latency_sem, 1, NULL);
++      if (!ok) {
++         if (dropped++ < 4)
++            LOGE("frame dropped: the copy or the passes did not finish");
++         continue;
++      }
++
++      const uint64_t t0 = os_time_get_nano();
++      uint32_t generated = 0, skipped = 0;
++      for (uint32_t k = 0; k < plan.count; k++) {
++         const bool real = k + 1 == plan.count;
++         if (k > 0 && pace_wait(this, t0 + k * plan.spacing_ns) && !real) {
++            skipped = plan.count - 1 - k;
++            k = plan.count - 1;
++         }
++         if (wsi_win32_compose_present(compose, &slots[plan.slot[k]].wrap,
++                                       MIN2(f.sync_interval, 1u)) == VK_SUCCESS &&
++             k + 1 < plan.count)
++            generated++;
++      }
++      wsi_enh_note_shown(enh, 1, generated, skipped);
++   }
++}
++
++/* ---- the hooks ------------------------------------------------------------ */
++
++typedef HRESULT (STDMETHODCALLTYPE *PFN_create_sc)(IDXGIFactory *, IUnknown *,
++                                                   DXGI_SWAP_CHAIN_DESC *,
++                                                   IDXGISwapChain **);
++typedef HRESULT (STDMETHODCALLTYPE *PFN_create_hwnd)(IDXGIFactory2 *, IUnknown *, HWND,
++                                                     const DXGI_SWAP_CHAIN_DESC1 *,
++                                                     const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *,
++                                                     IDXGIOutput *, IDXGISwapChain1 **);
++static PFN_create_sc orig_create_sc;
++static PFN_create_hwnd orig_create_hwnd;
++static uint64_t proxied, passed;
++
++static HRESULT STDMETHODCALLTYPE
++hook_create_hwnd(IDXGIFactory2 *f, IUnknown *dev, HWND hwnd,
++                 const DXGI_SWAP_CHAIN_DESC1 *d,
++                 const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *fs, IDXGIOutput *o,
++                 IDXGISwapChain1 **sc)
++{
++   if (!internal_create && dev && d && sc) {
++      wsi_dxgi_proxy *p = proxy_create(f, dev, hwnd, d, fs);
++      if (p) {
++         proxied++;
++         *sc = p;
++         return S_OK;
++      }
++   }
++   passed++;
++   const bool was = internal_create;
++   internal_create = true;
++   HRESULT hr = orig_create_hwnd(f, dev, hwnd, d, fs, o, sc);
++   internal_create = was;
++   return hr;
++}
++
++static HRESULT STDMETHODCALLTYPE
++hook_create_sc(IDXGIFactory *f, IUnknown *dev, DXGI_SWAP_CHAIN_DESC *d,
++               IDXGISwapChain **sc)
++{
++   if (!internal_create && dev && d && sc) {
++      IDXGIFactory2 *f2 = NULL;
++      if (SUCCEEDED(f->QueryInterface(__uuidof(IDXGIFactory2), (void **)&f2))) {
++         DXGI_SWAP_CHAIN_DESC1 d1 = {};
++         d1.Width = d->BufferDesc.Width;
++         d1.Height = d->BufferDesc.Height;
++         d1.Format = d->BufferDesc.Format;
++         d1.SampleDesc = d->SampleDesc;
++         d1.BufferUsage = d->BufferUsage;
++         d1.BufferCount = d->BufferCount;
++         d1.Scaling = DXGI_SCALING_STRETCH;
++         d1.SwapEffect = d->SwapEffect;
++         d1.AlphaMode = DXGI_ALPHA_MODE_UNSPECIFIED;
++         d1.Flags = d->Flags;
++         DXGI_SWAP_CHAIN_FULLSCREEN_DESC fs = {};
++         fs.RefreshRate = d->BufferDesc.RefreshRate;
++         fs.ScanlineOrdering = d->BufferDesc.ScanlineOrdering;
++         fs.Scaling = d->BufferDesc.Scaling;
++         fs.Windowed = d->Windowed;
++         wsi_dxgi_proxy *p = proxy_create(f2, dev, d->OutputWindow, &d1, &fs);
++         f2->Release();
++         if (p) {
++            proxied++;
++            p->fullscreen = !d->Windowed;
++            *sc = p;
++            return S_OK;
++         }
++      }
++   }
++   passed++;
++   const bool was = internal_create;
++   internal_create = true;
++   HRESULT hr = orig_create_sc(f, dev, d, sc);
++   internal_create = was;
++   return hr;
++}
++
++static bool
++patch(void *obj, unsigned index, void *hook, void **orig)
++{
++   void **vtbl = *(void ***)obj;
++   void **entry = &vtbl[index];
++   if (*entry == hook)
++      return true;
++   DWORD old;
++   if (!VirtualProtect(entry, sizeof(void *), PAGE_READWRITE, &old))
++      return false;
++   *orig = *entry;
++   *entry = hook;
++   DWORD ignored;
++   VirtualProtect(entry, sizeof(void *), old, &ignored);
++   FlushInstructionCache(GetCurrentProcess(), entry, sizeof(void *));
++   return true;
++}
++
++static DWORD WINAPI
++install_thread(LPVOID param)
++{
++   (void)param;
++   HMODULE me = NULL;
++   GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_PIN | GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
++                      (LPCSTR)(void *)&install_thread, &me);
++   HMODULE dxgi = LoadLibraryA("dxgi.dll");
++   typedef HRESULT (WINAPI *PFN_create_factory)(REFIID, void **);
++   PFN_create_factory create = dxgi ? (PFN_create_factory)(void *)
++      GetProcAddress(dxgi, "CreateDXGIFactory1") : NULL;
++   IDXGIFactory1 *f1 = NULL;
++   if (!create || FAILED(create(__uuidof(IDXGIFactory1), (void **)&f1))) {
++      LOGE("no DXGI factory: swap chains are not enhanced");
++      return 1;
++   }
++   IDXGIFactory2 *f2 = NULL;
++   f1->QueryInterface(__uuidof(IDXGIFactory2), (void **)&f2);
++   const bool a = patch(f1, 10, (void *)hook_create_sc, (void **)&orig_create_sc);
++   const bool b = f2 && patch(f2, 15, (void *)hook_create_hwnd, (void **)&orig_create_hwnd);
++   if (f2)
++      f2->Release();
++   f1->Release();
++   if (a && b)
++      LOGI("D3D swap chains of this process are presented through NVK with "
++           "upscaling and frame generation (where the settings apply)");
++   else
++      LOGE("DXGI could not be hooked (CreateSwapChain %d, CreateSwapChainForHwnd %d)",
++           a, b);
++   return 0;
++}
++
++static INIT_ONCE install_once = INIT_ONCE_STATIC_INIT;
++
++static BOOL CALLBACK
++install_init(PINIT_ONCE once, PVOID param, PVOID *ctx)
++{
++   (void)once; (void)param; (void)ctx;
++   /* Only where a Helios D3D driver runs on this NVK, never in DWM */
++   const bool d3d = GetModuleHandleA("helios_umd.dll") || GetModuleHandleA("helios_umd12.dll") ||
++                    GetModuleHandleA("helios_umd32.dll") || GetModuleHandleA("helios_umd12_32.dll");
++   char exe[MAX_PATH] = "";
++   GetModuleFileNameA(NULL, exe, sizeof(exe));
++   const char *base = strrchr(exe, '\\');
++   base = base ? base + 1 : exe;
++   if (!d3d || !_stricmp(base, "dwm.exe"))
++      return TRUE;
++   /* Off for this process: nothing is hooked */
++   struct wsi_enh_config c;
++   wsi_enh_config_get(&c);
++   if (!wsi_enh_config_on(&c) || !c.d3d)
++      return TRUE;
++   /* DXGI is not called from the driver's own initialisation: a helper
++    * thread, awaited (as the UMD's FlipUpgrade does) */
++   HANDLE t = CreateThread(NULL, 0, install_thread, NULL, 0, NULL);
++   if (t) {
++      if (WaitForSingleObject(t, 500) != WAIT_OBJECT_0)
++         LOGE("the DXGI hooks are still being installed after 500 ms");
++      CloseHandle(t);
++   }
++   return TRUE;
++}
++
++void
++wsi_win32_dxgi_install(void)
++{
++   InitOnceExecuteOnce(&install_once, install_init, NULL, NULL);
++}
+diff --git a/src/vulkan/wsi/wsi_common_win32_dxgi.h b/src/vulkan/wsi/wsi_common_win32_dxgi.h
+new file mode 100644
+index 0000000..f6296ef
+--- /dev/null
++++ b/src/vulkan/wsi/wsi_common_win32_dxgi.h
+@@ -0,0 +1,45 @@
++/*
++ * Copyright © 2026 Ole Algoritme
++ * SPDX-License-Identifier: MIT
++ */
++
++/* The D3D swap chain proxy (wsi_common_win32_dxgi.cpp) and its D3D12 half
++ * (wsi_common_win32_dxgi12.cpp, which d3d11.h must not meet). */
++#ifndef WSI_COMMON_WIN32_DXGI_H
++#define WSI_COMMON_WIN32_DXGI_H
++
++#include <stdbool.h>
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* Hooks DXGI's swap chain creation, once per process, where a Helios D3D
++ * driver runs on this NVK and the enhancement settings are on */
++void wsi_win32_dxgi_install(void);
++
++struct wsi_dxgi12;
++/* NULL when `queue` is not an ID3D12CommandQueue */
++struct wsi_dxgi12 *wsi_dxgi12_create(void *queue);
++void wsi_dxgi12_destroy(struct wsi_dxgi12 *d);
++bool wsi_dxgi12_buffers_create(struct wsi_dxgi12 *d, uint32_t count, uint32_t w,
++                               uint32_t h, uint32_t format, uint32_t usage);
++/* Ring texture k (shared): an NT handle the caller closes */
++bool wsi_dxgi12_ring_create(struct wsi_dxgi12 *d, uint32_t k, uint32_t w,
++                            uint32_t h, uint32_t format, void **nt_handle);
++void wsi_dxgi12_release_buffers(struct wsi_dxgi12 *d);
++bool wsi_dxgi12_get_buffer(struct wsi_dxgi12 *d, uint32_t i, const void *riid,
++                           void **out);
++/* On the application's queue: back buffer `index` into ring texture k;
++ * *value is the fence value that says it is done */
++bool wsi_dxgi12_copy(struct wsi_dxgi12 *d, uint32_t index, uint32_t k,
++                     uint64_t *value);
++bool wsi_dxgi12_copy_done(struct wsi_dxgi12 *d, uint64_t value, uint32_t timeout_ms);
++void wsi_dxgi12_idle(struct wsi_dxgi12 *d);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
+diff --git a/src/vulkan/wsi/wsi_common_win32_dxgi12.cpp b/src/vulkan/wsi/wsi_common_win32_dxgi12.cpp
+new file mode 100644
+index 0000000..c7bd523
+--- /dev/null
++++ b/src/vulkan/wsi/wsi_common_win32_dxgi12.cpp
+@@ -0,0 +1,252 @@
++/*
++ * Copyright © 2026 Ole Algoritme
++ * SPDX-License-Identifier: MIT
++ */
++
++/*
++ * The D3D12 half of the D3D swap chain proxy (wsi_common_win32_dxgi.cpp):
++ * the application's back buffers, the shared ring textures, and the copy
++ * from one into the other on the application's own queue, with a fence the
++ * proxy's present thread waits for.
++ */
++
++#include <windows.h>
++#include <directx/d3d12.h>
++#include <dxguids/dxguids.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "wsi_common_win32_dxgi.h"
++
++#define RING 3
++
++struct wsi_dxgi12 {
++   ID3D12CommandQueue *queue;
++   ID3D12Device *device;
++   D3D12_COMMAND_LIST_TYPE type;
++   ID3D12Fence *fence;
++   HANDLE event;
++   uint64_t value;
++   uint32_t count;
++   ID3D12Resource *buffers[16];
++   ID3D12Resource *ring[RING];
++   ID3D12CommandAllocator *alloc[RING];
++   ID3D12GraphicsCommandList *list[RING];
++   SRWLOCK lock;
++};
++
++struct wsi_dxgi12 *
++wsi_dxgi12_create(void *unk)
++{
++   IUnknown *u = (IUnknown *)unk;
++   ID3D12CommandQueue *q = NULL;
++   if (FAILED(u->QueryInterface(__uuidof(ID3D12CommandQueue), (void **)&q)))
++      return NULL;
++   struct wsi_dxgi12 *d = (struct wsi_dxgi12 *)calloc(1, sizeof(*d));
++   if (!d) {
++      q->Release();
++      return NULL;
++   }
++   InitializeSRWLock(&d->lock);
++   d->queue = q;
++   D3D12_COMMAND_QUEUE_DESC qd;
++#if defined(_MSC_VER) || !defined(_WIN32)
++   qd = q->GetDesc();
++#else
++   q->GetDesc(&qd);
++#endif
++   d->type = qd.Type;
++   if (FAILED(q->GetDevice(__uuidof(ID3D12Device), (void **)&d->device)) ||
++       FAILED(d->device->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence),
++                                     (void **)&d->fence)) ||
++       !(d->event = CreateEventA(NULL, FALSE, FALSE, NULL))) {
++      wsi_dxgi12_destroy(d);
++      return NULL;
++   }
++   for (uint32_t k = 0; k < RING; k++) {
++      if (FAILED(d->device->CreateCommandAllocator(d->type, __uuidof(ID3D12CommandAllocator),
++                                                   (void **)&d->alloc[k])) ||
++          FAILED(d->device->CreateCommandList(0, d->type, d->alloc[k], NULL,
++                                              __uuidof(ID3D12GraphicsCommandList),
++                                              (void **)&d->list[k]))) {
++         wsi_dxgi12_destroy(d);
++         return NULL;
++      }
++      d->list[k]->Close();
++   }
++   return d;
++}
++
++void
++wsi_dxgi12_idle(struct wsi_dxgi12 *d)
++{
++   if (!d->fence)
++      return;
++   AcquireSRWLockExclusive(&d->lock);
++   const uint64_t v = ++d->value;
++   d->queue->Signal(d->fence, v);
++   ReleaseSRWLockExclusive(&d->lock);
++   wsi_dxgi12_copy_done(d, v, 2000);
++}
++
++void
++wsi_dxgi12_release_buffers(struct wsi_dxgi12 *d)
++{
++   wsi_dxgi12_idle(d);
++   for (uint32_t i = 0; i < 16; i++) {
++      if (d->buffers[i])
++         d->buffers[i]->Release();
++      d->buffers[i] = NULL;
++   }
++   for (uint32_t k = 0; k < RING; k++) {
++      if (d->ring[k])
++         d->ring[k]->Release();
++      d->ring[k] = NULL;
++   }
++   d->count = 0;
++}
++
++void
++wsi_dxgi12_destroy(struct wsi_dxgi12 *d)
++{
++   if (!d)
++      return;
++   if (d->queue)
++      wsi_dxgi12_release_buffers(d);
++   for (uint32_t k = 0; k < RING; k++) {
++      if (d->list[k])
++         d->list[k]->Release();
++      if (d->alloc[k])
++         d->alloc[k]->Release();
++   }
++   if (d->fence)
++      d->fence->Release();
++   if (d->event)
++      CloseHandle(d->event);
++   if (d->device)
++      d->device->Release();
++   if (d->queue)
++      d->queue->Release();
++   free(d);
++}
++
++static ID3D12Resource *
++texture(struct wsi_dxgi12 *d, uint32_t w, uint32_t h, DXGI_FORMAT f,
++        D3D12_RESOURCE_FLAGS flags, D3D12_HEAP_FLAGS heap_flags)
++{
++   D3D12_HEAP_PROPERTIES hp = {};
++   hp.Type = D3D12_HEAP_TYPE_DEFAULT;
++   D3D12_RESOURCE_DESC rd = {};
++   rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
++   rd.Width = w;
++   rd.Height = h;
++   rd.DepthOrArraySize = 1;
++   rd.MipLevels = 1;
++   rd.Format = f;
++   rd.SampleDesc.Count = 1;
++   rd.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
++   rd.Flags = flags;
++   ID3D12Resource *r = NULL;
++   if (FAILED(d->device->CreateCommittedResource(&hp, heap_flags, &rd,
++                                                 D3D12_RESOURCE_STATE_COMMON, NULL,
++                                                 __uuidof(ID3D12Resource), (void **)&r)))
++      return NULL;
++   return r;
++}
++
++bool
++wsi_dxgi12_buffers_create(struct wsi_dxgi12 *d, uint32_t count, uint32_t w,
++                          uint32_t h, uint32_t format, uint32_t usage)
++{
++   D3D12_RESOURCE_FLAGS flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
++   if (usage & 0x400 /* DXGI_USAGE_UNORDERED_ACCESS */)
++      flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
++   d->count = count;
++   for (uint32_t i = 0; i < count && i < 16; i++) {
++      d->buffers[i] = texture(d, w, h, (DXGI_FORMAT)format, flags, D3D12_HEAP_FLAG_NONE);
++      if (!d->buffers[i])
++         return false;
++   }
++   return true;
++}
++
++bool
++wsi_dxgi12_ring_create(struct wsi_dxgi12 *d, uint32_t k, uint32_t w, uint32_t h,
++                       uint32_t format, void **nt_handle)
++{
++   d->ring[k] = texture(d, w, h, (DXGI_FORMAT)format,
++                        D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
++                        D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS,
++                        D3D12_HEAP_FLAG_SHARED);
++   if (!d->ring[k])
++      return false;
++   HANDLE h_ = NULL;
++   if (FAILED(d->device->CreateSharedHandle(d->ring[k], NULL, GENERIC_ALL, NULL, &h_)))
++      return false;
++   *nt_handle = h_;
++   return true;
++}
++
++bool
++wsi_dxgi12_get_buffer(struct wsi_dxgi12 *d, uint32_t i, const void *riid, void **out)
++{
++   if (i >= d->count || !d->buffers[i])
++      return false;
++   return SUCCEEDED(d->buffers[i]->QueryInterface(*(const IID *)riid, out));
++}
++
++static D3D12_RESOURCE_BARRIER
++transition(ID3D12Resource *r, D3D12_RESOURCE_STATES from, D3D12_RESOURCE_STATES to)
++{
++   D3D12_RESOURCE_BARRIER b = {};
++   b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++   b.Transition.pResource = r;
++   b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++   b.Transition.StateBefore = from;
++   b.Transition.StateAfter = to;
++   return b;
++}
++
++bool
++wsi_dxgi12_copy(struct wsi_dxgi12 *d, uint32_t index, uint32_t k, uint64_t *value)
++{
++   if (index >= d->count || !d->buffers[index] || !d->ring[k])
++      return false;
++   ID3D12GraphicsCommandList *l = d->list[k];
++   /* ring k is free: its last copy and the passes over it are done */
++   if (FAILED(d->alloc[k]->Reset()) || FAILED(l->Reset(d->alloc[k], NULL)))
++      return false;
++   /* The back buffer is in PRESENT (COMMON) as DXGI hands it over; the ring
++    * texture allows simultaneous access and stays COMMON */
++   D3D12_RESOURCE_BARRIER b = transition(d->buffers[index], D3D12_RESOURCE_STATE_PRESENT,
++                                         D3D12_RESOURCE_STATE_COPY_SOURCE);
++   l->ResourceBarrier(1, &b);
++   l->CopyResource(d->ring[k], d->buffers[index]);
++   b = transition(d->buffers[index], D3D12_RESOURCE_STATE_COPY_SOURCE,
++                  D3D12_RESOURCE_STATE_PRESENT);
++   l->ResourceBarrier(1, &b);
++   if (FAILED(l->Close()))
++      return false;
++   ID3D12CommandList *lists[1] = { l };
++   AcquireSRWLockExclusive(&d->lock);
++   d->queue->ExecuteCommandLists(1, lists);
++   *value = ++d->value;
++   d->queue->Signal(d->fence, *value);
++   ReleaseSRWLockExclusive(&d->lock);
++   return true;
++}
++
++bool
++wsi_dxgi12_copy_done(struct wsi_dxgi12 *d, uint64_t value, uint32_t timeout_ms)
++{
++   if (d->fence->GetCompletedValue() >= value)
++      return true;
++   /* one waiter at a time per event (the present thread, or an idle wait
++    * while it is stopped) */
++   if (FAILED(d->fence->SetEventOnCompletion(value, d->event)))
++      return false;
++   if (d->fence->GetCompletedValue() >= value)
++      return true;
++   return WaitForSingleObject(d->event, timeout_ms) == WAIT_OBJECT_0 ||
++          d->fence->GetCompletedValue() >= value;
++}
+diff --git a/src/vulkan/wsi/wsi_common_win32_enhance.c b/src/vulkan/wsi/wsi_common_win32_enhance.c
+index 5f4a9a4..b8bd819 100644
+--- a/src/vulkan/wsi/wsi_common_win32_enhance.c
++++ b/src/vulkan/wsi/wsi_common_win32_enhance.c
+@@ -177,6 +177,9 @@ read_global(struct wsi_enh_config *c)
+    size = sizeof(d);
+    if (RegGetValueA(HKEY_LOCAL_MACHINE, "SOFTWARE\\Helios", "EnhanceStats", RRF_RT_REG_DWORD, NULL, &d, &size) == ERROR_SUCCESS)
+       c->stats = d != 0;
++   size = sizeof(d);
++   if (RegGetValueA(HKEY_LOCAL_MACHINE, "SOFTWARE\\Helios", "EnhanceD3D", RRF_RT_REG_DWORD, NULL, &d, &size) == ERROR_SUCCESS)
++      c->d3d = d != 0;
+ }
+ 
+ /* A per-exe profile, HKLM\SOFTWARE\Helios\Enhance\<exe name>: the same
+@@ -213,6 +216,8 @@ read_profile(struct wsi_enh_config *c)
+       c->low_latency = d != 0;
+    if (reg_sz(sub, "Fit", s, sizeof(s)))
+       parse_fit(c, s);
++   if (reg_dw(sub, "D3D", &d))
++      c->d3d = d != 0;
+ }
+ 
+ static void
+@@ -244,6 +249,8 @@ read_env(struct wsi_enh_config *c)
+       c->all_windows = word_is(v, "all");
+    if ((v = os_get_option("MESA_WSI_ENHANCE_STATS")))
+       c->stats = atoi(v) != 0;
++   if ((v = os_get_option("MESA_WSI_ENHANCE_D3D")))
++      c->d3d = atoi(v) != 0;
+    /* Set for this process: every window of it */
+    if (any)
+       c->from_profile = true;
+@@ -290,6 +297,7 @@ wsi_enh_config_get(struct wsi_enh_config *out)
+          .fg_mult = 1,
+          .fg_quality = WSI_ENH_FG_FAST,
+          .fit = WSI_ENH_FIT_ASPECT,
++         .d3d = true,
+       };
+       read_global(&c);
+       read_profile(&c);
+diff --git a/src/vulkan/wsi/wsi_common_win32_enhance.h b/src/vulkan/wsi/wsi_common_win32_enhance.h
+index 5af1c0b..cc523c0 100644
+--- a/src/vulkan/wsi/wsi_common_win32_enhance.h
++++ b/src/vulkan/wsi/wsi_common_win32_enhance.h
+@@ -60,6 +60,7 @@ struct wsi_enh_config {
+    enum wsi_enh_fit fit;
+    bool all_windows;           /* false: borderless/fullscreen windows only */
+    bool stats;                 /* per-present CSV */
++   bool d3d;                   /* D3D11 / D3D12 swap chains too */
+    bool from_profile;          /* a per-exe profile set it */
+ };
+ 

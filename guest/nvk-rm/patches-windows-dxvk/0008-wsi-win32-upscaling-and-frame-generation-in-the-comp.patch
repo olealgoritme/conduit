@@ -1,0 +1,2848 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Sat, 24 Oct 2026 14:29:09 +0200
+Subject: [PATCH] wsi/win32: upscaling and frame generation in the composed
+ present
+
+Off by default.  With MESA_WSI_ENHANCE_SCALER / MESA_WSI_ENHANCE_FG or
+the HKLM\SOFTWARE\Helios Enhance* values (a per-exe profile under
+HKLM\SOFTWARE\Helios\Enhance\<exe>), a composed swapchain's DXGI flip swap
+chain is the window's size and every present runs compute passes on the
+application's queue (wsi_swapchain::present_cmd, submitted after the
+application's semaphores and before the present's fence):
+
+  scale    FSR 1 (EASU, then RCAS with the sharpness), bicubic,
+           bilinear, nearest or integer, into the picture region of an
+           output slot (a D3D11 shared texture of the window's size),
+           aspect kept with black bars or stretched
+  framegen 2x, 3x, 4x or adaptive (fill to the refresh or a target fps):
+           a luma pyramid of the frame, block-matching optical flow
+           between the last two frames, coarse to fine and symmetric
+           about the generated moment, and each generated picture
+           interpolated at output resolution into its own slot
+
+The present thread waits for the passes, hands the application's image
+back at once and presents the slots, generated ones first, paced a frame
+interval apart (a high-resolution timer); a newer frame cuts a cycle short.
+The application's thread never waits for a picture's time.  Generation
+steps aside after a pause, when the frame rate is near the refresh, and
+with low latency when the game reaches the target itself.
+
+With a scaler the surface reports no current extent, so DXVK, vkd3d-proton
+and native applications that take the swapchain size from the swapchain
+render at their own resolution.  Settings changes that need new buffers
+return VK_SUBOPTIMAL_KHR.  Statistics every 5 s in helios-wsi-<pid>.log
+(pictures shown, GPU time per pass from timestamps), per frame in
+enhance-<pid>-*.csv with MESA_WSI_ENHANCE_STATS=1.
+
+Passes: GLSL compute compiled to SPIR-V by glslangValidator at build time
+(src/vulkan/wsi/enhance), push descriptors and push constants.
+---
+ src/vulkan/wsi/enhance/enh_common.glsl    |   41 +
+ src/vulkan/wsi/enhance/enh_easu.comp      |   34 +
+ src/vulkan/wsi/enhance/enh_rcas.comp      |   30 +
+ src/vulkan/wsi/enhance/enh_scale.comp     |   60 +
+ src/vulkan/wsi/enhance/fg_down.comp       |   22 +
+ src/vulkan/wsi/enhance/fg_flow.comp       |   95 ++
+ src/vulkan/wsi/enhance/fg_interp.comp     |   67 +
+ src/vulkan/wsi/meson.build                |   24 +-
+ src/vulkan/wsi/wsi_common.c               |   42 +-
+ src/vulkan/wsi/wsi_common.h               |   19 +
+ src/vulkan/wsi/wsi_common_private.h       |   10 +
+ src/vulkan/wsi/wsi_common_win32.cpp       |  559 ++++++++-
+ src/vulkan/wsi/wsi_common_win32_enhance.c | 1372 +++++++++++++++++++++
+ src/vulkan/wsi/wsi_common_win32_enhance.h |  157 +++
+ 14 files changed, 2523 insertions(+), 9 deletions(-)
+ create mode 100644 src/vulkan/wsi/enhance/enh_common.glsl
+ create mode 100644 src/vulkan/wsi/enhance/enh_easu.comp
+ create mode 100644 src/vulkan/wsi/enhance/enh_rcas.comp
+ create mode 100644 src/vulkan/wsi/enhance/enh_scale.comp
+ create mode 100644 src/vulkan/wsi/enhance/fg_down.comp
+ create mode 100644 src/vulkan/wsi/enhance/fg_flow.comp
+ create mode 100644 src/vulkan/wsi/enhance/fg_interp.comp
+ create mode 100644 src/vulkan/wsi/wsi_common_win32_enhance.c
+ create mode 100644 src/vulkan/wsi/wsi_common_win32_enhance.h
+
+diff --git a/src/vulkan/wsi/enhance/enh_common.glsl b/src/vulkan/wsi/enhance/enh_common.glsl
+new file mode 100644
+index 0000000..90c8570
+--- /dev/null
++++ b/src/vulkan/wsi/enhance/enh_common.glsl
+@@ -0,0 +1,41 @@
++/*
++ * Copyright © 2026 Ole Algoritme
++ * SPDX-License-Identifier: MIT
++ *
++ * Head of every enhancement pass of the composed present
++ * (wsi_common_win32_enhance.c).  One descriptor layout for all of them:
++ * three sampled images (linear or nearest samplers as the pass needs) and
++ * one storage image written without a format, so the same pass writes an
++ * internal RGBA8/RGBA16F image or the window's B8G8R8A8 shared texture.
++ */
++layout(local_size_x = 8, local_size_y = 8) in;
++
++layout(set = 0, binding = 0) uniform sampler2D s_src;
++layout(set = 0, binding = 1) uniform sampler2D s_src2;
++layout(set = 0, binding = 2) uniform sampler2D s_aux;
++layout(set = 0, binding = 3) writeonly uniform image2D o_dst;
++
++layout(push_constant) uniform enh_push {
++   ivec2 src_size;   /* what s_src holds */
++   ivec2 dst_size;   /* the region written */
++   ivec2 dst_off;    /* its origin in o_dst */
++   ivec2 aux_size;   /* what s_aux holds */
++   vec4  p0;         /* per pass */
++   vec4  p1;
++   uint  mode;
++   uint  flags;
++} pc;
++
++#define ENH_FLAG_SRGB_ENCODE 1u   /* s_src is an sRGB view: write sRGB values */
++
++vec3 enh_srgb_encode(vec3 c)
++{
++   c = clamp(c, 0.0, 1.0);
++   return mix(c * 12.92, 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055,
++              step(vec3(0.0031308), c));
++}
++
++vec3 enh_out(vec3 c)
++{
++   return (pc.flags & ENH_FLAG_SRGB_ENCODE) != 0u ? enh_srgb_encode(c) : c;
++}
+diff --git a/src/vulkan/wsi/enhance/enh_easu.comp b/src/vulkan/wsi/enhance/enh_easu.comp
+new file mode 100644
+index 0000000..b644138
+--- /dev/null
++++ b/src/vulkan/wsi/enhance/enh_easu.comp
+@@ -0,0 +1,34 @@
++#version 450
++#extension GL_GOOGLE_include_directive : require
++/*
++ * Copyright © 2026 Ole Algoritme
++ * SPDX-License-Identifier: MIT
++ *
++ * FSR 1 EASU (third_party/fsr1, MIT, unmodified): the whole of s_src
++ * upscaled into the dst_size region, one pixel per invocation.  s_src is
++ * sampled through a linear sampler (textureGather).
++ */
++#include "enh_common.glsl"
++
++#define A_GPU 1
++#define A_GLSL 1
++#include "ffx_a.h"
++#define FSR_EASU_F 1
++AF4 FsrEasuRF(AF2 p) { return textureGather(s_src, p, 0); }
++AF4 FsrEasuGF(AF2 p) { return textureGather(s_src, p, 1); }
++AF4 FsrEasuBF(AF2 p) { return textureGather(s_src, p, 2); }
++#include "ffx_fsr1.h"
++
++void main()
++{
++   ivec2 p = ivec2(gl_GlobalInvocationID.xy);
++   if (p.x >= pc.dst_size.x || p.y >= pc.dst_size.y)
++      return;
++   AU4 c0, c1, c2, c3;
++   FsrEasuCon(c0, c1, c2, c3, AF1(pc.src_size.x), AF1(pc.src_size.y),
++              AF1(pc.src_size.x), AF1(pc.src_size.y),
++              AF1(pc.dst_size.x), AF1(pc.dst_size.y));
++   AF3 c;
++   FsrEasuF(c, AU2(p), c0, c1, c2, c3);
++   imageStore(o_dst, p + pc.dst_off, vec4(enh_out(c), 1.0));
++}
+diff --git a/src/vulkan/wsi/enhance/enh_rcas.comp b/src/vulkan/wsi/enhance/enh_rcas.comp
+new file mode 100644
+index 0000000..d129beb
+--- /dev/null
++++ b/src/vulkan/wsi/enhance/enh_rcas.comp
+@@ -0,0 +1,30 @@
++#version 450
++#extension GL_GOOGLE_include_directive : require
++/*
++ * Copyright © 2026 Ole Algoritme
++ * SPDX-License-Identifier: MIT
++ *
++ * FSR 1 RCAS (third_party/fsr1, MIT, unmodified): sharpens s_src 1:1 into
++ * the dst_size region.  p0.x: sharpness in stops (0 = sharpest).
++ */
++#include "enh_common.glsl"
++
++#define A_GPU 1
++#define A_GLSL 1
++#include "ffx_a.h"
++#define FSR_RCAS_F 1
++AF4 FsrRcasLoadF(ASU2 p) { return texelFetch(s_src, clamp(p, ASU2(0), pc.src_size - 1), 0); }
++void FsrRcasInputF(inout AF1 r, inout AF1 g, inout AF1 b) {}
++#include "ffx_fsr1.h"
++
++void main()
++{
++   ivec2 p = ivec2(gl_GlobalInvocationID.xy);
++   if (p.x >= pc.dst_size.x || p.y >= pc.dst_size.y)
++      return;
++   AU4 con;
++   FsrRcasCon(con, pc.p0.x);
++   AF1 r, g, b;
++   FsrRcasF(r, g, b, AU2(p), con);
++   imageStore(o_dst, p + pc.dst_off, vec4(enh_out(vec3(r, g, b)), 1.0));
++}
+diff --git a/src/vulkan/wsi/enhance/enh_scale.comp b/src/vulkan/wsi/enhance/enh_scale.comp
+new file mode 100644
+index 0000000..39ee641
+--- /dev/null
++++ b/src/vulkan/wsi/enhance/enh_scale.comp
+@@ -0,0 +1,60 @@
++#version 450
++#extension GL_GOOGLE_include_directive : require
++/*
++ * Copyright © 2026 Ole Algoritme
++ * SPDX-License-Identifier: MIT
++ *
++ * The plain scalers: the whole of s_src drawn into the dst_size region.
++ *   mode 0  nearest (also the 1:1 copy, and integer scaling)
++ *   mode 1  bilinear
++ *   mode 2  bicubic (Catmull-Rom, 4x4 taps through 9 bilinear fetches)
++ * s_src is sampled through a linear sampler.
++ */
++#include "enh_common.glsl"
++
++vec3 catmull_rom(vec2 uv, vec2 size)
++{
++   /* Catmull-Rom with bilinear taps (the usual 9-tap form) */
++   vec2 pos = uv * size;
++   vec2 tc1 = floor(pos - 0.5) + 0.5;
++   vec2 f = pos - tc1;
++   vec2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
++   vec2 w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
++   vec2 w2 = f * (0.5 + f * (2.0 - 1.5 * f));
++   vec2 w3 = f * f * (-0.5 + 0.5 * f);
++   vec2 w12 = w1 + w2;
++   vec2 off12 = w2 / w12;
++   vec2 inv = 1.0 / size;
++   vec2 t0 = (tc1 - 1.0) * inv;
++   vec2 t3 = (tc1 + 2.0) * inv;
++   vec2 t12 = (tc1 + off12) * inv;
++   vec3 c = vec3(0.0);
++   c += textureLod(s_src, vec2(t0.x,  t0.y), 0.0).rgb  * w0.x  * w0.y;
++   c += textureLod(s_src, vec2(t12.x, t0.y), 0.0).rgb  * w12.x * w0.y;
++   c += textureLod(s_src, vec2(t3.x,  t0.y), 0.0).rgb  * w3.x  * w0.y;
++   c += textureLod(s_src, vec2(t0.x,  t12.y), 0.0).rgb * w0.x  * w12.y;
++   c += textureLod(s_src, vec2(t12.x, t12.y), 0.0).rgb * w12.x * w12.y;
++   c += textureLod(s_src, vec2(t3.x,  t12.y), 0.0).rgb * w3.x  * w12.y;
++   c += textureLod(s_src, vec2(t0.x,  t3.y), 0.0).rgb  * w0.x  * w3.y;
++   c += textureLod(s_src, vec2(t12.x, t3.y), 0.0).rgb  * w12.x * w3.y;
++   c += textureLod(s_src, vec2(t3.x,  t3.y), 0.0).rgb  * w3.x  * w3.y;
++   return max(c, vec3(0.0));
++}
++
++void main()
++{
++   ivec2 p = ivec2(gl_GlobalInvocationID.xy);
++   if (p.x >= pc.dst_size.x || p.y >= pc.dst_size.y)
++      return;
++   vec2 uv = (vec2(p) + 0.5) / vec2(pc.dst_size);
++   vec3 c;
++   if (pc.mode == 0u) {
++      ivec2 s = min(ivec2(uv * vec2(pc.src_size)), pc.src_size - 1);
++      c = texelFetch(s_src, s, 0).rgb;
++   } else if (pc.mode == 1u) {
++      c = textureLod(s_src, uv, 0.0).rgb;
++   } else {
++      c = catmull_rom(uv, vec2(pc.src_size));
++   }
++   imageStore(o_dst, p + pc.dst_off, vec4(enh_out(c), 1.0));
++}
+diff --git a/src/vulkan/wsi/enhance/fg_down.comp b/src/vulkan/wsi/enhance/fg_down.comp
+new file mode 100644
+index 0000000..292acdf
+--- /dev/null
++++ b/src/vulkan/wsi/enhance/fg_down.comp
+@@ -0,0 +1,22 @@
++#version 450
++#extension GL_GOOGLE_include_directive : require
++/*
++ * Copyright © 2026 Ole Algoritme
++ * SPDX-License-Identifier: MIT
++ *
++ * One level of the frame-generation luma pyramid: each texel the average of
++ * a 2x2 block of the level below, one bilinear tap at the block's centre.
++ * mode 1: s_src is the colour frame and luma is taken here (Rec. 601; the
++ * flow only needs a stable brightness).  Written into o_dst (R16F).
++ */
++#include "enh_common.glsl"
++
++void main()
++{
++   ivec2 p = ivec2(gl_GlobalInvocationID.xy);
++   if (p.x >= pc.dst_size.x || p.y >= pc.dst_size.y)
++      return;
++   vec4 c = textureLod(s_src, (vec2(p) * 2.0 + 1.0) / vec2(pc.src_size), 0.0);
++   float y = pc.mode != 0u ? dot(c.rgb, vec3(0.299, 0.587, 0.114)) : c.r;
++   imageStore(o_dst, p, vec4(y, 0.0, 0.0, 1.0));
++}
+diff --git a/src/vulkan/wsi/enhance/fg_flow.comp b/src/vulkan/wsi/enhance/fg_flow.comp
+new file mode 100644
+index 0000000..a6c1d64
+--- /dev/null
++++ b/src/vulkan/wsi/enhance/fg_flow.comp
+@@ -0,0 +1,95 @@
++#version 450
++#extension GL_GOOGLE_include_directive : require
++/*
++ * Copyright © 2026 Ole Algoritme
++ * SPDX-License-Identifier: MIT
++ *
++ * Block-matching optical flow for frame generation, one pyramid level per
++ * dispatch, coarse to fine.  The match is symmetric about the generated
++ * moment: for a texel p of the in-between picture and a candidate motion v
++ * (previous -> newest frame) the previous frame is read at p - v/2 and the
++ * newest at p + v/2, scored by how alike the two 3x3 neighbourhoods are.
++ * Every texel of the picture to be made gets a vector: no holes.
++ *
++ *   coarsest level   exhaustive search, |v| <= radius texels (p0.y)
++ *   finer levels     the coarser vector here and at its four neighbours,
++ *                    and zero motion; the best refined by one texel
++ *
++ * s_src: previous frame's luma at this level, s_src2: newest, s_aux: the
++ * coarser level's flow (aux_size).  p0.x: frame pixels per texel of this
++ * level; mode 1 refines s_aux, 0 searches.  Output RGBA16F: rg the motion
++ * in frame pixels, b the match cost (mean absolute luma difference).
++ */
++#include "enh_common.glsl"
++
++const float LAMBDA = 0.002;   /* cost per texel of motion */
++
++float match(vec2 c, vec2 v, vec2 inv)
++{
++   vec2 a = c - 0.5 * v;
++   vec2 b = c + 0.5 * v;
++   float s = 0.0;
++   for (int dy = -1; dy <= 1; dy++) {
++      for (int dx = -1; dx <= 1; dx++) {
++         vec2 d = vec2(float(dx), float(dy));
++         float pa = textureLod(s_src, (a + d) * inv, 0.0).r;
++         float pb = textureLod(s_src2, (b + d) * inv, 0.0).r;
++         s += abs(pa - pb);
++      }
++   }
++   return s * (1.0 / 9.0) + LAMBDA * (abs(v.x) + abs(v.y));
++}
++
++void main()
++{
++   ivec2 p = ivec2(gl_GlobalInvocationID.xy);
++   if (p.x >= pc.dst_size.x || p.y >= pc.dst_size.y)
++      return;
++   vec2 inv = 1.0 / vec2(pc.dst_size);
++   float scale = pc.p0.x;
++   vec2 c = vec2(p) + 0.5;
++   vec2 best = vec2(0.0);
++   float bc = match(c, best, inv);
++
++   if (pc.mode == 0u) {
++      int r = int(pc.p0.y);
++      for (int y = -r; y <= r; y++) {
++         for (int x = -r; x <= r; x++) {
++            vec2 v = vec2(float(x), float(y));
++            float k = match(c, v, inv);
++            if (k < bc) {
++               bc = k;
++               best = v;
++            }
++         }
++      }
++   } else {
++      ivec2 q = p / 2;
++      const ivec2 off[5] = ivec2[5](ivec2(0, 0), ivec2(-1, 0), ivec2(1, 0),
++                                    ivec2(0, -1), ivec2(0, 1));
++      for (int i = 0; i < 5; i++) {
++         ivec2 t = clamp(q + off[i], ivec2(0), pc.aux_size - 1);
++         vec2 v = texelFetch(s_aux, t, 0).rg / scale;
++         float k = match(c, v, inv);
++         if (k < bc) {
++            bc = k;
++            best = v;
++         }
++      }
++      vec2 seed = best;
++      for (int y = -1; y <= 1; y++) {
++         for (int x = -1; x <= 1; x++) {
++            if (x == 0 && y == 0)
++               continue;
++            vec2 v = seed + vec2(float(x), float(y));
++            float k = match(c, v, inv);
++            if (k < bc) {
++               bc = k;
++               best = v;
++            }
++         }
++      }
++   }
++   float raw = bc - LAMBDA * (abs(best.x) + abs(best.y));
++   imageStore(o_dst, p, vec4(best * scale, raw, 1.0));
++}
+diff --git a/src/vulkan/wsi/enhance/fg_interp.comp b/src/vulkan/wsi/enhance/fg_interp.comp
+new file mode 100644
+index 0000000..0cb40f1
+--- /dev/null
++++ b/src/vulkan/wsi/enhance/fg_interp.comp
+@@ -0,0 +1,67 @@
++#version 450
++#extension GL_GOOGLE_include_directive : require
++/*
++ * Copyright © 2026 Ole Algoritme
++ * SPDX-License-Identifier: MIT
++ *
++ * The generated picture at phase p0.x between the previous (0) and the
++ * newest (1) frame, at the output's resolution, into the dst_size region of
++ * o_dst at dst_off.  s_src / s_src2: the two frames after the upscaler
++ * (dst_size, linear sampler); s_aux: the finest flow level (aux_size), in
++ * input pixels, p0.y input pixels per flow texel; p1.xy output pixels per
++ * input pixel.
++ *
++ *   candidates   the four flow vectors around the pixel and zero motion,
++ *                chosen per pixel by how well the frames agree along each
++ *                (object edges where the colour puts them; a static HUD
++ *                picks zero motion under a moving background)
++ *   motion       prev(x - t v) and cur(x + (1 - t) v), mixed by t
++ *   occlusion    when even the best candidate disagrees, the sample from
++ *                the frame nearer in time
++ *   low trust    where the flow match itself was poor (motion beyond the
++ *                search, a scene cut), a plain cross-fade
++ */
++#include "enh_common.glsl"
++
++void main()
++{
++   ivec2 p = ivec2(gl_GlobalInvocationID.xy);
++   if (p.x >= pc.dst_size.x || p.y >= pc.dst_size.y)
++      return;
++   vec2 inv = 1.0 / vec2(pc.dst_size);
++   vec2 k = pc.p1.xy;
++   vec2 c = vec2(p) + 0.5;
++   float t = pc.p0.x;
++   vec2 fc = (c / k) / pc.p0.y - 0.5;
++   ivec2 f0 = ivec2(floor(fc));
++   vec3 a_best = vec3(0.0), b_best = vec3(0.0);
++   float e_best = 1e9, k_best = 0.0;
++
++   for (int i = 0; i < 5; i++) {
++      vec2 v = vec2(0.0);
++      float cost = 0.0;
++      if (i < 4) {
++         ivec2 q = clamp(f0 + ivec2(i & 1, i >> 1), ivec2(0), pc.aux_size - 1);
++         vec4 f = texelFetch(s_aux, q, 0);
++         v = f.rg * k;
++         cost = f.b;
++      }
++      vec3 a = textureLod(s_src, (c - t * v) * inv, 0.0).rgb;
++      vec3 b = textureLod(s_src2, (c + (1.0 - t) * v) * inv, 0.0).rgb;
++      float e = dot(abs(a - b), vec3(1.0 / 3.0));
++      if (e < e_best) {
++         e_best = e;
++         a_best = a;
++         b_best = b;
++         k_best = i < 4 ? cost : e;
++      }
++   }
++   vec3 both = mix(a_best, b_best, t);
++   vec3 near = t < 0.5 ? a_best : t > 0.5 ? b_best : 0.5 * (a_best + b_best);
++   float conf_px = 1.0 - smoothstep(0.03, 0.12, e_best);
++   vec3 moved = mix(near, both, conf_px);
++   vec3 fade = mix(textureLod(s_src, c * inv, 0.0).rgb,
++                   textureLod(s_src2, c * inv, 0.0).rgb, t);
++   float conf_flow = 1.0 - smoothstep(0.05, 0.16, k_best);
++   imageStore(o_dst, p + pc.dst_off, vec4(mix(fade, moved, conf_flow), 1.0));
++}
+diff --git a/src/vulkan/wsi/meson.build b/src/vulkan/wsi/meson.build
+index d5201a2..8259a40 100644
+--- a/src/vulkan/wsi/meson.build
++++ b/src/vulkan/wsi/meson.build
+@@ -28,8 +28,30 @@ if with_platform_wayland
+ endif
+ 
+ if with_platform_windows
+-  files_vulkan_wsi += files('wsi_common_win32.cpp', 'wsi_common_win32_frametime.c', 'wsi_common_win32_compose.cpp')
++  files_vulkan_wsi += files('wsi_common_win32.cpp', 'wsi_common_win32_frametime.c', 'wsi_common_win32_compose.cpp',
++                            'wsi_common_win32_enhance.c')
+   platform_deps += dep_dxheaders
++  # The composed present's upscaling and frame-generation passes, compiled
++  # to SPIR-V here and embedded (enhance/; FidelityFX FSR 1 in
++  # enhance/third_party, MIT)
++  if not prog_glslang.found()
++    error('glslangValidator is needed for the Win32 WSI enhancement shaders')
++  endif
++  foreach s : ['enh_scale', 'enh_easu', 'enh_rcas', 'fg_down', 'fg_flow', 'fg_interp']
++    files_vulkan_wsi += custom_target(
++      s + '_spv.h',
++      input : 'enhance' / s + '.comp',
++      output : s + '_spv.h',
++      command : [
++        prog_glslang, '-V', '--target-env', 'vulkan1.1', '-S', 'comp',
++        '-I' + (meson.current_source_dir() / 'enhance'),
++        '-I' + (meson.current_source_dir() / 'enhance' / 'third_party' / 'fsr1'),
++        '--vn', s + '_spv', '-o', '@OUTPUT@', '@INPUT@',
++        glslang_quiet, glslang_depfile,
++      ],
++      depfile : s + '_spv.h.d',
++    )
++  endforeach
+ else
+   files_vulkan_wsi += files('wsi_common_headless.c')
+ endif
+diff --git a/src/vulkan/wsi/wsi_common.c b/src/vulkan/wsi/wsi_common.c
+index 28db48f..2fa8a98 100644
+--- a/src/vulkan/wsi/wsi_common.c
++++ b/src/vulkan/wsi/wsi_common.c
+@@ -238,6 +238,24 @@ wsi_device_init(struct wsi_device *wsi,
+    WSI_GET_CB(QueueSubmit2);
+    WSI_GET_CB(SetDebugUtilsObjectNameEXT);
+    WSI_GET_CB(WaitForFences);
++   WSI_GET_CB(CmdBindPipeline);
++   WSI_GET_CB(CmdClearColorImage);
++   WSI_GET_CB(CmdDispatch);
++   WSI_GET_CB(CmdPushConstants);
++   WSI_GET_CB(CmdPushDescriptorSetKHR);
++   WSI_GET_CB(CreateComputePipelines);
++   WSI_GET_CB(CreateDescriptorSetLayout);
++   WSI_GET_CB(CreateImageView);
++   WSI_GET_CB(CreatePipelineLayout);
++   WSI_GET_CB(CreateSampler);
++   WSI_GET_CB(CreateShaderModule);
++   WSI_GET_CB(DestroyDescriptorSetLayout);
++   WSI_GET_CB(DestroyImageView);
++   WSI_GET_CB(DestroyPipeline);
++   WSI_GET_CB(DestroyPipelineLayout);
++   WSI_GET_CB(DestroySampler);
++   WSI_GET_CB(DestroyShaderModule);
++   WSI_GET_CB(ResetCommandBuffer);
+    WSI_GET_CB(MapMemory);
+    WSI_GET_CB(UnmapMemory);
+    if (wsi->has_present_wait)
+@@ -2515,6 +2533,14 @@ wsi_common_queue_present(const struct wsi_device *wsi,
+       }
+    }
+ 
++   /* A backend's own pre-present GPU work (present_cmd) reads the images
++    * in shaders: the waits then cover every stage */
++   bool any_present_cmd = false;
++   for (uint32_t i = 0; i < pPresentInfo->swapchainCount; i++) {
++      VK_FROM_HANDLE(wsi_swapchain, swapchain, pPresentInfo->pSwapchains[i]);
++      any_present_cmd |= swapchain->present_cmd != NULL;
++   }
++
+    /* Gather up all the semaphores we need to wait on */
+    STACK_ARRAY(VkSemaphoreSubmitInfo, semaphore_wait_infos,
+                pPresentInfo->waitSemaphoreCount);
+@@ -2543,6 +2569,8 @@ wsi_common_queue_present(const struct wsi_device *wsi,
+           */
+          .stageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+       };
++      if (any_present_cmd)
++         semaphore_wait_infos[i].stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    }
+ 
+    const VkPresentIdKHR *present_ids =
+@@ -2726,7 +2754,7 @@ wsi_common_queue_present(const struct wsi_device *wsi,
+     */
+    {
+       STACK_ARRAY(VkCommandBufferSubmitInfo, command_buffer_infos,
+-                  pPresentInfo->swapchainCount * 2);
++                  pPresentInfo->swapchainCount * 3);
+       STACK_ARRAY(VkSemaphoreSubmitInfo, signal_semaphore_infos,
+                   pPresentInfo->swapchainCount *
+                   ARRAY_SIZE(image_signal_infos[0].semaphore_infos));
+@@ -2794,6 +2822,18 @@ wsi_common_queue_present(const struct wsi_device *wsi,
+             };
+          }
+ 
++         if (swapchain->present_cmd) {
++            VkCommandBuffer cmd =
++               swapchain->present_cmd(swapchain, image_index,
++                                      queue->queue_family_index);
++            if (cmd != VK_NULL_HANDLE) {
++               command_buffer_infos[command_buffer_count++] = (VkCommandBufferSubmitInfo) {
++                  .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
++                  .commandBuffer = cmd,
++               };
++            }
++         }
++
+          if (needs_timing_command_buffer) {
+             command_buffer_infos[command_buffer_count++] = (VkCommandBufferSubmitInfo) {
+                .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
+diff --git a/src/vulkan/wsi/wsi_common.h b/src/vulkan/wsi/wsi_common.h
+index defdf7b..32f5ea5 100644
+--- a/src/vulkan/wsi/wsi_common.h
++++ b/src/vulkan/wsi/wsi_common.h
+@@ -350,6 +350,25 @@ struct wsi_device {
+    WSI_CB(MapMemory);
+    WSI_CB(UnmapMemory);
+    WSI_CB(WaitSemaphores);
++   /* The composed present's enhancement passes (Windows) */
++   WSI_CB(CmdBindPipeline);
++   WSI_CB(CmdClearColorImage);
++   WSI_CB(CmdDispatch);
++   WSI_CB(CmdPushConstants);
++   WSI_CB(CmdPushDescriptorSetKHR);
++   WSI_CB(CreateComputePipelines);
++   WSI_CB(CreateDescriptorSetLayout);
++   WSI_CB(CreateImageView);
++   WSI_CB(CreatePipelineLayout);
++   WSI_CB(CreateSampler);
++   WSI_CB(CreateShaderModule);
++   WSI_CB(DestroyDescriptorSetLayout);
++   WSI_CB(DestroyImageView);
++   WSI_CB(DestroyPipeline);
++   WSI_CB(DestroyPipelineLayout);
++   WSI_CB(DestroySampler);
++   WSI_CB(DestroyShaderModule);
++   WSI_CB(ResetCommandBuffer);
+ #undef WSI_CB
+ 
+     struct wsi_interface *                  wsi[VK_ICD_WSI_PLATFORM_MAX];
+diff --git a/src/vulkan/wsi/wsi_common_private.h b/src/vulkan/wsi/wsi_common_private.h
+index 6a8d5c6..5d0b93f 100644
+--- a/src/vulkan/wsi/wsi_common_private.h
++++ b/src/vulkan/wsi/wsi_common_private.h
+@@ -266,6 +266,16 @@ struct wsi_swapchain {
+    bool gpu_ordered_present;
+    VkQueue present_queue;
+ 
++   /* Optional: GPU work of the backend's own for this present (the Win32
++    * composed present's upscaling and frame generation), recorded now and
++    * submitted on the present queue after the application's wait
++    * semaphores and before the present's fence and semaphores are
++    * signalled.  VK_NULL_HANDLE: none this time.
++    */
++   VkCommandBuffer (*present_cmd)(struct wsi_swapchain *swap_chain,
++                                  uint32_t image_index,
++                                  uint32_t queue_family_index);
++
+    struct {
+       enum wsi_swapchain_blit_type type;
+       VkSemaphore *semaphores;
+diff --git a/src/vulkan/wsi/wsi_common_win32.cpp b/src/vulkan/wsi/wsi_common_win32.cpp
+index f5a574c..e0b9796 100644
+--- a/src/vulkan/wsi/wsi_common_win32.cpp
++++ b/src/vulkan/wsi/wsi_common_win32.cpp
+@@ -29,6 +29,7 @@
+ 
+ #include "util/cnd_monotonic.h"
+ #include "util/log.h"
++#include "util/os_misc.h"
+ #include "util/os_time.h"
+ #include "util/u_debug.h"
+ #include "util/timespec.h"
+@@ -39,6 +40,7 @@
+ #include "vk_util.h"
+ #include "wsi_common_entrypoints.h"
+ #include "wsi_common_private.h"
++#include "wsi_common_win32_enhance.h"
+ 
+ #include <dxgi1_4.h>
+ #include <directx/d3d12.h>
+@@ -179,6 +181,24 @@ struct wsi_win32_swapchain {
+       uint32_t q[WSI_WIN32_COMPOSE_QUEUE];
+       uint32_t q_head, q_count;
+       uint64_t dropped;
++
++      /* Upscaling / frame generation (wsi_common_win32_enhance.c): the
++       * DXGI swap chain is out_extent (the window's size with a scaler),
++       * every present turns the application's image into plans[index]:
++       * output slots, generated pictures first, presented paced by the
++       * present thread. */
++      bool enh_want;             /* asked for at creation */
++      struct wsi_enh *enh;
++      struct wsi_enh_config enh_cfg;
++      VkExtent2D out_extent;
++      struct wsi_win32_image *slots;
++      uint32_t slot_count;
++      uint32_t slot_next;
++      struct wsi_enh_plan *plans;
++      HANDLE pace_timer;
++      HANDLE wake;
++      uint64_t next_check_ns;    /* settings, window size, refresh */
++      bool suboptimal;           /* the swapchain should be made again */
+    } compose;
+ 
+    struct wsi_win32_image     images[0];
+@@ -284,6 +304,16 @@ wsi_win32_surface_get_capabilities(VkIcdSurfaceBase *surf,
+       (uint32_t)win_rect.right - (uint32_t)win_rect.left,
+       (uint32_t)win_rect.bottom - (uint32_t)win_rect.top
+    };
++   /* An upscaler for this window (composed present): the swapchain may
++    * have any size, DXVK and vkd3d-proton then make it the game's back
++    * buffer size, and the present scales it to the window */
++   if (wsi_device->win32.compose_import != NULL) {
++      struct wsi_enh_config ec;
++      wsi_enh_config_get(&ec);
++      if (ec.scaler != WSI_ENH_SCALER_OFF &&
++          wsi_enh_config_applies(&ec, surface->hwnd))
++         caps->surfaceCapabilities.currentExtent = { UINT32_MAX, UINT32_MAX };
++   }
+    caps->surfaceCapabilities.minImageExtent = { 1u, 1u };
+    caps->surfaceCapabilities.maxImageExtent = {
+       wsi_device->maxImageDimension2D,
+@@ -929,8 +959,13 @@ wsi_win32_create_compose_image_mem(const struct wsi_swapchain *drv_chain,
+                                       &win32_image->compose);
+       return result;
+    }
+-   wsi_win32_compose_log(false, "compose: resource %u imported as swapchain image %u",
+-             imp.resource_id, (unsigned)(win32_image - chain->images));
++   if (win32_image >= chain->images &&
++       win32_image < chain->images + drv_chain->image_count + 1)
++      wsi_win32_compose_log(false, "compose: resource %u imported as swapchain image %u",
++                            imp.resource_id, (unsigned)(win32_image - chain->images));
++   else
++      wsi_win32_compose_log(false, "compose: resource %u imported as an output slot",
++                            imp.resource_id);
+ 
+    image->num_planes = 1;
+    image->sizes[0] = imp.size;
+@@ -953,6 +988,11 @@ wsi_win32_compose_configure_image(const struct wsi_swapchain *chain,
+    info->create.tiling = VK_IMAGE_TILING_OPTIMAL;
+    info->select_image_memory_type = wsi_select_device_memory_type;
+    info->create_mem = wsi_win32_create_compose_image_mem;
++   /* The enhancement passes sample the application's images */
++   if (((const struct wsi_win32_swapchain *)chain)->compose.enh_want) {
++      info->create.usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
++      info->usage2.usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
++   }
+    return VK_SUCCESS;
+ }
+ 
+@@ -980,6 +1020,289 @@ wsi_win32_compose_present_now(struct wsi_win32_swapchain *chain,
+    return result;
+ }
+ 
++/*
++ * Upscaling and frame generation (wsi_common_win32_enhance.c)
++ *
++ * The present's own submission runs the passes (wsi_win32_present_cmd);
++ * the present thread waits for its fence, gives the application's image
++ * back at once, and presents the plan's slots: the generated pictures
++ * spacing_ns apart, the real frame last.  A newer frame cuts a cycle short
++ * (its real frame is shown at once).  Only this thread ever waits for a
++ * picture's time; the application's thread never does.
++ */
++static uint64_t
++wsi_win32_refresh_ns(HWND hwnd)
++{
++   MONITORINFOEXA mi = {};
++   mi.cbSize = sizeof(mi);
++   if (!GetMonitorInfoA(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mi))
++      return 0;
++   DEVMODEA dm = {};
++   dm.dmSize = sizeof(dm);
++   if (!EnumDisplaySettingsA(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm) ||
++       dm.dmDisplayFrequency <= 1)
++      return 0;
++   return 1000000000ull / dm.dmDisplayFrequency;
++}
++
++static VkExtent2D
++wsi_win32_client_extent(HWND hwnd)
++{
++   RECT r;
++   if (!GetClientRect(hwnd, &r))
++      return { 0, 0 };
++   return { (uint32_t)(r.right - r.left), (uint32_t)(r.bottom - r.top) };
++}
++
++/* Output slots a configuration needs: the pictures of one cycle, the real
++ * frame of the cycle before (still to be shown) and two in copy */
++static uint32_t
++wsi_win32_enh_slots_for(const struct wsi_enh_config *c)
++{
++   if (!wsi_enh_config_fg(c))
++      return 3;
++   const uint32_t pics = c->fg_adaptive ? WSI_ENH_MAX_PICS : MAX2(c->fg_mult, 2u);
++   return pics + 3;
++}
++
++/* A settings change the swapchain cannot follow: the application makes a
++ * new one (VK_SUBOPTIMAL_KHR) */
++static bool
++wsi_win32_enh_needs_new_chain(const struct wsi_enh_config *old,
++                              const struct wsi_enh_config *c,
++                              uint32_t slot_count)
++{
++   return (old->scaler != WSI_ENH_SCALER_OFF) != (c->scaler != WSI_ENH_SCALER_OFF) ||
++          (old->scaler == WSI_ENH_SCALER_INTEGER) != (c->scaler == WSI_ENH_SCALER_INTEGER) ||
++          wsi_enh_config_fg(old) != wsi_enh_config_fg(c) ||
++          old->fit != c->fit ||
++          wsi_win32_enh_slots_for(c) > slot_count;
++}
++
++/* Every 250 ms: the settings, the window's size and the refresh rate */
++static void
++wsi_win32_enh_check(struct wsi_win32_swapchain *chain)
++{
++   const uint64_t now = os_time_get_nano();
++   if (now < chain->compose.next_check_ns)
++      return;
++   chain->compose.next_check_ns = now + 250ull * 1000 * 1000;
++
++   struct wsi_enh_config c;
++   wsi_enh_config_get(&c);
++   const bool applies = wsi_enh_config_applies(&c, chain->surface->base.hwnd);
++   if (!chain->compose.enh) {
++      /* Turned on for this window since the swapchain was made */
++      if (applies && !chain->compose.suboptimal) {
++         chain->compose.suboptimal = true;
++         wsi_win32_compose_log(false, "enhance: turned on; the application "
++                               "makes a new swapchain");
++      }
++      return;
++   }
++   wsi_enh_set_refresh(chain->compose.enh,
++                       wsi_win32_refresh_ns(chain->surface->base.hwnd));
++   if (!applies || wsi_win32_enh_needs_new_chain(&chain->compose.enh_cfg, &c,
++                                                 chain->compose.slot_count)) {
++      if (!chain->compose.suboptimal)
++         wsi_win32_compose_log(false, "enhance: settings changed; the "
++                               "application makes a new swapchain");
++      chain->compose.suboptimal = true;
++      return;
++   }
++   wsi_enh_update_config(chain->compose.enh, &c);
++   if (c.scaler != WSI_ENH_SCALER_OFF) {
++      const VkExtent2D e = wsi_win32_client_extent(chain->surface->base.hwnd);
++      if (e.width && e.height &&
++          (e.width != chain->compose.out_extent.width ||
++           e.height != chain->compose.out_extent.height))
++         chain->compose.suboptimal = true;
++   }
++}
++
++/* `want` output slots for a plan, in order; fewer when the present thread
++ * holds the rest longer than a moment (at least one, unless 2 s pass) */
++static uint32_t
++wsi_win32_enh_take_slots(struct wsi_win32_swapchain *chain, uint32_t want,
++                         uint32_t *out)
++{
++   const uint64_t start = os_time_get_nano();
++   uint32_t got = 0;
++   for (;;) {
++      uint32_t cand[WSI_ENH_MAX_PICS];
++      uint32_t nc = 0;
++      mtx_lock(&chain->acquire_mutex);
++      for (uint32_t k = 0; k < chain->compose.slot_count && got + nc < want; k++) {
++         const uint32_t i = (chain->compose.slot_next + k) % chain->compose.slot_count;
++         if (chain->compose.slots[i].state == WSI_IMAGE_IDLE) {
++            chain->compose.slots[i].state = WSI_IMAGE_DRAWING;
++            cand[nc++] = i;
++         }
++      }
++      mtx_unlock(&chain->acquire_mutex);
++      /* The D3D11 copy out of a slot shown before must be done */
++      for (uint32_t c = 0; c < nc; c++) {
++         struct wsi_win32_image *slot = &chain->compose.slots[cand[c]];
++         if (wsi_win32_compose_image_wait(chain->surface->compose,
++                                          &slot->compose, 0) == VK_SUCCESS) {
++            out[got++] = cand[c];
++            chain->compose.slot_next = (cand[c] + 1) % chain->compose.slot_count;
++         } else {
++            mtx_lock(&chain->acquire_mutex);
++            slot->state = WSI_IMAGE_IDLE;
++            mtx_unlock(&chain->acquire_mutex);
++         }
++      }
++      if (got == want)
++         return got;
++      const uint64_t spent = os_time_get_nano() - start;
++      if ((got > 0 && spent > 2ull * 1000 * 1000) || spent > 2000ull * 1000 * 1000)
++         return got;
++      mtx_lock(&chain->acquire_mutex);
++      struct timespec ts;
++      timespec_from_nsec(&ts, os_time_get_absolute_timeout(1000 * 1000));
++      u_cnd_monotonic_timedwait(&chain->acquire_cond, &chain->acquire_mutex, &ts);
++      mtx_unlock(&chain->acquire_mutex);
++   }
++}
++
++static void
++wsi_win32_enh_release_slots(struct wsi_win32_swapchain *chain,
++                            const struct wsi_enh_plan *plan, uint32_t from)
++{
++   mtx_lock(&chain->acquire_mutex);
++   for (uint32_t k = from; k < plan->count; k++)
++      chain->compose.slots[plan->slot[k]].state = WSI_IMAGE_IDLE;
++   u_cnd_monotonic_broadcast(&chain->acquire_cond);
++   mtx_unlock(&chain->acquire_mutex);
++}
++
++/* wsi_swapchain::present_cmd: the passes of this present */
++static VkCommandBuffer
++wsi_win32_present_cmd(struct wsi_swapchain *drv_chain, uint32_t index,
++                      uint32_t queue_family_index)
++{
++   struct wsi_win32_swapchain *chain = (struct wsi_win32_swapchain *)drv_chain;
++   struct wsi_enh_plan *plan = &chain->compose.plans[index];
++   plan->count = 0;
++   if (!chain->compose.enh || !chain->compose.threaded ||
++       chain->status != VK_SUCCESS || chain->surface->compose == NULL)
++      return VK_NULL_HANDLE;
++
++   wsi_win32_enh_check(chain);
++   const uint32_t want = wsi_enh_pictures(chain->compose.enh, os_time_get_nano());
++   struct wsi_enh_plan p = {};
++   p.count = wsi_win32_enh_take_slots(chain, want, p.slot);
++   if (p.count == 0) {
++      wsi_win32_compose_log(true, "enhance: no output slot came back in 2 s; "
++                            "frame dropped");
++      return VK_NULL_HANDLE;
++   }
++   VkCommandBuffer cmd = wsi_enh_record(chain->compose.enh, queue_family_index,
++                                        index, &p);
++   if (cmd == VK_NULL_HANDLE) {
++      wsi_win32_enh_release_slots(chain, &p, 0);
++      return VK_NULL_HANDLE;
++   }
++   mtx_lock(&chain->acquire_mutex);
++   for (uint32_t k = 0; k < p.count; k++)
++      chain->compose.slots[p.slot[k]].state = WSI_IMAGE_QUEUED;
++   mtx_unlock(&chain->acquire_mutex);
++   *plan = p;
++   return cmd;
++}
++
++/* Until `due`; true when a newer frame (or the end) came first */
++static bool
++wsi_win32_pace_wait(struct wsi_win32_swapchain *chain, uint64_t due)
++{
++   for (;;) {
++      if (p_atomic_read(&chain->compose.q_count) > 0 ||
++          p_atomic_read(&chain->compose.stop))
++         return true;
++      const uint64_t now = os_time_get_nano();
++      if (now >= due)
++         return false;
++      const uint64_t left = due - now;
++      if (left > 1500 * 1000 && chain->compose.pace_timer) {
++         /* the high-resolution timer to just before, then a short spin */
++         LARGE_INTEGER t;
++         t.QuadPart = -(LONGLONG)((left - 700 * 1000) / 100);
++         HANDLE h[2] = { chain->compose.pace_timer, chain->compose.wake };
++         if (SetWaitableTimer(chain->compose.pace_timer, &t, 0, NULL, NULL, FALSE))
++            WaitForMultipleObjects(chain->compose.wake ? 2 : 1, h, FALSE, INFINITE);
++         else
++            Sleep(1);
++      } else {
++         SwitchToThread();
++      }
++   }
++}
++
++static void
++wsi_win32_compose_enh_frame(struct wsi_win32_swapchain *chain, uint32_t index)
++{
++   const struct wsi_device *wsi = chain->wsi->wsi;
++   wsi->WaitForFences(chain->base.device, 1, &chain->base.fences[index],
++                      true, ~0ull);
++   const struct wsi_enh_plan plan = chain->compose.plans[index];
++
++   /* The passes have read the image: the application's again */
++   mtx_lock(&chain->acquire_mutex);
++   chain->images[index].state = WSI_IMAGE_IDLE;
++   chain->compose.plans[index].count = 0;
++   u_cnd_monotonic_broadcast(&chain->acquire_cond);
++   mtx_unlock(&chain->acquire_mutex);
++   if (plan.count == 0)
++      return;
++
++   const uint64_t t0 = os_time_get_nano();
++   uint32_t generated = 0, skipped = 0;
++   /* MESA_WSI_ENHANCE_SHOW=generated: only the generated pictures, to look
++    * at them (a debug view: the real frames are never shown) */
++   static int show_generated = -1;
++   if (show_generated < 0) {
++      const char *v = os_get_option("MESA_WSI_ENHANCE_SHOW");
++      show_generated = v && !strcmp(v, "generated");
++   }
++   for (uint32_t k = 0; k < plan.count; k++) {
++      const bool real = k + 1 == plan.count;
++      if (real && show_generated && plan.count > 1) {
++         wsi_win32_enh_release_slots(chain, &plan, k);
++         break;
++      }
++      if (k > 0 && wsi_win32_pace_wait(chain, t0 + k * plan.spacing_ns) && !real) {
++         /* A newer frame is here: the rest of the cycle goes, the real
++          * frame is shown now */
++         skipped = plan.count - 1 - k;
++         wsi_win32_enh_release_slots(chain, &plan, k);
++         mtx_lock(&chain->acquire_mutex);
++         chain->compose.slots[plan.slot[plan.count - 1]].state = WSI_IMAGE_QUEUED;
++         mtx_unlock(&chain->acquire_mutex);
++         k = plan.count - 1;
++      }
++      struct wsi_win32_image *slot = &chain->compose.slots[plan.slot[k]];
++      VkResult r = chain->surface->compose == NULL ? VK_ERROR_OUT_OF_DATE_KHR :
++         wsi_win32_compose_present(chain->surface->compose, &slot->compose,
++                                   chain->compose.sync_interval);
++      if (r != VK_SUCCESS) {
++         chain->status = r;
++         wsi_win32_compose_log(true, "enhance: present of slot %u: %d",
++                               plan.slot[k], (int)r);
++      } else if (k + 1 < plan.count) {
++         generated++;
++      }
++      mtx_lock(&chain->acquire_mutex);
++      slot->state = WSI_IMAGE_IDLE;
++      u_cnd_monotonic_broadcast(&chain->acquire_cond);
++      mtx_unlock(&chain->acquire_mutex);
++      if (r != VK_SUCCESS)
++         break;
++   }
++   chain->compose.presented = true;
++   wsi_enh_note_shown(chain->compose.enh, 1, generated, skipped);
++}
++
+ static int
+ wsi_win32_compose_thread(void *data)
+ {
+@@ -1003,6 +1326,12 @@ wsi_win32_compose_thread(void *data)
+       bool dropped = false;
+       while (chain->compose.replace && chain->compose.q_count > 0) {
+          chain->images[index].state = WSI_IMAGE_IDLE;
++         if (chain->compose.enh) {
++            struct wsi_enh_plan *plan = &chain->compose.plans[index];
++            for (uint32_t k = 0; k < plan->count; k++)
++               chain->compose.slots[plan->slot[k]].state = WSI_IMAGE_IDLE;
++            plan->count = 0;
++         }
+          chain->compose.dropped++;
+          dropped = true;
+          index = chain->compose.q[chain->compose.q_head];
+@@ -1013,6 +1342,11 @@ wsi_win32_compose_thread(void *data)
+          u_cnd_monotonic_broadcast(&chain->acquire_cond);
+       mtx_unlock(&chain->acquire_mutex);
+ 
++      if (chain->compose.enh) {
++         wsi_win32_compose_enh_frame(chain, index);
++         continue;
++      }
++
+       /* The rendering, on the CPU but off the application's thread: the
+        * D3D11 copy reads the image right after */
+       wsi->WaitForFences(chain->base.device, 1, &chain->base.fences[index],
+@@ -1026,8 +1360,23 @@ static VkResult
+ wsi_win32_queue_present_compose(struct wsi_win32_swapchain *chain,
+                                 struct wsi_win32_image *image)
+ {
+-   if (!chain->compose.threaded)
+-      return wsi_win32_compose_present_now(chain, image);
++   /* Off: the enhancement settings are looked at every 250 ms (a turn-on
++    * makes the application recreate the swapchain), nothing else */
++   if (!chain->compose.enh)
++      wsi_win32_enh_check(chain);
++   if (!chain->compose.threaded && chain->compose.enh) {
++      /* Retired (its present thread went with the new swapchain): the
++       * window's DXGI swap chain is the new one's now */
++      mtx_lock(&chain->acquire_mutex);
++      image->state = WSI_IMAGE_IDLE;
++      u_cnd_monotonic_broadcast(&chain->acquire_cond);
++      mtx_unlock(&chain->acquire_mutex);
++      return VK_ERROR_OUT_OF_DATE_KHR;
++   }
++   if (!chain->compose.threaded) {
++      VkResult r = wsi_win32_compose_present_now(chain, image);
++      return r == VK_SUCCESS && chain->compose.suboptimal ? VK_SUBOPTIMAL_KHR : r;
++   }
+ 
+    mtx_lock(&chain->acquire_mutex);
+    VkResult result = chain->status;
+@@ -1040,11 +1389,15 @@ wsi_win32_queue_present_compose(struct wsi_win32_swapchain *chain,
+          (uint32_t)(image - chain->images);
+       chain->compose.q_count++;
+       u_cnd_monotonic_signal(&chain->compose.cond);
++      if (chain->compose.wake)
++         SetEvent(chain->compose.wake);
+    } else {
+       image->state = WSI_IMAGE_IDLE;
+       u_cnd_monotonic_broadcast(&chain->acquire_cond);
+    }
+    mtx_unlock(&chain->acquire_mutex);
++   if (result == VK_SUCCESS && chain->compose.suboptimal)
++      result = VK_SUBOPTIMAL_KHR;
+    return result;
+ }
+ 
+@@ -1056,6 +1409,8 @@ wsi_win32_compose_thread_stop(struct wsi_win32_swapchain *chain)
+    mtx_lock(&chain->acquire_mutex);
+    chain->compose.stop = true;
+    u_cnd_monotonic_signal(&chain->compose.cond);
++   if (chain->compose.wake)
++      SetEvent(chain->compose.wake);
+    mtx_unlock(&chain->acquire_mutex);
+    thrd_join(chain->compose.thread, NULL);
+    u_cnd_monotonic_destroy(&chain->compose.cond);
+@@ -1235,6 +1590,145 @@ wsi_win32_image_finish(struct wsi_win32_swapchain *chain,
+    wsi_destroy_image(&chain->base, &image->base);
+ }
+ 
++static void
++wsi_win32_enh_teardown(struct wsi_win32_swapchain *chain,
++                       const VkAllocationCallbacks *allocator)
++{
++   const struct wsi_device *wsi = chain->wsi->wsi;
++   if (chain->compose.enh) {
++      /* The passes of every present are done before their images go */
++      for (uint32_t i = 0; i < chain->base.image_count; i++) {
++         if (chain->base.fences && chain->base.fences[i] != VK_NULL_HANDLE)
++            wsi->WaitForFences(chain->base.device, 1, &chain->base.fences[i],
++                               true, 2000ull * 1000 * 1000);
++      }
++      wsi_enh_destroy(chain->compose.enh);
++      chain->compose.enh = NULL;
++   }
++   chain->base.present_cmd = NULL;
++   for (uint32_t i = 0; chain->compose.slots && i < chain->compose.slot_count; i++) {
++      if (chain->compose.slots[i].base.image != VK_NULL_HANDLE ||
++          chain->compose.slots[i].compose.texture)
++         wsi_win32_image_finish(chain, allocator, &chain->compose.slots[i]);
++   }
++   vk_free(allocator, chain->compose.slots);
++   vk_free(allocator, chain->compose.plans);
++   chain->compose.slots = NULL;
++   chain->compose.plans = NULL;
++   chain->compose.slot_count = 0;
++   if (chain->compose.pace_timer)
++      CloseHandle(chain->compose.pace_timer);
++   if (chain->compose.wake)
++      CloseHandle(chain->compose.wake);
++   chain->compose.pace_timer = chain->compose.wake = NULL;
++}
++
++/* The output slots (D3D11 shared textures of the DXGI swap chain's size)
++ * and the passes; on failure everything is undone and the swapchain
++ * presents as without enhancement */
++static VkResult
++wsi_win32_enh_setup(struct wsi_win32_swapchain *chain,
++                    const VkSwapchainCreateInfoKHR *create_info,
++                    const VkAllocationCallbacks *allocator)
++{
++   const struct wsi_enh_config *cfg = &chain->compose.enh_cfg;
++   const uint32_t n = wsi_win32_enh_slots_for(cfg);
++   const VkExtent2D out = chain->compose.out_extent;
++   VkResult r = VK_ERROR_OUT_OF_HOST_MEMORY;
++
++   chain->compose.slots = (struct wsi_win32_image *)
++      vk_zalloc(allocator, n * sizeof(struct wsi_win32_image), 8,
++                VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
++   chain->compose.plans = (struct wsi_enh_plan *)
++      vk_zalloc(allocator, chain->base.image_count * sizeof(struct wsi_enh_plan), 8,
++                VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
++   if (!chain->compose.slots || !chain->compose.plans)
++      return r;
++   chain->compose.slot_count = n;
++
++   VkFormat unorm = create_info->imageFormat;
++   if (unorm == VK_FORMAT_B8G8R8A8_SRGB)
++      unorm = VK_FORMAT_B8G8R8A8_UNORM;
++   else if (unorm == VK_FORMAT_R8G8B8A8_SRGB)
++      unorm = VK_FORMAT_R8G8B8A8_UNORM;
++
++   /* As the application's images, at the output's size, written by the
++    * passes */
++   struct wsi_image_info info;
++   memset(&info, 0, sizeof(info));
++   info.wsi.sType = VK_STRUCTURE_TYPE_WSI_IMAGE_CREATE_INFO_MESA;
++   info.create.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
++   info.create.pNext = &info.wsi;
++   info.create.imageType = VK_IMAGE_TYPE_2D;
++   info.create.format = unorm;
++   info.create.extent = { out.width, out.height, 1 };
++   info.create.mipLevels = 1;
++   info.create.arrayLayers = 1;
++   info.create.samples = VK_SAMPLE_COUNT_1_BIT;
++   info.create.tiling = VK_IMAGE_TILING_OPTIMAL;
++   info.create.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
++                       VK_IMAGE_USAGE_TRANSFER_DST_BIT |
++                       VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
++                       VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
++   info.create.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
++   info.create.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++   info.color_space = create_info->imageColorSpace;
++   info.image_type = WSI_IMAGE_TYPE_WIN32_COMPOSE;
++   info.select_image_memory_type = wsi_select_device_memory_type;
++   info.create_mem = wsi_win32_create_compose_image_mem;
++
++   VkImage *slot_images = (VkImage *)malloc(n * sizeof(VkImage));
++   VkImage *src_images = (VkImage *)malloc(chain->base.image_count * sizeof(VkImage));
++   if (!slot_images || !src_images) {
++      free(slot_images);
++      free(src_images);
++      return r;
++   }
++   for (uint32_t i = 0; i < n; i++) {
++      struct wsi_win32_image *slot = &chain->compose.slots[i];
++      r = wsi_create_image(&chain->base, &info, &slot->base);
++      if (r != VK_SUCCESS) {
++         wsi_win32_compose_log(true, "enhance: output slot %u (%ux%u) failed: %d",
++                               i, out.width, out.height, (int)r);
++         break;
++      }
++      slot->chain = chain;
++      slot->state = WSI_IMAGE_IDLE;
++      slot_images[i] = slot->base.image;
++   }
++   if (r == VK_SUCCESS) {
++      for (uint32_t i = 0; i < chain->base.image_count; i++)
++         src_images[i] = chain->images[i].base.image;
++      struct wsi_enh_create_info ci = {};
++      ci.device = chain->base.device;
++      ci.wsi = chain->wsi->wsi;
++      ci.alloc = allocator;
++      ci.config = *cfg;
++      ci.src_format = create_info->imageFormat;
++      ci.src_extent = create_info->imageExtent;
++      ci.src_count = chain->base.image_count;
++      ci.src_images = src_images;
++      ci.dst_format = unorm;
++      ci.dst_extent = out;
++      ci.slot_count = n;
++      ci.slot_images = slot_images;
++      r = wsi_enh_create(&ci, &chain->compose.enh);
++   }
++   free(slot_images);
++   free(src_images);
++   if (r != VK_SUCCESS)
++      return r;
++
++   wsi_enh_set_refresh(chain->compose.enh,
++                       wsi_win32_refresh_ns(chain->surface->base.hwnd));
++   chain->compose.pace_timer =
++      CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
++                             TIMER_ALL_ACCESS);
++   chain->compose.wake = CreateEventA(NULL, FALSE, FALSE, NULL);
++   chain->base.present_cmd = wsi_win32_present_cmd;
++   return VK_SUCCESS;
++}
++
+ static VkResult
+ wsi_win32_swapchain_destroy(struct wsi_swapchain *drv_chain,
+                             const VkAllocationCallbacks *allocator)
+@@ -1244,6 +1738,7 @@ wsi_win32_swapchain_destroy(struct wsi_swapchain *drv_chain,
+ 
+    /* The present thread finishes its present before the images go away */
+    wsi_win32_compose_thread_stop(chain);
++   wsi_win32_enh_teardown(chain, allocator);
+ 
+    /* The display goes back to the desktop before the images go away */
+    if (chain->scanout.presented && chain->wsi->wsi->win32.scanout_release)
+@@ -1772,12 +2267,28 @@ wsi_win32_surface_create_swapchain(
+        * buffer back: three DXGI buffers */
+       const bool vsync = create_info->presentMode == VK_PRESENT_MODE_FIFO_KHR ||
+                          create_info->presentMode == VK_PRESENT_MODE_FIFO_RELAXED_KHR;
++      /* Upscaling / frame generation for this window: the DXGI swap chain
++       * is the window's size with a scaler (the passes need the present
++       * thread) */
++      chain->compose.out_extent = create_info->imageExtent;
++      wsi_enh_config_get(&chain->compose.enh_cfg);
++      chain->compose.enh_want =
++         wsi_enh_config_applies(&chain->compose.enh_cfg, surface->base.hwnd) &&
++         debug_get_bool_option("MESA_WSI_COMPOSE_THREAD", true) &&
++         num_images < WSI_WIN32_COMPOSE_QUEUE;
++      if (chain->compose.enh_want &&
++          chain->compose.enh_cfg.scaler != WSI_ENH_SCALER_OFF) {
++         const VkExtent2D client = wsi_win32_client_extent(surface->base.hwnd);
++         if (client.width && client.height)
++            chain->compose.out_extent = client;
++      }
+       VkResult cr = wsi_win32_compose_open(&surface->compose,
+                                            (void *)surface->base.hwnd,
+-                                           create_info->imageExtent.width,
+-                                           create_info->imageExtent.height,
++                                           chain->compose.out_extent.width,
++                                           chain->compose.out_extent.height,
+                                            create_info->imageFormat,
+-                                           vsync ? num_images : MAX2(num_images, 3u));
++                                           vsync && !chain->compose.enh_want ?
++                                              num_images : MAX2(num_images, 3u));
+       if (cr == VK_SUCCESS)
+          image_params = &compose_image_params;
+       else
+@@ -1928,6 +2439,40 @@ retry:
+             u_cnd_monotonic_destroy(&chain->compose.cond);
+          }
+       }
++   }
++   if (chain->compose.enh_want && chain->compose.enabled) {
++      VkResult er = chain->compose.threaded ?
++         wsi_win32_enh_setup(chain, create_info, allocator) :
++         VK_ERROR_FEATURE_NOT_PRESENT;
++      if (er != VK_SUCCESS) {
++         wsi_win32_compose_log(true, "enhance: not available for this swapchain "
++                               "(%d); presenting without it", (int)er);
++         wsi_win32_compose_thread_stop(chain);
++         wsi_win32_enh_teardown(chain, allocator);
++         chain->compose.enh_want = false;
++         /* The DXGI swap chain back to the images' size */
++         if (chain->compose.out_extent.width != create_info->imageExtent.width ||
++             chain->compose.out_extent.height != create_info->imageExtent.height) {
++            chain->compose.out_extent = create_info->imageExtent;
++            wsi_win32_compose_open(&surface->compose, (void *)surface->base.hwnd,
++                                   create_info->imageExtent.width,
++                                   create_info->imageExtent.height,
++                                   create_info->imageFormat, MAX2(num_images, 3u));
++         }
++         if (u_cnd_monotonic_init(&chain->compose.cond) == thrd_success) {
++            chain->compose.stop = false;
++            if (thrd_create(&chain->compose.thread, wsi_win32_compose_thread,
++                            chain) == thrd_success)
++               chain->compose.threaded = true;
++            else
++               u_cnd_monotonic_destroy(&chain->compose.cond);
++         }
++         chain->base.gpu_ordered_present = chain->compose.threaded;
++      }
++   }
++   if (chain->compose.enabled &&
++       chain->base.image_count < WSI_WIN32_COMPOSE_QUEUE &&
++       debug_get_bool_option("MESA_WSI_COMPOSE_THREAD", true)) {
+       wsi_win32_compose_log(!chain->compose.threaded,
+                             "compose: present mode %d, sync interval %u, %s",
+                             (int)chain->base.present_mode,
+diff --git a/src/vulkan/wsi/wsi_common_win32_enhance.c b/src/vulkan/wsi/wsi_common_win32_enhance.c
+new file mode 100644
+index 0000000..5f4a9a4
+--- /dev/null
++++ b/src/vulkan/wsi/wsi_common_win32_enhance.c
+@@ -0,0 +1,1372 @@
++/*
++ * Copyright © 2026 Ole Algoritme
++ * SPDX-License-Identifier: MIT
++ */
++
++/*
++ * Upscaling and frame generation in the composed present (Conduit Helios).
++ *
++ * With either on, a composed swapchain's DXGI flip swap chain is the
++ * window's size while the application's swapchain keeps its own, and every
++ * present records a command buffer on the application's queue (submitted by
++ * wsi_common_queue_present after the application's semaphores, before the
++ * present's fence) that turns the presented image into one or more output
++ * slots: D3D11 shared textures of the window's size, which the present
++ * thread copies into the DXGI back buffer and presents, paced.
++ *
++ *   scale      the image into the picture region of the output (FSR 1 EASU
++ *              then RCAS, or nearest / bilinear / bicubic / integer), into
++ *              the slot itself, or with frame generation into a history
++ *              image of the region's size
++ *   pyramid    frame generation: luma of the image at 1/2 .. 1/32
++ *   flow       block-matching optical flow between the last two frames,
++ *              coarse to fine, symmetric about the generated moment
++ *   interp     each generated picture at phase k/n, at output resolution,
++ *              straight into its slot
++ *   copy       the newest history image into the real frame's slot
++ *
++ * All passes are compute shaders compiled to SPIR-V at build time
++ * (enhance/), with push descriptors and push constants, so nothing here
++ * allocates per frame.  The frame-generation passes are a Vulkan port of
++ * Conduit's host viewer (docs/VIEWER-ENHANCE.md there); FSR 1 is AMD's
++ * FidelityFX header, unmodified (enhance/third_party, MIT).
++ */
++
++#include "wsi_common_private.h"
++#include "wsi_common_win32_enhance.h"
++
++#include <windows.h>
++#include <inttypes.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "util/os_misc.h"
++#include "util/os_time.h"
++#include "util/u_math.h"
++
++#include "enh_scale_spv.h"
++#include "enh_easu_spv.h"
++#include "enh_rcas_spv.h"
++#include "fg_down_spv.h"
++#include "fg_flow_spv.h"
++#include "fg_interp_spv.h"
++
++#define LOGI(...) wsi_win32_compose_log(false, "enhance: " __VA_ARGS__)
++#define LOGE(...) wsi_win32_compose_log(true, "enhance: " __VA_ARGS__)
++
++/* ---- settings ---------------------------------------------------------- */
++
++static const char *const scaler_names[WSI_ENH_SCALER_COUNT] = {
++   [WSI_ENH_SCALER_OFF] = "off",
++   [WSI_ENH_SCALER_NEAREST] = "nearest",
++   [WSI_ENH_SCALER_BILINEAR] = "bilinear",
++   [WSI_ENH_SCALER_BICUBIC] = "bicubic",
++   [WSI_ENH_SCALER_INTEGER] = "integer",
++   [WSI_ENH_SCALER_FSR] = "fsr",
++};
++
++const char *
++wsi_enh_scaler_name(enum wsi_enh_scaler s)
++{
++   return s < WSI_ENH_SCALER_COUNT ? scaler_names[s] : "?";
++}
++
++static bool
++word_is(const char *a, const char *b)
++{
++   return a && _stricmp(a, b) == 0;
++}
++
++static void
++parse_scaler(struct wsi_enh_config *c, const char *v)
++{
++   if (!v || !*v)
++      return;
++   for (unsigned i = 0; i < WSI_ENH_SCALER_COUNT; i++) {
++      if (word_is(v, scaler_names[i])) {
++         c->scaler = (enum wsi_enh_scaler)i;
++         return;
++      }
++   }
++   if (word_is(v, "fsr1"))
++      c->scaler = WSI_ENH_SCALER_FSR;
++}
++
++static void
++parse_fg(struct wsi_enh_config *c, const char *v)
++{
++   if (!v || !*v)
++      return;
++   if (word_is(v, "adaptive")) {
++      c->fg_adaptive = true;
++      c->fg_mult = 1;
++   } else if (word_is(v, "2x") || word_is(v, "3x") || word_is(v, "4x")) {
++      c->fg_adaptive = false;
++      c->fg_mult = (uint32_t)(v[0] - '0');
++   } else if (word_is(v, "off") || word_is(v, "0") || word_is(v, "1x")) {
++      c->fg_adaptive = false;
++      c->fg_mult = 1;
++   }
++}
++
++static void
++parse_quality(struct wsi_enh_config *c, const char *v)
++{
++   if (word_is(v, "fast"))
++      c->fg_quality = WSI_ENH_FG_FAST;
++   else if (word_is(v, "quality"))
++      c->fg_quality = WSI_ENH_FG_QUALITY;
++}
++
++static void
++parse_fit(struct wsi_enh_config *c, const char *v)
++{
++   if (word_is(v, "aspect"))
++      c->fit = WSI_ENH_FIT_ASPECT;
++   else if (word_is(v, "stretch"))
++      c->fit = WSI_ENH_FIT_STRETCH;
++}
++
++static bool
++reg_sz(const char *sub, const char *name, char *buf, DWORD size)
++{
++   return RegGetValueA(HKEY_LOCAL_MACHINE, sub, name, RRF_RT_REG_SZ, NULL,
++                       buf, &size) == ERROR_SUCCESS;
++}
++
++static bool
++reg_dw(const char *sub, const char *name, DWORD *out)
++{
++   DWORD size = sizeof(*out);
++   return RegGetValueA(HKEY_LOCAL_MACHINE, sub, name, RRF_RT_REG_DWORD, NULL,
++                       out, &size) == ERROR_SUCCESS;
++}
++
++/* The global values, HKLM\SOFTWARE\Helios Enhance* */
++static void
++read_global(struct wsi_enh_config *c)
++{
++   char s[64];
++   DWORD d, size;
++
++   size = sizeof(s);
++   if (RegGetValueA(HKEY_LOCAL_MACHINE, "SOFTWARE\\Helios", "EnhanceScaler", RRF_RT_REG_SZ, NULL, s, &size) == ERROR_SUCCESS)
++      parse_scaler(c, s);
++   size = sizeof(d);
++   if (RegGetValueA(HKEY_LOCAL_MACHINE, "SOFTWARE\\Helios", "EnhanceSharpness", RRF_RT_REG_DWORD, NULL, &d, &size) == ERROR_SUCCESS)
++      c->sharpness = MIN2(d, 100);
++   size = sizeof(s);
++   if (RegGetValueA(HKEY_LOCAL_MACHINE, "SOFTWARE\\Helios", "EnhanceFrameGen", RRF_RT_REG_SZ, NULL, s, &size) == ERROR_SUCCESS)
++      parse_fg(c, s);
++   size = sizeof(d);
++   if (RegGetValueA(HKEY_LOCAL_MACHINE, "SOFTWARE\\Helios", "EnhanceFgTarget", RRF_RT_REG_DWORD, NULL, &d, &size) == ERROR_SUCCESS)
++      c->fg_target_fps = MIN2(d, 1000);
++   size = sizeof(s);
++   if (RegGetValueA(HKEY_LOCAL_MACHINE, "SOFTWARE\\Helios", "EnhanceFgQuality", RRF_RT_REG_SZ, NULL, s, &size) == ERROR_SUCCESS)
++      parse_quality(c, s);
++   size = sizeof(d);
++   if (RegGetValueA(HKEY_LOCAL_MACHINE, "SOFTWARE\\Helios", "EnhanceLowLatency", RRF_RT_REG_DWORD, NULL, &d, &size) == ERROR_SUCCESS)
++      c->low_latency = d != 0;
++   size = sizeof(s);
++   if (RegGetValueA(HKEY_LOCAL_MACHINE, "SOFTWARE\\Helios", "EnhanceFit", RRF_RT_REG_SZ, NULL, s, &size) == ERROR_SUCCESS)
++      parse_fit(c, s);
++   size = sizeof(s);
++   if (RegGetValueA(HKEY_LOCAL_MACHINE, "SOFTWARE\\Helios", "EnhanceWindows", RRF_RT_REG_SZ, NULL, s, &size) == ERROR_SUCCESS)
++      c->all_windows = word_is(s, "all");
++   size = sizeof(d);
++   if (RegGetValueA(HKEY_LOCAL_MACHINE, "SOFTWARE\\Helios", "EnhanceStats", RRF_RT_REG_DWORD, NULL, &d, &size) == ERROR_SUCCESS)
++      c->stats = d != 0;
++}
++
++/* A per-exe profile, HKLM\SOFTWARE\Helios\Enhance\<exe name>: the same
++ * settings without the Enhance prefix; each one present wins. */
++static void
++read_profile(struct wsi_enh_config *c)
++{
++   char exe[MAX_PATH] = "";
++   if (!GetModuleFileNameA(NULL, exe, sizeof(exe)))
++      return;
++   const char *base = strrchr(exe, '\\');
++   base = base ? base + 1 : exe;
++   char sub[MAX_PATH + 32];
++   snprintf(sub, sizeof(sub), "SOFTWARE\\Helios\\Enhance\\%s", base);
++   HKEY k;
++   if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, sub, 0, KEY_READ, &k) != ERROR_SUCCESS)
++      return;
++   RegCloseKey(k);
++   c->from_profile = true;
++
++   char s[64];
++   DWORD d;
++   if (reg_sz(sub, "Scaler", s, sizeof(s)))
++      parse_scaler(c, s);
++   if (reg_dw(sub, "Sharpness", &d))
++      c->sharpness = MIN2(d, 100);
++   if (reg_sz(sub, "FrameGen", s, sizeof(s)))
++      parse_fg(c, s);
++   if (reg_dw(sub, "FgTarget", &d))
++      c->fg_target_fps = MIN2(d, 1000);
++   if (reg_sz(sub, "FgQuality", s, sizeof(s)))
++      parse_quality(c, s);
++   if (reg_dw(sub, "LowLatency", &d))
++      c->low_latency = d != 0;
++   if (reg_sz(sub, "Fit", s, sizeof(s)))
++      parse_fit(c, s);
++}
++
++static void
++read_env(struct wsi_enh_config *c)
++{
++   const char *v;
++   bool any = false;
++   if ((v = os_get_option("MESA_WSI_ENHANCE_SCALER"))) {
++      parse_scaler(c, v);
++      any = true;
++   }
++   if ((v = os_get_option("MESA_WSI_ENHANCE_SHARPNESS"))) {
++      c->sharpness = MIN2((uint32_t)atoi(v), 100);
++      any = true;
++   }
++   if ((v = os_get_option("MESA_WSI_ENHANCE_FG"))) {
++      parse_fg(c, v);
++      any = true;
++   }
++   if ((v = os_get_option("MESA_WSI_ENHANCE_FG_TARGET")))
++      c->fg_target_fps = MIN2((uint32_t)atoi(v), 1000);
++   if ((v = os_get_option("MESA_WSI_ENHANCE_FG_QUALITY")))
++      parse_quality(c, v);
++   if ((v = os_get_option("MESA_WSI_ENHANCE_LOW_LATENCY")))
++      c->low_latency = atoi(v) != 0;
++   if ((v = os_get_option("MESA_WSI_ENHANCE_FIT")))
++      parse_fit(c, v);
++   if ((v = os_get_option("MESA_WSI_ENHANCE_WINDOWS")))
++      c->all_windows = word_is(v, "all");
++   if ((v = os_get_option("MESA_WSI_ENHANCE_STATS")))
++      c->stats = atoi(v) != 0;
++   /* Set for this process: every window of it */
++   if (any)
++      c->from_profile = true;
++}
++
++static struct {
++   SRWLOCK lock;
++   bool loaded;
++   HKEY key;
++   HANDLE event;
++   struct wsi_enh_config cfg;
++} conf = { SRWLOCK_INIT };
++
++static void
++conf_arm(void)
++{
++   if (!conf.key) {
++      if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "SOFTWARE\\Helios", 0,
++                        KEY_NOTIFY | KEY_READ, &conf.key) != ERROR_SUCCESS) {
++         conf.key = NULL;
++         return;
++      }
++      conf.event = CreateEventA(NULL, FALSE, FALSE, NULL);
++   }
++   if (conf.event)
++      RegNotifyChangeKeyValue(conf.key, TRUE,
++                              REG_NOTIFY_CHANGE_NAME | REG_NOTIFY_CHANGE_LAST_SET,
++                              conf.event, TRUE);
++}
++
++void
++wsi_enh_config_get(struct wsi_enh_config *out)
++{
++   AcquireSRWLockExclusive(&conf.lock);
++   bool reload = !conf.loaded;
++   if (!reload && conf.event &&
++       WaitForSingleObject(conf.event, 0) == WAIT_OBJECT_0)
++      reload = true;
++   if (reload) {
++      conf_arm();
++      struct wsi_enh_config c = {
++         .scaler = WSI_ENH_SCALER_OFF,
++         .sharpness = 50,
++         .fg_mult = 1,
++         .fg_quality = WSI_ENH_FG_FAST,
++         .fit = WSI_ENH_FIT_ASPECT,
++      };
++      read_global(&c);
++      read_profile(&c);
++      read_env(&c);
++      if (conf.loaded && memcmp(&c, &conf.cfg, sizeof(c)) != 0)
++         LOGI("settings changed: scaler %s, sharpness %u, frame generation %s%ux, "
++              "%s windows", wsi_enh_scaler_name(c.scaler), c.sharpness,
++              c.fg_adaptive ? "adaptive " : "", c.fg_mult,
++              c.from_profile || c.all_windows ? "all" : "fullscreen");
++      conf.cfg = c;
++      conf.loaded = true;
++   }
++   *out = conf.cfg;
++   ReleaseSRWLockExclusive(&conf.lock);
++}
++
++bool
++wsi_enh_config_applies(const struct wsi_enh_config *c, void *window)
++{
++   if (!wsi_enh_config_on(c))
++      return false;
++   if (c->from_profile || c->all_windows)
++      return true;
++   /* Borderless or fullscreen: the client area covers its monitor */
++   HWND hwnd = (HWND)window;
++   RECT cr;
++   if (!GetClientRect(hwnd, &cr))
++      return false;
++   POINT tl = { cr.left, cr.top }, br = { cr.right, cr.bottom };
++   ClientToScreen(hwnd, &tl);
++   ClientToScreen(hwnd, &br);
++   MONITORINFO mi = { .cbSize = sizeof(mi) };
++   if (!GetMonitorInfoA(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mi))
++      return false;
++   return tl.x <= mi.rcMonitor.left && tl.y <= mi.rcMonitor.top &&
++          br.x >= mi.rcMonitor.right && br.y >= mi.rcMonitor.bottom;
++}
++
++/* ---- GPU objects -------------------------------------------------------- */
++
++enum enh_pipe {
++   P_SCALE,
++   P_EASU,
++   P_RCAS,
++   P_DOWN,
++   P_FLOW,
++   P_INTERP,
++   P_COUNT,
++};
++
++static const struct {
++   const uint32_t *code;
++   size_t size;
++   const char *name;
++} enh_spv[P_COUNT] = {
++#define SPV(p, n) [p] = { n##_spv, sizeof(n##_spv), #n }
++   SPV(P_SCALE, enh_scale),
++   SPV(P_EASU, enh_easu),
++   SPV(P_RCAS, enh_rcas),
++   SPV(P_DOWN, fg_down),
++   SPV(P_FLOW, fg_flow),
++   SPV(P_INTERP, fg_interp),
++#undef SPV
++};
++
++struct enh_push {
++   int32_t src_size[2];
++   int32_t dst_size[2];
++   int32_t dst_off[2];
++   int32_t aux_size[2];
++   float p0[4];
++   float p1[4];
++   uint32_t mode;
++   uint32_t flags;
++};
++#define ENH_FLAG_SRGB_ENCODE 1u
++
++#define ENH_LEVELS 6     /* pyramid levels 1..5 (1/2 .. 1/32) */
++#define ENH_FAMILIES 8
++
++/* Timestamps per frame: start, scale, pyramid, flow, interp, copy */
++enum { TS_START, TS_SCALE, TS_PYR, TS_FLOW, TS_INTERP, TS_COPY, TS_COUNT };
++
++struct enh_img {
++   VkImage image;
++   VkDeviceMemory mem;
++   VkImageView view;
++   VkExtent2D extent;
++};
++
++struct enh_frame {
++   VkCommandBuffer cmd;
++   uint32_t qfi;
++   bool ts_pending;
++   uint64_t frame;
++   uint32_t pictures;
++   uint32_t passes;       /* bit i: timestamp i was written */
++};
++
++struct wsi_enh {
++   VkDevice dev;
++   const struct wsi_device *wsi;
++   VkAllocationCallbacks alloc;
++   struct wsi_enh_config cfg;
++
++   VkFormat src_format;
++   bool src_srgb;
++   VkExtent2D src, dst;
++   VkRect2D rect;
++   uint32_t src_count, slot_count;
++   VkImage *src_images;
++   VkImageView *src_views;
++   VkImage *slot_images;
++   VkImageView *slot_views;
++   bool *slot_ready;
++
++   VkSampler linear, nearest;
++   VkDescriptorSetLayout dsl;
++   VkPipelineLayout layout;
++   VkPipeline pipe[P_COUNT];
++
++   struct enh_img tmp;                    /* EASU's output, rect size */
++   bool fg_ready;                         /* the resources below exist */
++   struct enh_img hist[2];                /* rect size, after the scaler */
++   struct enh_img pyr[2][ENH_LEVELS];
++   struct enh_img flow[ENH_LEVELS];
++   bool init_layouts;                     /* internal images still UNDEFINED */
++   int cur;
++   bool have_prev;
++
++   VkCommandPool pools[ENH_FAMILIES];
++   struct enh_frame *frames;
++   VkQueryPool queries;
++   bool ts_ok;
++
++   /* pacing */
++   uint64_t last_ns;
++   uint64_t interval_ns;
++   uint64_t refresh_ns;
++   uint64_t frame;
++
++   /* statistics */
++   SRWLOCK stat_lock;
++   uint64_t stat_t0;
++   uint64_t stat_frames, stat_real, stat_gen, stat_skipped, stat_pics;
++   uint64_t stat_gpu_frames;
++   double stat_gpu_us[TS_COUNT];
++   FILE *csv;
++};
++
++static VkResult
++enh_image(struct wsi_enh *e, struct enh_img *img, VkFormat format,
++          uint32_t w, uint32_t h)
++{
++   const struct wsi_device *wsi = e->wsi;
++   img->extent = (VkExtent2D){ MAX2(w, 1), MAX2(h, 1) };
++   const VkImageCreateInfo ici = {
++      .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
++      .imageType = VK_IMAGE_TYPE_2D,
++      .format = format,
++      .extent = { img->extent.width, img->extent.height, 1 },
++      .mipLevels = 1,
++      .arrayLayers = 1,
++      .samples = VK_SAMPLE_COUNT_1_BIT,
++      .tiling = VK_IMAGE_TILING_OPTIMAL,
++      .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
++      .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
++      .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
++   };
++   VkResult r = wsi->CreateImage(e->dev, &ici, &e->alloc, &img->image);
++   if (r != VK_SUCCESS)
++      return r;
++   VkMemoryRequirements req;
++   wsi->GetImageMemoryRequirements(e->dev, img->image, &req);
++   const VkMemoryAllocateInfo mai = {
++      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
++      .allocationSize = req.size,
++      .memoryTypeIndex = wsi_select_device_memory_type(wsi, req.memoryTypeBits),
++   };
++   r = wsi->AllocateMemory(e->dev, &mai, &e->alloc, &img->mem);
++   if (r != VK_SUCCESS)
++      return r;
++   r = wsi->BindImageMemory(e->dev, img->image, img->mem, 0);
++   if (r != VK_SUCCESS)
++      return r;
++   const VkImageViewCreateInfo vci = {
++      .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
++      .image = img->image,
++      .viewType = VK_IMAGE_VIEW_TYPE_2D,
++      .format = format,
++      .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
++   };
++   return wsi->CreateImageView(e->dev, &vci, &e->alloc, &img->view);
++}
++
++static void
++enh_image_destroy(struct wsi_enh *e, struct enh_img *img)
++{
++   const struct wsi_device *wsi = e->wsi;
++   if (img->view)
++      wsi->DestroyImageView(e->dev, img->view, &e->alloc);
++   if (img->image)
++      wsi->DestroyImage(e->dev, img->image, &e->alloc);
++   if (img->mem)
++      wsi->FreeMemory(e->dev, img->mem, &e->alloc);
++   memset(img, 0, sizeof(*img));
++}
++
++static VkResult
++enh_view(struct wsi_enh *e, VkImage image, VkFormat format, VkImageView *view)
++{
++   const VkImageViewCreateInfo vci = {
++      .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
++      .image = image,
++      .viewType = VK_IMAGE_VIEW_TYPE_2D,
++      .format = format,
++      .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
++   };
++   return e->wsi->CreateImageView(e->dev, &vci, &e->alloc, view);
++}
++
++static uint32_t
++level_dim(uint32_t d, unsigned level)
++{
++   return MAX2((d + (1u << level) - 1) >> level, 1u);
++}
++
++static VkResult
++enh_fg_resources(struct wsi_enh *e)
++{
++   if (e->fg_ready)
++      return VK_SUCCESS;
++   VkResult r = VK_SUCCESS;
++   for (unsigned h = 0; h < 2 && r == VK_SUCCESS; h++) {
++      r = enh_image(e, &e->hist[h], VK_FORMAT_R8G8B8A8_UNORM,
++                    e->rect.extent.width, e->rect.extent.height);
++      for (unsigned l = 1; l < ENH_LEVELS && r == VK_SUCCESS; l++)
++         r = enh_image(e, &e->pyr[h][l], VK_FORMAT_R16_SFLOAT,
++                       level_dim(e->src.width, l), level_dim(e->src.height, l));
++   }
++   for (unsigned l = 1; l < ENH_LEVELS && r == VK_SUCCESS; l++)
++      r = enh_image(e, &e->flow[l], VK_FORMAT_R16G16B16A16_SFLOAT,
++                    level_dim(e->src.width, l), level_dim(e->src.height, l));
++   if (r != VK_SUCCESS) {
++      LOGE("frame-generation images (%ux%u) could not be made: %d",
++           e->rect.extent.width, e->rect.extent.height, (int)r);
++      return r;
++   }
++   e->fg_ready = true;
++   e->init_layouts = true;
++   e->have_prev = false;
++   return VK_SUCCESS;
++}
++
++static VkResult
++enh_pipelines(struct wsi_enh *e)
++{
++   const struct wsi_device *wsi = e->wsi;
++   VkResult r;
++
++   const VkSamplerCreateInfo lin = {
++      .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
++      .magFilter = VK_FILTER_LINEAR,
++      .minFilter = VK_FILTER_LINEAR,
++      .mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
++      .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
++      .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
++      .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
++   };
++   r = wsi->CreateSampler(e->dev, &lin, &e->alloc, &e->linear);
++   if (r != VK_SUCCESS)
++      return r;
++   VkSamplerCreateInfo nst = lin;
++   nst.magFilter = nst.minFilter = VK_FILTER_NEAREST;
++   r = wsi->CreateSampler(e->dev, &nst, &e->alloc, &e->nearest);
++   if (r != VK_SUCCESS)
++      return r;
++
++   const VkDescriptorSetLayoutBinding b[4] = {
++      { 0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT },
++      { 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT },
++      { 2, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT },
++      { 3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT },
++   };
++   const VkDescriptorSetLayoutCreateInfo dci = {
++      .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
++      .flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR,
++      .bindingCount = 4,
++      .pBindings = b,
++   };
++   r = wsi->CreateDescriptorSetLayout(e->dev, &dci, &e->alloc, &e->dsl);
++   if (r != VK_SUCCESS)
++      return r;
++   const VkPushConstantRange pcr = {
++      VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(struct enh_push)
++   };
++   const VkPipelineLayoutCreateInfo lci = {
++      .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
++      .setLayoutCount = 1,
++      .pSetLayouts = &e->dsl,
++      .pushConstantRangeCount = 1,
++      .pPushConstantRanges = &pcr,
++   };
++   r = wsi->CreatePipelineLayout(e->dev, &lci, &e->alloc, &e->layout);
++   if (r != VK_SUCCESS)
++      return r;
++
++   for (unsigned p = 0; p < P_COUNT; p++) {
++      const VkShaderModuleCreateInfo sci = {
++         .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
++         .codeSize = enh_spv[p].size,
++         .pCode = enh_spv[p].code,
++      };
++      VkShaderModule mod;
++      r = wsi->CreateShaderModule(e->dev, &sci, &e->alloc, &mod);
++      if (r != VK_SUCCESS)
++         return r;
++      const VkComputePipelineCreateInfo pci = {
++         .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
++         .stage = {
++            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
++            .stage = VK_SHADER_STAGE_COMPUTE_BIT,
++            .module = mod,
++            .pName = "main",
++         },
++         .layout = e->layout,
++      };
++      r = wsi->CreateComputePipelines(e->dev, VK_NULL_HANDLE, 1, &pci,
++                                      &e->alloc, &e->pipe[p]);
++      wsi->DestroyShaderModule(e->dev, mod, &e->alloc);
++      if (r != VK_SUCCESS) {
++         LOGE("pipeline %s: %d", enh_spv[p].name, (int)r);
++         return r;
++      }
++   }
++   return VK_SUCCESS;
++}
++
++static void
++enh_compute_rect(struct wsi_enh *e)
++{
++   const uint32_t sw = e->src.width, sh = e->src.height;
++   const uint32_t dw = e->dst.width, dh = e->dst.height;
++   uint32_t w = dw, h = dh;
++   if (e->cfg.scaler == WSI_ENH_SCALER_INTEGER) {
++      const uint32_t f = MAX2(MIN2(dw / sw, dh / sh), 1u);
++      w = MIN2(sw * f, dw);
++      h = MIN2(sh * f, dh);
++   } else if (e->cfg.fit == WSI_ENH_FIT_ASPECT) {
++      /* the largest sw:sh rectangle that fits */
++      if ((uint64_t)dw * sh > (uint64_t)dh * sw) {
++         h = dh;
++         w = (uint32_t)(((uint64_t)dh * sw + sh / 2) / sh);
++      } else {
++         w = dw;
++         h = (uint32_t)(((uint64_t)dw * sh + sw / 2) / sw);
++      }
++      w = CLAMP(w, 1u, dw);
++      h = CLAMP(h, 1u, dh);
++   }
++   e->rect.extent = (VkExtent2D){ w, h };
++   e->rect.offset = (VkOffset2D){ (int32_t)((dw - w) / 2), (int32_t)((dh - h) / 2) };
++}
++
++static bool
++is_srgb(VkFormat f)
++{
++   return f == VK_FORMAT_B8G8R8A8_SRGB || f == VK_FORMAT_R8G8B8A8_SRGB;
++}
++
++static void
++stats_open_csv(struct wsi_enh *e)
++{
++   if (!e->cfg.stats || e->csv)
++      return;
++   char dir[MAX_PATH], path[MAX_PATH + 64];
++   DWORD n = GetEnvironmentVariableA("HELIOS_VK_FRAMETIME_DIR", dir, sizeof(dir));
++   if (n == 0 || n >= sizeof(dir)) {
++      char pd[MAX_PATH];
++      n = GetEnvironmentVariableA("ProgramData", pd, sizeof(pd));
++      snprintf(dir, sizeof(dir), "%s\\Helios",
++               n > 0 && n < sizeof(pd) ? pd : "C:\\ProgramData");
++   }
++   snprintf(path, sizeof(path), "%s\\enhance-%lu-%p.csv", dir,
++            (unsigned long)GetCurrentProcessId(), (void *)e);
++   e->csv = fopen(path, "w");
++   if (e->csv) {
++      fprintf(e->csv, "frame,pictures,interval_us,scale_us,pyramid_us,flow_us,"
++                      "interp_us,copy_us,gpu_total_us\n");
++      LOGI("per-frame statistics in %s", path);
++   }
++}
++
++VkResult
++wsi_enh_create(const struct wsi_enh_create_info *info, struct wsi_enh **out)
++{
++   const struct wsi_device *wsi = info->wsi;
++   struct wsi_enh *e = vk_zalloc(info->alloc, sizeof(*e), 8,
++                                 VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
++   if (!e)
++      return VK_ERROR_OUT_OF_HOST_MEMORY;
++   e->dev = info->device;
++   e->wsi = wsi;
++   e->alloc = *info->alloc;
++   e->cfg = info->config;
++   e->src_format = info->src_format;
++   e->src_srgb = is_srgb(info->src_format);
++   e->src = info->src_extent;
++   e->dst = info->dst_extent;
++   e->src_count = info->src_count;
++   e->slot_count = info->slot_count;
++   e->cur = 0;
++   InitializeSRWLock(&e->stat_lock);
++   e->stat_t0 = os_time_get_nano();
++   enh_compute_rect(e);
++
++   VkResult r = VK_ERROR_OUT_OF_HOST_MEMORY;
++   e->src_images = vk_zalloc(&e->alloc, sizeof(VkImage) * e->src_count, 8,
++                             VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
++   e->src_views = vk_zalloc(&e->alloc, sizeof(VkImageView) * e->src_count, 8,
++                            VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
++   e->frames = vk_zalloc(&e->alloc, sizeof(struct enh_frame) * e->src_count, 8,
++                         VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
++   e->slot_images = vk_zalloc(&e->alloc, sizeof(VkImage) * e->slot_count, 8,
++                              VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
++   e->slot_views = vk_zalloc(&e->alloc, sizeof(VkImageView) * e->slot_count, 8,
++                             VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
++   e->slot_ready = vk_zalloc(&e->alloc, sizeof(bool) * e->slot_count, 8,
++                             VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
++   if (!e->src_images || !e->src_views || !e->frames || !e->slot_images ||
++       !e->slot_views || !e->slot_ready)
++      goto fail;
++
++   for (uint32_t i = 0; i < e->src_count; i++) {
++      e->src_images[i] = info->src_images[i];
++      r = enh_view(e, info->src_images[i], info->src_format, &e->src_views[i]);
++      if (r != VK_SUCCESS)
++         goto fail;
++   }
++   for (uint32_t i = 0; i < e->slot_count; i++) {
++      e->slot_images[i] = info->slot_images[i];
++      r = enh_view(e, info->slot_images[i], info->dst_format, &e->slot_views[i]);
++      if (r != VK_SUCCESS)
++         goto fail;
++   }
++   r = enh_pipelines(e);
++   if (r != VK_SUCCESS)
++      goto fail;
++   r = enh_image(e, &e->tmp, VK_FORMAT_R8G8B8A8_UNORM,
++                 e->rect.extent.width, e->rect.extent.height);
++   if (r != VK_SUCCESS)
++      goto fail;
++   e->init_layouts = true;
++   if (wsi_enh_config_fg(&e->cfg)) {
++      r = enh_fg_resources(e);
++      if (r != VK_SUCCESS)
++         goto fail;
++   }
++
++   const VkQueryPoolCreateInfo qci = {
++      .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
++      .queryType = VK_QUERY_TYPE_TIMESTAMP,
++      .queryCount = e->src_count * TS_COUNT,
++   };
++   e->ts_ok = wsi->timestamp_period > 0.0f &&
++              wsi->CreateQueryPool(e->dev, &qci, &e->alloc, &e->queries) == VK_SUCCESS;
++
++   stats_open_csv(e);
++   LOGI("%ux%u -> %ux%u (picture %ux%u at %d,%d), scaler %s, sharpness %u, "
++        "frame generation %s%ux (%s), %u output slots",
++        e->src.width, e->src.height, e->dst.width, e->dst.height,
++        e->rect.extent.width, e->rect.extent.height, e->rect.offset.x,
++        e->rect.offset.y, wsi_enh_scaler_name(e->cfg.scaler), e->cfg.sharpness,
++        e->cfg.fg_adaptive ? "adaptive " : "", e->cfg.fg_mult,
++        e->cfg.fg_quality == WSI_ENH_FG_QUALITY ? "quality" : "fast",
++        e->slot_count);
++   *out = e;
++   return VK_SUCCESS;
++
++fail:
++   LOGE("set-up failed: %d", (int)r);
++   wsi_enh_destroy(e);
++   return r == VK_SUCCESS ? VK_ERROR_INITIALIZATION_FAILED : r;
++}
++
++static void
++stats_flush(struct wsi_enh *e, bool final)
++{
++   const uint64_t now = os_time_get_nano();
++   const double secs = (now - e->stat_t0) / 1e9;
++   if (!final && secs < 5.0)
++      return;
++   /* The last part-interval only when it says something */
++   if (e->stat_frames && secs >= 1.0) {
++      const double g = e->stat_gpu_frames ? 1.0 / e->stat_gpu_frames : 0.0;
++      LOGI("%.1f real + %.1f generated pictures/s shown (%" PRIu64 " generated "
++           "skipped), %.1f frames/s in, interval %.2f ms, refresh %.2f ms; GPU us "
++           "per frame: scale %.0f, pyramid %.0f, flow %.0f, interp %.0f, copy %.0f, "
++           "total %.0f",
++           e->stat_real / secs, e->stat_gen / secs, e->stat_skipped,
++           e->stat_frames / secs, e->interval_ns / 1e6, e->refresh_ns / 1e6,
++           e->stat_gpu_us[TS_SCALE] * g, e->stat_gpu_us[TS_PYR] * g,
++           e->stat_gpu_us[TS_FLOW] * g, e->stat_gpu_us[TS_INTERP] * g,
++           e->stat_gpu_us[TS_COPY] * g, e->stat_gpu_us[TS_START] * g);
++   }
++   e->stat_t0 = now;
++   e->stat_frames = e->stat_real = e->stat_gen = e->stat_skipped = 0;
++   e->stat_gpu_frames = 0;
++   memset(e->stat_gpu_us, 0, sizeof(e->stat_gpu_us));
++}
++
++void
++wsi_enh_destroy(struct wsi_enh *e)
++{
++   if (!e)
++      return;
++   const struct wsi_device *wsi = e->wsi;
++   AcquireSRWLockExclusive(&e->stat_lock);
++   stats_flush(e, true);
++   ReleaseSRWLockExclusive(&e->stat_lock);
++   if (e->csv)
++      fclose(e->csv);
++   if (e->queries)
++      wsi->DestroyQueryPool(e->dev, e->queries, &e->alloc);
++   for (unsigned f = 0; f < ENH_FAMILIES; f++) {
++      if (e->pools[f])
++         wsi->DestroyCommandPool(e->dev, e->pools[f], &e->alloc);
++   }
++   enh_image_destroy(e, &e->tmp);
++   for (unsigned h = 0; h < 2; h++) {
++      enh_image_destroy(e, &e->hist[h]);
++      for (unsigned l = 0; l < ENH_LEVELS; l++)
++         enh_image_destroy(e, &e->pyr[h][l]);
++   }
++   for (unsigned l = 0; l < ENH_LEVELS; l++)
++      enh_image_destroy(e, &e->flow[l]);
++   for (unsigned p = 0; p < P_COUNT; p++) {
++      if (e->pipe[p])
++         wsi->DestroyPipeline(e->dev, e->pipe[p], &e->alloc);
++   }
++   if (e->layout)
++      wsi->DestroyPipelineLayout(e->dev, e->layout, &e->alloc);
++   if (e->dsl)
++      wsi->DestroyDescriptorSetLayout(e->dev, e->dsl, &e->alloc);
++   if (e->linear)
++      wsi->DestroySampler(e->dev, e->linear, &e->alloc);
++   if (e->nearest)
++      wsi->DestroySampler(e->dev, e->nearest, &e->alloc);
++   for (uint32_t i = 0; e->src_views && i < e->src_count; i++) {
++      if (e->src_views[i])
++         wsi->DestroyImageView(e->dev, e->src_views[i], &e->alloc);
++   }
++   for (uint32_t i = 0; e->slot_views && i < e->slot_count; i++) {
++      if (e->slot_views[i])
++         wsi->DestroyImageView(e->dev, e->slot_views[i], &e->alloc);
++   }
++   vk_free(&e->alloc, e->src_images);
++   vk_free(&e->alloc, e->src_views);
++   vk_free(&e->alloc, e->frames);
++   vk_free(&e->alloc, e->slot_images);
++   vk_free(&e->alloc, e->slot_views);
++   vk_free(&e->alloc, e->slot_ready);
++   VkAllocationCallbacks alloc = e->alloc;
++   vk_free(&alloc, e);
++}
++
++void
++wsi_enh_update_config(struct wsi_enh *e, const struct wsi_enh_config *c)
++{
++   /* The region and the output size stay as they were made */
++   const bool fit_changed = c->fit != e->cfg.fit ||
++      (c->scaler == WSI_ENH_SCALER_INTEGER) != (e->cfg.scaler == WSI_ENH_SCALER_INTEGER);
++   struct wsi_enh_config keep = e->cfg;
++   e->cfg = *c;
++   if (fit_changed) {
++      e->cfg.fit = keep.fit;
++      if ((c->scaler == WSI_ENH_SCALER_INTEGER) != (keep.scaler == WSI_ENH_SCALER_INTEGER))
++         e->cfg.scaler = keep.scaler;
++   }
++   if (!wsi_enh_config_fg(&e->cfg))
++      e->have_prev = false;
++   stats_open_csv(e);
++}
++
++void
++wsi_enh_set_refresh(struct wsi_enh *e, uint64_t period_ns)
++{
++   e->refresh_ns = period_ns;
++}
++
++void
++wsi_enh_rect(const struct wsi_enh *e, VkRect2D *rect)
++{
++   *rect = e->rect;
++}
++
++#define ENH_GAP_NS (100ull * 1000 * 1000)   /* longer: a pause */
++#define ENH_MIN_NS (1ull * 1000 * 1000)     /* shorter: not a frame rate */
++
++uint32_t
++wsi_enh_pictures(struct wsi_enh *e, uint64_t now)
++{
++   const uint64_t d = e->last_ns && now > e->last_ns ? now - e->last_ns : 0;
++   const bool gap = !e->last_ns || d > ENH_GAP_NS ||
++                    (e->interval_ns && d > 4 * e->interval_ns);
++   if (d >= ENH_MIN_NS && d <= ENH_GAP_NS) {
++      /* an eighth of each new delta: steady in a few frames, and a single
++       * long frame (a hitch) moves it little */
++      e->interval_ns = e->interval_ns ? (e->interval_ns * 7 + d) / 8 : d;
++   }
++   e->last_ns = now;
++
++   if (!wsi_enh_config_fg(&e->cfg))
++      return 1;
++   if (gap) {
++      /* After a pause nothing slides from a stale frame */
++      e->have_prev = false;
++      return 1;
++   }
++   if (!e->have_prev || !e->interval_ns)
++      return 1;
++
++   const uint64_t refresh = e->refresh_ns;
++   uint32_t n;
++   if (e->cfg.fg_adaptive) {
++      /* Fill to the target (the refresh by default) */
++      uint64_t period = e->cfg.fg_target_fps ? 1000000000ull / e->cfg.fg_target_fps
++                                             : refresh;
++      if (!period)
++         period = 1000000000ull / 60;
++      if (refresh && period < refresh)
++         period = refresh;
++      n = (uint32_t)((e->interval_ns + period / 2) / period);
++      n = CLAMP(n, 1u, (uint32_t)WSI_ENH_MAX_PICS);
++   } else {
++      n = e->cfg.fg_mult;
++      if (refresh) {
++         /* Each picture about one refresh after the last at least: 120 fps
++          * on 240 Hz still makes 2x, 200 fps nothing */
++         const uint64_t fit = (e->interval_ns + refresh / 2) / refresh;
++         if (fit < n)
++            n = MAX2((uint32_t)fit, 1u);
++      }
++      if (e->cfg.low_latency && e->cfg.fg_target_fps &&
++          e->interval_ns * e->cfg.fg_target_fps <= 1100000000ull)
++         n = 1; /* the game reaches the target itself */
++   }
++   return MIN2(n, e->slot_count > 2 ? e->slot_count - 2 : 1);
++}
++
++/* ---- recording ---------------------------------------------------------- */
++
++static void
++barrier_global(const struct wsi_device *wsi, VkCommandBuffer cmd,
++               VkPipelineStageFlags src, VkAccessFlags src_access,
++               VkPipelineStageFlags dst, VkAccessFlags dst_access)
++{
++   const VkMemoryBarrier mb = {
++      .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
++      .srcAccessMask = src_access,
++      .dstAccessMask = dst_access,
++   };
++   wsi->CmdPipelineBarrier(cmd, src, dst, 0, 1, &mb, 0, NULL, 0, NULL);
++}
++
++static void
++compute_barrier(const struct wsi_device *wsi, VkCommandBuffer cmd)
++{
++   barrier_global(wsi, cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
++                  VK_ACCESS_SHADER_WRITE_BIT,
++                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
++                  VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
++}
++
++static void
++image_barrier(const struct wsi_device *wsi, VkCommandBuffer cmd, VkImage image,
++              VkImageLayout from, VkImageLayout to,
++              VkPipelineStageFlags src, VkAccessFlags src_access,
++              VkPipelineStageFlags dst, VkAccessFlags dst_access)
++{
++   const VkImageMemoryBarrier ib = {
++      .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
++      .srcAccessMask = src_access,
++      .dstAccessMask = dst_access,
++      .oldLayout = from,
++      .newLayout = to,
++      .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++      .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++      .image = image,
++      .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
++   };
++   wsi->CmdPipelineBarrier(cmd, src, dst, 0, 0, NULL, 0, NULL, 1, &ib);
++}
++
++/* One dispatch: samplers 0..2 (view, sampler), storage 3, constants */
++static void
++dispatch(struct wsi_enh *e, VkCommandBuffer cmd, enum enh_pipe p,
++         VkImageView s0, VkSampler sm0, VkImageView s1, VkImageView s2,
++         VkImageView dst, const struct enh_push *push)
++{
++   const struct wsi_device *wsi = e->wsi;
++   const VkDescriptorImageInfo ii[4] = {
++      { sm0, s0, VK_IMAGE_LAYOUT_GENERAL },
++      { e->linear, s1 ? s1 : s0, VK_IMAGE_LAYOUT_GENERAL },
++      { e->nearest, s2 ? s2 : s0, VK_IMAGE_LAYOUT_GENERAL },
++      { VK_NULL_HANDLE, dst, VK_IMAGE_LAYOUT_GENERAL },
++   };
++   VkWriteDescriptorSet w[4];
++   for (unsigned i = 0; i < 4; i++) {
++      w[i] = (VkWriteDescriptorSet) {
++         .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
++         .dstBinding = i,
++         .descriptorCount = 1,
++         .descriptorType = i < 3 ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
++                                 : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
++         .pImageInfo = &ii[i],
++      };
++   }
++   wsi->CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, e->pipe[p]);
++   wsi->CmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, e->layout,
++                                0, 4, w);
++   wsi->CmdPushConstants(cmd, e->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
++                         sizeof(*push), push);
++   wsi->CmdDispatch(cmd, DIV_ROUND_UP(push->dst_size[0], 8),
++                    DIV_ROUND_UP(push->dst_size[1], 8), 1);
++}
++
++static void
++push_sizes(struct enh_push *p, VkExtent2D src, VkExtent2D dst, VkOffset2D off)
++{
++   memset(p, 0, sizeof(*p));
++   p->src_size[0] = (int32_t)src.width;
++   p->src_size[1] = (int32_t)src.height;
++   p->dst_size[0] = (int32_t)dst.width;
++   p->dst_size[1] = (int32_t)dst.height;
++   p->dst_off[0] = off.x;
++   p->dst_off[1] = off.y;
++}
++
++/* The scaler: the application's image into `dst` (rect size at `off`) */
++static void
++record_scale(struct wsi_enh *e, VkCommandBuffer cmd, VkImageView src,
++             VkImageView dst, VkOffset2D off)
++{
++   struct enh_push p;
++   const VkExtent2D out = e->rect.extent;
++   const uint32_t srgb = e->src_srgb ? ENH_FLAG_SRGB_ENCODE : 0;
++   enum wsi_enh_scaler s = e->cfg.scaler;
++   const bool upscale = out.width >= e->src.width && out.height >= e->src.height;
++   /* EASU only enlarges */
++   if (s == WSI_ENH_SCALER_FSR && !upscale)
++      s = WSI_ENH_SCALER_BILINEAR;
++   if (s == WSI_ENH_SCALER_FSR) {
++      const bool rcas = e->cfg.sharpness > 0;
++      push_sizes(&p, e->src, out, rcas ? (VkOffset2D){ 0, 0 } : off);
++      p.flags = srgb;
++      dispatch(e, cmd, P_EASU, src, e->linear, VK_NULL_HANDLE, VK_NULL_HANDLE,
++               rcas ? e->tmp.view : dst, &p);
++      if (rcas) {
++         compute_barrier(e->wsi, cmd);
++         push_sizes(&p, out, out, off);
++         /* RCAS: 0 stops is the sharpest; 100 -> 0, 50 -> 1, 1 -> ~2 */
++         p.p0[0] = 2.0f * (1.0f - (float)e->cfg.sharpness / 100.0f);
++         dispatch(e, cmd, P_RCAS, e->tmp.view, e->nearest, VK_NULL_HANDLE, VK_NULL_HANDLE, dst, &p);
++      }
++      return;
++   }
++   push_sizes(&p, e->src, out, off);
++   p.flags = srgb;
++   switch (s) {
++   case WSI_ENH_SCALER_BILINEAR:
++      p.mode = 1;
++      break;
++   case WSI_ENH_SCALER_BICUBIC:
++      p.mode = 2;
++      break;
++   default: /* nearest, integer, and the 1:1 copy of frame generation alone */
++      p.mode = out.width == e->src.width && out.height == e->src.height ? 0 :
++               (s == WSI_ENH_SCALER_OFF ? 1 : 0);
++      break;
++   }
++   dispatch(e, cmd, P_SCALE, src, e->linear, VK_NULL_HANDLE, VK_NULL_HANDLE, dst, &p);
++}
++
++static void
++timestamp(struct wsi_enh *e, VkCommandBuffer cmd, struct enh_frame *f,
++          uint32_t index, unsigned which)
++{
++   if (!e->ts_ok)
++      return;
++   e->wsi->CmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
++                             e->queries, index * TS_COUNT + which);
++   f->passes |= 1u << which;
++}
++
++/* The previous use of this frame slot's timestamps, now complete (the
++ * present's throttle waited for its fence) */
++static void
++collect_timestamps(struct wsi_enh *e, uint32_t index)
++{
++   struct enh_frame *f = &e->frames[index];
++   if (!f->ts_pending)
++      return;
++   f->ts_pending = false;
++   uint64_t ts[TS_COUNT];
++   if (e->wsi->GetQueryPoolResults(e->dev, e->queries, index * TS_COUNT,
++                                   TS_COUNT, sizeof(ts), ts, sizeof(uint64_t),
++                                   VK_QUERY_RESULT_64_BIT) != VK_SUCCESS)
++      return;
++   const double us = e->wsi->timestamp_period / 1000.0;
++   double d[TS_COUNT] = { 0 };
++   uint64_t last = ts[TS_START];
++   for (unsigned i = 1; i < TS_COUNT; i++) {
++      if (!(f->passes & (1u << i)))
++         continue;
++      d[i] = (double)(ts[i] - last) * us;
++      last = ts[i];
++   }
++   d[TS_START] = (double)(last - ts[TS_START]) * us;   /* total */
++   AcquireSRWLockExclusive(&e->stat_lock);
++   e->stat_gpu_frames++;
++   for (unsigned i = 0; i < TS_COUNT; i++)
++      e->stat_gpu_us[i] += d[i];
++   if (e->csv) {
++      fprintf(e->csv, "%" PRIu64 ",%u,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f\n",
++              f->frame, f->pictures, e->interval_ns / 1000.0, d[TS_SCALE],
++              d[TS_PYR], d[TS_FLOW], d[TS_INTERP], d[TS_COPY], d[TS_START]);
++   }
++   ReleaseSRWLockExclusive(&e->stat_lock);
++}
++
++static VkCommandBuffer
++frame_cmd(struct wsi_enh *e, uint32_t qfi, struct enh_frame *f)
++{
++   const struct wsi_device *wsi = e->wsi;
++   if (qfi >= ENH_FAMILIES)
++      return VK_NULL_HANDLE;
++   if (f->cmd && f->qfi == qfi) {
++      wsi->ResetCommandBuffer(f->cmd, 0);
++      return f->cmd;
++   }
++   if (f->cmd) {
++      wsi->FreeCommandBuffers(e->dev, e->pools[f->qfi], 1, &f->cmd);
++      f->cmd = VK_NULL_HANDLE;
++   }
++   if (!e->pools[qfi]) {
++      const VkCommandPoolCreateInfo pci = {
++         .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
++         .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
++         .queueFamilyIndex = qfi,
++      };
++      if (wsi->CreateCommandPool(e->dev, &pci, &e->alloc, &e->pools[qfi]) != VK_SUCCESS)
++         return VK_NULL_HANDLE;
++   }
++   const VkCommandBufferAllocateInfo cai = {
++      .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
++      .commandPool = e->pools[qfi],
++      .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
++      .commandBufferCount = 1,
++   };
++   if (wsi->AllocateCommandBuffers(e->dev, &cai, &f->cmd) != VK_SUCCESS) {
++      f->cmd = VK_NULL_HANDLE;
++      return VK_NULL_HANDLE;
++   }
++   f->qfi = qfi;
++   return f->cmd;
++}
++
++VkCommandBuffer
++wsi_enh_record(struct wsi_enh *e, uint32_t qfi, uint32_t src_index,
++               struct wsi_enh_plan *plan)
++{
++   const struct wsi_device *wsi = e->wsi;
++   if (src_index >= e->src_count || plan->count == 0)
++      return VK_NULL_HANDLE;
++   const bool fg = wsi_enh_config_fg(&e->cfg);
++   if (fg && enh_fg_resources(e) != VK_SUCCESS)
++      return VK_NULL_HANDLE;
++
++   struct enh_frame *f = &e->frames[src_index];
++   if (e->ts_ok)
++      collect_timestamps(e, src_index);
++   VkCommandBuffer cmd = frame_cmd(e, qfi, f);
++   if (!cmd) {
++      LOGE("no command buffer for queue family %u", qfi);
++      return VK_NULL_HANDLE;
++   }
++   const VkCommandBufferBeginInfo bi = {
++      .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
++      .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
++   };
++   if (wsi->BeginCommandBuffer(cmd, &bi) != VK_SUCCESS)
++      return VK_NULL_HANDLE;
++
++   plan->frame = ++e->frame;
++   /* The pictures of a cycle a frame interval apart in all; low latency
++    * shows them one refresh apart, so the real frame is held less */
++   plan->spacing_ns = plan->count < 2 ? 0 : e->interval_ns / plan->count;
++   if (plan->count > 1 && e->cfg.low_latency && e->refresh_ns)
++      plan->spacing_ns = MIN2(plan->spacing_ns, e->refresh_ns);
++   f->frame = plan->frame;
++   f->pictures = plan->count;
++   f->passes = 0;
++   if (e->ts_ok) {
++      wsi->CmdResetQueryPool(cmd, e->queries, src_index * TS_COUNT, TS_COUNT);
++      timestamp(e, cmd, f, src_index, TS_START);
++   }
++
++   /* Everything before: the application's rendering of the image, and our
++    * own earlier passes (history, slots) */
++   barrier_global(wsi, cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
++                  VK_ACCESS_MEMORY_WRITE_BIT,
++                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
++                  VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
++                  VK_ACCESS_TRANSFER_WRITE_BIT);
++   image_barrier(wsi, cmd, e->src_images[src_index],
++                 VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_LAYOUT_GENERAL,
++                 VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_WRITE_BIT,
++                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
++   if (e->init_layouts) {
++      struct enh_img *imgs[2 + 2 * ENH_LEVELS + ENH_LEVELS];
++      unsigned n = 0;
++      imgs[n++] = &e->tmp;
++      if (e->fg_ready) {
++         for (unsigned h = 0; h < 2; h++) {
++            imgs[n++] = &e->hist[h];
++            for (unsigned l = 1; l < ENH_LEVELS; l++)
++               imgs[n++] = &e->pyr[h][l];
++         }
++         for (unsigned l = 1; l < ENH_LEVELS; l++)
++            imgs[n++] = &e->flow[l];
++      }
++      for (unsigned i = 0; i < n; i++) {
++         if (imgs[i]->image)
++            image_barrier(wsi, cmd, imgs[i]->image, VK_IMAGE_LAYOUT_UNDEFINED,
++                          VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0,
++                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
++                          VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
++      }
++      e->init_layouts = false;
++   }
++   /* A slot's first use: GENERAL, and black where the picture does not
++    * cover it (the bars stay black from then on) */
++   const bool bars = e->rect.extent.width != e->dst.width ||
++                     e->rect.extent.height != e->dst.height;
++   bool cleared = false;
++   for (uint32_t k = 0; k < plan->count; k++) {
++      const uint32_t s = plan->slot[k];
++      if (e->slot_ready[s])
++         continue;
++      image_barrier(wsi, cmd, e->slot_images[s], VK_IMAGE_LAYOUT_UNDEFINED,
++                    VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0,
++                    VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
++                    VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT);
++      if (bars) {
++         const VkClearColorValue black = { .float32 = { 0, 0, 0, 1 } };
++         const VkImageSubresourceRange range = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
++         wsi->CmdClearColorImage(cmd, e->slot_images[s], VK_IMAGE_LAYOUT_GENERAL,
++                                 &black, 1, &range);
++         cleared = true;
++      }
++      e->slot_ready[s] = true;
++   }
++   if (cleared)
++      barrier_global(wsi, cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
++                     VK_ACCESS_TRANSFER_WRITE_BIT,
++                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
++                     VK_ACCESS_SHADER_WRITE_BIT);
++
++   const VkImageView src = e->src_views[src_index];
++   const VkOffset2D zero = { 0, 0 };
++   const uint32_t real_slot = plan->slot[plan->count - 1];
++
++   if (!fg) {
++      record_scale(e, cmd, src, e->slot_views[real_slot], e->rect.offset);
++      timestamp(e, cmd, f, src_index, TS_SCALE);
++   } else {
++      const int cur = e->cur, prev = cur ^ 1;
++      record_scale(e, cmd, src, e->hist[cur].view, zero);
++      timestamp(e, cmd, f, src_index, TS_SCALE);
++
++      /* the luma pyramid of this frame, from the application's image */
++      struct enh_push p;
++      for (unsigned l = 1; l < ENH_LEVELS; l++) {
++         const struct enh_img *from = l == 1 ? NULL : &e->pyr[cur][l - 1];
++         push_sizes(&p, from ? from->extent : e->src, e->pyr[cur][l].extent, zero);
++         p.mode = l == 1 ? 1 : 0;
++         dispatch(e, cmd, P_DOWN, from ? from->view : src, e->linear, VK_NULL_HANDLE, VK_NULL_HANDLE,
++                  e->pyr[cur][l].view, &p);
++         compute_barrier(wsi, cmd);
++      }
++      timestamp(e, cmd, f, src_index, TS_PYR);
++
++      if (plan->count > 1 && e->have_prev) {
++         const bool hq = e->cfg.fg_quality == WSI_ENH_FG_QUALITY;
++         const unsigned finest = hq ? 1 : 2;
++         const unsigned coarsest = hq ? 5 : 4;
++         for (unsigned l = coarsest; l >= finest; l--) {
++            push_sizes(&p, e->pyr[cur][l].extent, e->flow[l].extent, zero);
++            p.p0[0] = (float)(1u << l);
++            p.p0[1] = 4.0f;               /* search radius, texels */
++            p.mode = l == coarsest ? 0 : 1;
++            if (l < coarsest) {
++               p.aux_size[0] = (int32_t)e->flow[l + 1].extent.width;
++               p.aux_size[1] = (int32_t)e->flow[l + 1].extent.height;
++            }
++            dispatch(e, cmd, P_FLOW, e->pyr[prev][l].view, e->linear,
++                     e->pyr[cur][l].view,
++                     l < coarsest ? e->flow[l + 1].view : e->pyr[cur][l].view,
++                     e->flow[l].view, &p);
++            compute_barrier(wsi, cmd);
++         }
++         timestamp(e, cmd, f, src_index, TS_FLOW);
++
++         for (uint32_t k = 0; k + 1 < plan->count; k++) {
++            push_sizes(&p, e->rect.extent, e->rect.extent, e->rect.offset);
++            p.aux_size[0] = (int32_t)e->flow[finest].extent.width;
++            p.aux_size[1] = (int32_t)e->flow[finest].extent.height;
++            p.p0[0] = (float)(k + 1) / (float)plan->count;
++            p.p0[1] = (float)(1u << finest);
++            p.p1[0] = (float)e->rect.extent.width / (float)e->src.width;
++            p.p1[1] = (float)e->rect.extent.height / (float)e->src.height;
++            dispatch(e, cmd, P_INTERP, e->hist[prev].view, e->linear,
++                     e->hist[cur].view, e->flow[finest].view,
++                     e->slot_views[plan->slot[k]], &p);
++         }
++         timestamp(e, cmd, f, src_index, TS_INTERP);
++      }
++
++      /* the real frame from the history image */
++      push_sizes(&p, e->rect.extent, e->rect.extent, e->rect.offset);
++      p.mode = 0;
++      dispatch(e, cmd, P_SCALE, e->hist[cur].view, e->nearest, VK_NULL_HANDLE, VK_NULL_HANDLE,
++               e->slot_views[real_slot], &p);
++      timestamp(e, cmd, f, src_index, TS_COPY);
++      e->cur = prev;
++      e->have_prev = true;
++   }
++
++   /* Every query of the range is written (the results come back only when
++    * all of them are available); the stages that did not run are not
++    * counted (f->passes) */
++   if (e->ts_ok) {
++      for (unsigned i = 1; i < TS_COUNT; i++) {
++         if (!(f->passes & (1u << i)))
++            wsi->CmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
++                                   e->queries, src_index * TS_COUNT + i);
++      }
++   }
++   image_barrier(wsi, cmd, e->src_images[src_index], VK_IMAGE_LAYOUT_GENERAL,
++                 VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
++                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT,
++                 VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0);
++   /* The slots go to the D3D11 device once the fence has signalled */
++   barrier_global(wsi, cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
++                  VK_ACCESS_SHADER_WRITE_BIT,
++                  VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT | VK_PIPELINE_STAGE_HOST_BIT,
++                  VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_HOST_READ_BIT);
++   if (wsi->EndCommandBuffer(cmd) != VK_SUCCESS)
++      return VK_NULL_HANDLE;
++   f->ts_pending = e->ts_ok;
++
++   AcquireSRWLockExclusive(&e->stat_lock);
++   e->stat_frames++;
++   e->stat_pics += plan->count;
++   stats_flush(e, false);
++   ReleaseSRWLockExclusive(&e->stat_lock);
++   return cmd;
++}
++
++void
++wsi_enh_note_shown(struct wsi_enh *e, uint32_t real, uint32_t generated,
++                   uint32_t skipped)
++{
++   AcquireSRWLockExclusive(&e->stat_lock);
++   e->stat_real += real;
++   e->stat_gen += generated;
++   e->stat_skipped += skipped;
++   ReleaseSRWLockExclusive(&e->stat_lock);
++}
+diff --git a/src/vulkan/wsi/wsi_common_win32_enhance.h b/src/vulkan/wsi/wsi_common_win32_enhance.h
+new file mode 100644
+index 0000000..5af1c0b
+--- /dev/null
++++ b/src/vulkan/wsi/wsi_common_win32_enhance.h
+@@ -0,0 +1,157 @@
++/*
++ * Copyright © 2026 Ole Algoritme
++ * SPDX-License-Identifier: MIT
++ */
++
++/*
++ * Upscaling and frame generation in the composed present (Conduit Helios,
++ * wsi_common_win32_enhance.c): after the application, from its presented
++ * images only, on the application's own queue, for every Vulkan swapchain
++ * that presents through the window's D3D11 flip swap chain (native Vulkan,
++ * D3D11 on DXVK, D3D12 on vkd3d-proton).
++ *
++ * Off by default.  Off, nothing here runs and nothing changes: the
++ * composed present copies the application's images as before.
++ */
++#ifndef WSI_COMMON_WIN32_ENHANCE_H
++#define WSI_COMMON_WIN32_ENHANCE_H
++
++#include <stdbool.h>
++#include <stdint.h>
++#include <vulkan/vulkan_core.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++struct wsi_device;
++
++enum wsi_enh_scaler {
++   WSI_ENH_SCALER_OFF = 0,
++   WSI_ENH_SCALER_NEAREST,
++   WSI_ENH_SCALER_BILINEAR,
++   WSI_ENH_SCALER_BICUBIC,
++   WSI_ENH_SCALER_INTEGER,     /* largest whole factor that fits, nearest */
++   WSI_ENH_SCALER_FSR,         /* FSR 1: EASU, then RCAS */
++   WSI_ENH_SCALER_COUNT,
++};
++
++enum wsi_enh_fit {
++   WSI_ENH_FIT_ASPECT = 0,     /* keep the aspect ratio, black bars */
++   WSI_ENH_FIT_STRETCH,
++};
++
++enum wsi_enh_fg_quality {
++   WSI_ENH_FG_FAST = 0,        /* flow down to 1/4 of the frame */
++   WSI_ENH_FG_QUALITY,         /* flow down to 1/2, one more coarse level */
++};
++
++#define WSI_ENH_MAX_MULT    4  /* fixed multipliers: 2x, 3x, 4x */
++#define WSI_ENH_MAX_PICS    8  /* adaptive: up to 8 pictures per real frame */
++
++struct wsi_enh_config {
++   enum wsi_enh_scaler scaler;
++   uint32_t sharpness;         /* 0..100 */
++   uint32_t fg_mult;           /* 1 = off, 2..4 */
++   bool fg_adaptive;           /* fill to fg_target (or the refresh) */
++   uint32_t fg_target_fps;     /* 0: the display's refresh */
++   enum wsi_enh_fg_quality fg_quality;
++   bool low_latency;
++   enum wsi_enh_fit fit;
++   bool all_windows;           /* false: borderless/fullscreen windows only */
++   bool stats;                 /* per-present CSV */
++   bool from_profile;          /* a per-exe profile set it */
++};
++
++static inline bool
++wsi_enh_config_fg(const struct wsi_enh_config *c)
++{
++   return c->fg_mult > 1 || c->fg_adaptive;
++}
++
++static inline bool
++wsi_enh_config_on(const struct wsi_enh_config *c)
++{
++   return c->scaler != WSI_ENH_SCALER_OFF || wsi_enh_config_fg(c);
++}
++
++/* The settings for this process (env > per-exe profile > global), read
++ * again only after the registry key changed.  Cheap: one non-blocking
++ * event check per call. */
++void wsi_enh_config_get(struct wsi_enh_config *config);
++
++/* Whether the settings apply to this window: per-exe profiles and
++ * EnhanceWindows=all apply to every window, the global settings otherwise
++ * only to windows that cover their monitor. */
++bool wsi_enh_config_applies(const struct wsi_enh_config *config, void *hwnd);
++
++const char *wsi_enh_scaler_name(enum wsi_enh_scaler s);
++
++/* ---- per swapchain ---------------------------------------------------- */
++
++struct wsi_enh;
++
++struct wsi_enh_create_info {
++   VkDevice device;
++   const struct wsi_device *wsi;
++   const VkAllocationCallbacks *alloc;
++   struct wsi_enh_config config;
++
++   /* The application's swapchain images (sampled) */
++   VkFormat src_format;
++   VkExtent2D src_extent;
++   uint32_t src_count;
++   const VkImage *src_images;
++
++   /* The output slots: D3D11 shared textures of the window's size,
++    * presented through the DXGI swap chain (storage, transfer dst) */
++   VkFormat dst_format;
++   VkExtent2D dst_extent;
++   uint32_t slot_count;
++   const VkImage *slot_images;
++};
++
++VkResult wsi_enh_create(const struct wsi_enh_create_info *info,
++                        struct wsi_enh **out);
++void wsi_enh_destroy(struct wsi_enh *e);
++
++/* Settings that change without new resources (scaler filter, sharpness,
++ * frame-generation mode, pacing); the rest waits for a new swapchain. */
++void wsi_enh_update_config(struct wsi_enh *e, const struct wsi_enh_config *c);
++
++/* The display's refresh period (0: unknown) */
++void wsi_enh_set_refresh(struct wsi_enh *e, uint64_t period_ns);
++
++/* What a real frame turns into: `count` pictures, generated ones first and
++ * the real frame last, `spacing_ns` apart. */
++struct wsi_enh_plan {
++   uint32_t count;
++   uint32_t slot[WSI_ENH_MAX_PICS];
++   uint64_t spacing_ns;
++   uint64_t frame;             /* real frame number */
++};
++
++/* How many pictures the frame presented now should make (1: the real one
++ * only).  Updates the frame-interval estimate; called once per present. */
++uint32_t wsi_enh_pictures(struct wsi_enh *e, uint64_t now_ns);
++
++/* Records the frame's passes from application image `src_index` into the
++ * plan's slots; plan->count and plan->slot[] are filled in by the caller
++ * (slots it owns until they are presented).  Returns the command buffer to
++ * submit on queue family `qfi`, VK_NULL_HANDLE on failure (logged). */
++VkCommandBuffer wsi_enh_record(struct wsi_enh *e, uint32_t qfi,
++                               uint32_t src_index,
++                               struct wsi_enh_plan *plan);
++
++/* From the present thread: what was shown (for the statistics) */
++void wsi_enh_note_shown(struct wsi_enh *e, uint32_t real, uint32_t generated,
++                        uint32_t skipped);
++
++/* The output region (the picture inside the bars) */
++void wsi_enh_rect(const struct wsi_enh *e, VkRect2D *rect);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* WSI_COMMON_WIN32_ENHANCE_H */

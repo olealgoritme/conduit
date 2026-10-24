@@ -1,0 +1,265 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Sat, 24 Oct 2026 12:45:49 +0200
+Subject: [PATCH 2/4] helios: Vulkan instance of its own when DXGI is not
+ DXVK's
+
+A Windows guest runs Microsoft's DXGI, which has neither
+IDXGIVkInteropFactory nor IDXGIVkInteropAdapter, so DXVK-NVAPI found no
+GPU. When the factory has no Vulkan interop, DXVK-NVAPI now creates one
+Vulkan 1.1 instance of its own from vulkan-1.dll (once per process, kept
+until exit) and gives each DXGI adapter the physical device whose
+VkPhysicalDeviceIDProperties::deviceLUID equals the adapter's LUID,
+preferring NVK or NVIDIA's driver when several match. Adapters without a
+match (Basic Render, display-only) are skipped.
+
+Such an adapter reports the Vulkan device's PCI vendor and device ID
+instead of the DXGI adapter's when Vulkan reports an NVIDIA GPU: the
+guest's DXGI adapter is a virtual one (vendor 0x1af4) in front of it.
+The DXVK nvapiHack check uses the same vendor ID.
+---
+ src/nvapi/nvapi_adapter.cpp          |  32 ++++++--
+ src/nvapi/nvapi_resource_factory.cpp |  14 ++--
+ src/shared/vk.cpp                    | 112 +++++++++++++++++++++++++++
+ src/shared/vk.h                      |  10 +++
+ 4 files changed, 157 insertions(+), 11 deletions(-)
+
+diff --git a/src/nvapi/nvapi_adapter.cpp b/src/nvapi/nvapi_adapter.cpp
+index 9587ff6..a1030d5 100644
+--- a/src/nvapi/nvapi_adapter.cpp
++++ b/src/nvapi/nvapi_adapter.cpp
+@@ -28,16 +28,27 @@ namespace dxvk {
+         m_memoryInfo.ReservedVideoMemory = 1024;
+ 
+         // Get the Vulkan handle from the DXGI adapter to get access to Vulkan device properties which has some information we want.
++        VkInstance vkInstance = VK_NULL_HANDLE;
++        VkPhysicalDevice vkDevice = VK_NULL_HANDLE;
++        auto idsFromVulkan = false;
+         Com<IDXGIVkInteropAdapter> dxgiVkInteropAdapter;
+-        if (FAILED(m_dxgiAdapter->QueryInterface(IID_PPV_ARGS(&dxgiVkInteropAdapter)))) {
++        if (SUCCEEDED(m_dxgiAdapter->QueryInterface(IID_PPV_ARGS(&dxgiVkInteropAdapter))))
++            dxgiVkInteropAdapter->GetVulkanHandles(&vkInstance, &vkDevice);
++        else if (m_vk.GetOwnInstance() != VK_NULL_HANDLE) {
++            // Helios: Microsoft's DXGI; the physical device with the adapter's LUID.
++            // Adapters without one (Basic Render, display-only) are skipped.
++            vkInstance = m_vk.GetOwnInstance();
++            vkDevice = m_vk.FindPhysicalDeviceByLuid(dxgiDesc.AdapterLuid);
++            if (vkDevice == VK_NULL_HANDLE) {
++                log::info(str::format("No Vulkan device with the LUID of DXGI adapter ", index, " (", str::fromws(dxgiDesc.Description), "), skipping it"));
++                return false;
++            }
++            idsFromVulkan = true;
++        } else {
+             log::info("Querying Vulkan handle from DXGI adapter failed, please ensure that DXVK's dxgi.dll is present");
+             return false;
+         }
+ 
+-        VkInstance vkInstance = VK_NULL_HANDLE;
+-        VkPhysicalDevice vkDevice = VK_NULL_HANDLE;
+-        dxgiVkInteropAdapter->GetVulkanHandles(&vkInstance, &vkDevice);
+-
+         m_vkExtensions = m_vk.GetDeviceExtensions(vkInstance, vkDevice);
+         if (m_vkExtensions.empty())
+             return false;
+@@ -87,6 +98,15 @@ namespace dxvk {
+         m_vk.GetPhysicalDeviceProperties2(vkInstance, vkDevice, &deviceProperties2);
+         m_vkProperties = deviceProperties2.properties;
+ 
++        // Helios: the DXGI adapter is a virtual one (vendor 0x1af4) in front of
++        // the GPU that Vulkan reports; report the GPU's PCI IDs.
++        if (idsFromVulkan && m_vkProperties.vendorID == NvidiaPciVendorId) {
++            log::info(str::format("Reporting the Vulkan device's PCI IDs ", std::hex, m_vkProperties.vendorID, ":", m_vkProperties.deviceID,
++                " instead of the DXGI adapter's ", m_dxgiVendorId, ":", m_dxgiDeviceId));
++            m_dxgiVendorId = m_vkProperties.vendorID;
++            m_dxgiDeviceId = m_vkProperties.deviceID;
++        }
++
+         auto allowOtherDrivers = env::getEnvVariable(allowOtherDriversEnvName);
+         if (allowOtherDrivers == "1")
+             log::info(str::format(allowOtherDriversEnvName, " is set, reporting also GPUs with non-NVIDIA proprietary driver"));
+@@ -95,7 +115,7 @@ namespace dxvk {
+             return false;
+ 
+         if ((HasNvProprietaryDriver() || HasNvkDriver())
+-            && dxgiDesc.VendorId != NvidiaPciVendorId
++            && m_dxgiVendorId != NvidiaPciVendorId
+             && env::getEnvVariable("DXVK_ENABLE_NVAPI") != "1")
+             return false; // DXVK NVAPI-hack is enabled, skip this adapter
+ 
+diff --git a/src/nvapi/nvapi_resource_factory.cpp b/src/nvapi/nvapi_resource_factory.cpp
+index 3cdb735..c6dbc2a 100644
+--- a/src/nvapi/nvapi_resource_factory.cpp
++++ b/src/nvapi/nvapi_resource_factory.cpp
+@@ -6,12 +6,16 @@
+ namespace dxvk {
+     std::unique_ptr<Vk> NvapiResourceFactory::CreateVulkan(Com<IDXGIFactory1>& dxgiFactory) {
+         Com<IDXGIVkInteropFactory> dxgiVkFactory;
+-        if (FAILED(dxgiFactory->QueryInterface(IID_PPV_ARGS(&dxgiVkFactory)))) {
+-            log::info("Querying Vulkan entry point from DXGI factory failed, please ensure that DXVK's dxgi.dll (version 2.1 or newer) is present");
+-            return nullptr;
+-        }
++        if (SUCCEEDED(dxgiFactory->QueryInterface(IID_PPV_ARGS(&dxgiVkFactory))))
++            return std::make_unique<Vk>(std::move(dxgiVkFactory));
++
++        // Helios: Microsoft's DXGI on a Windows guest. DXGI adapters are matched
++        // to the physical devices of our own Vulkan instance by LUID.
++        if (auto vk = Vk::CreateWithOwnInstance())
++            return vk;
+ 
+-        return std::make_unique<Vk>(std::move(dxgiVkFactory));
++        log::info("Querying Vulkan entry point from DXGI factory failed, please ensure that DXVK's dxgi.dll (version 2.1 or newer) is present");
++        return nullptr;
+     }
+ 
+     Com<IDXGIFactory1> NvapiResourceFactory::CreateDXGIFactory1() {
+diff --git a/src/shared/vk.cpp b/src/shared/vk.cpp
+index 519852c..14ac823 100644
+--- a/src/shared/vk.cpp
++++ b/src/shared/vk.cpp
+@@ -1,5 +1,6 @@
+ #include "vk.h"
+ #include "../util/util_log.h"
++#include "../util/util_string.h"
+ 
+ namespace dxvk {
+     Vk::Vk() = default;
+@@ -74,6 +75,117 @@ namespace dxvk {
+             : NV_SYSTEM_TYPE_GPU_UNKNOWN;
+     }
+ 
++    std::unique_ptr<Vk> Vk::CreateWithOwnInstance() {
++        // One instance per process, never destroyed: NvAPI_Unload/NvAPI_Initialize
++        // cycles reuse it, and no Vulkan call runs from DllMain at unload.
++        static std::mutex mutex;
++        static VkInstance instance = VK_NULL_HANDLE;
++        static PFN_vkGetInstanceProcAddr vkGetInstanceProcAddr = nullptr;
++
++        std::scoped_lock lock(mutex);
++        if (instance == VK_NULL_HANDLE) {
++            auto module = ::LoadLibraryA("vulkan-1.dll");
++            if (!module) {
++                log::info("Loading vulkan-1.dll failed");
++                return nullptr;
++            }
++
++            auto gipa = reinterpret_cast<PFN_vkGetInstanceProcAddr>(reinterpret_cast<void*>(::GetProcAddress(module, "vkGetInstanceProcAddr")));
++            if (!gipa)
++                return nullptr;
++
++            auto vkEnumerateInstanceVersion = reinterpret_cast<PFN_vkEnumerateInstanceVersion>(gipa(VK_NULL_HANDLE, "vkEnumerateInstanceVersion"));
++            auto vkCreateInstance = reinterpret_cast<PFN_vkCreateInstance>(gipa(VK_NULL_HANDLE, "vkCreateInstance"));
++            uint32_t version = VK_API_VERSION_1_0;
++            if (vkEnumerateInstanceVersion)
++                vkEnumerateInstanceVersion(&version);
++
++            if (!vkCreateInstance || version < VK_API_VERSION_1_1) {
++                log::info("The Vulkan loader does not offer Vulkan 1.1");
++                return nullptr;
++            }
++
++            VkApplicationInfo appInfo{};
++            appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
++            appInfo.pApplicationName = "DXVK-NVAPI";
++            appInfo.pEngineName = "DXVK-NVAPI";
++            appInfo.apiVersion = VK_API_VERSION_1_1;
++
++            VkInstanceCreateInfo createInfo{};
++            createInfo.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
++            createInfo.pApplicationInfo = &appInfo;
++
++            VkInstance created = VK_NULL_HANDLE;
++            auto result = vkCreateInstance(&createInfo, nullptr, &created);
++            if (result != VK_SUCCESS) {
++                log::info(str::format("Creating a Vulkan instance failed: ", result));
++                return nullptr;
++            }
++
++            instance = created;
++            vkGetInstanceProcAddr = gipa;
++            log::info("Created a Vulkan instance of our own (DXGI is not DXVK's)");
++        }
++
++        auto gdpa = reinterpret_cast<PFN_vkGetDeviceProcAddr>(vkGetInstanceProcAddr(instance, "vkGetDeviceProcAddr"));
++        auto vk = std::make_unique<Vk>(vkGetInstanceProcAddr, gdpa);
++        vk->m_ownInstance = instance;
++        return vk;
++    }
++
++    VkPhysicalDevice Vk::FindPhysicalDeviceByLuid(const LUID& luid) const {
++        if (m_ownInstance == VK_NULL_HANDLE)
++            return VK_NULL_HANDLE;
++
++        auto vkEnumeratePhysicalDevices = GetInstanceProcAddress<PFN_vkEnumeratePhysicalDevices>(m_ownInstance, "vkEnumeratePhysicalDevices");
++        auto vkGetPhysicalDeviceProperties = GetInstanceProcAddress<PFN_vkGetPhysicalDeviceProperties>(m_ownInstance, "vkGetPhysicalDeviceProperties");
++        if (!vkEnumeratePhysicalDevices || !vkGetPhysicalDeviceProperties)
++            return VK_NULL_HANDLE;
++
++        auto count = 0U;
++        if (vkEnumeratePhysicalDevices(m_ownInstance, &count, nullptr) != VK_SUCCESS || count == 0)
++            return VK_NULL_HANDLE;
++
++        std::vector<VkPhysicalDevice> devices(count);
++        if (vkEnumeratePhysicalDevices(m_ownInstance, &count, devices.data()) < VK_SUCCESS)
++            return VK_NULL_HANDLE;
++        devices.resize(count);
++
++        VkPhysicalDevice match = VK_NULL_HANDLE;
++        for (auto device : devices) {
++            VkPhysicalDeviceProperties properties{};
++            vkGetPhysicalDeviceProperties(device, &properties);
++            if (properties.apiVersion < VK_API_VERSION_1_1)
++                continue;
++
++            auto extensions = GetDeviceExtensions(m_ownInstance, device);
++            auto hasDriverProperties = extensions.find(VK_KHR_DRIVER_PROPERTIES_EXTENSION_NAME) != extensions.end();
++
++            VkPhysicalDeviceDriverPropertiesKHR driverProperties{};
++            driverProperties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES_KHR;
++
++            VkPhysicalDeviceIDProperties idProperties{};
++            idProperties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES;
++            idProperties.pNext = hasDriverProperties ? &driverProperties : nullptr;
++
++            VkPhysicalDeviceProperties2 properties2{};
++            properties2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
++            properties2.pNext = &idProperties;
++            GetPhysicalDeviceProperties2(m_ownInstance, device, &properties2);
++
++            if (!idProperties.deviceLUIDValid || memcmp(idProperties.deviceLUID, &luid, sizeof(luid)) != 0)
++                continue;
++
++            if (driverProperties.driverID == VK_DRIVER_ID_MESA_NVK || driverProperties.driverID == VK_DRIVER_ID_NVIDIA_PROPRIETARY)
++                return device;
++
++            if (match == VK_NULL_HANDLE)
++                match = device;
++        }
++
++        return match;
++    }
++
+     template <typename T>
+     T Vk::GetInstanceProcAddress(VkInstance vkInstance, const char* name) const {
+         return reinterpret_cast<T>(m_vkGetInstanceProcAddr(vkInstance, name));
+diff --git a/src/shared/vk.h b/src/shared/vk.h
+index f07c5b8..23309ec 100644
+--- a/src/shared/vk.h
++++ b/src/shared/vk.h
+@@ -21,7 +21,17 @@ namespace dxvk {
+ 
+         [[nodiscard]] static NV_GPU_TYPE ToNvGpuType(VkPhysicalDeviceType vkDeviceType);
+ 
++        // Helios: a Vulkan instance of our own from vulkan-1.dll, for a process
++        // whose DXGI is not DXVK's (Windows guests run Microsoft's DXGI)
++        [[nodiscard]] static std::unique_ptr<Vk> CreateWithOwnInstance();
++        [[nodiscard]] VkInstance GetOwnInstance() const { return m_ownInstance; }
++        // The physical device of the own instance whose deviceLUID is luid;
++        // with several, the one on NVK or NVIDIA's driver
++        [[nodiscard]] VkPhysicalDevice FindPhysicalDeviceByLuid(const LUID& luid) const;
++
+       private:
++        VkInstance m_ownInstance = VK_NULL_HANDLE;
++
+         Com<IDXGIVkInteropFactory> m_dxgiVkInteropFactory;
+         PFN_vkGetInstanceProcAddr m_vkGetInstanceProcAddr{};
+         PFN_vkGetDeviceProcAddr m_vkGetDeviceProcAddr{};

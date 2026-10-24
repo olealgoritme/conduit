@@ -1,0 +1,1423 @@
+From e94a73f7f32ae9df9735dd7e03913843931950f8 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Mon, 12 Oct 2026 23:42:26 +0200
+Subject: [PATCH 64/65] nvk: parse CUDA cubins without libelf (in-tree ELF64
+ reader)
+
+The Windows build has no libelf, and nv_cubin_nolibelf.c rejected every
+CUDA module, so VK_NVX_binary_import (DLSS) could not work there.
+
+nv_cubin_elf.c is nv_cubin.c on top of a small ELF64 reader: the ELF
+header (little-endian ELF64, EM_CUDA), section headers with the
+SHN_XINDEX escapes, section data, string tables and the symbol table,
+with every offset, size and index checked against the image.  .nv.info
+records are bounds-checked too, and a symbol table whose entsize is not
+an Elf64_Sym is refused (nv_cubin.c divides by it).  The module keeps a
+copy of the image, so kernel names and code do not point into the
+application's pCreateInfo->pData after vkCreateCuModuleNVX returns.
+
+Builds with libelf keep nv_cubin.c.  tests/nv_cubin_elf_test.c (meson
+test nv_cubin_elf) checks a synthetic cubin with two kernels, its old-ABI
+and extended-numbering variants, an unaligned buffer, every truncation of
+it and twelve broken images that must be refused; with libelf it runs
+nv_cubin.c on the same input and compares.  Given files, it parses every
+CUDA ELF embedded in them: the 1490 cubins in nvngx_dlss.dll 3.5.10 and
+310.9.1, nvngx_dlssd.dll and nvngx_dlssg.dll 310.9.1 (sm_75 to sm_120)
+parse identically to libelf.
+---
+ src/nouveau/cubin/meson.build               |  34 +-
+ src/nouveau/cubin/nv_cubin_elf.c            | 620 ++++++++++++++++++
+ src/nouveau/cubin/nv_cubin_nolibelf.c       |  40 --
+ src/nouveau/cubin/tests/nv_cubin_elf_test.c | 657 ++++++++++++++++++++
+ 4 files changed, 1309 insertions(+), 42 deletions(-)
+ create mode 100644 src/nouveau/cubin/nv_cubin_elf.c
+ delete mode 100644 src/nouveau/cubin/nv_cubin_nolibelf.c
+ create mode 100644 src/nouveau/cubin/tests/nv_cubin_elf_test.c
+
+diff --git a/src/nouveau/cubin/meson.build b/src/nouveau/cubin/meson.build
+index 2d3a33b..c80bc7a 100644
+--- a/src/nouveau/cubin/meson.build
++++ b/src/nouveau/cubin/meson.build
+@@ -7,8 +7,8 @@ libnouveau_cubin_files = files(
+ if dep_elf.found()
+   libnouveau_cubin_files += files('nv_cubin.c')
+ else
+-  # Without libelf (Windows) CUDA modules cannot be parsed
+-  libnouveau_cubin_files += files('nv_cubin_nolibelf.c')
++  # Without libelf (Windows) cubins are parsed by an in-tree ELF64 reader
++  libnouveau_cubin_files += files('nv_cubin_elf.c')
+ endif
+ 
+ _libnouveau_cubin = static_library(
+@@ -26,3 +26,33 @@ idep_nouveau_cubin = declare_dependency(
+   include_directories : include_directories('.'),
+   link_with : _libnouveau_cubin,
+ )
++
++if with_tests
++  # nv_cubin_elf.c with its entry points renamed nv_cubin_elf_*, so that the
++  # test can run it next to libelf's nv_cubin.c and compare the two.
++  _libnouveau_cubin_elf_test = static_library(
++    'nouveau_cubin_elf_test',
++    files('nv_cubin_elf.c'),
++    include_directories : [inc_include, inc_src],
++    c_args : [
++      '-Dnv_cubin_module_init=nv_cubin_elf_module_init',
++      '-Dnv_cubin_module_fini=nv_cubin_elf_module_fini',
++      '-Dnv_cubin_module_find_function=nv_cubin_elf_module_find_function',
++      '-Dnv_cubin_function_get_param_info=nv_cubin_elf_function_get_param_info',
++    ],
++    dependencies : [idep_mesautil],
++  )
++
++  test(
++    'nv_cubin_elf',
++    executable(
++      'nv_cubin_elf_test',
++      files('tests/nv_cubin_elf_test.c'),
++      include_directories : [inc_include, inc_src, include_directories('.')],
++      c_args : dep_elf.found() ? ['-DUSE_LIBELF'] : [],
++      link_with : [_libnouveau_cubin_elf_test, _libnouveau_cubin],
++      dependencies : [dep_elf],
++    ),
++    suite : ['nouveau'],
++  )
++endif
+diff --git a/src/nouveau/cubin/nv_cubin_elf.c b/src/nouveau/cubin/nv_cubin_elf.c
+new file mode 100644
+index 0000000..4840dee
+--- /dev/null
++++ b/src/nouveau/cubin/nv_cubin_elf.c
+@@ -0,0 +1,620 @@
++/*
++ * Copyright © 2025 Autumn Ashton
++ * Copyright © 2026 Conduit contributors
++ * SPDX-License-Identifier: MIT
++ *
++ * nv_cubin without libelf: the same cubin parsing as nv_cubin.c on top of a
++ * small in-tree ELF64 reader, for builds that have no libelf (Windows).
++ *
++ * Only what nv_cubin.c asks libelf for is implemented: the ELF header, the
++ * section headers (with the SHN_XINDEX escapes), section data, string
++ * tables and the symbol table.  Cubins are little-endian ELF64
++ * (e_machine EM_CUDA); anything else is refused.  Every offset, size and
++ * index is checked against the image, and the image is copied, so the
++ * module does not point into the caller's buffer (VK_NVX_binary_import
++ * only guarantees pData during vkCreateCuModuleNVX).
++ */
++#include "nv_cubin.h"
++
++#include "nv_cubin_defs.h"
++
++#include "util/log.h"
++#include "util/macros.h"
++
++#include <assert.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++/* ELF64 as in the System V gABI; no <elf.h> on Windows. */
++#define NV_EI_NIDENT     16
++#define NV_EI_CLASS      4
++#define NV_EI_DATA       5
++#define NV_EI_OSABI      7
++#define NV_ELFCLASS64    2
++#define NV_ELFDATA2LSB   1
++#define NV_EM_CUDA       190
++
++#define NV_SHN_UNDEF     0
++#define NV_SHN_LORESERVE 0xff00
++#define NV_SHN_XINDEX    0xffff
++
++#define NV_SHT_SYMTAB    2
++#define NV_SHT_STRTAB    3
++#define NV_SHT_NOBITS    8
++
++#define NV_STB_GLOBAL    1
++#define NV_STT_FUNC      2
++#define NV_STV_DEFAULT   0
++
++typedef struct {
++   uint8_t e_ident[NV_EI_NIDENT];
++   uint16_t e_type;
++   uint16_t e_machine;
++   uint32_t e_version;
++   uint64_t e_entry;
++   uint64_t e_phoff;
++   uint64_t e_shoff;
++   uint32_t e_flags;
++   uint16_t e_ehsize;
++   uint16_t e_phentsize;
++   uint16_t e_phnum;
++   uint16_t e_shentsize;
++   uint16_t e_shnum;
++   uint16_t e_shstrndx;
++} nv_elf64_ehdr;
++
++typedef struct {
++   uint32_t sh_name;
++   uint32_t sh_type;
++   uint64_t sh_flags;
++   uint64_t sh_addr;
++   uint64_t sh_offset;
++   uint64_t sh_size;
++   uint32_t sh_link;
++   uint32_t sh_info;
++   uint64_t sh_addralign;
++   uint64_t sh_entsize;
++} nv_elf64_shdr;
++
++typedef struct {
++   uint32_t st_name;
++   uint8_t st_info;
++   uint8_t st_other;
++   uint16_t st_shndx;
++   uint64_t st_value;
++   uint64_t st_size;
++} nv_elf64_sym;
++
++static_assert(sizeof(nv_elf64_ehdr) == 64, "ELF64 header");
++static_assert(sizeof(nv_elf64_shdr) == 64, "ELF64 section header");
++static_assert(sizeof(nv_elf64_sym) == 24, "ELF64 symbol");
++
++/* The module's private ELF state (struct Elf is opaque in nv_cubin.h). */
++struct Elf {
++   uint8_t *image; /* owned copy of the cubin */
++   size_t size;
++   nv_elf64_shdr *shdrs; /* aligned copies of the section headers */
++   size_t shnum;
++};
++
++struct nv_elf_data {
++   uint8_t *buf; /* NULL for SHT_NOBITS */
++   size_t size;
++};
++
++static bool
++nv_cubin_error(const char *what)
++{
++   mesa_loge("nvk cubin elf error: %s\n", what);
++   return false;
++}
++
++static bool
++nv_elf_range_ok(const struct Elf *elf, uint64_t offset, uint64_t size)
++{
++   return offset <= elf->size && size <= elf->size - offset;
++}
++
++static bool
++nv_elf_open(struct Elf *elf, const void *data, size_t size, size_t *shstrndx,
++            nv_elf64_ehdr *ehdr_out)
++{
++   memset(elf, 0, sizeof(*elf));
++
++   nv_elf64_ehdr ehdr;
++   if (data == NULL || size < sizeof(ehdr))
++      return nv_cubin_error("Cubin was not an elf");
++   memcpy(&ehdr, data, sizeof(ehdr));
++
++   if (memcmp(ehdr.e_ident, "\x7f" "ELF", 4) != 0)
++      return nv_cubin_error("Cubin was not an elf");
++   if (ehdr.e_ident[NV_EI_CLASS] != NV_ELFCLASS64)
++      return nv_cubin_error("Failed to get elf header (not ELF64)");
++   if (ehdr.e_ident[NV_EI_DATA] != NV_ELFDATA2LSB)
++      return nv_cubin_error("Failed to get elf header (not little-endian)");
++
++   elf->image = malloc(size);
++   if (elf->image == NULL)
++      return nv_cubin_error("Out of memory");
++   memcpy(elf->image, data, size);
++   elf->size = size;
++
++   if (ehdr.e_shoff == 0)
++      return nv_cubin_error("No section headers");
++   if (ehdr.e_shentsize != sizeof(nv_elf64_shdr))
++      return nv_cubin_error("Unexpected section header size");
++   if (!nv_elf_range_ok(elf, ehdr.e_shoff, sizeof(nv_elf64_shdr)))
++      return nv_cubin_error("Section headers beyond the end of the elf");
++
++   /* Section 0 holds the real count and string table index when they do
++    * not fit in the ELF header. */
++   nv_elf64_shdr shdr0;
++   memcpy(&shdr0, elf->image + ehdr.e_shoff, sizeof(shdr0));
++
++   uint64_t shnum = ehdr.e_shnum;
++   if (shnum == 0)
++      shnum = shdr0.sh_size;
++   if (shnum == 0 || shnum > (elf->size / sizeof(nv_elf64_shdr)) ||
++       !nv_elf_range_ok(elf, ehdr.e_shoff, shnum * sizeof(nv_elf64_shdr)))
++      return nv_cubin_error("Section headers beyond the end of the elf");
++
++   uint64_t strndx = ehdr.e_shstrndx;
++   if (strndx == NV_SHN_XINDEX)
++      strndx = shdr0.sh_link;
++   if (strndx >= shnum)
++      return nv_cubin_error("Couldn't get section header string table index");
++
++   elf->shdrs = malloc(shnum * sizeof(nv_elf64_shdr));
++   if (elf->shdrs == NULL)
++      return nv_cubin_error("Out of memory");
++   memcpy(elf->shdrs, elf->image + ehdr.e_shoff,
++          shnum * sizeof(nv_elf64_shdr));
++   elf->shnum = shnum;
++
++   *shstrndx = strndx;
++   *ehdr_out = ehdr;
++   return true;
++}
++
++static void
++nv_elf_close(struct Elf *elf)
++{
++   free(elf->shdrs);
++   free(elf->image);
++   memset(elf, 0, sizeof(*elf));
++}
++
++static const nv_elf64_shdr *
++nv_elf_shdr(const struct Elf *elf, size_t index)
++{
++   return index < elf->shnum ? &elf->shdrs[index] : NULL;
++}
++
++static bool
++nv_elf_section_data(const struct Elf *elf, const nv_elf64_shdr *shdr,
++                    struct nv_elf_data *out)
++{
++   if (shdr->sh_type == NV_SHT_NOBITS) {
++      out->buf = NULL;
++      out->size = shdr->sh_size;
++      return true;
++   }
++   if (!nv_elf_range_ok(elf, shdr->sh_offset, shdr->sh_size))
++      return false;
++   out->buf = elf->image + shdr->sh_offset;
++   out->size = shdr->sh_size;
++   return true;
++}
++
++/* A NUL-terminated string at offset in string table section index. */
++static const char *
++nv_elf_strptr(const struct Elf *elf, size_t index, uint64_t offset)
++{
++   const nv_elf64_shdr *shdr = nv_elf_shdr(elf, index);
++   struct nv_elf_data data;
++   if (shdr == NULL || shdr->sh_type != NV_SHT_STRTAB ||
++       !nv_elf_section_data(elf, shdr, &data) || offset >= data.size)
++      return NULL;
++
++   const char *str = (const char *)data.buf + offset;
++   if (memchr(str, 0, data.size - offset) == NULL)
++      return NULL;
++   return str;
++}
++
++static const nv_elf64_shdr *
++nv_cubin_module_get_section(const struct nv_cubin_module *module,
++                            const char *lookup_name)
++{
++   for (size_t i = 1; i < module->elf->shnum; i++) {
++      const nv_elf64_shdr *header = &module->elf->shdrs[i];
++      const char *section_name =
++         nv_elf_strptr(module->elf, module->shstrndx, header->sh_name);
++      if (!section_name || !*section_name)
++         continue;
++
++      if (!strcmp(section_name, lookup_name))
++         return header;
++   }
++
++   return NULL;
++}
++
++static uint32_t
++nv_cubin_module_get_static_smem_size(const struct nv_cubin_module *module,
++                                     const char *name)
++{
++   char section_name[2048];
++   snprintf(section_name, sizeof(section_name), ".nv.shared.%s", name);
++
++   const nv_elf64_shdr *section =
++      nv_cubin_module_get_section(module, section_name);
++   if (!section)
++      return 0;
++
++   struct nv_elf_data data;
++   if (!nv_elf_section_data(module->elf, section, &data))
++      return 0;
++
++   /* Assume this is all zero'ed. */
++   return (uint32_t)data.size;
++}
++
++/* One .nv.info attribute: the 4-byte header, then for EIFMT_SVAL
++ * sval.size bytes of payload.  Returns false when the record runs past the
++ * section.
++ */
++static bool
++nv_cubin_next_attribute(const uint8_t **ptr, const uint8_t *end,
++                        struct nvinfo_attribute_header_t *header,
++                        const uint8_t **payload, size_t *payload_size)
++{
++   if ((size_t)(end - *ptr) < sizeof(*header))
++      return false;
++   memcpy(header, *ptr, sizeof(*header));
++   *ptr += sizeof(*header);
++   *payload = *ptr;
++   *payload_size = 0;
++
++   if (header->format == NVINFO_EIFMT_SVAL) {
++      if ((size_t)(end - *ptr) < header->sval.size)
++         return false;
++      *payload_size = header->sval.size;
++      *ptr += header->sval.size;
++   }
++   return true;
++}
++
++#define NV_ATTR_PAYLOAD(type, var, payload, size)                            \
++   type var;                                                                 \
++   if ((size) < sizeof(type))                                                \
++      return nv_cubin_error("Short .nv.info attribute");                    \
++   memcpy(&var, (payload), sizeof(type))
++
++static bool
++nv_cubin_function_parse_base_nvinfo(struct nv_cubin_module *module,
++                                    struct nv_cubin_function *function)
++{
++   const nv_elf64_shdr *section =
++      nv_cubin_module_get_section(module, ".nv.info");
++   if (!section)
++      return nv_cubin_error("No .nv.info section");
++
++   struct nv_elf_data data;
++   if (!nv_elf_section_data(module->elf, section, &data) || !data.buf)
++      return nv_cubin_error("No .nv.info section data");
++
++   const uint8_t *ptr = data.buf;
++   const uint8_t *end = ptr + data.size;
++   while (ptr < end) {
++      struct nvinfo_attribute_header_t attr_header;
++      const uint8_t *payload;
++      size_t payload_size;
++      if (!nv_cubin_next_attribute(&ptr, end, &attr_header, &payload,
++                                   &payload_size))
++         return nv_cubin_error("Truncated .nv.info attribute");
++
++      switch (attr_header.attribute) {
++      case NVINFO_EIATTR_MIN_STACK_SIZE: {
++         if (attr_header.format != NVINFO_EIFMT_SVAL)
++            return nv_cubin_error("Unexpected header format");
++         NV_ATTR_PAYLOAD(struct nvinfo_attr_min_stack_size_t, attr, payload,
++                         payload_size);
++         if (attr.symbol_index == function->symbol_index)
++            function->slm_size = attr.size;
++         break;
++      }
++      case NVINFO_EIATTR_REGCOUNT: {
++         if (attr_header.format != NVINFO_EIFMT_SVAL)
++            return nv_cubin_error("Unexpected header format");
++         NV_ATTR_PAYLOAD(struct nvinfo_attr_regcount_t, attr, payload,
++                         payload_size);
++         if (attr.symbol_index == function->symbol_index)
++            function->gpr_count = attr.count;
++         break;
++      }
++      default:
++         break;
++      }
++   }
++
++   return true;
++}
++
++static bool
++nv_cubin_function_parse_extended_nvinfo(struct nv_cubin_module *module,
++                                        struct nv_cubin_function *function)
++{
++   char nvinfo_name[2048];
++   snprintf(nvinfo_name, sizeof(nvinfo_name), ".nv.info.%s", function->name);
++
++   const nv_elf64_shdr *section =
++      nv_cubin_module_get_section(module, nvinfo_name);
++   if (!section)
++      return nv_cubin_error("No .nv.info section");
++
++   struct nv_elf_data data;
++   if (!nv_elf_section_data(module->elf, section, &data) || !data.buf)
++      return nv_cubin_error("No .nv.info section data");
++
++   const uint8_t *ptr = data.buf;
++   const uint8_t *end = ptr + data.size;
++   while (ptr < end) {
++      struct nvinfo_attribute_header_t attr_header;
++      const uint8_t *payload;
++      size_t payload_size;
++      if (!nv_cubin_next_attribute(&ptr, end, &attr_header, &payload,
++                                   &payload_size))
++         return nv_cubin_error("Truncated .nv.info attribute");
++
++      switch (attr_header.attribute) {
++      case NVINFO_EIATTR_PARAM_CBANK: {
++         if (attr_header.format != NVINFO_EIFMT_SVAL)
++            return nv_cubin_error("Unexpected header format");
++         NV_ATTR_PAYLOAD(struct nvinfo_param_cbank_t, attr, payload,
++                         payload_size);
++         function->params_offset = attr.params_offset;
++         function->params_size = attr.params_size;
++         break;
++      }
++      case NVINFO_EIATTR_KPARAM_INFO: {
++         if (attr_header.format != NVINFO_EIFMT_SVAL)
++            return nv_cubin_error("Unexpected header format");
++         NV_ATTR_PAYLOAD(struct nvinfo_kparam_info_t, attr, payload,
++                         payload_size);
++
++         struct nv_cubin_function_param_info *infos =
++            realloc(function->param_infos,
++                    sizeof(*infos) * (function->param_info_count + 1));
++         if (infos == NULL)
++            return nv_cubin_error("Out of memory");
++         function->param_infos = infos;
++
++         struct nv_cubin_function_param_info *func_param =
++            &infos[function->param_info_count++];
++         func_param->index = attr.index;
++         func_param->ordinal = attr.ordinal;
++         func_param->offset = attr.offset;
++         func_param->size = (attr.packed >> 18) & 0x3fff;
++         break;
++      }
++      case NVINFO_EIATTR_CRS_STACK_SIZE: {
++         if (attr_header.format != NVINFO_EIFMT_SVAL)
++            return nv_cubin_error("Unexpected header format");
++         NV_ATTR_PAYLOAD(struct nvinfo_crs_stack_size_t, attr, payload,
++                         payload_size);
++         function->crs_size = attr.size;
++         break;
++      }
++      case NVINFO_EIATTR_NUM_BARRIERS: {
++         /* new version has NUM_BARRIERS as an attribute. */
++         if (attr_header.format != NVINFO_EIFMT_BVAL)
++            return nv_cubin_error("Unexpected header format");
++         function->num_control_barriers = attr_header.bval.value;
++         break;
++      }
++      default:
++         break;
++      }
++   }
++
++   return true;
++}
++
++static bool
++nv_cubin_function_init(struct nv_cubin_module *module,
++                       struct nv_cubin_function *function,
++                       uint32_t symbol_index, const char *symbol_name,
++                       const nv_elf64_sym *symbol)
++{
++   memset(function, 0, sizeof(*function));
++
++   if (symbol->st_size == 0)
++      return nv_cubin_error("Function with no size!");
++
++   size_t code_section_index = symbol->st_shndx;
++   if (code_section_index == NV_SHN_UNDEF)
++      return nv_cubin_error("Function with no code section!");
++   if (code_section_index >= NV_SHN_LORESERVE)
++      return nv_cubin_error("Function with invalid code section!");
++
++   const nv_elf64_shdr *code_section_header =
++      nv_elf_shdr(module->elf, code_section_index);
++   if (!code_section_header)
++      return nv_cubin_error("Function with invalid code section!");
++
++   struct nv_elf_data code_section_data;
++   if (!nv_elf_section_data(module->elf, code_section_header,
++                            &code_section_data) ||
++       !code_section_data.buf)
++      return nv_cubin_error("Couldn't get code section data");
++
++   if (symbol->st_value < code_section_header->sh_addr)
++      return nv_cubin_error("Function extends beyond section bounds");
++   uint64_t offset_in_section =
++      symbol->st_value - code_section_header->sh_addr;
++   if (offset_in_section > code_section_data.size ||
++       symbol->st_size > code_section_data.size - offset_in_section)
++      return nv_cubin_error("Function extends beyond section bounds");
++
++   function->symbol_index = symbol_index;
++   function->name = symbol_name;
++
++   function->code_ptr = code_section_data.buf;
++   function->code_size = code_section_data.size;
++   function->func_offset = offset_in_section;
++
++   function->static_smem_size =
++      nv_cubin_module_get_static_smem_size(module, symbol_name);
++
++   if (module->abi < NV_ELF_OSABI_41) {
++      /* old version has SHF_BARRIERS in .sectionheader */
++      const uint8_t shf_barriers = (code_section_header->sh_flags >> 20) & 0xf;
++      function->num_control_barriers = shf_barriers;
++   }
++
++   if (!nv_cubin_function_parse_base_nvinfo(module, function))
++      return nv_cubin_error("Couldn't parse base .nv.info");
++
++   if (!nv_cubin_function_parse_extended_nvinfo(module, function))
++      return nv_cubin_error("Couldn't parse extended .nv.info");
++
++   return true;
++}
++
++static void
++nv_cubin_function_fini(struct nv_cubin_function *function)
++{
++   free(function->param_infos);
++   function->param_infos = NULL;
++}
++
++static bool
++nv_cubin_module_parse_functions(struct nv_cubin_module *module)
++{
++   /* Iterate over the symbol table and extract the data about each function. */
++   for (size_t s = 1; s < module->elf->shnum; s++) {
++      const nv_elf64_shdr *symtab_section_header = &module->elf->shdrs[s];
++
++      /* We only care about symbol tables. */
++      if (symtab_section_header->sh_type != NV_SHT_SYMTAB)
++         continue;
++
++      struct nv_elf_data symtab_data;
++      if (!nv_elf_section_data(module->elf, symtab_section_header,
++                               &symtab_data) ||
++          !symtab_data.buf)
++         return nv_cubin_error("Couldn't get .symtab section data");
++
++      if (symtab_section_header->sh_entsize != sizeof(nv_elf64_sym))
++         return nv_cubin_error("Unexpected symbol size");
++
++      size_t num_symbols = symtab_data.size / sizeof(nv_elf64_sym);
++      for (size_t i = 0; i < num_symbols; i++) {
++         nv_elf64_sym symbol;
++         memcpy(&symbol, symtab_data.buf + i * sizeof(symbol), sizeof(symbol));
++
++         const char *symbol_name = nv_elf_strptr(
++            module->elf, symtab_section_header->sh_link, symbol.st_name);
++         /* We don't care about any unnamed functions. */
++         if (!symbol_name || symbol_name[0] == '\0')
++            continue;
++
++         if ((symbol.st_info & 0xf) != NV_STT_FUNC ||
++             (symbol.st_info >> 4) != NV_STB_GLOBAL ||
++             (symbol.st_other & 0x3) != NV_STV_DEFAULT)
++            continue;
++
++         struct nv_cubin_function *functions =
++            realloc(module->functions,
++                    sizeof(*functions) * (module->function_count + 1));
++         if (functions == NULL)
++            return nv_cubin_error("Out of memory");
++         module->functions = functions;
++
++         /* Counted before init so that fini frees a half-parsed one. */
++         struct nv_cubin_function *function =
++            &functions[module->function_count++];
++         if (!nv_cubin_function_init(module, function, (uint32_t)i,
++                                     symbol_name, &symbol))
++            return nv_cubin_error("Couldn't init function");
++      }
++   }
++
++   return true;
++}
++
++/* public interface */
++
++bool
++nv_cubin_module_init(struct nv_cubin_module *module, const void *data,
++                     size_t size)
++{
++   memset(module, 0, sizeof(*module));
++
++   module->elf = calloc(1, sizeof(struct Elf));
++   if (module->elf == NULL)
++      return nv_cubin_error("Out of memory");
++
++   nv_elf64_ehdr ehdr;
++   if (!nv_elf_open(module->elf, data, size, &module->shstrndx, &ehdr))
++      return nv_cubin_error("Couldn't load elf");
++
++   if (ehdr.e_machine != NV_EM_CUDA)
++      return nv_cubin_error("ELF is not targeting Cuda");
++
++   module->abi = ehdr.e_ident[NV_EI_OSABI];
++
++   /* new version encodes e_flags differently... */
++   if (module->abi >= NV_ELF_OSABI_41)
++      module->sm = (ehdr.e_flags >> 8) & 0xFF;
++   else
++      module->sm = (ehdr.e_flags >> 16) & 0xFF;
++
++   if (!nv_cubin_module_parse_functions(module))
++      return nv_cubin_error("Couldn't parse functions");
++
++   return true;
++}
++
++void
++nv_cubin_module_fini(struct nv_cubin_module *module)
++{
++   for (uint32_t i = 0; i < module->function_count; i++)
++      nv_cubin_function_fini(&module->functions[i]);
++   module->function_count = 0;
++
++   free(module->functions);
++   module->functions = NULL;
++
++   if (module->elf) {
++      nv_elf_close(module->elf);
++      free(module->elf);
++      module->elf = NULL;
++   }
++}
++
++const struct nv_cubin_function *
++nv_cubin_module_find_function(const struct nv_cubin_module *module,
++                              const char *name)
++{
++   for (uint32_t i = 0; i < module->function_count; i++) {
++      const struct nv_cubin_function *function = &module->functions[i];
++      if (!strcmp(function->name, name))
++         return function;
++   }
++
++   return NULL;
++}
++
++const struct nv_cubin_function_param_info *
++nv_cubin_function_get_param_info(const struct nv_cubin_function *function,
++                                 uint32_t index)
++{
++   for (uint32_t i = 0; i < function->param_info_count; i++) {
++      if (function->param_infos[i].ordinal == index)
++         return &function->param_infos[i];
++   }
++   return NULL;
++}
+diff --git a/src/nouveau/cubin/nv_cubin_nolibelf.c b/src/nouveau/cubin/nv_cubin_nolibelf.c
+deleted file mode 100644
+index 280b375..0000000
+--- a/src/nouveau/cubin/nv_cubin_nolibelf.c
++++ /dev/null
+@@ -1,40 +0,0 @@
+-/*
+- * Copyright © 2026 Conduit contributors
+- * SPDX-License-Identifier: MIT
+- *
+- * nv_cubin for builds without libelf (Windows): every CUDA module is
+- * rejected.
+- */
+-#include "nv_cubin.h"
+-
+-#include "util/log.h"
+-
+-#include <string.h>
+-
+-bool
+-nv_cubin_module_init(struct nv_cubin_module *module, const void *data,
+-                     size_t size)
+-{
+-   memset(module, 0, sizeof(*module));
+-   mesa_loge("nvk: CUDA modules are not supported in a build without libelf");
+-   return false;
+-}
+-
+-void
+-nv_cubin_module_fini(struct nv_cubin_module *module)
+-{
+-}
+-
+-const struct nv_cubin_function *
+-nv_cubin_module_find_function(const struct nv_cubin_module *module,
+-                              const char *name)
+-{
+-   return NULL;
+-}
+-
+-const struct nv_cubin_function_param_info *
+-nv_cubin_function_get_param_info(const struct nv_cubin_function *function,
+-                                 uint32_t index)
+-{
+-   return NULL;
+-}
+diff --git a/src/nouveau/cubin/tests/nv_cubin_elf_test.c b/src/nouveau/cubin/tests/nv_cubin_elf_test.c
+new file mode 100644
+index 0000000..34f51e0
+--- /dev/null
++++ b/src/nouveau/cubin/tests/nv_cubin_elf_test.c
+@@ -0,0 +1,657 @@
++/*
++ * Copyright © 2026 Conduit contributors
++ * SPDX-License-Identifier: MIT
++ *
++ * Tests for nv_cubin_elf.c, the libelf-free cubin parser.  It is built here
++ * with its public functions renamed nv_cubin_elf_*, so that with libelf the
++ * same program also runs nv_cubin.c and compares the two.
++ *
++ *   nv_cubin_elf_test              synthetic cubins: a valid one, its
++ *                                  variants (old ABI, extended section
++ *                                  numbering, unaligned buffer) and broken
++ *                                  ones that must be refused
++ *   nv_cubin_elf_test FILE...      also every CUDA ELF found in FILE (a
++ *                                  cubin, a fatbin or a DLL that embeds
++ *                                  them, e.g. nvngx_dlss.dll); with libelf
++ *                                  both parsers must agree on each
++ */
++#include "nv_cubin.h"
++#include "nv_cubin_defs.h"
++
++#include <stdarg.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++bool nv_cubin_elf_module_init(struct nv_cubin_module *module, const void *data,
++                              size_t size);
++void nv_cubin_elf_module_fini(struct nv_cubin_module *module);
++const struct nv_cubin_function *
++nv_cubin_elf_module_find_function(const struct nv_cubin_module *module,
++                                  const char *name);
++const struct nv_cubin_function_param_info *
++nv_cubin_elf_function_get_param_info(const struct nv_cubin_function *function,
++                                     uint32_t index);
++
++static int failures;
++static bool quiet_errors;
++
++#define CHECK(cond, ...)                                                       \
++   do {                                                                        \
++      if (!(cond)) {                                                           \
++         failures++;                                                           \
++         fprintf(stderr, "FAIL %s:%d: %s: ", __FILE__, __LINE__, #cond);       \
++         fprintf(stderr, __VA_ARGS__);                                         \
++         fprintf(stderr, "\n");                                                \
++      }                                                                        \
++   } while (0)
++
++/* --- a small ELF64 writer for the synthetic cubins --- */
++
++struct buf {
++   uint8_t *data;
++   size_t size, cap;
++};
++
++static size_t
++buf_put(struct buf *b, const void *data, size_t size, size_t align)
++{
++   size_t off = (b->size + align - 1) & ~(align - 1);
++   if (off + size > b->cap) {
++      b->cap = (off + size) * 2 + 256;
++      b->data = realloc(b->data, b->cap);
++   }
++   memset(b->data + b->size, 0, off - b->size);
++   if (data)
++      memcpy(b->data + off, data, size);
++   else
++      memset(b->data + off, 0, size);
++   b->size = off + size;
++   return off;
++}
++
++static uint32_t
++strtab_add(struct buf *b, const char *s)
++{
++   if (b->size == 0)
++      buf_put(b, "", 1, 1);
++   return (uint32_t)buf_put(b, s, strlen(s) + 1, 1);
++}
++
++struct shdr {
++   uint32_t name, type;
++   uint64_t flags, addr, offset, size;
++   uint32_t link, info;
++   uint64_t addralign, entsize;
++};
++
++struct sym {
++   uint32_t name;
++   uint8_t info, other;
++   uint16_t shndx;
++   uint64_t value, size;
++};
++
++struct ehdr {
++   uint8_t ident[16];
++   uint16_t type, machine;
++   uint32_t version;
++   uint64_t entry, phoff, shoff;
++   uint32_t flags;
++   uint16_t ehsize, phentsize, phnum, shentsize, shnum, shstrndx;
++};
++
++static void
++nvinfo_sval(struct buf *b, uint8_t attr, const void *payload, uint16_t size)
++{
++   uint8_t hdr[4] = { NVINFO_EIFMT_SVAL, attr, size & 0xff, size >> 8 };
++   buf_put(b, hdr, 4, 1);
++   buf_put(b, payload, size, 1);
++}
++
++static void
++nvinfo_bval(struct buf *b, uint8_t attr, uint8_t value)
++{
++   uint8_t hdr[4] = { NVINFO_EIFMT_BVAL, attr, value, 0 };
++   buf_put(b, hdr, 4, 1);
++}
++
++enum variant {
++   V_OK,
++   V_OLD_ABI,         /* OSABI < 0x41: sm in e_flags >> 16, barriers in sh_flags */
++   V_XINDEX,          /* e_shnum = 0 and e_shstrndx = SHN_XINDEX */
++   V_BAD_MAGIC,
++   V_ELF32,
++   V_BIG_ENDIAN,
++   V_NOT_CUDA,
++   V_SHOFF_PAST_END,
++   V_SHSTRNDX_RANGE,
++   V_SECTION_PAST_END,
++   V_SYM_PAST_SECTION,
++   V_SYM_BAD_SHNDX,
++   V_NVINFO_TRUNCATED,
++   V_NO_EXT_NVINFO,
++   V_ENTSIZE_ZERO,
++   V_STRTAB_UNTERMINATED,
++};
++
++#define SM 120
++#define REGS 40
++#define STACK 0x30
++#define CRS 0x20
++#define BARRIERS 3
++#define PARAMS_OFF 0x210
++#define PARAMS_SIZE 24
++#define SMEM 0x400
++
++/* A cubin with two kernels in one .text section ("k_main" at 0x0 and
++ * "k_second" at 0x100), a local function and a data object that must be
++ * skipped, .nv.info with per-symbol REGCOUNT/MIN_STACK_SIZE and
++ * .nv.info.<kernel> with PARAM_CBANK, two KPARAM_INFO, CRS_STACK_SIZE and
++ * NUM_BARRIERS, and a NOBITS .nv.shared.k_main.
++ */
++static uint8_t *
++make_cubin(enum variant v, size_t *size_out)
++{
++   struct buf shstr = { 0 }, str = { 0 }, out = { 0 };
++   struct shdr sh[16];
++   unsigned n = 1;
++   memset(sh, 0, sizeof(sh));
++
++   uint8_t code[0x200];
++   for (unsigned i = 0; i < sizeof(code); i++)
++      code[i] = (uint8_t)(i * 7 + 1);
++
++   const unsigned s_text = n++;
++   const unsigned s_info = n++;
++   const unsigned s_info_k = n++;
++   const unsigned s_info_k2 = n++;
++   const unsigned s_shared = n++;
++   const unsigned s_symtab = n++;
++   const unsigned s_strtab = n++;
++   const unsigned s_shstrtab = n++;
++
++   sh[s_text].name = strtab_add(&shstr, ".text.k_main");
++   sh[s_info].name = strtab_add(&shstr, ".nv.info");
++   sh[s_info_k].name = strtab_add(&shstr, v == V_NO_EXT_NVINFO ?
++                                  ".nv.info.k_other" : ".nv.info.k_main");
++   sh[s_info_k2].name = strtab_add(&shstr, ".nv.info.k_second");
++   sh[s_shared].name = strtab_add(&shstr, ".nv.shared.k_main");
++   sh[s_symtab].name = strtab_add(&shstr, ".symtab");
++   sh[s_strtab].name = strtab_add(&shstr, ".strtab");
++   sh[s_shstrtab].name = strtab_add(&shstr, ".shstrtab");
++
++   uint32_t n_main = strtab_add(&str, "k_main");
++   uint32_t n_second = strtab_add(&str, "k_second");
++   uint32_t n_local = strtab_add(&str, "local_fn");
++   uint32_t n_obj = strtab_add(&str, "some_data");
++
++   struct sym syms[5];
++   memset(syms, 0, sizeof(syms));
++   /* 1: k_main, GLOBAL FUNC */
++   syms[1] = (struct sym){ n_main, (1 << 4) | 2, 0, s_text, 0x1000, 0x100 };
++   /* 2: k_second, GLOBAL FUNC */
++   syms[2] = (struct sym){ n_second, (1 << 4) | 2, 0, s_text, 0x1100, 0x100 };
++   /* 3: local function: skipped */
++   syms[3] = (struct sym){ n_local, (0 << 4) | 2, 0, s_text, 0x1000, 0x10 };
++   /* 4: global object: skipped */
++   syms[4] = (struct sym){ n_obj, (1 << 4) | 1, 0, s_text, 0x1000, 0x10 };
++   if (v == V_SYM_PAST_SECTION)
++      syms[2].size = 0x101;
++   if (v == V_SYM_BAD_SHNDX)
++      syms[1].shndx = 0x40;
++
++   struct buf info = { 0 };
++   for (uint32_t s = 1; s <= 2; s++) {
++      uint32_t regcount[2] = { s, REGS + s };
++      uint32_t stack[2] = { s, STACK + s };
++      nvinfo_sval(&info, NVINFO_EIATTR_REGCOUNT, regcount, sizeof(regcount));
++      nvinfo_sval(&info, NVINFO_EIATTR_MIN_STACK_SIZE, stack, sizeof(stack));
++   }
++   nvinfo_bval(&info, 0x55, 9); /* an unknown BVAL is skipped */
++   if (v == V_NVINFO_TRUNCATED) {
++      uint8_t hdr[4] = { NVINFO_EIFMT_SVAL, NVINFO_EIATTR_REGCOUNT, 8, 0 };
++      buf_put(&info, hdr, 4, 1);
++      buf_put(&info, "\1\0\0", 3, 1); /* 3 of the promised 8 bytes */
++   }
++
++   struct buf info_k[2] = { { 0 }, { 0 } };
++   for (unsigned k = 0; k < 2; k++) {
++      struct buf *b = &info_k[k];
++      struct nvinfo_param_cbank_t cbank = { 0x123, PARAMS_OFF + k, PARAMS_SIZE };
++      nvinfo_sval(b, NVINFO_EIATTR_PARAM_CBANK, &cbank, sizeof(cbank));
++      /* KPARAM_INFO for ordinal 1 (offset 8, 16 bytes) then ordinal 0
++       * (offset 0, 8 bytes): size is bits 18..31 of packed. */
++      struct nvinfo_kparam_info_t p1 = { 0, 1, 8, 16u << 18 };
++      struct nvinfo_kparam_info_t p0 = { 0, 0, 0, 8u << 18 };
++      nvinfo_sval(b, NVINFO_EIATTR_KPARAM_INFO, &p1, sizeof(p1));
++      nvinfo_sval(b, NVINFO_EIATTR_KPARAM_INFO, &p0, sizeof(p0));
++      uint32_t crs = CRS + k;
++      nvinfo_sval(b, NVINFO_EIATTR_CRS_STACK_SIZE, &crs, sizeof(crs));
++      if (v != V_OLD_ABI)
++         nvinfo_bval(b, NVINFO_EIATTR_NUM_BARRIERS, BARRIERS + k);
++   }
++
++   /* Layout: ELF header, then section contents, then the headers. */
++   buf_put(&out, NULL, sizeof(struct ehdr), 8);
++
++   sh[s_text].type = 1; /* PROGBITS */
++   sh[s_text].addr = 0x1000;
++   sh[s_text].flags = 0x6 | (v == V_OLD_ABI ? (uint64_t)BARRIERS << 20 : 0);
++   sh[s_text].offset = buf_put(&out, code, sizeof(code), 128);
++   sh[s_text].size = sizeof(code);
++   if (v == V_SECTION_PAST_END)
++      sh[s_text].size = 0x100000;
++
++   sh[s_info].type = 0x70000000;
++   sh[s_info].offset = buf_put(&out, info.data, info.size, 4);
++   sh[s_info].size = info.size;
++
++   sh[s_info_k].type = 0x70000000;
++   sh[s_info_k].offset = buf_put(&out, info_k[0].data, info_k[0].size, 4);
++   sh[s_info_k].size = info_k[0].size;
++
++   sh[s_info_k2].type = 0x70000000;
++   sh[s_info_k2].offset = buf_put(&out, info_k[1].data, info_k[1].size, 4);
++   sh[s_info_k2].size = info_k[1].size;
++
++   sh[s_shared].type = 8; /* NOBITS */
++   sh[s_shared].size = SMEM;
++   sh[s_shared].offset = 0x7fffffff; /* ignored for NOBITS */
++
++   sh[s_symtab].type = 2;
++   sh[s_symtab].link = s_strtab;
++   sh[s_symtab].entsize = v == V_ENTSIZE_ZERO ? 0 : sizeof(struct sym);
++   sh[s_symtab].offset = buf_put(&out, syms, sizeof(syms), 8);
++   sh[s_symtab].size = sizeof(syms);
++
++   sh[s_strtab].type = 3;
++   sh[s_strtab].offset = buf_put(&out, str.data, str.size, 1);
++   sh[s_strtab].size = str.size;
++   if (v == V_STRTAB_UNTERMINATED) {
++      /* "some_data" without its NUL at the end of the section */
++      sh[s_strtab].size -= 1;
++   }
++
++   sh[s_shstrtab].type = 3;
++   sh[s_shstrtab].offset = buf_put(&out, shstr.data, shstr.size, 1);
++   sh[s_shstrtab].size = shstr.size;
++
++   if (v == V_XINDEX) {
++      sh[0].size = n;
++      sh[0].link = s_shstrtab;
++   }
++   size_t shoff = buf_put(&out, sh, n * sizeof(struct shdr), 8);
++
++   struct ehdr eh;
++   memset(&eh, 0, sizeof(eh));
++   memcpy(eh.ident, "\x7f" "ELF", 4);
++   eh.ident[4] = v == V_ELF32 ? 1 : 2;
++   eh.ident[5] = v == V_BIG_ENDIAN ? 2 : 1;
++   eh.ident[6] = 1;
++   eh.ident[7] = v == V_OLD_ABI ? 0x33 : NV_ELF_OSABI_41;
++   eh.type = 2;
++   eh.machine = v == V_NOT_CUDA ? 62 : 190;
++   eh.version = 1;
++   eh.shoff = v == V_SHOFF_PAST_END ? out.size + 64 : shoff;
++   eh.flags = v == V_OLD_ABI ? (SM << 16) | SM : (SM << 8) | 0x8;
++   eh.ehsize = sizeof(eh);
++   eh.shentsize = sizeof(struct shdr);
++   eh.shnum = v == V_XINDEX ? 0 : n;
++   eh.shstrndx = v == V_XINDEX ? 0xffff :
++                 v == V_SHSTRNDX_RANGE ? n + 3 : s_shstrtab;
++   if (v == V_BAD_MAGIC)
++      eh.ident[1] = 'X';
++   memcpy(out.data, &eh, sizeof(eh));
++
++   free(shstr.data);
++   free(str.data);
++   free(info.data);
++   free(info_k[0].data);
++   free(info_k[1].data);
++   *size_out = out.size;
++   return out.data;
++}
++
++static void
++check_valid(enum variant v, const struct nv_cubin_module *m,
++            const uint8_t *image, size_t size)
++{
++   CHECK(m->sm == SM, "sm %u", m->sm);
++   CHECK(m->abi == (v == V_OLD_ABI ? 0x33u : 0x41u), "abi 0x%x", m->abi);
++   CHECK(m->function_count == 2, "function_count %u", m->function_count);
++
++   const char *names[2] = { "k_main", "k_second" };
++   for (unsigned k = 0; k < 2; k++) {
++      const struct nv_cubin_function *f =
++         nv_cubin_elf_module_find_function(m, names[k]);
++      CHECK(f != NULL, "%s not found", names[k]);
++      if (!f)
++         continue;
++      CHECK(f->symbol_index == k + 1, "%s symbol_index %u", names[k],
++            f->symbol_index);
++      CHECK(f->func_offset == 0x100 * k, "%s func_offset 0x%zx", names[k],
++            f->func_offset);
++      CHECK(f->code_size == 0x200, "%s code_size 0x%zx", names[k],
++            f->code_size);
++      CHECK(f->code_ptr && f->code_ptr[0] == 1 && f->code_ptr[1] == 8,
++            "%s code bytes", names[k]);
++      /* The module keeps its own copy of the image */
++      CHECK(f->code_ptr && (f->code_ptr < image ||
++                            f->code_ptr >= image + size),
++            "%s code points into the caller's buffer", names[k]);
++      CHECK(f->gpr_count == REGS + k + 1, "%s gpr_count %u", names[k],
++            f->gpr_count);
++      CHECK(f->slm_size == STACK + k + 1, "%s slm_size %u", names[k],
++            f->slm_size);
++      CHECK(f->crs_size == CRS + k, "%s crs_size %u", names[k], f->crs_size);
++      CHECK(f->num_control_barriers == BARRIERS + (v == V_OLD_ABI ? 0 : k),
++            "%s barriers %u", names[k], f->num_control_barriers);
++      CHECK(f->params_offset == PARAMS_OFF + k, "%s params_offset 0x%x",
++            names[k], f->params_offset);
++      CHECK(f->params_size == PARAMS_SIZE, "%s params_size %u", names[k],
++            f->params_size);
++      CHECK(f->static_smem_size == (k == 0 ? SMEM : 0),
++            "%s static_smem_size 0x%x", names[k], f->static_smem_size);
++      CHECK(f->param_info_count == 2, "%s param_info_count %u", names[k],
++            f->param_info_count);
++      const struct nv_cubin_function_param_info *p0 =
++         nv_cubin_elf_function_get_param_info(f, 0);
++      const struct nv_cubin_function_param_info *p1 =
++         nv_cubin_elf_function_get_param_info(f, 1);
++      CHECK(p0 && p0->offset == 0 && p0->size == 8, "%s param 0", names[k]);
++      CHECK(p1 && p1->offset == 8 && p1->size == 16, "%s param 1", names[k]);
++      CHECK(nv_cubin_elf_function_get_param_info(f, 2) == NULL,
++            "%s param 2 exists", names[k]);
++   }
++   CHECK(nv_cubin_elf_module_find_function(m, "local_fn") == NULL,
++         "local function listed");
++   CHECK(nv_cubin_elf_module_find_function(m, "some_data") == NULL,
++         "data object listed");
++}
++
++#ifdef USE_LIBELF
++static void compare_parsers(const char *what, const void *data, size_t size);
++#endif
++
++static void
++run_synthetic(void)
++{
++   static const struct {
++      enum variant v;
++      const char *name;
++      bool valid;
++   } cases[] = {
++      { V_OK, "valid", true },
++      { V_OLD_ABI, "old ABI", true },
++      { V_XINDEX, "extended section numbering", true },
++      { V_BAD_MAGIC, "bad magic", false },
++      { V_ELF32, "ELF32", false },
++      { V_BIG_ENDIAN, "big-endian", false },
++      { V_NOT_CUDA, "not EM_CUDA", false },
++      { V_SHOFF_PAST_END, "section headers past the end", false },
++      { V_SHSTRNDX_RANGE, "e_shstrndx out of range", false },
++      { V_SECTION_PAST_END, "section data past the end", false },
++      { V_SYM_PAST_SECTION, "function past its section", false },
++      { V_SYM_BAD_SHNDX, "function in a missing section", false },
++      { V_NVINFO_TRUNCATED, "truncated .nv.info attribute", false },
++      { V_NO_EXT_NVINFO, "no .nv.info.<kernel>", false },
++      { V_ENTSIZE_ZERO, "symbol table entsize 0", false },
++      { V_STRTAB_UNTERMINATED, "unterminated string table", true },
++   };
++
++   for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
++      size_t size;
++      uint8_t *image = make_cubin(cases[i].v, &size);
++      struct nv_cubin_module m;
++      int before = failures;
++
++      quiet_errors = !cases[i].valid;
++      bool ok = nv_cubin_elf_module_init(&m, image, size);
++      quiet_errors = false;
++      CHECK(ok == cases[i].valid, "%s: init returned %d", cases[i].name, ok);
++      if (ok && cases[i].valid) {
++         /* Scribble over the input: the module must not depend on it */
++         uint8_t *copy = malloc(size);
++         memcpy(copy, image, size);
++         memset(image, 0xcd, size);
++         check_valid(cases[i].v, &m, image, size);
++         memcpy(image, copy, size);
++         free(copy);
++      }
++      nv_cubin_elf_module_fini(&m);
++
++      /* Every proper prefix of a valid cubin must be refused or parsed
++       * without reading past it (run under ASan/valgrind to see the
++       * difference). */
++      if (cases[i].v == V_OK) {
++         for (size_t cut = 0; cut < size; cut += (cut < 128 ? 1 : 61)) {
++            uint8_t *prefix = malloc(cut ? cut : 1);
++            memcpy(prefix, image, cut);
++            quiet_errors = true;
++            if (nv_cubin_elf_module_init(&m, prefix, cut))
++               CHECK(m.function_count <= 2, "prefix %zu", cut);
++            quiet_errors = false;
++            nv_cubin_elf_module_fini(&m);
++            free(prefix);
++         }
++
++         /* Unaligned input buffer */
++         uint8_t *odd = malloc(size + 3);
++         memcpy(odd + 3, image, size);
++         ok = nv_cubin_elf_module_init(&m, odd + 3, size);
++         CHECK(ok, "unaligned buffer refused");
++         if (ok)
++            check_valid(V_OK, &m, odd + 3, size);
++         nv_cubin_elf_module_fini(&m);
++         free(odd);
++      }
++
++#ifdef USE_LIBELF
++      if (cases[i].valid && cases[i].v != V_STRTAB_UNTERMINATED)
++         compare_parsers(cases[i].name, image, size);
++#endif
++      printf("%s %s\n", failures == before ? "ok  " : "FAIL", cases[i].name);
++      free(image);
++   }
++}
++
++/* --- real cubins --- */
++
++static uint8_t *
++read_file(const char *path, size_t *size)
++{
++   FILE *f = fopen(path, "rb");
++   if (!f)
++      return NULL;
++   fseek(f, 0, SEEK_END);
++   long len = ftell(f);
++   fseek(f, 0, SEEK_SET);
++   uint8_t *data = malloc(len > 0 ? len : 1);
++   *size = fread(data, 1, len, f);
++   fclose(f);
++   return data;
++}
++
++/* The extent of an ELF64 image at p: the end of its section headers or of
++ * its furthest section, whichever is later. */
++static size_t
++elf_extent(const uint8_t *p, size_t avail)
++{
++   struct ehdr eh;
++   if (avail < sizeof(eh))
++      return 0;
++   memcpy(&eh, p, sizeof(eh));
++   if (eh.shentsize != sizeof(struct shdr) || eh.shnum == 0)
++      return 0;
++   size_t end = eh.shoff + (size_t)eh.shnum * sizeof(struct shdr);
++   if (eh.shoff > avail || end > avail)
++      return 0;
++   for (unsigned i = 0; i < eh.shnum; i++) {
++      struct shdr sh;
++      memcpy(&sh, p + eh.shoff + i * sizeof(sh), sizeof(sh));
++      if (sh.type != 8 && sh.offset + sh.size > end &&
++          sh.offset + sh.size <= avail)
++         end = sh.offset + sh.size;
++   }
++   return end;
++}
++
++static void
++dump_module(FILE *out, const struct nv_cubin_module *m,
++            const struct nv_cubin_function *(*find)(const struct nv_cubin_module *, const char *),
++            const struct nv_cubin_function_param_info *(*param)(const struct nv_cubin_function *, uint32_t))
++{
++   fprintf(out, "sm %u abi 0x%x functions %u\n", m->sm, m->abi,
++           m->function_count);
++   for (uint32_t i = 0; i < m->function_count; i++) {
++      const struct nv_cubin_function *f = &m->functions[i];
++      fprintf(out, " %s sym %u off 0x%zx code 0x%zx gpr %u slm %u crs %u "
++              "bar %u smem %u params 0x%x+%u nparams %u\n",
++              f->name, f->symbol_index, f->func_offset, f->code_size,
++              f->gpr_count, f->slm_size, f->crs_size,
++              f->num_control_barriers, f->static_smem_size, f->params_offset,
++              f->params_size, f->param_info_count);
++      for (uint32_t p = 0; p < f->param_info_count; p++) {
++         const struct nv_cubin_function_param_info *pi = param(f, p);
++         if (pi)
++            fprintf(out, "  param %u: index %u offset %u size %u\n", p,
++                    pi->index, pi->offset, pi->size);
++      }
++      if (find(m, f->name) == NULL)
++         fprintf(out, "  (not found by name)\n");
++   }
++}
++
++#ifdef USE_LIBELF
++static char *
++dump_to_string(const struct nv_cubin_module *m, bool elf_variant)
++{
++   char *s = NULL;
++   size_t len = 0;
++   FILE *f = open_memstream(&s, &len);
++   if (elf_variant)
++      dump_module(f, m, nv_cubin_elf_module_find_function,
++                  nv_cubin_elf_function_get_param_info);
++   else
++      dump_module(f, m, nv_cubin_module_find_function,
++                  nv_cubin_function_get_param_info);
++   fclose(f);
++   return s;
++}
++
++static bool
++same_code(const struct nv_cubin_module *a, const struct nv_cubin_module *b)
++{
++   for (uint32_t i = 0; i < a->function_count && i < b->function_count; i++) {
++      if (a->functions[i].code_size != b->functions[i].code_size ||
++          memcmp(a->functions[i].code_ptr, b->functions[i].code_ptr,
++                 a->functions[i].code_size))
++         return false;
++   }
++   return true;
++}
++
++static void
++compare_parsers(const char *what, const void *data, size_t size)
++{
++   struct nv_cubin_module a, b;
++   memset(&b, 0, sizeof(b));
++   bool ok_a = nv_cubin_elf_module_init(&a, data, size);
++   bool ok_b = nv_cubin_module_init(&b, data, size);
++   CHECK(ok_a == ok_b, "%s: in-tree %d, libelf %d", what, ok_a, ok_b);
++   if (ok_a && ok_b) {
++      char *da = dump_to_string(&a, true);
++      char *db = dump_to_string(&b, false);
++      CHECK(strcmp(da, db) == 0, "%s: parsers differ\nin-tree:\n%slibelf:\n%s",
++            what, da, db);
++      CHECK(same_code(&a, &b), "%s: code bytes differ", what);
++      free(da);
++      free(db);
++   }
++   nv_cubin_elf_module_fini(&a);
++   nv_cubin_module_fini(&b);
++}
++#endif
++
++static void
++run_file(const char *path, bool verbose)
++{
++   size_t size;
++   uint8_t *data = read_file(path, &size);
++   if (!data) {
++      CHECK(false, "cannot read %s", path);
++      return;
++   }
++
++   unsigned found = 0, parsed = 0, functions = 0;
++   unsigned by_sm[256] = { 0 };
++   for (size_t off = 0; off + 64 <= size; off++) {
++      if (memcmp(data + off, "\x7f" "ELF\x02\x01", 6) != 0 ||
++          data[off + 18] != 190 || data[off + 19] != 0)
++         continue;
++      size_t len = elf_extent(data + off, size - off);
++      if (len == 0)
++         continue;
++      found++;
++
++      struct nv_cubin_module m;
++      if (nv_cubin_elf_module_init(&m, data + off, len)) {
++         parsed++;
++         functions += m.function_count;
++         by_sm[m.sm & 0xff]++;
++         if (verbose) {
++            printf("%s+0x%zx:\n", path, off);
++            dump_module(stdout, &m, nv_cubin_elf_module_find_function,
++                        nv_cubin_elf_function_get_param_info);
++         }
++      } else {
++         CHECK(false, "%s+0x%zx: in-tree parser refused it", path, off);
++      }
++      nv_cubin_elf_module_fini(&m);
++
++#ifdef USE_LIBELF
++      char what[512];
++      snprintf(what, sizeof(what), "%s+0x%zx", path, off);
++      compare_parsers(what, data + off, len);
++#endif
++      off += len - 1;
++   }
++
++   printf("%s: %u CUDA ELFs, %u parsed, %u kernels; by sm:", path, found,
++          parsed, functions);
++   for (unsigned sm = 0; sm < 256; sm++)
++      if (by_sm[sm])
++         printf(" sm_%u x%u", sm, by_sm[sm]);
++   printf("\n");
++   free(data);
++}
++
++/* mesa_log for the parsers (util/log.c is not linked) */
++void
++mesa_log(int level, const char *tag, const char *format, ...)
++{
++   if (quiet_errors && !getenv("NV_CUBIN_TEST_VERBOSE"))
++      return;
++   va_list va;
++   va_start(va, format);
++   fprintf(stderr, "%s: ", tag);
++   vfprintf(stderr, format, va);
++   va_end(va);
++}
++
++int
++main(int argc, char **argv)
++{
++   bool verbose = getenv("NV_CUBIN_TEST_VERBOSE") != NULL;
++
++   run_synthetic();
++   for (int i = 1; i < argc; i++)
++      run_file(argv[i], verbose);
++
++#ifdef USE_LIBELF
++   printf("compared against libelf's nv_cubin.c\n");
++#endif
++   printf("%s (%d failures)\n", failures ? "FAILED" : "PASSED", failures);
++   return failures ? 1 : 0;
++}
+-- 
+2.43.0
+

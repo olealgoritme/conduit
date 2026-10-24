@@ -1,0 +1,91 @@
+# What Install-OptiScaler.ps1 downloads, and the games it refuses.
+#
+# OptiScaler (github.com/optiscaler/OptiScaler) is GPL-3.0. Conduit does not
+# ship it: the script fetches this release from GitHub at install time,
+# checks the SHA-256 below, and keeps it with its LICENSE in
+# C:\ProgramData\Helios\optiscaler\<version>\. To move to a newer release, run
+# `Install-OptiScaler.ps1 -DownloadOnly -Version latest` in a guest: it prints
+# the asset's name, URL and SHA-256 for the release.* lines.
+#
+# One entry per line: key, value, then free text (labels). Values have no
+# spaces. The tray (conduit-gpu-tray) reads the anticheat.* lines at build
+# time, so the menu and the script refuse the same games.
+
+release.version  0.9.4
+release.tag      v0.9.4
+release.url      https://github.com/optiscaler/OptiScaler/releases/download/v0.9.4/Optiscaler_0.9.4-final.20260718._MM.7z
+release.sha256   575cb4df866116093df75af607e37fd70e10f5163e0f23fd5c804142e80ef0ad
+release.size     55016448
+license.url      https://raw.githubusercontent.com/optiscaler/OptiScaler/v0.9.4/LICENSE
+license.sha256   3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986
+source.url       https://github.com/optiscaler/OptiScaler/tree/v0.9.4
+
+# Used only when Windows' tar.exe cannot read the archive (Windows 11 builds
+# before 23H2): 7-Zip's 7zr.exe (LGPL-2.1, 7z archives only), also fetched
+# and hash-checked, never shipped.
+7zr.url          https://github.com/ip7z/7zip/releases/download/26.04/7zr.exe
+7zr.sha256       256feca8e274e5da655e2a284fabafd9f554365eb164862089dacd4e8276d282
+
+# Games with kernel or online anti-cheat. OptiScaler injects a DLL into the
+# game; with these that can get the account banned. Refused unless -Force.
+#
+# anticheat.exe: the game's executable name (case-insensitive, * at the end
+# matches any rest).
+anticheat.exe    cs2.exe                           Counter-Strike 2 (VAC)
+anticheat.exe    csgo.exe                          Counter-Strike: Global Offensive (VAC)
+anticheat.exe    dota2.exe                         Dota 2 (VAC)
+anticheat.exe    project8.exe                      Deadlock (VAC)
+anticheat.exe    VALORANT*                         Valorant (Riot Vanguard)
+anticheat.exe    League*                           League of Legends (Riot Vanguard)
+anticheat.exe    Fortnite*                         Fortnite (Easy Anti-Cheat, BattlEye)
+anticheat.exe    r5apex*                           Apex Legends (Easy Anti-Cheat)
+anticheat.exe    TslGame*                          PUBG: Battlegrounds (BattlEye)
+anticheat.exe    ExecPubg.exe                      PUBG: Battlegrounds (BattlEye)
+anticheat.exe    RainbowSix*                       Rainbow Six Siege (BattlEye)
+anticheat.exe    Overwatch.exe                     Overwatch 2 (online anti-cheat)
+anticheat.exe    destiny2.exe                      Destiny 2 (BattlEye)
+anticheat.exe    EscapeFromTarkov*                 Escape from Tarkov (BattlEye)
+anticheat.exe    GTA5*                             Grand Theft Auto V (BattlEye)
+anticheat.exe    cod.exe                           Call of Duty (Ricochet)
+anticheat.exe    ModernWarfare.exe                 Call of Duty (Ricochet)
+anticheat.exe    BlackOps*                         Call of Duty (Ricochet)
+anticheat.exe    bf2042.exe                        Battlefield 2042 (EA Javelin)
+anticheat.exe    bf6.exe                           Battlefield 6 (EA Javelin)
+anticheat.exe    Marvel-Win64-Shipping.exe         Marvel Rivals (NetEase anti-cheat)
+anticheat.exe    DeltaForceClient*                 Delta Force (ACE)
+anticheat.exe    GenshinImpact.exe                 Genshin Impact (HoYoProtect)
+anticheat.exe    YuanShen.exe                      Genshin Impact (HoYoProtect)
+anticheat.exe    StarRail.exe                      Honkai: Star Rail (HoYoProtect)
+anticheat.exe    ZenlessZoneZero.exe               Zenless Zone Zero (HoYoProtect)
+anticheat.exe    HaloInfinite.exe                  Halo Infinite (online anti-cheat)
+
+# anticheat.path: a file or folder of this name in the game's folder or the
+# folders above it, up to four levels and not past an anticheat.root
+# (case-insensitive, * at the end).
+anticheat.path   EasyAntiCheat*                    Easy Anti-Cheat
+anticheat.path   start_protected_game.exe          Easy Anti-Cheat
+anticheat.path   BattlEye*                         BattlEye
+anticheat.path   BEService*                        BattlEye
+anticheat.path   EAAntiCheat*                      EA Javelin anti-cheat
+anticheat.path   vgk*                              Riot Vanguard
+anticheat.path   AntiCheatExpert*                  ACE (Anti-Cheat Expert)
+anticheat.path   GameGuard*                        nProtect GameGuard
+anticheat.path   XIGNCODE*                         XIGNCODE3
+anticheat.path   mhyprot*                          HoYoProtect
+anticheat.path   HoYoKProtect*                     HoYoProtect
+
+# anticheat.root: library folders the search above stops below (the whole
+# rest of the line is the name). A drive's root always stops it.
+anticheat.root   common
+anticheat.root   steamapps
+anticheat.root   SteamLibrary
+anticheat.root   Steam
+anticheat.root   Program Files
+anticheat.root   Program Files (x86)
+anticheat.root   Epic Games
+anticheat.root   XboxGames
+anticheat.root   GOG Games
+anticheat.root   Games
+anticheat.root   ProgramData
+anticheat.root   Users
+anticheat.root   Windows

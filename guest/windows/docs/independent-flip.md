@@ -1148,9 +1148,19 @@ part of any frame.
   AND/XOR, 0/0 black, 0/1 white, 1/0 transparent, 1/1 invert. An ARGB plane cannot invert, so an inverting pixel is drawn black
   with a white outline on its transparent neighbours (the text I-beam stays visible on dark and light backgrounds).
 * **`DxgkDdiSetPointerPosition`** (PASSIVE, up to the mouse rate): one spinlock and a compare, unless `Flags.Visible` changed;
-  then the image is shown or hidden on the host. **The position never travels**: the host pointer is the cursor (the viewer sets
-  the image as its `wl_pointer` cursor over the guest), so it moves at host rate with no guest latency. X and Y ride along on
-  each command, informational.
+  then the image is shown or hidden on the host. Ungrabbed, the host pointer is the cursor (the viewer sets the image as its
+  `wl_pointer` cursor over the guest), so it moves at host rate with no guest latency, and X and Y ride along on each command,
+  informational.
+* **The position, under a grab** (`HwCursorPos`, default 1): the host pointer is locked then and the viewer draws the guest
+  cursor itself, at the guest's position. A visible pointer whose X, Y changed sends `HELIOS_CMD_MOVE_CURSOR` (0x0381, 40 bytes:
+  header, scanout, X, Y, flags 0) on the cursor queue only (never the control queue), fire and forget: the call takes the pointer
+  gate only if it is free, takes the answer of a move still out (one still pending: this one is skipped, the next call sends the
+  newest position) and puts the new one on the queue without waiting. The answer says whether to go on: `RESP_OK_NODATA` while a
+  display client draws at the guest's position, `RESP_ERR_UNSPEC` when none does (or the host does not know the command); after
+  a refusal the next move probes no sooner than 100 ms later (`hc::PROBE_100NS`), so an ungrabbed desktop costs at most ten
+  commands a second while the pointer moves, and a hidden pointer (a game in relative mode) none. A shape or visibility command
+  first takes the answer of a move still out (spinning at most 2 ms, `hc::MOVE_REAP_100NS`). The policy is
+  `helios_kmd_logic::hw_cursor::Moves`.
 * **Failure is the software cursor.** A shape the host cannot take, an image that cannot be made or mapped, a host command that
   fails: `SetPointerShape` answers `STATUS_UNSUCCESSFUL`, and dxgkrnl draws that shape in software, as before (the host image is
   hidden first, so two cursors never show). A host that refuses the command (`RESP_ERR_*`: an old backend under `HwCursor=2`) is not
@@ -1169,7 +1179,7 @@ part of any frame.
 | device restart (`pnputil /restart-device`, TDR) | per generation: `reset_for_start` forgets the image (its resource id may name another resource in the next generation), the host hides the cursor when the transport resets (`Venus::release`), dxgkrnl sets the shape again and the first shape makes a new image |
 | host refused / old backend | the caps carry no pointer without `NVGPU_CFG_VENUS_CURSOR` (default knob); with `HwCursor=2` every shape fails over to software |
 | viewer reconnect, `conduit view` started later | the backend keeps the last cursor and re-sends it to a client that connects (as for Linux guests) |
-| grab (CTRL+ALT+G, relative pointer) | the viewer hides the host pointer, and with it the guest's image: no cursor under grab (as for a Linux guest's cursor plane; games draw their own). `HwCursor=0` keeps the old guest-drawn cursor for desktop use under grab |
+| grab (CTRL+ALT+G, relative pointer) | the viewer hides the host pointer and draws the guest's image itself at the position the moves report (`HwCursorPos`); a hidden pointer (games in relative mode) sends no moves and is not drawn. `HwCursorPos=0` sends none: no cursor under grab |
 | multi-monitor | one VidPN source; a shape or position for another source is refused (shape) or ignored (position) |
 | boot console shown | the backend does not send the guest's cursor over the console |
 
@@ -1188,7 +1198,9 @@ Counters (event-gated like `Idf*`: zeros at every StartDevice, then from the per
 published with the next other change), `CurShow` / `CurHide` (show / hide commands the host took), `CurFmt` (last shape: 1 mono, 2
 color, 4 masked color, +0x100 premultiplied by the KMD), `CurSize` (`width << 16 | height`), `CurRefuse` (shapes left to the
 software cursor), `CurWhy` (last reason: 1 flags, 2 size, 3 pitch, 4 hotspot, 5 no pixels, 6 source, 7 host, 8 image), `CurHostErr`
-(host commands that failed), `CurXor` (inverting pixels in the last shape). Host: the backend logs `venus: the guest's hardware
+(host commands that failed), `CurXor` (inverting pixels in the last shape), `CurPosKnob` (`HwCursorPos`), `CurMoveN` (moves
+sent), `CurMoveRef` (moves the host refused: no client wanted positions), `CurMoveSkip` (moves not sent: one still out, or another
+pointer operation held the queue). Host: the backend logs `venus: the guest's hardware
 cursor is served (CMD_SET_CURSOR_BLOB)` at start and counts `set_cursor_blob=N` in its teardown `venus: ... command(s)` line.
 
 ### 12.3a The cursor queue and timeouts (`HwCursorQ`)

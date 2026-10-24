@@ -41,7 +41,10 @@ The protocol is the `conduit-ctl` crate (`host/ctl`): requests
 whether a desktop session exists), `run`, `stop`, `apps`, `icon`, `put`, `get`,
 `ls`, `settime` (set the guest's clock after the host slept,
 [SUSPEND.md](SUSPEND.md); the Windows tray sets it, the Linux agent answers
-that it cannot). Request ids grow across commands, so a late answer to an abandoned
+that it cannot), `upscaler` (Windows: the upscaler games get, `conduit
+upscaler`, [dlss.md](../guest/nvk-rm/docs/dlss.md); the tray writes
+`HKLM\SOFTWARE\Helios` `Upscaler` and the OptiScaler.ini files listed under
+`HKLM\SOFTWARE\Helios\OptiScaler`, nothing else). Request ids grow across commands, so a late answer to an abandoned
 request is never taken for the current one. Lines over 4 MiB are dropped, an
 unknown op or a malformed line gets an error response, and each agent handles
 every request separately, so one bad request cannot stop it.

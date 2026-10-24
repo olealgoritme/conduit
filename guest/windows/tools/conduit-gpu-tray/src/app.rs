@@ -4,6 +4,8 @@ use crate::gfx::{self, argb, wide, Gfx};
 use crate::sendto;
 use crate::sys;
 use crate::view::{self, Snapshot, Wait};
+use gpu_tray::enhance;
+use gpu_tray::optiscaler::{self, Pending, Pick};
 use gpu_tray::policy::{on_denied, OnDenied};
 use gpu_tray::{
     copied_text, default_share, icon_face, tooltip, IconMetric, LineReader, Model, Share, CHANNEL,
@@ -35,6 +37,8 @@ const WM_SHOW: u32 = WM_APP + 3;
 const WM_DROPPED: u32 = WM_APP + 4;
 /// End the app (from another thread).
 const WM_CLOSE_APP: u32 = WM_APP + 5;
+/// An Install-OptiScaler.ps1 run finished; show its notification.
+const WM_OPTI_DONE: u32 = WM_APP + 6;
 const TIMER: usize = 1;
 /// Repaints the open popup for the waiting animation.
 const ANIM: usize = 2;
@@ -51,6 +55,14 @@ const ID_OPEN_DEFAULT: usize = 7;
 const ID_SHARE: usize = 100;
 /// Menu ids of the recent launches submenu: this plus the index.
 const ID_LAUNCH: usize = 300;
+/// Upscaling and frame generation: global settings at ID_ENH plus
+/// setting * 16 plus choice; profiles at ID_ENH_APP plus app * 256 plus
+/// setting * 16 plus choice, the app's "remove profile" at plus 255
+const ID_ENH: usize = 1000;
+const ID_ENH_APP: usize = 2000;
+const ENH_APPS: usize = 8;
+/// Games with OptiScaler that are not running, after the open apps
+const OPTI_APPS: usize = 8;
 
 // Channel state, written by the reader thread.
 const CH_WAITING: u8 = 0;
@@ -80,6 +92,19 @@ static MUTEX_HANDLE: AtomicIsize = AtomicIsize::new(0);
 static HANDOFF_TRIED: AtomicBool = AtomicBool::new(false);
 /// How long a started elevated copy has to show its window.
 const HANDOFF_WAIT: Duration = Duration::from_secs(6);
+
+/// OptiScaler picks for one game (by exe path), run by the timer once
+/// nothing runs from the game's folder.
+struct OptiJob {
+    path: String,
+    name: String,
+    pending: Pending,
+    /// Install-OptiScaler.ps1 runs for it now
+    busy: bool,
+}
+static OPTI_JOBS: Mutex<Vec<OptiJob>> = Mutex::new(Vec::new());
+/// Finished runs (ok, text), for the notification on WM_OPTI_DONE.
+static OPTI_DONE: Mutex<Vec<(bool, String)>> = Mutex::new(Vec::new());
 
 fn model() -> &'static Mutex<Model> {
     MODEL.get_or_init(|| Mutex::new(Model::default()))
@@ -655,6 +680,11 @@ fn context_menu(hwnd: HWND) {
         }
         let t = wide("Recent launches (click to stop)");
         AppendMenuW(m, MF_POPUP, sub as usize, t.as_ptr());
+        // Upscaling and frame generation (NVK's composed present)
+        let enh_apps = enh_apps();
+        let enh = enhance_menu(&enh_apps);
+        let t = wide("Upscaling and frame generation");
+        AppendMenuW(m, MF_POPUP, enh as usize, t.as_ptr());
         AppendMenuW(m, MF_SEPARATOR, 0, null());
         add(
             ID_KEEP,
@@ -704,6 +734,24 @@ fn context_menu(hwnd: HWND) {
             id if id >= ID_LAUNCH && id - ID_LAUNCH < launches.len() => {
                 let _ = crate::launch::stop(launches[id - ID_LAUNCH].pid);
             }
+            id if (ID_ENH..ID_ENH + enhance::ALL.len() * 16).contains(&id) => {
+                enhance_pick(None, id - ID_ENH);
+            }
+            id if (ID_ENH_APP..ID_ENH_APP + enh_apps.len() * 256).contains(&id) => {
+                let app = &enh_apps[(id - ID_ENH_APP) / 256];
+                let k = (id - ID_ENH_APP) % 256;
+                if k == 255 {
+                    sys::enhance_remove_profile(&app.name);
+                } else if k >= optiscaler::MENU_BASE {
+                    if let (Some(p), Some(path)) =
+                        (optiscaler::pick_of(k - optiscaler::MENU_BASE), &app.path)
+                    {
+                        opti_pick(hwnd, &app.name, path, p);
+                    }
+                } else {
+                    enhance_pick(Some(&app.name), k);
+                }
+            }
             ID_AUTOSTART => sys::set_autostart(!sys::autostart_enabled(), &exe_path()),
             ID_EXIT => {
                 DestroyWindow(hwnd);
@@ -711,6 +759,354 @@ fn context_menu(hwnd: HWND) {
             _ => {}
         }
     }
+}
+
+/// One setting's choices as a radio submenu; ids base + choice
+unsafe fn enhance_choices(exe: Option<&str>, s: &enhance::Setting, base: usize) -> HMENU {
+    let sub = CreatePopupMenu();
+    let stored = sys::enhance_get(exe, s);
+    // In a profile an absent value means "as the global setting"
+    let cur = if exe.is_some() && stored.is_none() {
+        usize::MAX
+    } else {
+        s.index_of(stored.as_deref())
+    };
+    let writable = sys::elevated();
+    for (i, (_, text)) in s.choices.iter().enumerate() {
+        let t = wide(text);
+        let fl = if i == cur { MF_CHECKED } else { 0 } | if writable { 0 } else { MF_GRAYED };
+        AppendMenuW(sub, MF_STRING | fl, base + i, t.as_ptr());
+    }
+    sub
+}
+
+/// An app with a profile entry: an open window's, or a game with OptiScaler.
+struct EnhApp {
+    name: String,
+    /// The exe's full path, when known
+    path: Option<String>,
+    running: bool,
+}
+
+/// The profile entries: the apps with open windows, then the games with
+/// OptiScaler from Install-OptiScaler.ps1 that are not among them.
+fn enh_apps() -> Vec<EnhApp> {
+    let windowed = sys::windowed_exes();
+    let file = |p: &str| p.rsplit('\\').next().unwrap_or(p).to_string();
+    let names: Vec<String> = windowed.iter().map(|p| file(p)).collect();
+    let mut out: Vec<EnhApp> = enhance::profile_candidates(&names, ENH_APPS)
+        .into_iter()
+        .map(|name| EnhApp {
+            path: windowed
+                .iter()
+                .find(|p| file(p).eq_ignore_ascii_case(&name))
+                .cloned(),
+            name,
+            running: true,
+        })
+        .collect();
+    for (name, path) in sys::optiscaler_games() {
+        if out.len() >= ENH_APPS + OPTI_APPS {
+            break;
+        }
+        if !out.iter().any(|a| a.name.eq_ignore_ascii_case(&name)) {
+            out.push(EnhApp {
+                name,
+                path: Some(path),
+                running: false,
+            });
+        }
+    }
+    out
+}
+
+/// A profile's OptiScaler submenu: install or remove, the upscaler and
+/// frame generation, or why it is not offered. Ids: `base` (the profile's
+/// block) + optiscaler::MENU_BASE + offset.
+unsafe fn optiscaler_menu(base: usize, app: &EnhApp) -> HMENU {
+    use optiscaler as o;
+    let m = CreatePopupMenu();
+    let id = |off: usize| base + o::MENU_BASE + off;
+    let grayed = |menu: HMENU, text: &str| {
+        let t = wide(text);
+        AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, t.as_ptr());
+    };
+    let item = |menu: HMENU, off: usize, text: &str, enabled: bool, checked: bool| {
+        let t = wide(text);
+        let fl = if enabled { 0 } else { MF_GRAYED } | if checked { MF_CHECKED } else { 0 };
+        AppendMenuW(menu, MF_STRING | fl, id(off), t.as_ptr());
+    };
+    let Some(path) = app.path.as_deref() else {
+        grayed(m, "The game's folder is not known");
+        return m;
+    };
+    let dir = o::parent_dir(path);
+    let marker = sys::read_text(&format!("{dir}\\{}", o::MARKER)).map(|t| o::parse_marker(&t));
+    let ini = sys::read_text(&format!("{dir}\\OptiScaler.ini")).unwrap_or_default();
+    let pinned = o::pinned_version();
+    let (pending, busy) = OPTI_JOBS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|j| j.path.eq_ignore_ascii_case(path))
+        .map(|j| (j.pending.clone(), j.busy))
+        .unwrap_or_default();
+    match &marker {
+        Some(mk) => grayed(
+            m,
+            &format!(
+                "OptiScaler {} installed",
+                mk.version.as_deref().unwrap_or("")
+            ),
+        ),
+        None => grayed(
+            m,
+            &format!("OptiScaler {pinned} (GPL-3.0, downloaded from its GitHub release)"),
+        ),
+    }
+    if sys::optiscaler_script(&exe_path()).is_none() {
+        grayed(
+            m,
+            "Needs Install-OptiScaler.ps1 next to the installed tray (Program Files\\Conduit)",
+        );
+        return m;
+    }
+    if marker.is_none() {
+        if let Some(ac) = o::AntiCheat::builtin().find(dir, Some(&app.name), sys::dir_names) {
+            grayed(m, &format!("Not offered: the game has anti-cheat: {ac}"));
+            grayed(m, "OptiScaler injects a DLL into the game; with anti-cheat that can get the account banned");
+            return m;
+        }
+    }
+    let installed = marker.is_some();
+    let will_install = pending.install == Some(true);
+    let will_remove = pending.install == Some(false);
+    if let Some(mk) = &marker {
+        if mk.version.as_deref() != Some(pinned.as_str()) {
+            item(
+                m,
+                o::MENU_INSTALL,
+                &format!("Update to {pinned} (keeps OptiScaler.ini)"),
+                true,
+                will_install,
+            );
+        }
+        item(m, o::MENU_REMOVE, "Remove OptiScaler", true, will_remove);
+    } else {
+        item(m, o::MENU_INSTALL, "Install OptiScaler", true, will_install);
+    }
+    let usable = (installed && !will_remove) || will_install;
+    let up = CreatePopupMenu();
+    let cur = pending
+        .upscaler
+        .or_else(|| installed.then(|| o::ini_mode(&ini)).flatten());
+    let dlss_ok = sys::dlss_ready(dir);
+    for (i, (mode, text)) in o::UPSCALERS.iter().enumerate() {
+        if *mode == "dlss" && !dlss_ok {
+            item(
+                up,
+                o::MENU_UPSCALER + i,
+                "DLSS (needs Install-Dlss.ps1)",
+                false,
+                cur == Some(*mode),
+            );
+        } else {
+            item(up, o::MENU_UPSCALER + i, text, usable, cur == Some(*mode));
+        }
+    }
+    let t = wide("Upscaler");
+    AppendMenuW(
+        m,
+        MF_POPUP | if usable { 0 } else { MF_GRAYED },
+        up as usize,
+        t.as_ptr(),
+    );
+    let fg = CreatePopupMenu();
+    let fg_on = pending
+        .framegen
+        .unwrap_or_else(|| installed && o::ini_framegen(&ini));
+    item(
+        fg,
+        o::MENU_FG_ON,
+        "On (OptiFG: FSR 3.1 frame generation, DX12 games)",
+        usable,
+        fg_on,
+    );
+    item(fg, o::MENU_FG_OFF, "Off", usable, !fg_on);
+    let t = wide("Frame generation");
+    AppendMenuW(
+        m,
+        MF_POPUP | if usable { 0 } else { MF_GRAYED },
+        fg as usize,
+        t.as_ptr(),
+    );
+    AppendMenuW(m, MF_SEPARATOR, 0, null());
+    if busy {
+        grayed(m, "Install-OptiScaler.ps1 is running...");
+    }
+    if !pending.is_empty() {
+        let what = pending.describe();
+        if app.running {
+            grayed(m, &format!("Waiting for {} to close: {what}", app.name));
+        } else {
+            grayed(m, &format!("Queued: {what}"));
+        }
+    } else if app.running && !busy {
+        grayed(m, &format!("Changes wait until {} is closed", app.name));
+    }
+    grayed(m, "The game reads it at its next start");
+    m
+}
+
+/// A menu pick for a game: queued, and run at once when the game is closed.
+fn opti_pick(hwnd: HWND, name: &str, path: &str, p: Pick) {
+    {
+        let mut jobs = OPTI_JOBS.lock().unwrap_or_else(|e| e.into_inner());
+        match jobs.iter_mut().find(|j| j.path.eq_ignore_ascii_case(path)) {
+            Some(j) => j.pending.add(p),
+            None => {
+                let mut pending = Pending::default();
+                pending.add(p);
+                jobs.push(OptiJob {
+                    path: path.to_string(),
+                    name: name.to_string(),
+                    pending,
+                    busy: false,
+                });
+            }
+        }
+    }
+    opti_pump(hwnd);
+}
+
+/// Starts Install-OptiScaler.ps1 (in a thread) for every game with queued
+/// picks that nothing runs from any more; the script checks that again.
+fn opti_pump(hwnd: HWND) {
+    let mut jobs = OPTI_JOBS.lock().unwrap_or_else(|e| e.into_inner());
+    jobs.retain(|j| j.busy || !j.pending.is_empty());
+    if !jobs.iter().any(|j| !j.busy) {
+        return;
+    }
+    let Some(script) = sys::optiscaler_script(&exe_path()) else {
+        jobs.retain(|j| j.busy);
+        return;
+    };
+    let procs = sys::process_paths();
+    let h = hwnd as usize;
+    for j in jobs.iter_mut().filter(|j| !j.busy) {
+        let dir = optiscaler::parent_dir(&j.path).to_string();
+        if procs.iter().any(|p| optiscaler::runs_from(p, &dir)) {
+            continue;
+        }
+        let Some(args) = std::mem::take(&mut j.pending).args(&j.path) else {
+            continue;
+        };
+        j.busy = true;
+        let (name, path, script) = (j.name.clone(), j.path.clone(), script.clone());
+        std::thread::spawn(move || {
+            let (code, out) = sys::run_optiscaler(&script, &args);
+            let r = optiscaler::result_text(&name, code, &out);
+            OPTI_DONE.lock().unwrap_or_else(|e| e.into_inner()).push(r);
+            let mut jobs = OPTI_JOBS.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(j) = jobs.iter_mut().find(|j| j.path.eq_ignore_ascii_case(&path)) {
+                j.busy = false;
+            }
+            jobs.retain(|j| j.busy || !j.pending.is_empty());
+            drop(jobs);
+            unsafe { PostMessageW(h as HWND, WM_OPTI_DONE, 0, 0) };
+        });
+    }
+}
+
+/// A notification balloon from the tray icon.
+fn notify(hwnd: HWND, ok: bool, title: &str, text: &str) {
+    let mut nid: NOTIFYICONDATAW = unsafe { std::mem::zeroed() };
+    nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+    nid.hWnd = hwnd;
+    nid.uID = TRAY_ID;
+    nid.uFlags = NIF_INFO;
+    nid.dwInfoFlags = if ok { NIIF_INFO } else { NIIF_WARNING };
+    for (d, s) in nid
+        .szInfoTitle
+        .iter_mut()
+        .zip(title.encode_utf16().take(63))
+    {
+        *d = s;
+    }
+    for (d, s) in nid.szInfo.iter_mut().zip(text.encode_utf16().take(255)) {
+        *d = s;
+    }
+    unsafe { Shell_NotifyIconW(NIM_MODIFY, &nid) };
+}
+
+/// The settings menu: the global settings, then a profile per open app
+unsafe fn enhance_menu(apps: &[EnhApp]) -> HMENU {
+    let m = CreatePopupMenu();
+    let scaler = enhance::SCALER.index_of(sys::enhance_get(None, &enhance::SCALER).as_deref());
+    let fg = enhance::FRAMEGEN.index_of(sys::enhance_get(None, &enhance::FRAMEGEN).as_deref());
+    let counter =
+        enhance::OVERLAY.index_of(sys::enhance_get(None, &enhance::OVERLAY).as_deref()) != 0;
+    let t = wide(&format!(
+        "All games: {}{}",
+        enhance::summary(scaler, fg),
+        if counter { ", FPS counter" } else { "" }
+    ));
+    AppendMenuW(m, MF_STRING | MF_GRAYED, 0, t.as_ptr());
+    for (si, s) in enhance::ALL.iter().enumerate() {
+        let sub = enhance_choices(None, s, ID_ENH + si * 16);
+        let t = wide(s.title);
+        AppendMenuW(m, MF_POPUP, sub as usize, t.as_ptr());
+    }
+    AppendMenuW(m, MF_SEPARATOR, 0, null());
+    if apps.is_empty() {
+        let t = wide("Per-game profiles: no open windows");
+        AppendMenuW(m, MF_STRING | MF_GRAYED, 0, t.as_ptr());
+    }
+    for (ai, app) in apps.iter().enumerate() {
+        let pm = CreatePopupMenu();
+        let has = sys::enhance_has_profile(&app.name);
+        for (si, s) in enhance::ALL.iter().enumerate() {
+            if !s.per_exe {
+                continue;
+            }
+            let sub = enhance_choices(Some(&app.name), s, ID_ENH_APP + ai * 256 + si * 16);
+            let t = wide(s.title);
+            AppendMenuW(pm, MF_POPUP, sub as usize, t.as_ptr());
+        }
+        AppendMenuW(pm, MF_SEPARATOR, 0, null());
+        let opti = optiscaler_menu(ID_ENH_APP + ai * 256, app);
+        let t = wide("OptiScaler");
+        AppendMenuW(pm, MF_POPUP, opti as usize, t.as_ptr());
+        AppendMenuW(pm, MF_SEPARATOR, 0, null());
+        let t = wide("Remove profile (use the settings for all games)");
+        let fl = if has && sys::elevated() { 0 } else { MF_GRAYED };
+        AppendMenuW(pm, MF_STRING | fl, ID_ENH_APP + ai * 256 + 255, t.as_ptr());
+        let t = wide(&format!(
+            "Profile for {}{}{}",
+            app.name,
+            if has { " (set)" } else { "" },
+            if app.running { "" } else { " (not running)" }
+        ));
+        AppendMenuW(m, MF_POPUP, pm as usize, t.as_ptr());
+    }
+    AppendMenuW(m, MF_SEPARATOR, 0, null());
+    let t = wide(
+        "Filters apply at once; turning on or off: at the game's next swap chain (D3D: next start)",
+    );
+    AppendMenuW(m, MF_STRING | MF_GRAYED, 0, t.as_ptr());
+    m
+}
+
+/// A menu pick: setting k / 16, choice k % 16
+fn enhance_pick(exe: Option<&str>, k: usize) {
+    let (si, ci) = (k / 16, k % 16);
+    let Some(s) = enhance::ALL.get(si) else {
+        return;
+    };
+    let Some((value, _)) = s.choices.get(ci) else {
+        return;
+    };
+    sys::enhance_set(exe, s, value);
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
@@ -738,6 +1134,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             0
         }
         WM_TIMER => {
+            opti_pump(hwnd);
             refresh_shares();
             if tick().saturating_sub(LAST_SENDTO.load(Relaxed)) >= 10_000 {
                 LAST_SENDTO.store(tick(), Relaxed);
@@ -762,6 +1159,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_CLOSE_APP => {
             DestroyWindow(hwnd);
+            0
+        }
+        WM_OPTI_DONE => {
+            let done: Vec<(bool, String)> =
+                std::mem::take(&mut *OPTI_DONE.lock().unwrap_or_else(|e| e.into_inner()));
+            if let Some((ok, text)) = done.last() {
+                notify(hwnd, *ok && done.iter().all(|d| d.0), "OptiScaler", text);
+            }
             0
         }
         WM_DROPFILES => {

@@ -12,13 +12,15 @@
 //!
 //! # Shape
 //!
-//! One command at a time, in one preallocated buffer: `[MsgHeader{GpuCmd}, the command] ->
-//! [MsgHeader, virtio_gpu_ctrl_hdr]`, the same message the control queue carries. No interrupt
-//! (the avail ring asks for none, and no MSI-X vector is programmed for this queue): the sender
-//! polls the used ring at PASSIVE for the answer, which a backend that serves this queue ahead of
-//! the control queue gives within one control request. A command still unanswered when the
-//! sender gives up stays in flight with its buffer; the next send reaps it first and, while it is
-//! still out, is refused `QueueFull` (the caller keeps the command owed and sends it later).
+//! One command at a time, in one preallocated buffer (a shape or visibility command, waited for,
+//! or a position move, never waited for: `ddi/hw_cursor.rs` tells them apart):
+//! `[MsgHeader{GpuCmd}, the command] -> [MsgHeader, virtio_gpu_ctrl_hdr]`, the same message the
+//! control queue carries. No interrupt (the avail ring asks for none, and no MSI-X vector is
+//! programmed for this queue): the sender polls the used ring at PASSIVE for the answer, which a
+//! backend that serves this queue ahead of the control queue gives within one control request.
+//! A command still unanswered when the sender gives up stays in flight with its buffer; the next
+//! send reaps it first and, while it is still out, is refused `QueueFull` (the caller keeps the
+//! command owed and sends it later).
 //!
 //! # Locking
 //!
@@ -38,6 +40,7 @@ const CMD_MAX: usize = 256;
 const RESP_BYTES: usize = core::mem::size_of::<helios_protocol::VirtioGpuCtrlHdr>();
 
 const _: () = assert!(core::mem::size_of::<helios_protocol::HeliosSetCursorBlob>() <= CMD_MAX);
+const _: () = assert!(core::mem::size_of::<helios_protocol::HeliosMoveCursor>() <= CMD_MAX);
 
 /// The cursor queue, its one buffer, and the command in flight.
 pub(super) struct CursorRing {
