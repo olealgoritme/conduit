@@ -165,6 +165,44 @@ scale, so it lines up with the picture in `stretch` too.
 `host/viewer/test/test_view.c` checks the mapping for every mode, area and
 output scale.
 
+## The guest's cursor
+
+A guest with a hardware cursor (a Windows guest's pointer, a Linux guest's
+cursor plane) hands the viewer its image (`CMD_CURSOR`, docs/SCANOUT.md).
+Over the picture that image is the host pointer's, so it moves at host speed
+with no guest round trip; the stats overlay says `CURSOR HOST`. A guest that
+hides its cursor (a game) gets no host pointer over the picture.
+
+- **Copied when the display does not take it.** A display that lists no
+  LINEAR ARGB8888 dma-buf (Hyprland on NVIDIA) gets each new shape drawn
+  once by the viewer's GPU into shared memory; a move copies nothing. When
+  the image cannot be copied, the viewer's own arrow stands in for it.
+- **Under grab** (`Ctrl+Alt+G`) the host pointer is locked and shows no
+  image, so the viewer draws the guest cursor itself, where the guest says
+  its pointer is (`CMD_CURSOR_POS`; a Windows guest reports it while a
+  grabbed viewer draws it). It starts where the host pointer was when the
+  grab began, and is drawn only while the guest shows a cursor, the window
+  has the keyboard and the pointer is over the picture: under a game that
+  hides it nothing is drawn, and a release, a focus loss or the pointer
+  leaving takes it away at once. The overlay says `CURSOR VIEWER` while it
+  is drawn. A guest that reports no position (a Linux guest, an older Windows
+  driver) shows no cursor under grab.
+  - Wayland: a subsurface over the picture with the cursor's buffer,
+    scaled like the picture, with no input region. A move commits only the
+    cursor's own parent (a 1x1 transparent subsurface), never the picture.
+    When it goes, both surfaces lose their buffer; when it appears or goes,
+    the window's surface is committed once, nothing attached, with the area
+    the cursor covers damaged, so a compositor that repaints only damage
+    repaints it. It is unmapped when not
+    drawn, so the picture can be scanned out directly again; while it is
+    drawn it is listed among the direct scanout blockers. While tearing in
+    fullscreen it moves with a cursor nudge (below).
+  - X11: the guest's image stays the window's cursor under grab. The pointer
+    is confined and the deltas come from XI2 raw motion, which a warp does
+    not disturb, so the viewer warps the host pointer to the guest's
+    position and the X server draws the cursor there. Released, the host
+    pointer is where the guest's was.
+
 ## Presentation: immediate, vsync or latest per refresh
 
 A game in the VM renders as fast as it can; how soon each frame reaches the
@@ -272,7 +310,8 @@ its own (its configuration, tearing, a software cursor). The log also has a
 feedback:` line with the scanout tranche (or that the compositor names none).
 In fullscreen, a picture with no host cursor image (the guest draws its own,
 and always under grab) sets a NULL cursor, so no cursor needs to be
-composited over it.
+composited over it; the guest cursor the viewer draws under grab is
+composited while the guest shows one.
 
 A session with `WLR_NO_HARDWARE_CURSORS=1` (common with NVIDIA on wlroots-based
 compositors) has every cursor drawn in software, and a visible software cursor

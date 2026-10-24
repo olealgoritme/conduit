@@ -390,6 +390,8 @@ struct nb_sink {
      * CMD_CURSOR received -- read by the stats overlay, never reset. */
     uint64_t n_input;
     uint64_t n_cursor;
+    /* CMD_CURSOR_POS received (the guest's pointer position, under grab). */
+    uint64_t n_cursor_pos;
 
 };
 
@@ -634,6 +636,14 @@ struct nb_session_ops {
      */
     int  (*cursor)(struct nb_session *s, const struct nb_buf_desc *d,
                    unsigned hot_x, unsigned hot_y);
+    /*
+     * Conduit: the guest's pointer position (CMD_CURSOR_POS), guest pixels,
+     * the hotspot's.  OPTIONAL; a backend that sets it must also advertise
+     * NVKVM_BROKER_CAP_CURSOR_POS.  Arrives only while grabbed (give or take
+     * one in flight when the grab ends), when the backend draws the guest
+     * cursor itself because the host pointer is locked.
+     */
+    void (*cursor_pos)(struct nb_session *s, int x, int y);
     /*
      * virtio-nvgpu: a broker-owned CTRL+ALT+<key> chord other than G and F
      * (O overlay, D direct mode).  OPTIONAL; when NULL those chords are not

@@ -284,13 +284,16 @@ test-scanout: test/test_scanout.c nb_scanout.h
 test-relacc: test/test_relacc.c nb_relacc.h
 	$(CC) $(CFLAGS) -I . -o $@ test/test_relacc.c
 
+test-sprite: test/test_sprite.c nb_sprite.h nb_view.h
+	$(CC) $(CFLAGS) -I . -o $@ test/test_sprite.c
+
 test-present: test/test_present.c nb_present.h nb_scanout.h
 	$(CC) $(CFLAGS) -I . -o $@ test/test_present.c
 
 test-vmpause: test/test_vmpause.c nb_vmpause.h
 	$(CC) $(CFLAGS) -I . -o $@ test/test_vmpause.c
 
-check: all test-utf8 test-overlay test-relacc test-vmpause test-view test-ui test-pace test-latch test-blit test-gpusel test-scanout test-present $(if $(HAVE_GBM),test-gpuscale,)
+check: all test-utf8 test-overlay test-relacc test-sprite test-vmpause test-view test-ui test-pace test-latch test-blit test-gpusel test-scanout test-present $(if $(HAVE_GBM),test-gpuscale,)
 	./test-utf8
 	./test-present
 	./test-pace
@@ -302,6 +305,7 @@ check: all test-utf8 test-overlay test-relacc test-vmpause test-view test-ui tes
 	./test-view
 	./test-ui
 	./test-relacc
+	./test-sprite
 	./test-vmpause
 	./test-overlay
 	bash selftest.sh
@@ -326,4 +330,4 @@ install: $(BIN)
 
 clean:
 	rm -f $(BIN) $(TESTCLIENT) $(RELAY) $(DMASRC) $(SCANTEST) *.o *.d build_id.h \
-	      *-client-protocol.h *-protocol.c test-utf8 test-overlay test-gpuscale test-pace test-latch test-blit test-gpusel test-scanout test-present test-vmpause test/utf8_extracted.inc
+	      *-client-protocol.h *-protocol.c test-utf8 test-overlay test-gpuscale test-pace test-latch test-blit test-gpusel test-scanout test-present test-vmpause test-sprite test/utf8_extracted.inc

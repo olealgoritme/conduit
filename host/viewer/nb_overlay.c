@@ -388,7 +388,8 @@ void nb_ov_paint(uint32_t *px, unsigned w, unsigned h, unsigned sc,
     ov_line(px, w, h, sc, 10, l,
             s->rejected_ps > 0 || s->superseded_ps > 0 ? OV_YELLOW : OV_FG);
     snprintf(l, sizeof(l), "INPUT %.0f/S CURSOR %s", s->input_ps,
-             in->host_cursor ? "HOST" : "GUEST");
+             in->viewer_cursor ? "VIEWER" : in->host_cursor ? "HOST"
+                                                            : "GUEST");
     ov_line(px, w, h, sc, 11, l, OV_FG);
     /* How frames reach the compositor (nb_blit.h) and on which GPU. */
     snprintf(l, sizeof(l), "%s%s%s", in->path ? in->path : "-",

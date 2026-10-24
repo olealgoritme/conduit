@@ -55,6 +55,13 @@ pub const VIRTIO_GPU_CMD_RESOURCE_UNMAP_BLOB: u32 = 0x0209;
 pub const HELIOS_CMD_SET_CURSOR_BLOB: u32 = 0x0380;
 /// [`HeliosSetCursorBlob::flags`]: shown. Clear (or resource 0): hidden.
 pub const HELIOS_CURSOR_BLOB_F_VISIBLE: u32 = 1 << 0;
+/// Conduit extension, not virtio-gpu: where the guest's pointer is ([`HeliosMoveCursor`]), on
+/// the cursor queue only. The host answers `RESP_OK_NODATA` while a display client draws the
+/// guest cursor at the guest's position (the viewer under a grab, when the host pointer is
+/// locked), and `RESP_ERR_UNSPEC` when none needs positions -- as a host without the command
+/// does. The host's definition is `host/backend/protocol/src/venus.rs` `CMD_MOVE_CURSOR`;
+/// docs/SCANOUT.md "Hardware cursor, Windows guests".
+pub const HELIOS_CMD_MOVE_CURSOR: u32 = 0x0381;
 
 // ── Response types ────────────────────────────────────────────────────────
 pub const VIRTIO_GPU_RESP_OK_NODATA: u32 = 0x1100;
@@ -364,6 +371,19 @@ pub struct HeliosSetCursorBlob {
     pub flags: u32,
 }
 
+/// [`HELIOS_CMD_MOVE_CURSOR`]: the pointer is at (`x`, `y`) of scanout `scanout_id`, in its
+/// pixels, as `DxgkDdiSetPointerPosition` reports it (the host takes it as the hotspot's
+/// position). `flags` is 0. 40 bytes, field for field the host's `MoveCursor`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct HeliosMoveCursor {
+    pub hdr: VirtioGpuCtrlHdr,
+    pub scanout_id: u32,
+    pub x: i32,
+    pub y: i32,
+    pub flags: u32,
+}
+
 // Compile-time guarantees that the on-wire sizes are what the host expects.
 const _: () = {
     assert!(core::mem::size_of::<VirtioGpuCtrlHdr>() == 24);
@@ -381,6 +401,11 @@ const _: () = {
     assert!(core::mem::offset_of!(HeliosSetCursorBlob, resource_id) == 28);
     assert!(core::mem::offset_of!(HeliosSetCursorBlob, offset) == 48);
     assert!(core::mem::offset_of!(HeliosSetCursorBlob, flags) == 68);
+    assert!(core::mem::size_of::<HeliosMoveCursor>() == 40);
+    assert!(core::mem::offset_of!(HeliosMoveCursor, scanout_id) == 24);
+    assert!(core::mem::offset_of!(HeliosMoveCursor, x) == 28);
+    assert!(core::mem::offset_of!(HeliosMoveCursor, y) == 32);
+    assert!(core::mem::offset_of!(HeliosMoveCursor, flags) == 36);
 };
 
 /// Pin every wire constant above to the `virtio-bindings` crate (generated from

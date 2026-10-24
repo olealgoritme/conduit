@@ -41,6 +41,7 @@
  */
 #include <errno.h>
 #include <fcntl.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -244,6 +245,33 @@ struct nb_x11 {
     int       dlg_hot;          /* hovered row, -1 = none                 */
     bool      cursor_hidden;    /* what the content window currently shows */
     bool      cursor_dirty;     /* re-apply the policy even if unchanged  */
+    xcb_cursor_t cursor_cur;    /* the cursor the content window has      */
+
+    /*
+     * virtio-nvgpu: the guest's cursor (CMD_CURSOR) as the content window's
+     * cursor -- the host pointer's image over the picture, grabbed or not.
+     * X cursors are not scaled by the server, so the viewer's GPU draws the
+     * image at the picture's scale and reads it back once per shape (and
+     * again when the scale changes); a move copies nothing.  Under grab the
+     * pointer is confined and the deltas come from XI2 raw motion, so the
+     * host pointer is free to be placed: it is WARPED to where the guest
+     * says its pointer is (CMD_CURSOR_POS), and the server draws the cursor
+     * there.  Raw motion does not see a warp.
+     */
+    struct nb_gs *gc_gs;
+    bool      gc_gs_failed;
+    int       gc_fd;            /* our dup of the image's dma-buf, -1 none */
+    struct nb_buf_desc gc_d;    /* its description (fd = gc_fd)            */
+    unsigned  gc_hx, gc_hy;     /* hotspot, guest pixels                   */
+    bool      gc_on;            /* the guest shows a cursor                */
+    xcb_cursor_t gc_cursor;     /* built from it, 0 = none (copy failed)   */
+    int       gc_k1000;         /* the scale it was built at, -1 = never   */
+    uint32_t  gc_tw, gc_th;     /* the copier's read-back size             */
+    bool      gpos_valid;       /* a warp target is known                  */
+    int       warp_x, warp_y;   /* the last one, window coordinates        */
+#ifdef NB_HAVE_XCB_RENDER
+    xcb_render_pictformat_t argb_fmt;   /* depth-32 ARGB, 0 = none        */
+#endif
 
     /*
      * Display settings (nb_view.h) and where they last put the picture: the
@@ -295,6 +323,7 @@ static void x11_dlg_hide(struct nb_x11 *x);
 static void x11_dlg_paint(struct nb_x11 *x);
 static int  x11_dlg_hit(int px, int py);
 static void x11_cursor_policy(struct nb_x11 *x);
+static void x11_gc_follow(struct nb_x11 *x);
 static void x11_blit(struct nb_x11 *x, xcb_drawable_t d, xcb_gcontext_t gc,
                      const uint32_t *px, int w, int h);
 static void x11_clip_serve(struct nb_x11 *x,
@@ -887,6 +916,7 @@ static void x11_place(struct nb_x11 *x, int bw, int bh)
 
     nb_view_place(&x->vst.cur, bw, bh, x->win_w, x->win_h, 120, &x->place);
     x11_ptr_follow(x, bw, bh);
+    x11_gc_follow(x);
     if (x->con_x != v->x || x->con_y != v->y || x->con_w != v->w ||
         x->con_h != v->h) {
         x11_size_content_at(x, v->x, v->y, v->w, v->h);
@@ -2197,20 +2227,311 @@ static void x11_cursor_init(struct nb_x11 *x)
  */
 static void x11_cursor_policy(struct nb_x11 *x)
 {
-    bool hide = x->current >= 0 && !x->idle_shown && !x->dlg_mapped &&
-                !x->ui.open;
+    bool guest = x->current >= 0 && !x->idle_shown && !x->dlg_mapped &&
+                 !x->ui.open;
+    xcb_cursor_t want;
     uint32_t v;
 
     if (x->ui.open) {
         return;                 /* the area editor owns the shape */
     }
-    if (!x->blank_cursor || (hide == x->cursor_hidden && !x->cursor_dirty)) {
+    if (!x->blank_cursor) {
+        return;
+    }
+    /*
+     * Over the guest's picture: the guest's own cursor image when it gave one
+     * (CMD_CURSOR) -- grabbed too, where the pointer is warped to the guest's
+     * position -- and the viewer's ordinary arrow (none set: the parent's)
+     * when that image could not be copied.  A guest without a cursor image
+     * draws its cursor into the frame, or hides it: blank.
+     */
+    if (!guest) {
+        want = XCB_CURSOR_NONE;
+    } else if (x->gc_on) {
+        want = x->gc_cursor ? x->gc_cursor : XCB_CURSOR_NONE;
+    } else {
+        want = x->blank_cursor;
+    }
+    if (want == x->cursor_cur && !x->cursor_dirty) {
         return;                 /* idempotent: this runs on every frame */
     }
-    x->cursor_hidden = hide;
+    x->cursor_cur = want;
+    x->cursor_hidden = want == x->blank_cursor;
     x->cursor_dirty = false;
-    v = hide ? x->blank_cursor : XCB_CURSOR_NONE;
+    v = want;
     xcb_change_window_attributes(x->c, x->content, XCB_CW_CURSOR, &v);
+    xcb_flush(x->c);
+}
+
+/* ── virtio-nvgpu: the guest's cursor ────────────────────────────────────── */
+
+#define NB_X11_FOURCC_AR24 0x34325241u
+/* Largest cursor the viewer builds after scaling (a 256-pixel guest cursor
+ * on a picture drawn at twice its size). */
+#define NB_X11_CURSOR_MAX 512
+
+/* The GPU that copies cursor images, opened the first time one is needed. */
+static bool x11_gc_gs_ready(struct nb_x11 *x)
+{
+    const char *node = x->cfg ? x->cfg->render_node : NULL;
+    char why[200] = "";
+
+    if (x->gc_gs || x->gc_gs_failed) {
+        return x->gc_gs != NULL;
+    }
+    x->gc_gs = nb_gs_open(node, 0, NB_X11_FOURCC_AR24, 0, why, sizeof(why));
+    if (!x->gc_gs && node) {
+        x->gc_gs = nb_gs_open(NULL, 0, NB_X11_FOURCC_AR24, 0, why,
+                              sizeof(why));
+    }
+    if (!x->gc_gs) {
+        x->gc_gs_failed = true;
+        nb_err("guest cursor: no GPU here copies the guest's cursor image "
+               "(%s); the viewer's own arrow stands in for it",
+               why[0] ? why : "no render node");
+        return false;
+    }
+    nb_log("guest cursor: copied by %s at the picture's scale when its "
+           "shape changes; moves are the host pointer's",
+           nb_gs_node(x->gc_gs));
+    return true;
+}
+
+/* The picture's scale now, per axis. */
+static void x11_gc_scale(struct nb_x11 *x, double *kx, double *ky)
+{
+    *kx = *ky = 1.0;
+    if (x->current >= 0 && x->bufs[x->current].w > 0 &&
+        x->bufs[x->current].h > 0) {
+        nb_view_cursor_scale(&x->place, (int)x->bufs[x->current].w,
+                             (int)x->bufs[x->current].h, kx, ky);
+    }
+}
+
+static int x11_gc_k1000(double kx, double ky)
+{
+    return (int)(kx * 1000.0 + 0.5) * 65536 + (int)(ky * 1000.0 + 0.5);
+}
+
+/*
+ * The X cursor from the current image, at the picture's scale: the GPU draws
+ * it with its alpha into a read-back target, and the pixels become a
+ * depth-32 picture RENDER makes a cursor of.  0, or -errno (no cursor then:
+ * the policy shows the viewer's arrow).
+ */
+static int x11_gc_build(struct nb_x11 *x)
+{
+#ifdef NB_HAVE_XCB_RENDER
+    struct nb_gs_draw dr = { 0 };
+    char why[200] = "";
+    double kx, ky;
+    uint32_t *px;
+    int dw, dh, hx, hy, r;
+    xcb_pixmap_t pix;
+    xcb_gcontext_t gc;
+    xcb_render_picture_t pic;
+    xcb_cursor_t cur, old;
+
+    x11_gc_scale(x, &kx, &ky);
+    x->gc_k1000 = x11_gc_k1000(kx, ky);
+    if (x->gc_fd < 0 || !x->argb_fmt || !x11_gc_gs_ready(x)) {
+        return -ENOTSUP;
+    }
+    dw = (int)(x->gc_d.width * kx + 0.5);
+    dh = (int)(x->gc_d.height * ky + 0.5);
+    dw = dw < 1 ? 1 : dw > NB_X11_CURSOR_MAX ? NB_X11_CURSOR_MAX : dw;
+    dh = dh < 1 ? 1 : dh > NB_X11_CURSOR_MAX ? NB_X11_CURSOR_MAX : dh;
+    hx = (int)(x->gc_hx * kx + 0.5);
+    hy = (int)(x->gc_hy * ky + 0.5);
+    hx = hx >= dw ? dw - 1 : hx;
+    hy = hy >= dh ? dh - 1 : hy;
+    if ((uint32_t)dw != x->gc_tw || (uint32_t)dh != x->gc_th) {
+        x->gc_tw = x->gc_th = 0;
+        if (nb_gs_targets_readback(x->gc_gs, (uint32_t)dw, (uint32_t)dh, why,
+                                   sizeof(why)) <= 0) {
+            nb_err("guest cursor: %dx%d copy target: %s", dw, dh, why);
+            return -EIO;
+        }
+        x->gc_tw = (uint32_t)dw;
+        x->gc_th = (uint32_t)dh;
+    }
+    dr.dw = dw;
+    dr.dh = dh;
+    dr.sw = x->gc_d.width;
+    dr.sh = x->gc_d.height;
+    dr.alpha = true;
+    dr.nearest = dw == (int)x->gc_d.width && dh == (int)x->gc_d.height;
+    nb_gs_src_drop(x->gc_gs, 0);
+    r = nb_gs_src(x->gc_gs, 0, x->gc_fd, x->gc_d.width, x->gc_d.height,
+                  x->gc_d.stride, x->gc_d.offset, x->gc_d.fourcc,
+                  x->gc_d.modifier) >= 0 ? 0 : -EIO;
+    if (r == 0) {
+        r = nb_gs_draw(x->gc_gs, &dr, 50000, NULL);
+    }
+    px = r == 0 ? malloc((size_t)dw * (size_t)dh * 4) : NULL;
+    if (r == 0 && !px) {
+        r = -ENOMEM;
+    }
+    if (r == 0) {
+        r = nb_gs_readback(x->gc_gs, 0, px);
+    }
+    nb_gs_src_drop(x->gc_gs, 0);
+    if (r != 0) {
+        free(px);
+        nb_err("guest cursor: GPU copy of the %ux%u image failed (%d)",
+               x->gc_d.width, x->gc_d.height, r);
+        return r;
+    }
+    /* Premultiplied ARGB, which is what a RENDER cursor takes. */
+    pix = xcb_generate_id(x->c);
+    xcb_create_pixmap(x->c, 32, pix, x->screen->root, (uint16_t)dw,
+                      (uint16_t)dh);
+    gc = xcb_generate_id(x->c);
+    xcb_create_gc(x->c, gc, pix, 0, NULL);
+    {
+        uint32_t maxreq = xcb_get_maximum_request_length(x->c);
+        int rows = (int)((maxreq > 4096 ? maxreq - 4096 : 1024) /
+                         (uint32_t)dw);
+
+        rows = rows < 1 ? 1 : rows;
+        for (int y = 0; y < dh; y += rows) {
+            int n = dh - y < rows ? dh - y : rows;
+
+            xcb_put_image(x->c, XCB_IMAGE_FORMAT_Z_PIXMAP, pix, gc,
+                          (uint16_t)dw, (uint16_t)n, 0, (int16_t)y, 0, 32,
+                          (uint32_t)(dw * n * 4),
+                          (const uint8_t *)(px + (size_t)y * (size_t)dw));
+        }
+    }
+    free(px);
+    pic = xcb_generate_id(x->c);
+    xcb_render_create_picture(x->c, pic, pix, x->argb_fmt, 0, NULL);
+    cur = xcb_generate_id(x->c);
+    xcb_render_create_cursor(x->c, cur, pic, (uint16_t)hx, (uint16_t)hy);
+    xcb_render_free_picture(x->c, pic);
+    xcb_free_gc(x->c, gc);
+    xcb_free_pixmap(x->c, pix);
+    old = x->gc_cursor;
+    x->gc_cursor = cur;
+    x11_cursor_policy(x);
+    if (old) {
+        xcb_free_cursor(x->c, old);     /* the window holds the new one */
+    }
+    xcb_flush(x->c);
+    return 0;
+#else
+    (void)x;
+    return -ENOTSUP;
+#endif
+}
+
+/* Drop the image: a hide, a failed copy, or the VM went away. */
+static void x11_gc_drop(struct nb_x11 *x)
+{
+    xcb_cursor_t old = x->gc_cursor;
+
+    x->gc_cursor = 0;
+    x11_cursor_policy(x);
+    if (old) {
+        xcb_free_cursor(x->c, old);
+    }
+    if (x->gc_fd >= 0) {
+        close(x->gc_fd);
+        x->gc_fd = -1;
+    }
+    x->gc_k1000 = -1;
+}
+
+static int x11_cursor(struct nb_session *s, const struct nb_buf_desc *d,
+                      unsigned hx, unsigned hy)
+{
+    struct nb_x11 *x = s->priv;
+    int fd, r;
+
+    if (!d) {
+        x->gc_on = false;
+        x->gpos_valid = false;
+        x11_cursor_policy(x);
+        return 0;
+    }
+    /* Kept, so a new scale can copy it again without the guest. */
+    fd = fcntl(d->fd, F_DUPFD_CLOEXEC, 0);
+    if (fd < 0) {
+        return -errno;
+    }
+    if (x->gc_fd >= 0) {
+        close(x->gc_fd);
+    }
+    x->gc_fd = fd;
+    x->gc_d = *d;
+    x->gc_d.fd = fd;
+    x->gc_hx = hx;
+    x->gc_hy = hy;
+    x->gc_on = true;
+    r = x11_gc_build(x);
+    if (r != 0) {
+        /* The guest shows a cursor this viewer cannot copy: the arrow. */
+        xcb_cursor_t old = x->gc_cursor;
+
+        x->gc_cursor = 0;
+        x11_cursor_policy(x);
+        if (old) {
+            xcb_free_cursor(x->c, old);
+        }
+        xcb_flush(x->c);
+    }
+    return r;
+}
+
+/* The picture's scale changed: the same image again at the new one. */
+static void x11_gc_follow(struct nb_x11 *x)
+{
+    double kx, ky;
+
+    if (!x->gc_on || x->gc_fd < 0) {
+        return;
+    }
+    x11_gc_scale(x, &kx, &ky);
+    if (x11_gc_k1000(kx, ky) != x->gc_k1000) {
+        (void)x11_gc_build(x);
+    }
+}
+
+/*
+ * CMD_CURSOR_POS, under grab: put the host pointer where the guest's is.  The
+ * pointer is confined to the window and the guest gets raw deltas, so the
+ * warp moves only the image the server draws; it is the guest's own hotspot
+ * position mapped through the picture, kept inside the visible picture.
+ */
+static void x11_cursor_pos(struct nb_session *s, int gx, int gy)
+{
+    struct nb_x11 *x = s->priv;
+    const struct nb_rect *v = &x->place.vis;
+    int bw, bh, wx, wy;
+    double kx, ky;
+
+    if (!x->grabbed || !x->gc_on || x->current < 0 || x->ui.open ||
+        x->dlg_mapped) {
+        return;
+    }
+    bw = (int)x->bufs[x->current].w;
+    bh = (int)x->bufs[x->current].h;
+    if (bw <= 0 || bh <= 0 || v->w <= 0 || v->h <= 0) {
+        return;
+    }
+    nb_view_cursor_scale(&x->place, bw, bh, &kx, &ky);
+    wx = (int)floor(x->place.pic.x + gx * kx + 0.5);
+    wy = (int)floor(x->place.pic.y + gy * ky + 0.5);
+    wx = wx < v->x ? v->x : wx >= v->x + v->w ? v->x + v->w - 1 : wx;
+    wy = wy < v->y ? v->y : wy >= v->y + v->h ? v->y + v->h - 1 : wy;
+    if (x->gpos_valid && wx == x->warp_x && wy == x->warp_y) {
+        return;
+    }
+    x->gpos_valid = true;
+    x->warp_x = wx;
+    x->warp_y = wy;
+    xcb_warp_pointer(x->c, XCB_NONE, x->win, 0, 0, 0, 0, (int16_t)wx,
+                     (int16_t)wy);
     xcb_flush(x->c);
 }
 
@@ -2492,6 +2813,9 @@ static int x11_set_grab(struct nb_session *s, bool on)
     }
     xcb_flush(x->c);
     x->grabbed = on;
+    /* A grab starts with the pointer where the guest's is (it followed the
+     * host pointer until now); released, the host pointer leads again. */
+    x->gpos_valid = false;
     return 0;
 }
 
@@ -2569,7 +2893,16 @@ static void x11_close(struct nb_session *s)
             x11_buf_free(x, i);
         }
         x11_gt_drop(x);
+        x11_gc_drop(x);
         xcb_flush(x->c);
+    }
+    if (x->gc_fd >= 0) {
+        close(x->gc_fd);
+        x->gc_fd = -1;
+    }
+    if (x->gc_gs) {
+        nb_gs_close(x->gc_gs);
+        x->gc_gs = NULL;
     }
     if (x->gs) {
         nb_gs_close(x->gs);
@@ -2810,6 +3143,8 @@ skip_dmabuf_extensions:
     nb_ui_init(&x->ui, &x->vst);
     nb_upscaler_init(&x->upscaler);
     x->ui_cur = -1;
+    x->gc_fd = -1;
+    x->gc_k1000 = -1;
 #ifdef NB_HAVE_XCB_RENDER
     {
         /* One depth-24 format is all the scaler needs; without it we simply
@@ -2823,10 +3158,21 @@ skip_dmabuf_extensions:
                 xcb_render_query_pict_formats_formats_iterator(pf);
 
             for (; it.rem; xcb_render_pictforminfo_next(&it)) {
-                if (it.data->depth == 24 &&
-                    it.data->type == XCB_RENDER_PICT_TYPE_DIRECT) {
+                const xcb_render_directformat_t *df = &it.data->direct;
+
+                if (it.data->type != XCB_RENDER_PICT_TYPE_DIRECT) {
+                    continue;
+                }
+                if (it.data->depth == 24 && !x->pict_fmt) {
                     x->pict_fmt = it.data->id;
-                    break;
+                }
+                /* The guest cursor's: A8R8G8B8, as a RENDER cursor wants. */
+                if (it.data->depth == 32 && df->alpha_shift == 24 &&
+                    df->red_shift == 16 && df->green_shift == 8 &&
+                    df->blue_shift == 0 && df->alpha_mask == 0xff &&
+                    df->red_mask == 0xff && df->green_mask == 0xff &&
+                    df->blue_mask == 0xff && !x->argb_fmt) {
+                    x->argb_fmt = it.data->id;
                 }
             }
             free(pf);
@@ -2974,6 +3320,25 @@ formats_done:
              "this build has no xcb-xinput, so there is NO relative motion "
              "under grab: the pointer is confined but a fast turn stops at "
              "the window edge (install libxcb-xinput-dev and rebuild)");
+#endif
+#ifdef NB_HAVE_XCB_RENDER
+    /*
+     * The guest's cursor image as this window's cursor: needs a depth-32
+     * RENDER format and a GPU that copies the image.  Its position under
+     * grab needs the deltas to come from XI2 raw motion, which a warp of
+     * the host pointer does not disturb.
+     */
+    if (x->argb_fmt && x11_gc_gs_ready(x)) {
+        s->caps |= NVKVM_BROKER_CAP_CURSOR;
+#ifdef NB_HAVE_XCB_XINPUT
+        if (x->have_xi) {
+            s->caps |= NVKVM_BROKER_CAP_CURSOR_POS;
+        }
+#endif
+    } else {
+        nb_log("guest cursor: not offered (needs a depth-32 RENDER format "
+               "and a GPU that copies the image); the guest draws its own");
+    }
 #endif
     if (!s->grab_caveat[0]) {
         snprintf(s->grab_caveat, sizeof(s->grab_caveat),
@@ -3471,6 +3836,10 @@ static void x11_client_detach_clip(struct nb_session *s, uint64_t generation)
     struct nb_x11 *x = s->priv;
 
     x->client_attached = false;
+    /* The guest's cursor described the departed VM. */
+    x->gc_on = false;
+    x->gpos_valid = false;
+    x11_gc_drop(x);
     if (x->fetch_active && x->fetch_generation == generation) {
         x->fetch_active = false;
         x->fetch_generation = 0;
@@ -4146,6 +4515,8 @@ static const struct nb_session_ops x11_ops = {
     .resync = x11_resync,
     .tick = x11_tick,
     .hotkey = x11_hotkey,
+    .cursor = x11_cursor,
+    .cursor_pos = x11_cursor_pos,
     .notify_clipboard = x11_notify_clipboard,
     .set_clipboard = x11_set_clipboard,
     .fetch_clipboard = x11_fetch_clipboard,
