@@ -1,5 +1,5 @@
 conduit-stream
-Copyright 2026 The Conduit authors. Licensed under the Apache License 2.0 (LICENSE).
+Copyright 2026 Ole Algoritme and the Conduit contributors. Licensed under the Apache License 2.0 (LICENSE).
 
 The GameStream host in src/gamestream/ is an independent implementation of
 the protocol spoken by Moonlight (https://moonlight-stream.org). The protocol's

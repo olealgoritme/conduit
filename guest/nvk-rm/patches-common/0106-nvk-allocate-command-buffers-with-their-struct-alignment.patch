@@ -1,0 +1,23 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: SR_team <me@sr.team>
+Date: Sat, 24 Oct 2026 03:00:00 +0500
+Subject: [PATCH] nvk: allocate command buffers with their struct alignment
+
+nvk_cmd_buffer contains descriptor state aligned to 16 bytes. Request
+that alignment from the command pool allocator rather than assuming
+8-byte allocations happen to be more aligned.
+
+---
+diff --git a/src/nouveau/vulkan/nvk_cmd_buffer.c b/src/nouveau/vulkan/nvk_cmd_buffer.c
+index d810686bb86..840a72460c8 100644
+--- a/src/nouveau/vulkan/nvk_cmd_buffer.c
++++ b/src/nouveau/vulkan/nvk_cmd_buffer.c
+@@ -86,7 +86,7 @@ nvk_create_cmd_buffer(struct vk_command_pool *vk_pool,
+    struct nvk_cmd_buffer *cmd;
+    VkResult result;
+
+-   cmd = vk_zalloc(&pool->vk.alloc, sizeof(*cmd), 8,
++   cmd = vk_zalloc(&pool->vk.alloc, sizeof(*cmd), alignof(struct nvk_cmd_buffer),
+                    VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+    if (cmd == NULL)
+       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);

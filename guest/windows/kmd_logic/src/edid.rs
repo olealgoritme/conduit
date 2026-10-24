@@ -152,6 +152,20 @@ pub fn signal_for(w: u32, h: u32, refresh_mhz: u32, native: Option<&NativeTiming
     }
 }
 
+/// The primary allocation must report the same refresh fraction as its VidPn mode.
+pub fn allocation_refresh_rate(
+    w: u32,
+    h: u32,
+    refresh_mhz: u32,
+    native: Option<&NativeTiming>,
+) -> (u32, u32) {
+    let (n, d) = signal_for(w, h, refresh_mhz, native).vsync;
+    (
+        n.min(u64::from(u32::MAX)) as u32,
+        d.min(u64::from(u32::MAX)) as u32,
+    )
+}
+
 /// DisplayID 2.0 data block tag: Type VII Detailed Timing (3-byte pixel clock
 /// in 1 kHz units, stored minus one).
 const DID_TYPE_VII: u8 = 0x22;
@@ -366,6 +380,18 @@ mod tests {
         assert_eq!((t.width, t.height), (1920, 1080));
         // build_edid targets 60 Hz; the 10 kHz clock step leaves it within 0.1 Hz.
         assert!(t.refresh_mhz.abs_diff(60_000) < 100, "{}", t.refresh_mhz);
+    }
+
+    #[test]
+    fn primary_refresh_keeps_the_native_pixel_clock_fraction() {
+        let n = native_timing(include_bytes!("testdata/edid-1600x900-60.bin")).unwrap();
+        assert_eq!((n.width, n.height, n.refresh_mhz), (1600, 900, 59_999));
+        let actual = allocation_refresh_rate(1600, 900, n.refresh_mhz, Some(&n));
+        assert_eq!(actual, (583_375, 9_723));
+        assert_ne!(actual, (59_999, 1000));
+        assert_eq!(allocation_refresh_rate(1280, 720, 59_999, Some(&n)), (59_999, 1000));
+        assert_eq!(allocation_refresh_rate(1600, 900, 120_000, Some(&n)), (120, 1));
+        assert_eq!(allocation_refresh_rate(1600, 900, 60_000, None), (60, 1));
     }
 
     #[test]
