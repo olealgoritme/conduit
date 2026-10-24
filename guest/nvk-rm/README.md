@@ -66,10 +66,13 @@ Patch numbers are file numbers in the directory named in the patch tables.
 | `NVK_MDI_BATCH` | 0 | read indirect multi-draw records in batches of n (max 204; 64 suggested) (common 24) |
 | `NVK_DRAW_SYSVAL_SKIP` | 0 | write draw parameters to the root table only for shaders that read them (common 35) |
 | `NVK_MME_PACK_INSTR`, `NVK_SKIP_DRAWID`, `NVK_BLACKWELL_MME_MEMBAR` | 0, 0, 1 | MME/indirect-draw A/B levers (common 26, 29) |
+| `NVK_DISPATCH_INDIRECT_PREFETCH` | 0 | only the first indirect dispatch argument copy after a barrier is a no-prefetch GPFIFO entry; the default makes every copy one (2 per indirect dispatch) (common 82) |
+| `NVK_BARRIER_DEDUP` | 0 | a barrier whose storage-write flush already invalidated the shader data caches emits no second GLOBAL_DATA invalidate (common 82) |
 | **Memory** | | |
 | `NVK_RM_BAR_MB` | 0 | the DEVICE_LOCAL \| HOST_VISIBLE heap through BAR1: 0 off, -1 all of BAR1, N MiB caps it (common 30) |
 | `NVK_RM_DESC_TABLE_VRAM` | 0 | descriptor tables/pools in CPU-mapped VRAM (common 26, 52) |
 | `NVK_RM_UPLOAD_VRAM` | `compute` on Windows, 0 elsewhere | command buffer upload memory in CPU-mapped VRAM: `compute` the compute root descriptor tables (a tiny dispatch costs 0.48 us from VRAM, 2.5-3.7 us from system memory), `1` all of it, `0` none (common 26, 52, 73) |
+| `NVK_QMD_LAT` | 1 on Windows, 0 elsewhere | QMDs come from the compute root tables' latency-bound upload stream (VRAM under `NVK_RM_UPLOAD_VRAM=compute`); `0` keeps them in the general upload stream, which is system memory (common 82) |
 | `NVK_CMD_MEM_CACHE` | 64 | command buffer memory blocks of each kind a device keeps from destroyed and trimmed command pools for new ones; 0 frees them (common 54) |
 | `NVK_RM_SYSMEM_CACHED` | 1 | host-visible system memory GPU-cacheable in L2 (`=0` off, `=desc`/`=app` one kind only) |
 | `NVK_RM_COMPRESSION` | 1 | compressible VRAM for images in dedicated allocations on GB20x |
@@ -106,7 +109,7 @@ Patch numbers are file numbers in the directory named in the patch tables.
 | `NAK_VEC_CSE` | 1 | the copies that make a splat a register vector serve its later uses in the block (common 66) |
 | `NAK_WEAK_MEM` | 0 | weak (L1-cacheable) order for non-coherent global, SSBO and image accesses (common 67) |
 | `NAK_BAR_SHARE`, `NAK_LAT` | 0, 0 | scoreboard sharing and SM120 latency padding, for hardware validation with `tools/naktest` (common 63) |
-| `NVK_DIAG_NO_WFI_BARRIER`, `NVK_DIAG_WFI_COUNT` | 0, 0 | measurement only: pipeline barriers without WAIT_FOR_IDLE (unsafe); count barrier idles per second (common 64) |
+| `NVK_DIAG_NO_WFI_BARRIER`, `NVK_DIAG_WFI_COUNT` | 0, 0 | measurement only: pipeline barriers without WAIT_FOR_IDLE (unsafe; it does not affect barriers with a shader storage write in the source scope, whose cache flush idles itself); count barrier idles per second (common 64) |
 | **Queues** | | |
 | `NVK_RM_ASYNC_COMPUTE` | 1 on GB20x, 0 elsewhere | a compute queue family whose queues run next to the graphics queue (see "Async compute"); 0 = one queue family (common 69) |
 | `NVK_RM_ASYNC_WAIT_SWITCH` | 0 | 1: every GPU wait asks for a TSG switch when it blocks, also waits between channels of one TSG (common 69) |
@@ -210,6 +213,12 @@ was full.
 busiest window and a whole-run table per shader (ms per frame and calls per
 frame with `--fps`, the frame rate of the profiled run). `--skip` leaves out
 the first windows (loading and shader compiles).
+
+`tools/dispcost` gives a profile-free number per dispatch. It runs N
+dependent dispatches in one command buffer, timestamps only the start and
+the end, and reports the cost per dispatch for each barrier variant,
+shader size and grid, and for direct and indirect dispatch. It runs on NVK
+and on NVIDIA's driver.
 
 ### Dispatch capture (common 0072)
 
@@ -392,6 +401,7 @@ backend. Numbers are file numbers (there is no 0016 or 0025).
 | 0075 | NAK: a divergent loop with no continue skips the per-iteration lane sync (BSSY/BSYNC around the body) and its breaks go to the loop's exit sync directly (`NAK_LOOP_CONT_SYNC=1` restores the sync; part of the shader cache key) |
 | 0076 | NAK: the GPR copy of a uniform value that the legalizer makes serves the block's non-ALU uses too (`NAK_DEBUG=noucse` makes a copy per use) |
 | 0077 | NAK: in compute shaders, a trailing loop that never iterates and a trailing divergent if with a small guarded side become an early exit (EXIT for the lanes that leave) followed by the rest of the shader at the top level, where its uniform values use the uniform datapath; the rematerializer, `nak_nir_opt_uniform_address` and divergent top-level loops follow (`NAK_EARLY_EXIT=0` restores the old structure; part of the shader cache key) |
+| 0082 | QMDs from the latency-bound upload stream next to the compute root tables, so on Windows they are in CPU-mapped VRAM and a dependent dispatch no longer waits for a system memory read after a barrier's idle (`NVK_QMD_LAT`, default on on Windows); opt-in `NVK_DISPATCH_INDIRECT_PREFETCH` (prefetchable indirect argument copies after the first one since a barrier) and `NVK_BARRIER_DEDUP` (no second shader data invalidate after a storage-write flush). Measured with `tools/dispcost` |
 
 ## Per-draw cost (common 0001-0007)
 

@@ -1778,6 +1778,21 @@ read = "device creation"
 effect = "Which command buffer upload memory lives in CPU-mapped VRAM written through BAR1 instead of system memory. compute (the default on Windows): the compute root descriptor tables, which every dispatch waits for (tiny dispatches cost 0.48 us each from VRAM against 2.5-3.7 us from system memory on an RTX 5090); 1: all upload memory; 0: none."
 default_note = "compute on Windows, 0 elsewhere"
 
+[env.NVK_QMD_LAT]
+class = "tuning"
+read = "first use (once per process)"
+effect = "QMDs (the compute dispatch descriptors) come from the compute root tables' latency-bound upload stream, which is CPU-mapped VRAM under NVK_RM_UPLOAD_VRAM=compute, so a dispatch after a barrier does not wait for a system memory read. 1 is the default on Windows; 0 (the default elsewhere) keeps them in the general upload stream in system memory."
+
+[env.NVK_DISPATCH_INDIRECT_PREFETCH]
+class = "experiment"
+read = "first use (once per process)"
+effect = "1: only the first indirect dispatch argument copy after a barrier is a no-prefetch pushbuffer entry; by default every copy is one (two per indirect dispatch). A/B knob, default 0."
+
+[env.NVK_BARRIER_DEDUP]
+class = "experiment"
+read = "first use (once per process)"
+effect = "1: a pipeline barrier whose storage-write flush already invalidated the shader data caches emits no second GLOBAL_DATA invalidate. A/B knob, default 0."
+
 [env.NVK_RM_VIDEO]
 class = "debug"
 read = "physical device enumeration"
