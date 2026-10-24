@@ -52,7 +52,7 @@
  X(vkCreateFence) X(vkWaitForFences) X(vkResetFences) X(vkDeviceWaitIdle) \
  X(vkCreatePipelineCache) X(vkGetPipelineCacheData) \
  X(vkCreateGraphicsPipelines) X(vkCmdBeginRendering) X(vkCmdEndRendering) X(vkCmdDraw) X(vkCmdSetViewport) \
- X(vkCmdSetScissor)
+ X(vkCmdSetScissor) X(vkCmdDrawIndexed) X(vkCmdBindIndexBuffer) X(vkCmdBindVertexBuffers)
 #define X(n) static PFN_##n n;
 VKFUNCS(X)
 #undef X
@@ -163,7 +163,8 @@ struct res {
     VkBuffer stage; uint8_t *stage_map; uint64_t alloc_size, stage_size;
     VkBuffer pristine; /* device-local copy of the captured bytes of a writable resource, for resets */
     VkBuffer rb; uint8_t *rb_map;
-    /* draws: an attachment (1 color, 2 depth, 3 stencil), its index and view format */
+    /* draws: an attachment (1 color, 2 depth, 3 stencil), its index and view format; or the index buffer (4), a
+     * vertex buffer (5, attachment = its binding) */
     int role; uint32_t attachment; VkFormat att_format; VkImageAspectFlags att_aspects; int att_shared;
 };
 
@@ -227,7 +228,8 @@ static void load_manifest(struct json *m)
         r->file = jstr(j, "file", NULL); r->size = ju64(j, "size", 0); r->note = jstr(j, "note", NULL);
         {
             const char *role = jstr(j, "role", "");
-            r->role = !strcmp(role, "color") ? 1 : !strcmp(role, "depth") ? 2 : !strcmp(role, "stencil") ? 3 : 0;
+            r->role = !strcmp(role, "color") ? 1 : !strcmp(role, "depth") ? 2 : !strcmp(role, "stencil") ? 3 :
+                      !strcmp(role, "index") ? 4 : !strcmp(role, "vertex") ? 5 : 0;
             r->attachment = (uint32_t)jnum(j, "attachment", 0);
             r->att_format = (VkFormat)jnum(j, "attachment_format", 0);
         }
@@ -373,6 +375,8 @@ static void create_device(void)
     if (have_md) exts[nexts++] = "VK_EXT_mutable_descriptor_type"; else if (have_vmd) exts[nexts++] = "VK_VALVE_mutable_descriptor_type";
     if (have_fc2) exts[nexts++] = "VK_KHR_shader_float_controls2";
     if (have_rb2) exts[nexts++] = "VK_EXT_robustness2";
+    int have_vad = has_ext(ep, ne, "VK_EXT_vertex_attribute_divisor"); /* draws with instance step rates */
+    if (have_vad) exts[nexts++] = "VK_EXT_vertex_attribute_divisor";
     free(ep);
 
     struct { VkStructureType s; void *p; VkBool32 fc2; } fc2f = { (VkStructureType)1000528000, NULL, 0 };
@@ -380,6 +384,9 @@ static void create_device(void)
     VkPhysicalDeviceMutableDescriptorTypeFeaturesEXT mdf = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MUTABLE_DESCRIPTOR_TYPE_FEATURES_EXT,
                                                              have_rb2 ? (void *)&rb2 : (have_fc2 ? (void *)&fc2f : NULL) };
     VkPhysicalDeviceVulkan13Features f13 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, (have_md || have_vmd) ? (void *)&mdf : mdf.pNext };
+    VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT vadf = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT,
+                                                               f13.pNext };
+    if (have_vad) f13.pNext = &vadf;
     VkPhysicalDeviceVulkan12Features f12 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &f13 };
     VkPhysicalDeviceVulkan11Features f11 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, &f12 };
     VkPhysicalDeviceFeatures2 f2 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &f11 };
@@ -555,7 +562,8 @@ static void create_resources(uint8_t *push)
             r->alloc_size = align_up(want ? want : 16, 256);
             r->buf = make_buffer(r->alloc_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
                                  VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
-                                 VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, NULL);
+                                 VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+                                 VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, NULL);
             make_stage(r, r->alloc_size);
             if (r->kind == R_BDA && r->push_offset >= 0 && r->push_offset + 8 <= 256) {
                 VkBufferDeviceAddressInfo bi = { VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, NULL, r->buf };
@@ -647,6 +655,29 @@ static void create_graphics_pipeline(VkShaderModule fs)
         { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_VERTEX_BIT, vs, "main", NULL },
         { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_FRAGMENT_BIT, fs, "main", NULL } };
     VkPipelineVertexInputStateCreateInfo vi = { VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
+    VkVertexInputBindingDescription vib[32]; VkVertexInputAttributeDescription via[32];
+    VkVertexInputBindingDivisorDescriptionEXT vid[32]; uint32_t nvid = 0;
+    VkPipelineVertexInputDivisorStateCreateInfoEXT vdiv = { VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_DIVISOR_STATE_CREATE_INFO_EXT };
+    {
+        const struct json *vj = jget(d, "vertex_input"), *bs = jget(vj, "bindings"), *as = jget(vj, "attributes");
+        for (int i = 0; bs && i < bs->n && i < 32; i++) {
+            const struct json *b = jidx(bs, i);
+            vib[i] = (VkVertexInputBindingDescription){ (uint32_t)jnum(b, "binding", 0), (uint32_t)jnum(b, "stride", 0),
+                                                        (VkVertexInputRate)jnum(b, "input_rate", 0) };
+            uint32_t div = (uint32_t)jnum(b, "divisor", 1);
+            if (vib[i].inputRate == VK_VERTEX_INPUT_RATE_INSTANCE && div != 1)
+                vid[nvid++] = (VkVertexInputBindingDivisorDescriptionEXT){ vib[i].binding, div };
+            vi.vertexBindingDescriptionCount = (uint32_t)i + 1;
+        }
+        for (int i = 0; as && i < as->n && i < 32; i++) {
+            const struct json *a = jidx(as, i);
+            via[i] = (VkVertexInputAttributeDescription){ (uint32_t)jnum(a, "location", 0), (uint32_t)jnum(a, "binding", 0),
+                                                          (VkFormat)jnum(a, "format", 0), (uint32_t)jnum(a, "offset", 0) };
+            vi.vertexAttributeDescriptionCount = (uint32_t)i + 1;
+        }
+        vi.pVertexBindingDescriptions = vib; vi.pVertexAttributeDescriptions = via;
+        if (nvid) { vdiv.vertexBindingDivisorCount = nvid; vdiv.pVertexBindingDivisors = vid; vi.pNext = &vdiv; }
+    }
     VkPipelineInputAssemblyStateCreateInfo ia = { VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, NULL, 0,
         (VkPrimitiveTopology)jnum(d, "topology", VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST), (VkBool32)jnum(d, "primitive_restart", 0) };
     VkPipelineViewportStateCreateInfo vp = { VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, NULL, 0, 1, NULL, 1, NULL };
@@ -740,8 +771,23 @@ static void record_draw(VkCommandBuffer cb)
                     { (uint32_t)jarr(d, "scissor", 2, 1), (uint32_t)jarr(d, "scissor", 3, 1) } };
     vkCmdSetViewport(cb, 0, 1, &v);
     vkCmdSetScissor(cb, 0, 1, &sc);
-    vkCmdDraw(cb, (uint32_t)jnum(d, "vertex_count", 3), (uint32_t)jnum(d, "instance_count", 1),
-              (uint32_t)jnum(d, "first_vertex", 0), (uint32_t)jnum(d, "first_instance", 0));
+    for (int i = 0; i < NR; i++) {
+        struct res *r = &R[i];
+        if (r->role == 5 && r->buf) {
+            VkDeviceSize o = 0;
+            vkCmdBindVertexBuffers(cb, r->attachment, 1, &r->buf, &o);
+        }
+    }
+    int indexed = (int)jnum(d, "indexed", 0);
+    for (int i = 0; indexed && i < NR; i++)
+        if (R[i].role == 4 && R[i].buf) vkCmdBindIndexBuffer(cb, R[i].buf, 0, (VkIndexType)jnum(d, "index_type", 0));
+    if (indexed)
+        /* the index resource starts at the draw's first index */
+        vkCmdDrawIndexed(cb, (uint32_t)jnum(d, "index_count", 0), (uint32_t)jnum(d, "instance_count", 1), 0,
+                         (int32_t)jnum(d, "vertex_offset", 0), (uint32_t)jnum(d, "first_instance", 0));
+    else
+        vkCmdDraw(cb, (uint32_t)jnum(d, "vertex_count", 3), (uint32_t)jnum(d, "instance_count", 1),
+                  (uint32_t)jnum(d, "first_vertex", 0), (uint32_t)jnum(d, "first_instance", 0));
     vkCmdEndRendering(cb);
 }
 
@@ -976,8 +1022,9 @@ int main(int argc, char **argv)
     /* Checksums of what the shader may write (after the last dispatch, from the captured state with resets) */
     uint64_t all = 0xcbf29ce484222325ull;
     if (g_draw)
-        printf("%s on %s: draw of %u vertices x %u instances, area %ux%u, %d resources (%d writable, %d not captured), "
+        printf("%s on %s: draw of %u %s x %u instances, area %ux%u, %d resources (%d writable, %d not captured), "
                "%.1f MiB, pipeline %.1f ms\n", g_hash, g_pp.deviceName, (uint32_t)jnum(g_dj, "vertex_count", 0),
+               jnum(g_dj, "indexed", 0) ? "indices" : "vertices",
                (uint32_t)jnum(g_dj, "instance_count", 0), (uint32_t)jarr(g_dj, "render_area", 2, 0),
                (uint32_t)jarr(g_dj, "render_area", 3, 0), NR, nwrite, nerr, bytes / 1048576.0, g_compile_ms);
     else
