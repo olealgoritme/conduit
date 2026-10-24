@@ -1,3 +1,5 @@
+Copyright 2026 Ole Algoritme and the Conduit contributors.
+
 Conduit is a combination of components under different licenses:
 
 - guest/linux: GPL-2.0-only (from virtio-nvgpu driver/)

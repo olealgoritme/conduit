@@ -454,5 +454,8 @@ by the WinBoat project (rupansh, TibixDev), with
 [virglrenderer](https://gitlab.freedesktop.org/virgl/virglrenderer).
 Licenses: see [LICENSE](LICENSE) and the `NOTICE` files in each component.
 
+Conduit is made by Ole Algoritme. Copyright 2026 Ole Algoritme and the
+Conduit contributors.
+
 NVIDIA, GeForce and RTX are trademarks of NVIDIA Corporation. Conduit is not
 affiliated with NVIDIA.
