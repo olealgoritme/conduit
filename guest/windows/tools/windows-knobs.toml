@@ -636,6 +636,12 @@ read = "each swapchain creation and every registry change (composed present)"
 effect = "1: generated pictures one refresh apart, so the real frame is held back less (the cadence gets uneven); with a fixed multiplier and EnhanceFgTarget, no generation while the game reaches the target. A per-exe profile's LowLatency wins."
 see = "[enhance.md](../guest/nvk-rm/docs/enhance.md)"
 
+[umd.EnhanceOverlay]
+class = "supported"
+read = "each swapchain creation and every registry change (composed present)"
+effect = "1: an on-screen counter at the top left of every presented picture: the application's frames per second / pictures shown per second, the frame generation mode and the scaler (e.g. 80 / 160  FG 2x  FSR), updated twice a second; Vulkan, Zink, D3D11 and D3D12 (EnhanceD3D). On its own it turns the composed present's enhancement path on (a 1:1 copy with the counter). Default 0. A per-exe profile's Overlay wins; the tray sets both."
+see = "[enhance.md](../guest/nvk-rm/docs/enhance.md#on-screen-counter)"
+
 [umd.EnhanceScaler]
 class = "supported"
 read = "each swapchain creation and every registry change (composed present)"
@@ -1426,6 +1432,12 @@ class = "supported"
 read = "each swapchain creation"
 effect = "1 or 0; wins over EnhanceLowLatency."
 see = "[enhance.md](../guest/nvk-rm/docs/enhance.md)"
+
+[env.MESA_WSI_ENHANCE_OVERLAY]
+class = "supported"
+read = "each swapchain creation"
+effect = "1: the on-screen counter for every window of the process, 0: none; wins over EnhanceOverlay and a profile's Overlay."
+see = "[enhance.md](../guest/nvk-rm/docs/enhance.md#on-screen-counter)"
 
 [env.MESA_WSI_ENHANCE_SCALER]
 class = "supported"
