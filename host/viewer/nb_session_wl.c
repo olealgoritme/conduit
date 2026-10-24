@@ -2974,17 +2974,19 @@ static int wl_gs_present(struct nb_wl *w, int slot, int pw, int ph,
                  used != w->vst.upscale && w->vst.upscale ? "Upscaler: " : "",
                  used != w->vst.upscale && w->vst.upscale && why ? why : "");
     }
-    /* The main surface: one opaque output-size buffer, nothing on top. */
+    /* The main surface: one opaque output-size buffer, nothing on top.
+     * Without wp_viewporter the buffer is the surface's size already
+     * (wl_nvp_frame), so there is nothing to set. */
     wl_leave_sub(w);
-    if (w->vp_src[0]) {
+    if (w->viewport && w->vp_src[0]) {
         wp_viewport_set_source(w->viewport, wl_fixed_from_int(-1),
                                wl_fixed_from_int(-1), wl_fixed_from_int(-1),
                                wl_fixed_from_int(-1));
         w->vp_src[0] = false;
     }
-    if (pw == w->win_w && ph == w->win_h) {
+    if (w->viewport && pw == w->win_w && ph == w->win_h) {
         wp_viewport_set_destination(w->viewport, -1, -1);
-    } else {
+    } else if (w->viewport) {
         wp_viewport_set_destination(w->viewport, w->win_w, w->win_h);
     }
     /* The pass was waited for: the acquire point is signalled at the
@@ -3008,6 +3010,63 @@ static int wl_gs_present(struct nb_wl *w, int slot, int pw, int ph,
                         : w->so.why);
     }
     return 1;
+}
+
+/*
+ * PICTURE ENHANCEMENT WITHOUT wp_viewporter.  Then a surface is the size of
+ * its buffer, and the guest's buffer is shown 1:1 as it is (the plain path,
+ * unchanged).  With an upscaler or frame generation on, the GPU pass instead
+ * draws a buffer of the WINDOW's size -- the configured size, or the guest's
+ * when the compositor leaves the size to us -- with the picture placed as
+ * the scaling settings say (nb_view_place), and that buffer is the surface:
+ * nothing needs a viewport.  Gamescope's headless backend and any compositor
+ * without the protocol take this path.  true: drawn (or dropped: gs_dropped),
+ * *out_w x *out_h is the surface now; false: the plain path shows the frame.
+ */
+static bool wl_nvp_frame(struct nb_wl *w, struct nb_wl_buf *sl, int *out_w,
+                         int *out_h)
+{
+    int pw, ph, r;
+
+    w->gs_frame = false;
+    w->gs_dropped = false;
+    if (!wl_enh_on(w) || w->gs_dead || sl->fd < 0 || sl->shm) {
+        if (w->gs_shown) {
+            w->gs_shown = false;
+            /* The surface is the guest's buffer again: the pointer maps 1:1
+             * (the placement the pass used would map it wrongly). */
+            nb_view_place(&w->vst.cur, (int)sl->w, (int)sl->h, (int)sl->w,
+                          (int)sl->h, 120, &w->place);
+            nb_log("picture: the guest's buffer as it is again (no "
+                   "wp_viewporter)");
+        }
+        return false;
+    }
+    pw = w->win_w > 0 ? w->win_w : (int)sl->w;
+    ph = w->win_h > 0 ? w->win_h : (int)sl->h;
+    /* Placed in window coordinates at scale 1: the buffer is the window. */
+    nb_view_place(&w->vst.cur, (int)sl->w, (int)sl->h, pw, ph, 120,
+                  &w->place);
+    w->fit_w = w->place.pic.w;
+    w->fit_h = w->place.pic.h;
+    w->off_x = w->place.vis.x;
+    w->off_y = w->place.vis.y;
+    if (w->win_w <= 0 || w->win_h <= 0) {
+        w->win_w = pw;
+        w->win_h = ph;
+    }
+    r = wl_gs_present(w, w->pending, pw, ph, true);
+    if (r < 0) {
+        return false;
+    }
+    w->gs_frame = true;
+    w->gs_dropped = r == 0;
+    *out_w = pw;
+    *out_h = ph;
+    if (w->gc_on && gc_layout(w, false)) {
+        cur_apply(w, w->last_serial);
+    }
+    return true;
 }
 
 static struct wl_surface *wl_viewport_apply(struct nb_wl *w, int bw, int bh,
@@ -3422,7 +3481,18 @@ static int wl_commit(struct nb_session *s, struct nb_sink *sink)
         if (w->gc_on && gc_layout(w, false)) {
             cur_apply(w, w->last_serial);
         }
+    } else if (wl_nvp_frame(w, sl, &new_w, &new_h)) {
+        /* No wp_viewporter, an upscaler or frame generation on: the GPU pass
+         * drew a buffer of the window's size, which is the surface's size. */
+        if (w->gs_dropped) {
+            if (w->sink && !wl_hold_release(s, sl->id, sl->seq)) {
+                nb_sink_release(w->sink, sl->id, sl->seq);
+            }
+            w->pending = -1;
+            return 0;
+        }
     } else {
+        w->gs_frame = false;
         wl_attach_sf(w, 0, sl->buf, NB_XA_GUEST, w->pending, !sl->shm, 0);
         new_w = (int)sl->w;
         new_h = (int)sl->h;
@@ -4030,17 +4100,15 @@ static void wl_gs_prio_follow(struct nb_wl *w)
     }
 }
 
-/* Without wp_viewporter there is no GPU pass at all (the window is the
- * guest's buffer): say so once instead of silently doing nothing. */
+/* Without wp_viewporter the pass draws window-size buffers (wl_nvp_frame):
+ * said once, since the surface then follows the window, not the guest. */
 static void wl_enh_viewport_note(struct nb_wl *w)
 {
     if (!w->viewport && wl_enh_on(w) && !w->enh_noviewport_told) {
         w->enh_noviewport_told = true;
-        nb_err("upscaling/frame generation off: no wp_viewporter (the "
-               "compositor does not offer it, so the window shows the "
-               "guest's buffer as it is)");
-        snprintf(w->enh_note, sizeof(w->enh_note),
-                 "Off here: the compositor has no wp_viewporter");
+        nb_log("upscaling/frame generation: no wp_viewporter; the GPU pass "
+               "draws buffers of the window's size (the surface is the "
+               "buffer), the plain mode shows the guest's buffer as it is");
     }
 }
 
@@ -8271,8 +8339,7 @@ static const struct nb_ui_env *wl_ui_env(struct nb_wl *w)
     e.modes = &nb_mode_rx.cur;
     /* The GPU pass needs a viewport to undo, and a GPU that has not failed;
      * whether its driver has GLES 3.1 is only known once it ran. */
-    e.enhance_ok = w->viewport && !w->gs_dead &&
-                   (!w->gs || nb_gs_enhance_ok(w->gs, NULL));
+    e.enhance_ok = !w->gs_dead && (!w->gs || nb_gs_enhance_ok(w->gs, NULL));
     e.nvsm_ok = nb_vkp_available(NULL);
     e.nvsm_restart = w->vst.fgen == NB_FGEN_NVSM && !w->vk_on && !w->vk_dead;
     e.enhance_why = w->fg_dead && nb_fgen_mult(w->vst.fgen) > 1

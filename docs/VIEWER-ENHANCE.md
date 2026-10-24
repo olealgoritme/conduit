@@ -49,9 +49,16 @@ preempting it; the plain scaler keeps its high priority.
 `CONDUIT_VIEWER_GPU_PRIORITY=low|medium|high|realtime` overrides both, to
 compare. The log says what was asked and what the driver granted.
 
-Without `wp_viewporter` (some headless compositors) there is no GPU pass:
-the viewer logs `upscaling/frame generation off: no wp_viewporter` and the
-menu says so.
+**Without `wp_viewporter`** (gamescope's headless backend, some other
+compositors) a surface is the size of its buffer. The plain mode shows the
+guest's buffer as it is, as always. With an upscaler or frame generation on,
+the GPU pass draws a buffer of the window's size instead (the size the
+compositor configured, `--size`, or fullscreen; the guest's size when the
+compositor leaves it to the client), with the picture placed as Scaling and
+Picture area say, and that buffer is the surface. Smooth Motion needs
+`wp_viewporter`. `host/viewer/headless_gamescope_test.sh [off fsr nis cas
+fg2x fg3x]` runs each mode inside `gamescope --backend headless` with the
+test frame source and checks the `--stats` lines.
 
 **Cost.** With an upscaler on, every frame goes through the viewer's GPU pass
 (also in a window), so the frame is no longer handed to the compositor as it
