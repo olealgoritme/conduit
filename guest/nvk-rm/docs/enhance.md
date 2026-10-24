@@ -45,8 +45,8 @@ pacing settings take effect at once.
 
 | Global (`HKLM\SOFTWARE\Helios`) | Profile (`...\Helios\Enhance\<exe>`) | Environment | Values | Default |
 |---|---|---|---|---|
-| `EnhanceScaler` (REG_SZ) | `Scaler` | `MESA_WSI_ENHANCE_SCALER` | `off`, `fsr`, `bicubic`, `bilinear`, `nearest`, `integer` | `off` |
-| `EnhanceSharpness` (DWORD) | `Sharpness` | `MESA_WSI_ENHANCE_SHARPNESS` | 0..100 (FSR's RCAS; 0: EASU alone) | 50 |
+| `EnhanceScaler` (REG_SZ) | `Scaler` | `MESA_WSI_ENHANCE_SCALER` | `off`, `fsr`, `nis`, `sgsr`, `cas`, `bicubic`, `bilinear`, `nearest`, `integer`, `xbr` (also `pixel`) | `off` |
+| `EnhanceSharpness` (DWORD) | `Sharpness` | `MESA_WSI_ENHANCE_SHARPNESS` | 0..100 (FSR's RCAS, 0: EASU alone; NIS's and CAS's sharpness) | 50 |
 | `EnhanceFrameGen` (REG_SZ) | `FrameGen` | `MESA_WSI_ENHANCE_FG` | `off`, `2x`, `3x`, `4x`, `adaptive` | `off` |
 | `EnhanceFgTarget` (DWORD) | `FgTarget` | `MESA_WSI_ENHANCE_FG_TARGET` | adaptive: pictures per second to fill to; 0 = the display's refresh | 0 |
 | `EnhanceFgQuality` (REG_SZ) | `FgQuality` | `MESA_WSI_ENHANCE_FG_QUALITY` | `fast` (flow down to 1/4 of the frame), `quality` (down to 1/2, propagation on every level: about twice the flow's cost, for strong GPUs) | `fast` |
@@ -77,9 +77,27 @@ copies that into the DXGI back buffer as before.
 | Scaler | What |
 |---|---|
 | `fsr` | AMD FidelityFX Super Resolution 1: EASU, then RCAS at the sharpness (two passes, the intermediate at the picture's size). Upscaling only; smaller than the image, bilinear |
+| `nis` | NVIDIA Image Scaling: a 6-tap scaler with directional filters and adaptive sharpening, one pass. 1x to 2x per axis; outside that (and for sRGB swapchains) FSR 1 |
+| `sgsr` | Snapdragon Game Super Resolution 1: one pass, Lanczos-like weights along the edge direction, cheap (for weaker GPUs). Upscaling only |
+| `cas` | AMD FidelityFX Contrast Adaptive Sharpening: sharpening, and scaling up to 4x the area, in one pass |
 | `bicubic` | Catmull-Rom, nine bilinear taps |
 | `bilinear`, `nearest` | the plain filters |
 | `integer` | the largest whole factor that fits, nearest: sharp pixels for fixed low-resolution games |
+| `xbr` | Hyllian's xBR-lv2: edge-directed scaling for pixel art at any factor (smooth diagonals, sharp edges, only nearby colours) |
+
+Against a truth rendered at the output size (`tools/enhance-eval`, the
+same scene box-filtered to the input size and scaled back), PSNR in dB, and
+the GPU time on the host's RTX 5090:
+
+| Input -> 2560x1440 | nearest | bilinear | bicubic | FSR | NIS | SGSR | CAS | xBR |
+|---|---|---|---|---|---|---|---|---|
+| photo-like, 1920x1080 | 29.9 | 31.1 | 32.2 | 32.6 | 32.2 | 32.9 | 32.4 | 30.9 |
+| photo-like, 1280x720 | 28.3 | 28.3 | 29.1 | 29.5 | 28.1 | 29.3 | 29.1 | 29.2 |
+| pixel art, 640x360 | exact | 25.5 | 26.3 | 25.6 | (over 2x) | 27.4 | 25.7 | 32.6 |
+| GPU us | 32 | 31 | 30 | 71 | 56-67 | 32 | 31 | 63-65 |
+
+In the guest (D3D12, 1920x1080 to 2560x1440): NIS 85 us, SGSR 40, CAS 40,
+xBR 75, FSR 90-97.
 
 `aspect` keeps the image's aspect ratio, centred, with black bars (cleared
 once per output slot); `stretch` fills the window.
@@ -279,7 +297,6 @@ cost):
 
 - D3D10, swap chains for composition or a CoreWindow, HDR and 10-bit
   formats, and multisampled chains (they stay with DXGI).
-- NIS, CAS, SGSR and pixel-art scalers, a learned upscaler tier, and a
-  learned interpolator tier.
+- A learned upscaler tier and a learned interpolator tier.
 - Profiles from the tray for applications without an open window (the
   registry takes any executable name).

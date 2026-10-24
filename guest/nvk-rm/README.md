@@ -123,7 +123,7 @@ Patch numbers are file numbers in the directory named in the patch tables.
 | `MESA_WSI_WIN32_FIFO_ONLY` | 0 | offer FIFO only (otherwise IMMEDIATE and MAILBOX too) |
 | `MESA_WSI_COMPOSE_THREAD` | 1 | composed presents on a per-swapchain thread |
 | `MESA_WSI_COMPOSE_ADAPTER` | auto | D3D11 adapter index of the composed path |
-| `MESA_WSI_ENHANCE_SCALER` | registry, else off | upscaling in the composed present: `off`, `fsr`, `bicubic`, `bilinear`, `nearest`, `integer` (see [docs/enhance.md](docs/enhance.md); dxvk 0008) |
+| `MESA_WSI_ENHANCE_SCALER` | registry, else off | upscaling in the composed present: `off`, `fsr`, `nis`, `sgsr`, `cas`, `bicubic`, `bilinear`, `nearest`, `integer`, `xbr` (see [docs/enhance.md](docs/enhance.md); dxvk 0008, 0013) |
 | `MESA_WSI_ENHANCE_FG` | registry, else off | frame generation in the composed present: `off`, `2x`, `3x`, `4x`, `adaptive` |
 | `MESA_WSI_ENHANCE_SHARPNESS`, `_FG_TARGET`, `_FG_QUALITY`, `_LOW_LATENCY`, `_FIT`, `_WINDOWS`, `_STATS`, `_SHOW`, `_D3D` | registry, else 50, 0, fast, 0, aspect, fullscreen, 0, all, 1 | the other enhancement settings ([docs/enhance.md](docs/enhance.md#settings)) |
 | **Helios interface** | | |
@@ -317,6 +317,8 @@ Each patch builds on its own.
 | 0009 | D3D11 and D3D12 swap chains through the same: where a Helios D3D driver runs on NVK and enhancement is on, NVK hooks DXGI's swap chain creation and hands the application an `IDXGISwapChain4` of its own whose presents are copied into shared ring textures, enhanced on an NVK device of its own and presented through the composed present (`MESA_WSI_ENHANCE_D3D`, `EnhanceD3D`; see [docs/enhance.md](docs/enhance.md#d3d-swap-chains)) |
 | 0010 | the composed present's own DXGI swap chains pass the D3D swap chain hooks (`wsi_win32_dxgi_internal`): in a Vulkan process the composed present's D3D11 device loads the Helios UMD, NVK hooked DXGI there too, and its own flip swap chain was taken by the proxy (every picture enhanced twice) |
 | 0011 | frame generation: flow propagation (`fg_flow` mode 2, one round per level), a motion cost per frame pixel, a 1/32 coarsest level, nine interpolation candidates; tuned with `tools/enhance-eval` (see [docs/enhance.md](docs/enhance.md#measuring-the-interpolation)) |
+| 0012 | NVIDIA Image Scaling SDK v1.0.3 (MIT), FidelityFX CAS (MIT), Snapdragon Game Super Resolution 1 (BSD-3-Clause), Hyllian's xBR-lv2 (MIT), vendored unmodified under `src/vulkan/wsi/enhance/third_party` |
+| 0013 | the `nis`, `cas`, `sgsr` and `xbr` scalers; `enhance/adapt.py` turns copies of the SGSR and xBR fragment shaders into functions and NIS's coefficient tables into constants at build time |
 
 ## `patches-common/`: generic NVK work
 

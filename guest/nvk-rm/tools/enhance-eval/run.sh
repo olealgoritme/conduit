@@ -15,3 +15,16 @@ for tier in fast quality; do
   echo "== $tier"
   if [ -n "$out" ]; then mkdir -p "$out/$tier"; "$tmp/fg_eval" "$tmp" $tier "$out/$tier"; else "$tmp/fg_eval" "$tmp" $tier; fi
 done
+# the scalers: their shaders need the adapted includes
+gen=$tmp/gen
+mkdir -p "$gen"
+python3 "$enh/adapt.py" sgsr "$enh/third_party/sgsr/sgsr1_shader_mobile_edge_direction.frag" "$gen/sgsr1_adapted.glsl"
+python3 "$enh/adapt.py" xbr "$enh/third_party/xbr/xbr-lv2-standalone.slang" "$gen/xbr_lv2_adapted.glsl"
+python3 "$enh/adapt.py" nis-coef "$enh/third_party/nis/NIS_Config.h" "$gen/nis_coef.glsl"
+for s in enh_scale enh_easu enh_rcas enh_nis enh_cas enh_sgsr enh_xbr; do
+  glslangValidator -V --target-env vulkan1.1 -S comp -I"$enh" -I"$gen" -I"$enh/third_party/fsr1" \
+    -I"$enh/third_party/cas" -I"$enh/third_party/nis" -o "$tmp/$s.spv" "$enh/$s.comp" >/dev/null
+done
+cc -O2 -Wall -o "$tmp/scale_eval" "$here/scale_eval.c" -lvulkan -lm
+echo "== scalers"
+if [ -n "$out" ]; then mkdir -p "$out/scale"; "$tmp/scale_eval" "$tmp" "$out/scale"; else "$tmp/scale_eval" "$tmp"; fi
