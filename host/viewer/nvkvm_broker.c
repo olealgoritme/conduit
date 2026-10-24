@@ -2475,6 +2475,33 @@ static void nb_handle_cmd(struct nb_sink *s, const struct nvkvm_broker_cmd *c,
         }
         return;
 
+    case NVKVM_BROKER_CMD_CURSOR_POS:
+        /*
+         * Conduit: where the guest's pointer is (a Windows guest reports it
+         * from DxgkDdiSetPointerPosition).  Only to a broker that offered
+         * CAP_CURSOR_POS; no fd and nothing but x, y and the counter.  One
+         * that arrives just after the grab went off is not an error: the
+         * client sent it while the grab was still on.
+         */
+        if (!ss->ops->cursor_pos || !(ss->caps & NVKVM_BROKER_CAP_CURSOR_POS)) {
+            if (fd >= 0) {
+                close(fd);
+            }
+            nb_violation(s, "CURSOR_POS sent to a broker that did not offer it");
+            return;
+        }
+        if (fd >= 0 || c->flags != 0 || c->reserved1 != 0 || c->stride ||
+            c->offset || c->fourcc || c->modifier) {
+            if (fd >= 0) {
+                close(fd);
+            }
+            nb_violation(s, "CURSOR_POS carried an fd or buffer fields");
+            return;
+        }
+        s->n_cursor_pos++;
+        ss->ops->cursor_pos(ss, (int32_t)c->width, (int32_t)c->height);
+        return;
+
     case NVKVM_BROKER_CMD_MODES:
         /*
          * The display's mode list, one record per mode.  Only to a broker
@@ -3231,6 +3258,9 @@ static void usage(void)
 "  --vm-pause-cmd CMD, --vm-resume-cmd CMD\n"
 "                       commands the menu's Pause / Resume run (/bin/sh); the\n"
 "                       menu shows the VM paused once the command exits 0\n"
+"  --vm-upscaler-cmd CMD\n"
+"                       the menu's Upscaler row runs `CMD default|dlss|fsr|xess`\n"
+"                       (/bin/sh): what games get in a Windows guest\n"
 "  --open-menu          start with the menu open (CTRL+ALT+M toggles)\n"
 "\n"
 "  Display hotkeys (CTRL+ALT+...): M menu, S scale, A area, R guest\n"
@@ -3841,6 +3871,8 @@ int main(int argc, char **argv)
             cfg.vm_pause_cmd = v; }
         else if (!strcmp(a, "--vm-resume-cmd")) { NEEDVAL();
             cfg.vm_resume_cmd = v; }
+        else if (!strcmp(a, "--vm-upscaler-cmd")) { NEEDVAL();
+            cfg.vm_upscaler_cmd = v; }
         else if (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage(); return 0; }
         else if (!strcmp(a, "-V") || !strcmp(a, "--version")) {
             printf("conduit-viewer %s\n", CONDUIT_BUILD_ID); return 0; }

@@ -1,0 +1,332 @@
+// ngx-smoketest --cutest: small CUDA kernels that check, one feature at a
+// time, what DLSS kernels rely on when NVK runs them through
+// VK_NVX_binary_import: launch constants, module globals and __constant__
+// data, local memory (the stack), shared memory, textures and surfaces
+// through VK_NVX_image_view_handle handles, cp.async, ldmatrix and the
+// tensor cores.  Compile it for the GPU on the host with
+// guest/nvk-rm/tools/cubin-cache/nvk-cubin-cache.py (see README.md).
+.version 8.0
+.target sm_89
+.address_size 64
+
+.global .align 4 .u32 gvar[4] = {11, 22, 33, 44};
+.const .align 4 .u32 cvar[4] = {55, 66, 77, 88};
+
+// out[0..2] = ntid, out[3..5] = nctaid, out[6] = magic, out[7] = gvar[1],
+// out[8] = cvar[2], out[9] = gvar[3] after writing magic to it,
+// out[10] = in[5] through ld.global.nc, out[11] = %warpsize
+.visible .entry k_consts(.param .u64 out, .param .u64 in, .param .u32 magic)
+{
+	.reg .pred %p<2>;
+	.reg .b32 %r<16>;
+	.reg .b64 %rd<8>;
+
+	ld.param.u64 %rd1, [out];
+	cvta.to.global.u64 %rd1, %rd1;
+	ld.param.u64 %rd5, [in];
+	cvta.to.global.u64 %rd5, %rd5;
+	ld.param.u32 %r0, [magic];
+	mov.u32 %r1, %tid.x;
+	mov.u32 %r2, %ctaid.x;
+	or.b32 %r3, %r1, %r2;
+	mov.u32 %r4, %tid.y;
+	or.b32 %r3, %r3, %r4;
+	mov.u32 %r4, %ctaid.y;
+	or.b32 %r3, %r3, %r4;
+	setp.ne.u32 %p1, %r3, 0;
+	@%p1 bra DONE;
+	mov.u32 %r5, %ntid.x;
+	st.global.u32 [%rd1+0], %r5;
+	mov.u32 %r5, %ntid.y;
+	st.global.u32 [%rd1+4], %r5;
+	mov.u32 %r5, %ntid.z;
+	st.global.u32 [%rd1+8], %r5;
+	mov.u32 %r5, %nctaid.x;
+	st.global.u32 [%rd1+12], %r5;
+	mov.u32 %r5, %nctaid.y;
+	st.global.u32 [%rd1+16], %r5;
+	mov.u32 %r5, %nctaid.z;
+	st.global.u32 [%rd1+20], %r5;
+	st.global.u32 [%rd1+24], %r0;
+	mov.u64 %rd2, gvar;
+	ld.global.u32 %r6, [%rd2+4];
+	st.global.u32 [%rd1+28], %r6;
+	mov.u64 %rd3, cvar;
+	ld.const.u32 %r7, [%rd3+8];
+	st.global.u32 [%rd1+32], %r7;
+	st.global.u32 [%rd2+12], %r0;
+	membar.gl;
+	ld.volatile.global.u32 %r8, [%rd2+12];
+	st.global.u32 [%rd1+36], %r8;
+	ld.global.nc.u32 %r9, [%rd5+20];
+	st.global.u32 [%rd1+40], %r9;
+	mov.u32 %r10, WARP_SZ;
+	st.global.u32 [%rd1+44], %r10;
+DONE:
+	ret;
+}
+
+// A 64-entry local array indexed at run time (lives on the stack):
+// arr[i] = 3 * i + n; out[t] = arr[(t + idx) & 63] for t < ntid.x;
+// thread 0 also writes the array's local and generic addresses at
+// out + 512 and out + 520, and arr[idx] read through the generic address
+// at out + 528.
+.visible .entry k_local(.param .u64 out, .param .u32 n, .param .u32 idx)
+{
+	.local .align 4 .b8 arr[256];
+	.reg .pred %p<3>;
+	.reg .b32 %r<12>;
+	.reg .b64 %rd<10>;
+
+	ld.param.u64 %rd1, [out];
+	cvta.to.global.u64 %rd1, %rd1;
+	ld.param.u32 %r1, [n];
+	ld.param.u32 %r2, [idx];
+	mov.u64 %rd2, arr;
+	mov.u32 %r3, 0;
+LOOP:
+	mad.lo.u32 %r4, %r3, 3, %r1;
+	mul.wide.u32 %rd3, %r3, 4;
+	add.u64 %rd4, %rd2, %rd3;
+	st.local.u32 [%rd4], %r4;
+	add.u32 %r3, %r3, 1;
+	setp.lt.u32 %p1, %r3, 64;
+	@%p1 bra LOOP;
+	mov.u32 %r5, %tid.x;
+	add.u32 %r6, %r5, %r2;
+	and.b32 %r6, %r6, 63;
+	mul.wide.u32 %rd3, %r6, 4;
+	add.u64 %rd4, %rd2, %rd3;
+	ld.local.u32 %r7, [%rd4];
+	mul.wide.u32 %rd5, %r5, 4;
+	add.u64 %rd6, %rd1, %rd5;
+	st.global.u32 [%rd6], %r7;
+	setp.ne.u32 %p2, %r5, 0;
+	@%p2 bra END;
+	st.global.u64 [%rd1+512], %rd2;
+	cvta.local.u64 %rd7, %rd2;
+	st.global.u64 [%rd1+520], %rd7;
+	// arr[idx] through its generic address
+	mul.wide.u32 %rd8, %r2, 4;
+	add.u64 %rd9, %rd7, %rd8;
+	ld.u32 %r8, [%rd9];
+	st.global.u32 [%rd1+528], %r8;
+END:
+	ret;
+}
+
+// Shared memory, 256 threads: sh[t] = 7 * t + 1, barrier,
+// out[t] = sh[255 - t] (shared address) and out[256 + t] = sh[t ^ 1]
+// (generic address of the shared array).
+.visible .entry k_shared(.param .u64 out)
+{
+	.shared .align 4 .b8 sh[1024];
+	.reg .b32 %r<12>;
+	.reg .b64 %rd<12>;
+
+	ld.param.u64 %rd1, [out];
+	cvta.to.global.u64 %rd1, %rd1;
+	mov.u32 %r1, %tid.x;
+	mad.lo.u32 %r2, %r1, 7, 1;
+	mov.u64 %rd2, sh;
+	mul.wide.u32 %rd3, %r1, 4;
+	add.u64 %rd4, %rd2, %rd3;
+	st.shared.u32 [%rd4], %r2;
+	bar.sync 0;
+	sub.u32 %r3, 255, %r1;
+	mul.wide.u32 %rd5, %r3, 4;
+	add.u64 %rd6, %rd2, %rd5;
+	ld.shared.u32 %r4, [%rd6];
+	add.u64 %rd7, %rd1, %rd3;
+	st.global.u32 [%rd7], %r4;
+	cvta.shared.u64 %rd8, %rd2;
+	xor.b32 %r5, %r1, 1;
+	mul.wide.u32 %rd9, %r5, 4;
+	add.u64 %rd10, %rd8, %rd9;
+	ld.u32 %r6, [%rd10];
+	st.global.u32 [%rd7+1024], %r6;
+	ret;
+}
+
+// Texture fetch through a texture object (combined image sampler handle),
+// normalized coordinates at texel centres: out[y*w + x] = texel (RGBA f32);
+// k_tld does the same with integer coordinates.
+.visible .entry k_tex(.param .u64 tex, .param .u64 out, .param .u32 w, .param .u32 h)
+{
+	.reg .pred %p<3>;
+	.reg .b32 %r<16>;
+	.reg .f32 %f<12>;
+	.reg .b64 %rd<8>;
+
+	ld.param.u64 %rd1, [tex];
+	ld.param.u64 %rd2, [out];
+	cvta.to.global.u64 %rd2, %rd2;
+	ld.param.u32 %r1, [w];
+	ld.param.u32 %r2, [h];
+	mov.u32 %r3, %ctaid.x;
+	mov.u32 %r4, %ntid.x;
+	mov.u32 %r5, %tid.x;
+	mad.lo.u32 %r6, %r3, %r4, %r5;
+	mov.u32 %r3, %ctaid.y;
+	mov.u32 %r4, %ntid.y;
+	mov.u32 %r5, %tid.y;
+	mad.lo.u32 %r7, %r3, %r4, %r5;
+	setp.ge.u32 %p1, %r6, %r1;
+	setp.ge.u32 %p2, %r7, %r2;
+	or.pred %p1, %p1, %p2;
+	@%p1 bra END;
+	cvt.rn.f32.u32 %f1, %r6;
+	add.f32 %f1, %f1, 0f3F000000;
+	cvt.rn.f32.u32 %f2, %r1;
+	div.rn.f32 %f1, %f1, %f2;
+	cvt.rn.f32.u32 %f3, %r7;
+	add.f32 %f3, %f3, 0f3F000000;
+	cvt.rn.f32.u32 %f4, %r2;
+	div.rn.f32 %f3, %f3, %f4;
+	tex.2d.v4.f32.f32 {%f5, %f6, %f7, %f8}, [%rd1, {%f1, %f3}];
+	mad.lo.u32 %r8, %r7, %r1, %r6;
+	mul.wide.u32 %rd3, %r8, 16;
+	add.u64 %rd4, %rd2, %rd3;
+	st.global.v4.f32 [%rd4], {%f5, %f6, %f7, %f8};
+END:
+	ret;
+}
+
+.visible .entry k_tld(.param .u64 tex, .param .u64 out, .param .u32 w, .param .u32 h)
+{
+	.reg .pred %p<3>;
+	.reg .b32 %r<16>;
+	.reg .f32 %f<12>;
+	.reg .b64 %rd<8>;
+
+	ld.param.u64 %rd1, [tex];
+	ld.param.u64 %rd2, [out];
+	cvta.to.global.u64 %rd2, %rd2;
+	ld.param.u32 %r1, [w];
+	ld.param.u32 %r2, [h];
+	mov.u32 %r3, %ctaid.x;
+	mov.u32 %r4, %ntid.x;
+	mov.u32 %r5, %tid.x;
+	mad.lo.u32 %r6, %r3, %r4, %r5;
+	mov.u32 %r3, %ctaid.y;
+	mov.u32 %r4, %ntid.y;
+	mov.u32 %r5, %tid.y;
+	mad.lo.u32 %r7, %r3, %r4, %r5;
+	setp.ge.u32 %p1, %r6, %r1;
+	setp.ge.u32 %p2, %r7, %r2;
+	or.pred %p1, %p1, %p2;
+	@%p1 bra END;
+	tex.2d.v4.f32.s32 {%f5, %f6, %f7, %f8}, [%rd1, {%r6, %r7}];
+	mad.lo.u32 %r8, %r7, %r1, %r6;
+	mul.wide.u32 %rd3, %r8, 16;
+	add.u64 %rd4, %rd2, %rd3;
+	st.global.v4.f32 [%rd4], {%f5, %f6, %f7, %f8};
+END:
+	ret;
+}
+
+// Surfaces (storage image handles): out[y*w + x] = src pixel (raw 32 bit),
+// and the pixel, bitwise inverted, is stored to dst.
+.visible .entry k_surf(.param .u64 src, .param .u64 dst, .param .u64 out, .param .u32 w, .param .u32 h)
+{
+	.reg .pred %p<3>;
+	.reg .b32 %r<16>;
+	.reg .b64 %rd<8>;
+
+	ld.param.u64 %rd1, [src];
+	ld.param.u64 %rd5, [dst];
+	ld.param.u64 %rd2, [out];
+	cvta.to.global.u64 %rd2, %rd2;
+	ld.param.u32 %r1, [w];
+	ld.param.u32 %r2, [h];
+	mov.u32 %r3, %ctaid.x;
+	mov.u32 %r4, %ntid.x;
+	mov.u32 %r5, %tid.x;
+	mad.lo.u32 %r6, %r3, %r4, %r5;
+	mov.u32 %r3, %ctaid.y;
+	mov.u32 %r4, %ntid.y;
+	mov.u32 %r5, %tid.y;
+	mad.lo.u32 %r7, %r3, %r4, %r5;
+	setp.ge.u32 %p1, %r6, %r1;
+	setp.ge.u32 %p2, %r7, %r2;
+	or.pred %p1, %p1, %p2;
+	@%p1 bra END;
+	shl.b32 %r9, %r6, 2;
+	suld.b.2d.b32.trap {%r10}, [%rd1, {%r9, %r7}];
+	mad.lo.u32 %r8, %r7, %r1, %r6;
+	mul.wide.u32 %rd3, %r8, 4;
+	add.u64 %rd4, %rd2, %rd3;
+	st.global.u32 [%rd4], %r10;
+	not.b32 %r11, %r10;
+	sust.b.2d.b32.trap [%rd5, {%r9, %r7}], {%r11};
+END:
+	ret;
+}
+
+// cp.async from global to shared (16 bytes per thread, 64 threads), then
+// ldmatrix.x1 from the first 8 rows of 16 bytes: out[t] = in[63 - t]
+// (dwords, via cp.async) for t < 256; out[256 + lane] = ldmatrix
+// result of lane (warp 0).
+.visible .entry k_async(.param .u64 in, .param .u64 out)
+{
+	.shared .align 16 .b8 sa[1024];
+	.reg .pred %p<3>;
+	.reg .b32 %r<16>;
+	.reg .b64 %rd<12>;
+
+	ld.param.u64 %rd1, [in];
+	cvta.to.global.u64 %rd1, %rd1;
+	ld.param.u64 %rd2, [out];
+	cvta.to.global.u64 %rd2, %rd2;
+	mov.u32 %r1, %tid.x;
+	mov.u64 %rd3, sa;
+	cvt.u32.u64 %r2, %rd3;
+	shl.b32 %r3, %r1, 4;
+	add.u32 %r4, %r2, %r3;
+	mul.wide.u32 %rd4, %r3, 1;
+	add.u64 %rd5, %rd1, %rd4;
+	cp.async.cg.shared.global [%r4], [%rd5], 16;
+	cp.async.commit_group;
+	cp.async.wait_all;
+	bar.sync 0;
+	// out[4t..4t+3] = sa dwords of row 63 - t
+	sub.u32 %r5, 63, %r1;
+	shl.b32 %r6, %r5, 4;
+	add.u32 %r7, %r2, %r6;
+	ld.shared.v4.u32 {%r8, %r9, %r10, %r11}, [%r7];
+	mul.wide.u32 %rd6, %r3, 1;
+	add.u64 %rd7, %rd2, %rd6;
+	st.global.v4.u32 [%rd7], {%r8, %r9, %r10, %r11};
+	setp.ge.u32 %p1, %r1, 32;
+	@%p1 bra END;
+	// ldmatrix: lanes 0-7 give the row addresses (row = lane, 16 bytes each)
+	and.b32 %r12, %r1, 7;
+	shl.b32 %r12, %r12, 4;
+	add.u32 %r12, %r2, %r12;
+	ldmatrix.sync.aligned.m8n8.x1.shared.b16 {%r13}, [%r12];
+	mul.wide.u32 %rd8, %r1, 4;
+	add.u64 %rd9, %rd2, %rd8;
+	st.global.u32 [%rd9+1024], %r13;
+END:
+	ret;
+}
+
+// Tensor cores: one warp, D = A * B + C with A, B all 1.0 (f16) and
+// C = lane: out[4 * lane + i] = D[i] = 16 + lane.
+.visible .entry k_mma(.param .u64 out)
+{
+	.reg .b32 %r<12>;
+	.reg .f32 %f<12>;
+	.reg .b64 %rd<6>;
+
+	ld.param.u64 %rd1, [out];
+	cvta.to.global.u64 %rd1, %rd1;
+	mov.u32 %r1, %tid.x;
+	cvt.rn.f32.u32 %f1, %r1;
+	mov.b32 %r2, 0x3c003c00;
+	mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%f2, %f3, %f4, %f5}, {%r2, %r2, %r2, %r2}, {%r2, %r2}, {%f1, %f1, %f1, %f1};
+	mul.wide.u32 %rd2, %r1, 16;
+	add.u64 %rd3, %rd1, %rd2;
+	st.global.v4.f32 [%rd3], {%f2, %f3, %f4, %f5};
+	ret;
+}

@@ -1,0 +1,101 @@
+From 2503da072c40d2085748935a45bf218f495e77ee Mon Sep 17 00:00:00 2001
+From: SR_team <me@sr.team>
+Date: Sat, 24 Oct 2026 04:01:25 +0500
+Subject: [PATCH] nak: preserve execution predicate anti-dependencies
+
+---
+ .../compiler/nak/opt_instr_sched_postpass.rs  | 77 +++++++++++++++++++
+ 1 file changed, 77 insertions(+)
+
+diff --git a/src/nouveau/compiler/nak/opt_instr_sched_postpass.rs b/src/nouveau/compiler/nak/opt_instr_sched_postpass.rs
+index 8f5ce6be000..45af1ccb73e 100644
+--- a/src/nouveau/compiler/nak/opt_instr_sched_postpass.rs
++++ b/src/nouveau/compiler/nak/opt_instr_sched_postpass.rs
+@@ -108,6 +108,13 @@ fn generate_dep_graph(sm: &ShaderModelInfo, instrs: &[Instr]) -> DepGraph {
+             }
+         });
+
++        // Predicate reads constrain order even though WaP has no latency.
++        uses.for_each_instr_pred_mut(instr, |u| {
++            if let Some((w_ip, _)) = u.write {
++                g.add_edge(ip, w_ip, EdgeLabel { latency: 0 });
++            }
++        });
++
+         // We're iterating in reverse, so writes are logically first
+         uses.for_each_instr_dst_mut(instr, |i, c| {
+             c.set_write((ip, i));
+@@ -254,3 +261,73 @@ impl Shader<'_> {
+         }
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn gpr(i: u32) -> RegRef {
++        RegRef::new(RegFile::GPR, i, 1)
++    }
++
++    fn p0() -> RegRef {
++        RegRef::new(RegFile::Pred, 0, 1)
++    }
++
++    fn guard(instr: &mut Instr, inverted: bool) {
++        instr.pred = Pred {
++            pred_ref: PredRef::Reg(p0()),
++            pred_inv: inverted,
++        };
++    }
++
++    fn write_p0() -> Instr {
++        Instr::new(OpFSetP {
++            dst: p0().into(),
++            set_op: PredSetOp::And,
++            cmp_op: FloatCmpOp::OrdLt,
++            srcs: [gpr(2).into(), gpr(3).into()],
++            accum: true.into(),
++            ftz: false,
++        })
++    }
++
++    #[test]
++    fn predicate_read_precedes_overwrite() {
++        let sm = ShaderModelInfo::new(89, 48);
++        for inverted in [false, true] {
++            let mut read = Instr::new(OpMov {
++                dst: gpr(0).into(),
++                src: gpr(1).into(),
++                quad_lanes: 0xf,
++            });
++            guard(&mut read, inverted);
++
++            let (scheduled, _) = sched_buffer(&sm, vec![read, write_p0()]);
++            let scheduled: Vec<_> = scheduled.collect();
++
++            assert_eq!(scheduled.len(), 2);
++            assert!(matches!(&scheduled[0].op, Op::Mov(_)));
++            assert_eq!(scheduled[0].pred.pred_inv, inverted);
++            assert!(matches!(&scheduled[1].op, Op::FSetP(_)));
++        }
++    }
++
++    #[test]
++    fn predicate_read_write_avoids_self_dependency() {
++        let sm = ShaderModelInfo::new(89, 48);
++        for inverted in [false, true] {
++            let mut read_write = write_p0();
++            guard(&mut read_write, inverted);
++
++            let (scheduled, _) =
++                sched_buffer(&sm, vec![read_write, write_p0()]);
++            let scheduled: Vec<_> = scheduled.collect();
++
++            assert_eq!(scheduled.len(), 2);
++            assert!(!scheduled[0].pred.is_true());
++            assert_eq!(scheduled[0].pred.pred_inv, inverted);
++            assert!(scheduled[1].pred.is_true());
++        }
++    }
++}

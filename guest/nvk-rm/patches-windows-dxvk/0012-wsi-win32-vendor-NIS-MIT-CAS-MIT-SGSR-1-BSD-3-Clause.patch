@@ -1,0 +1,3703 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Sat, 24 Oct 2026 15:36:53 +0200
+Subject: [PATCH] wsi/win32: vendor NIS (MIT), CAS (MIT), SGSR 1
+ (BSD-3-Clause) and xBR-lv2 (MIT)
+
+NVIDIA Image Scaling SDK v1.0.3 (NIS_Scaler.h, NIS_Config.h), AMD
+FidelityFX CAS 1.20190610 (ffx_cas.h), Snapdragon Game Super Resolution 1
+(sgsr1_shader_mobile_edge_direction.frag) and Hyllian's xBR-lv2
+(xbr-lv2-standalone.slang), unmodified, with their licences, for the
+composed present's scalers.
+---
+ src/vulkan/wsi/enhance/third_party/README.md  |   22 +-
+ .../wsi/enhance/third_party/cas/LICENSE.txt   |   14 +
+ .../wsi/enhance/third_party/cas/ffx_cas.h     | 1445 +++++++++++++++++
+ .../wsi/enhance/third_party/nis/LICENSE.txt   |   20 +
+ .../wsi/enhance/third_party/nis/NIS_Config.h  |  541 ++++++
+ .../wsi/enhance/third_party/nis/NIS_Scaler.h  | 1020 ++++++++++++
+ .../wsi/enhance/third_party/sgsr/LICENSE      |   29 +
+ .../sgsr1_shader_mobile_edge_direction.frag   |  176 ++
+ .../wsi/enhance/third_party/xbr/LICENSE.txt   |   25 +
+ .../third_party/xbr/xbr-lv2-standalone.slang  |  309 ++++
+ 10 files changed, 3597 insertions(+), 4 deletions(-)
+ create mode 100644 src/vulkan/wsi/enhance/third_party/cas/LICENSE.txt
+ create mode 100644 src/vulkan/wsi/enhance/third_party/cas/ffx_cas.h
+ create mode 100644 src/vulkan/wsi/enhance/third_party/nis/LICENSE.txt
+ create mode 100644 src/vulkan/wsi/enhance/third_party/nis/NIS_Config.h
+ create mode 100644 src/vulkan/wsi/enhance/third_party/nis/NIS_Scaler.h
+ create mode 100644 src/vulkan/wsi/enhance/third_party/sgsr/LICENSE
+ create mode 100644 src/vulkan/wsi/enhance/third_party/sgsr/sgsr1_shader_mobile_edge_direction.frag
+ create mode 100644 src/vulkan/wsi/enhance/third_party/xbr/LICENSE.txt
+ create mode 100644 src/vulkan/wsi/enhance/third_party/xbr/xbr-lv2-standalone.slang
+
+diff --git a/src/vulkan/wsi/enhance/third_party/README.md b/src/vulkan/wsi/enhance/third_party/README.md
+index 24d25cb..290a324 100644
+--- a/src/vulkan/wsi/enhance/third_party/README.md
++++ b/src/vulkan/wsi/enhance/third_party/README.md
+@@ -1,9 +1,23 @@
+ # Vendored shader sources
+ 
+-Used by the Win32 WSI's upscaling (`../enh_easu.comp`, `../enh_rcas.comp`).
+-Each directory has its license; the files are byte-for-byte the upstream
+-ones.
++Used by the Win32 WSI's upscaling (`../enh_*.comp`). Each directory has its
++licence; the files are byte-for-byte the upstream ones.
+ 
+-| Directory | What | License | Upstream |
++| Directory | What | Licence | Upstream |
+ |---|---|---|---|
+ | `fsr1/` | `ffx_a.h`, `ffx_fsr1.h`: AMD FidelityFX Super Resolution 1 (EASU, RCAS), v1.20210629 | MIT | github.com/GPUOpen-Effects/FidelityFX-FSR, `ffx-fsr/` |
++| `cas/` | `ffx_cas.h`: AMD FidelityFX Contrast Adaptive Sharpening, 1.20190610 | MIT | github.com/GPUOpen-Effects/FidelityFX-CAS, `ffx-cas/` |
++| `nis/` | `NIS_Scaler.h`, `NIS_Config.h`: NVIDIA Image Scaling SDK v1.0.3 | MIT | github.com/NVIDIAGameWorks/NVIDIAImageScaling, `NIS/` |
++| `sgsr/` | `sgsr1_shader_mobile_edge_direction.frag`: Snapdragon Game Super Resolution 1 | BSD-3-Clause | github.com/SnapdragonStudios/snapdragon-gsr, `sgsr/v1/include/glsl/`, commit d926f07 |
++| `xbr/` | `xbr-lv2-standalone.slang`: Hyllian's xBR-lv2 | MIT (in the file's header; `LICENSE.txt` repeats it) | github.com/libretro/slang-shaders, `edge-smoothing/xbr/shaders/`, commit 259ff81 |
++
++How they are used:
++
++- FSR 1 and CAS are included as they are (`A_GPU`, `A_GLSL`).
++- NIS's GLSL path is included as it is; its coefficient tables are
++  generated from `NIS_Config.h` at build time (`../adapt.py nis-coef`) as
++  constant arrays the shader reads instead of textures.
++- SGSR 1 and xBR-lv2 are fragment shaders; `../adapt.py` turns a copy of
++  each into a function a compute shader calls (it removes the `#version`,
++  the stage inputs and outputs and the resource declarations, and renames
++  `main`), at build time. The vendored files stay unmodified.
+diff --git a/src/vulkan/wsi/enhance/third_party/cas/LICENSE.txt b/src/vulkan/wsi/enhance/third_party/cas/LICENSE.txt
+new file mode 100644
+index 0000000..6d39975
+--- /dev/null
++++ b/src/vulkan/wsi/enhance/third_party/cas/LICENSE.txt
+@@ -0,0 +1,14 @@
++Copyright (c) 2017-2019 Advanced Micro Devices, Inc. All rights reserved.
++
++Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation
++files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy,
++modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the
++Software is furnished to do so, subject to the following conditions:
++
++The above copyright notice and this permission notice shall be included in all copies or substantial portions of the
++Software.
++
++THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE
++WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL THE AUTHORS OR
++COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+diff --git a/src/vulkan/wsi/enhance/third_party/cas/ffx_cas.h b/src/vulkan/wsi/enhance/third_party/cas/ffx_cas.h
+new file mode 100644
+index 0000000..34b99bf
+--- /dev/null
++++ b/src/vulkan/wsi/enhance/third_party/cas/ffx_cas.h
+@@ -0,0 +1,1445 @@
++//_____________________________________________________________/\_______________________________________________________________
++//==============================================================================================================================
++//
++//                                 [CAS] FIDELITY FX - CONSTRAST ADAPTIVE SHARPENING 1.20190610
++//
++//==============================================================================================================================
++// LICENSE
++// =======
++// Copyright (c) 2017-2019 Advanced Micro Devices, Inc. All rights reserved.
++// -------
++// Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation
++// files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy,
++// modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the
++// Software is furnished to do so, subject to the following conditions:
++// -------
++// The above copyright notice and this permission notice shall be included in all copies or substantial portions of the
++// Software.
++// -------
++// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE
++// WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL THE AUTHORS OR
++// COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++// ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
++//------------------------------------------------------------------------------------------------------------------------------
++// ABOUT
++// =====
++// CAS is a spatial only filter.
++// CAS takes RGB color input.
++// CAS enchances sharpness and local high-frequency contrast, and with or without added upsampling.
++// CAS outputs RGB color.
++//------------------------------------------------------------------------------------------------------------------------------
++// SUGGESTIONS FOR INTEGRATION
++// ===========================
++// Best for performance, run CAS in sharpen-only mode, choose a video mode to have scan-out or the display scale.
++//  - Sharpen-only mode is faster, and provides a better quality sharpening.
++// The scaling support in CAS was designed for when the application wants to do Dynamic Resolution Scaling (DRS).
++//  - With DRS, the render resolution can change per frame.
++//  - Use CAS to sharpen and upsample to the fixed output resolution, then composite the full resolution UI over CAS output.
++//  - This can all happen in one compute dispatch.
++// It is likely better to reduce the amount of film grain which happens before CAS (as CAS will amplify grain).
++//  - An alternative would be to add grain after CAS.
++// It is best to run CAS after tonemapping.
++//  - CAS needs to have input value 1.0 at the peak of the display output.
++// It is ok to run CAS after compositing UI (it won't harm the UI).
++//------------------------------------------------------------------------------------------------------------------------------
++// EXECUTION
++// =========
++// CAS runs as a compute shader.
++// CAS is designed to be run either in a 32-bit, CasFilter(), or packed 16-bit, CasFilterH(), form.
++// The 32-bit form works on 8x8 tiles via one {64,1,1} workgroup.
++// The 16-bit form works on a pair of 8x8 tiles in a 16x8 configuration via one {64,1,1} workgroup.
++// CAS is designed to work best in semi-persistent form if running not async with graphics.
++// For 32-bit this means looping across a collection of 4 8x8 tiles in a 2x2 tile foot-print.
++// For 16-bit this means looping 2 times, once for the top 16x8 region and once for the bottom 16x8 region.
++//------------------------------------------------------------------------------------------------------------------------------
++// INTEGRATION SUMMARY FOR CPU
++// ===========================
++// // Make sure <stdint.h> has already been included.
++// // Setup pre-portability-header defines.
++// #define A_CPU 1
++// // Include the portability header (requires version 1.20190530 or later which is backwards compatible).
++// #include "ffx_a.h"
++// // Include the CAS header.
++// #include "ffx_cas.h"
++// ...
++// // Call the setup function to build out the constants for the shader, pass these to the shader.
++// // The 'varAU4(const0);' expands into 'uint32_t const0[4];' on the CPU.
++// varAU4(const0);
++// varAU4(const1);
++// CasSetup(const0,const1,
++//  0.0f,             // Sharpness tuning knob (0.0 to 1.0).
++//  1920.0f,1080.0f,  // Example input size.
++//  2560.0f,1440.0f); // Example output size.
++// ...
++// // Later dispatch the shader based on the amount of semi-persistent loop unrolling.
++// // Here is an example for running with the 16x16 (4-way unroll for 32-bit or 2-way unroll for 16-bit)
++// vkCmdDispatch(cmdBuf,(widthInPixels+15)>>4,(heightInPixels+15)>>4,1);
++//------------------------------------------------------------------------------------------------------------------------------
++// INTEGRATION SUMMARY FOR GPU
++// ===========================
++// // Setup layout. Example below for VK_FORMAT_R16G16B16A16_SFLOAT.
++// layout(set=0,binding=0,rgba16f)uniform image2D imgSrc;
++// layout(set=0,binding=1,rgba16f)uniform image2D imgDst; 
++// ...
++// // Setup pre-portability-header defines (sets up GLSL/HLSL path, packed math support, etc)
++// #define A_GPU 1
++// #define A_GLSL 1
++// #define A_HALF 1
++// ...
++// // Include the portability header (or copy it in without an include).
++// #include "ffx_a.h"
++// ...
++// // Define the fetch function(s).
++// // CasLoad() takes a 32-bit unsigned integer 2D coordinate and loads color.
++// AF3 CasLoad(ASU2 p){return imageLoad(imgSrc,p).rgb;}
++// // CasLoadH() is the 16-bit version taking 16-bit unsigned integer 2D coordinate and loading 16-bit float color.
++// // The ASU2() typecast back to 32-bit is a NO-OP, the compiler pattern matches and uses A16 opcode support instead.
++// // The AH3() typecast to 16-bit float is a NO-OP, the compiler pattern matches and uses D16 opcode support instead.
++// AH3 CasLoadH(ASW2 p){return AH3(imageLoad(imgSrc,ASU2(p)).rgb);}
++// ...
++// // Define the input modifiers as nop's initially.
++// // See "INPUT FORMAT SPECIFIC CASES" below for specifics on what to place in these functions.
++// void CasInput(inout AF1 r,inout AF1 g,inout AF1 b){}
++// void CasInputH(inout AH2 r,inout AH2 g,inout AH2 b){}
++// ...
++// // Include this CAS header file (or copy it in without an include).
++// #include "ffx_cas.h"
++// ...
++// // Example in shader integration for loop-unrolled 16x16 case for 32-bit.
++// layout(local_size_x=64)in;
++// void main(){
++//   // Fetch constants from CasSetup().
++//   AU4 const0=cb.const0;
++//   AU4 const1=cb.const1;
++//   // Do remapping of local xy in workgroup for a more PS-like swizzle pattern.
++//   AU2 gxy=ARmp8x8(gl_LocalInvocationID.x)+AU2(gl_WorkGroupID.x<<4u,gl_WorkGroupID.y<<4u);
++//   // Filter.
++//   AF4 c;
++//   CasFilter(c.r,c.g,c.b,gxy,const0,const1,false);imageStore(imgDst,ASU2(gxy),c);
++//   gxy.x+=8u;
++//   CasFilter(c.r,c.g,c.b,gxy,const0,const1,false);imageStore(imgDst,ASU2(gxy),c);
++//   gxy.y+=8u;
++//   CasFilter(c.r,c.g,c.b,gxy,const0,const1,false);imageStore(imgDst,ASU2(gxy),c);
++//   gxy.x-=8u;
++//   CasFilter(c.r,c.g,c.b,gxy,const0,const1,false);imageStore(imgDst,ASU2(gxy),c);}
++// ...
++// // Example for semi-persistent 16x16 but this time for packed math.
++// // Use this before including 'cas.h' if not using the non-packed filter function.
++// #define CAS_PACKED_ONLY 1
++// ...
++// layout(local_size_x=64)in;
++// void main(){
++//  // Fetch constants from CasSetup().
++//  AU4 const0=cb.const0;
++//  AU4 const1=cb.const1;
++//  // Do remapping of local xy in workgroup for a more PS-like swizzle pattern.
++//  AU2 gxy=ARmp8x8(gl_LocalInvocationID.x)+AU2(gl_WorkGroupID.x<<4u,gl_WorkGroupID.y<<4u);
++//  // Filter.
++//  AH4 c0,c1;AH2 cR,cG,cB;
++//  CasFilterH(cR,cG,cB,gxy,const0,const1,false);
++//  // Extra work integrated after CAS would go here.
++//  ...
++//  // Suggest only running CasDepack() right before stores, to maintain packed math for any work after CasFilterH().
++//  CasDepack(c0,c1,cR,cG,cB);
++//  imageStore(imgDst,ASU2(gxy),AF4(c0));
++//  imageStore(imgDst,ASU2(gxy)+ASU2(8,0),AF4(c1));
++//  gxy.y+=8u;
++//  CasFilterH(cR,cG,cB,gxy,const0,const1,false);
++//  ...
++//  CasDepack(c0,c1,cR,cG,cB);
++//  imageStore(imgDst,ASU2(gxy),AF4(c0));
++//  imageStore(imgDst,ASU2(gxy)+ASU2(8,0),AF4(c1));}
++//------------------------------------------------------------------------------------------------------------------------------
++// CAS FILTERING LOGIC
++// ===================
++// CAS uses the minimal nearest 3x3 source texel window for filtering.
++// The filter coefficients are radially symmetric (phase adaptive, computed per pixel based on output pixel center).
++// The filter kernel adapts to local contrast (adjusting the negative lobe strength of the filter kernel).
++//------------------------------------------------------------------------------------------------------------------------------
++// CAS INPUT REQUIREMENTS
++// ======================
++// This is designed to be a linear filter.
++// Running CAS on perceptual inputs will yield over-sharpening.
++// Input must range between {0 to 1} for each color channel.
++// CAS output will be {0 to 1} ranged as well.
++// CAS does 5 loads, so any conversion applied during CasLoad() or CasInput() has a 5 load * 3 channel = 15x cost amplifier.
++//  - So input conversions need to be factored into the prior pass's output.
++//  - But if necessary use CasInput() instead of CasLoad(), as CasInput() works with packed color.
++//  - For CAS with scaling the amplifier is 12 load * 3 channel = 36x cost amplifier.
++// Any conversion applied to output has a 3x cost amplifier (3 color channels).
++//  - Output conversions are substantially less expensive.
++// Added VALU ops due to conversions will have visible cost as this shader is already quite VALU heavy.
++// This filter does not function well on sRGB or gamma 2.2 non-linear data.
++// This filter does not function on PQ non-linear data.
++//  - Due to the shape of PQ, the positive side of the ring created by the negative lobe tends to become over-bright.
++//------------------------------------------------------------------------------------------------------------------------------
++// INPUT FORMAT SPECIFIC CASES
++// ===========================
++//  - FP16 with all non-negative values ranging {0 to 1}.
++//     - Use as is, filter is designed for linear input and output ranging {0 to 1}.
++// ---------------------------
++//  - UNORM with linear conversion approximation.
++//     - This could be used for both sRGB or FreeSync2 native (gamma 2.2) cases.
++//     - Load/store with either 10:10:10:2 UNORM or 8:8:8:8 UNORM (aka VK_FORMAT_R8G8B8A8_UNORM).
++//     - Use gamma 2.0 conversion in CasInput(), as an approximation.
++//     - Modifications: 
++//        // Change the CasInput*() function to square the inputs.
++//        void CasInput(inout AF1 r,inout AF1 g,inout AF1 b){r*=r;g*=g;b*=b;}
++//        void CasInputH(inout AH2 r,inout AH2 g,inout AH2 b){r*=r;g*=g;b*=b;}
++//        ...
++//        // Do linear to gamma 2.0 before store.
++//        // Since it will be common to do processing after CAS, the filter function returns linear.
++//        c.r=sqrt(c.r);c.g=sqrt(c.g);c.b=sqrt(c.b);
++//        imageStore(imgDst,ASU2(gxy),c);
++//        ...
++//        // And for packed.
++//        CasFilterH(cR,cG,cB,gxy,const0,const1,true);
++//        cR=sqrt(cR);cG=sqrt(cG);cB=sqrt(cB);
++//        CasDepack(c0,c1,cR,cG,cB);
++//        imageStore(img[0],ASU2(gxy),AF4(c0));
++//        imageStore(img[0],ASU2(gxy+AU2(8,0)),AF4(c1));
++// ---------------------------
++//  - sRGB with slightly better quality and higher cost.
++//     - Use texelFetch() with sRGB format (VK_FORMAT_R8G8B8A8_SRGB) for loads (gets linear into shader).
++//     - Store to destination using UNORM (not sRGB) stores and do the linear to sRGB conversion in the shader.
++//     - Modifications:
++//        // Use texel fetch instead of image load (on GCN this will translate into an image load in the driver).
++//        // Hardware has sRGB to linear on loads (but in API only for read-only, aka texture instead of UAV/image).
++//        AF3 CasLoad(ASU2 p){return texelFetch(texSrc,p,0).rgb;}
++//        ...
++//        // Do linear to sRGB before store (GPU lacking hardware conversion support for linear to sRGB on store).
++//        c.r=AToSrgbF1(c.r);c.g=AToSrgbF1(c.g);c.b=AToSrgbF1(c.b);
++//        imageStore(imgDst,ASU2(gxy),c);
++//        ...
++//        // And for packed.
++//        CasFilterH(cR,cG,cB,gxy,const0,const1,true);
++//        cR=AToSrgbH2(cR);cG=AToSrgbH2(cG);cB=AToSrgbH2(cB);
++//        CasDepack(c0,c1,cR,cG,cB);
++//        imageStore(img[0],ASU2(gxy),AF4(c0));
++//        imageStore(img[0],ASU2(gxy+AU2(8,0)),AF4(c1));
++// ---------------------------
++//  - HDR10 output via scRGB.
++//     - Pass before CAS needs to write out linear Rec.2020 colorspace output (all positive values).
++//        - Write to FP16 with {0 to 1} mapped to {0 to maxNits} nits.
++//           - Where 'maxNits' is typically not 10000.
++//           - Instead set 'maxNits' to the nits level that the HDR TV starts to clip white.
++//           - This can be even as low as 1000 nits on some HDR TVs.
++//     - After CAS do matrix multiply to take Rec.2020 back to sRGB and multiply by 'maxNits/80.0'.
++//        - Showing GPU code below to generate constants, likely most need to use CPU code instead.
++//           - Keeping the GPU code here because it is easier to read in these docs.
++//        - Can use 'lpm.h' source to generate the conversion matrix for Rec.2020 to sRGB:
++//           // Output conversion matrix from sRGB to Rec.2020.
++//           AF3 conR,conG,conB;
++//           // Working space temporaries (Rec.2020).
++//           AF3 rgbToXyzXW;AF3 rgbToXyzYW;AF3 rgbToXyzZW;
++//           LpmColRgbToXyz(rgbToXyzXW,rgbToXyzYW,rgbToXyzZW,lpmCol2020R,lpmCol2020G,lpmCol2020B,lpmColD65);
++//           // Output space temporaries (Rec.709, same as sRGB primaries).
++//           AF3 rgbToXyzXO;AF3 rgbToXyzYO;AF3 rgbToXyzZO;
++//           LpmColRgbToXyz(rgbToXyzXO,rgbToXyzYO,rgbToXyzZO,lpmCol709R,lpmCol709G,lpmCol709B,lpmColD65);
++//           AF3 xyzToRgbRO;AF3 xyzToRgbGO;AF3 xyzToRgbBO;
++//           LpmMatInv3x3(xyzToRgbRO,xyzToRgbGO,xyzToRgbBO,rgbToXyzXO,rgbToXyzYO,rgbToXyzZO);
++//           // Generate the matrix.
++//           LpmMatMul3x3(conR,conG,conB,xyzToRgbRO,xyzToRgbGO,xyzToRgbBO,rgbToXyzXW,rgbToXyzYW,rgbToXyzZW);
++//        - Adjust the conversion matrix for the multiply by 'maxNits/80.0'.
++//           // After this the constants can be stored into a constant buffer.
++//           AF1 conScale=maxNits*ARcpF1(80.0);
++//           conR*=conScale;conG*=conScale;conB*=conScale;
++//        - After CAS do the matrix multiply (passing the fetched constants into the shader).
++//           outputR=dot(AF3(colorR,colorG,colorB),conR);
++//           outputG=dot(AF3(colorR,colorG,colorB),conG);
++//           outputB=dot(AF3(colorR,colorG,colorB),conB);
++//     - Hopefully no developer is taking scRGB as input to CAS.
++//        - If that was the case, the conversion matrix from sRGB to Rec.2020 can be built changing the above code.
++//           - Swap the 'lpmCol709*' and 'lpmCol2020*' inputs to LpmColRgbToXyz().
++//           - Then scale by '80.0/maxNits' instead of 'maxNits/80.0'.
++// ---------------------------
++//  - HDR10 output via native 10:10:10:2.
++//     - Pass before CAS needs to write out linear Rec.2020 colorspace output (all positive values).
++//        - Write to FP16 with {0 to 1} mapped to {0 to maxNits} nits.
++//           - Where 'maxNits' is typically not 10000.
++//           - Instead set 'maxNits' to the nits level that the HDR TV starts to clip white.
++//           - This can be even as low as 1000 nits on some HDR TVs.
++//        - Hopefully no developer needs to take PQ as input here, but if so can use A to convert PQ to linear:
++//           // Where 'k0' is a constant of 'maxNits/10000.0'.
++//           colorR=AFromPqF1(colorR*k0);
++//           colorG=AFromPqF1(colorG*k0);
++//           colorB=AFromPqF1(colorB*k0);
++//     - After CAS convert from linear to PQ.
++//        // Where 'k1' is a constant of '10000.0/maxNits'.
++//        colorR=AToPqF1(colorR*k1);
++//        colorG=AToPqF1(colorG*k1);
++//        colorB=AToPqF1(colorB*k1);
++// ---------------------------
++//  - Example of a bad idea for CAS input design.
++//     - Have the pass before CAS store out in 10:10:10:2 UNORM with gamma 2.0.
++//     - Store the output of CAS with sRGB to linear conversion, or with a gamma 2.2 conversion for FreeSync2 native.
++//     - This will drop precision because the inputs had been quantized to 10-bit,
++//       and the output is using a different tonal transform,
++//       so inputs and outputs won't align for similar values.
++//     - It might be "ok" for 8-bit/channel CAS output, but definately not a good idea for 10-bit/channel output.
++//------------------------------------------------------------------------------------------------------------------------------
++// ALGORITHM DESCRIPTION
++// =====================
++// This describes the algorithm with CAS_BETTER_DIAGONALS defined.
++// The default is with CAS_BETTER_DIAGONALS not defined (which is faster).
++// Starting with no scaling.
++// CAS fetches a 3x3 neighborhood around the pixel 'e',
++//  a b c
++//  d(e)f
++//  g h i
++// It then computes a 'soft' minimum and maximum,
++//  a b c             b
++//  d e f * 0.5  +  d e f * 0.5
++//  g h i             h
++// The minimum and maximums give an idea of local contrast.
++//  --- 1.0     ^
++//   |          |  <-- This minimum distance to the signal limit is divided by MAX to get a base sharpening amount 'A'.
++//  --- MAX     v
++//   |
++//   |
++//  --- MIN     ^
++//   |          |  <-- The MIN side is more distant in this example so it is not used, but for dark colors it would be used.
++//   |          |
++//  --- 0.0     v
++// The base sharpening amount 'A' from above is shaped with a sqrt().
++// This 'A' ranges from 0 := no sharpening, to 1 := full sharpening.
++// Then 'A' is scaled by the sharpness knob while being transformed to a negative lobe (values from -1/5 to -1/8 for A=1).
++// The final filter kernel looks like this,
++//  0 A 0 
++//  A 1 A  <-- Center is always 1.0, followed by the negative lobe 'A' in a ring, and windowed into a circle with the 0.0s.
++//  0 A 0
++// The local neighborhood is then multiplied by the kernel weights, summed and divided by the sum of the kernel weights.
++// The high quality path computes filter weights per channel.
++// The low quality path uses the green channel's filter weights to compute the 'A' factor for all channels.
++// ---------------------
++// The scaling path is a little more complex.
++// It starts by fetching the 4x4 neighborhood around the pixel centered between centers of pixels {f,g,j,k},
++//  a b c d
++//  e(f g)h
++//  i(j k)l
++//  m n o p
++// The algorithm then computes the no-scaling result for {f,g,j,k}.
++// It then interpolates between those no-scaling results.
++// The interpolation is adaptive.
++// To hide bilinear interpolation and restore diagonals, it weights bilinear weights by 1/(const+contrast).
++// Where 'contrast' is the soft 'max-min'.
++// This makes edges thin out a little.
++// ---------------------
++// Without CAS_BETTER_DIAGONALS defined, the algorithm is a little faster.
++// Instead of using the 3x3 "box" with the 5-tap "circle" this uses just the "circle".
++// Drops to 5 texture fetches for no-scaling.
++// Drops to 12 texture fetches for scaling.
++// Drops a bunch of math.
++//------------------------------------------------------------------------------------------------------------------------------
++// IDEAS FOR FUTURE
++// ================
++//  - Avoid V_CVT's by using denormals.
++//  - Manually pack FP16 literals.
++//------------------------------------------------------------------------------------------------------------------------------
++// CHANGE LOG
++// ==========
++// 20190610 - Misc documentation cleanup.
++// 20190609 - Removed lowQuality bool, improved scaling logic.
++// 20190530 - Unified CPU/GPU setup code, using new ffx_a.h, faster, define CAS_BETTER_DIAGONALS to get older slower one.
++// 20190529 - Missing a good way to re-interpret packed in HLSL, so disabling approximation optimizations for now.
++// 20190528 - Fixed so GPU CasSetup() generates half data all the time.
++// 20190527 - Implemented approximations for rcp() and sqrt().
++// 20190524 - New algorithm, adjustable sharpness, scaling to 4x area. Fixed checker debug for no-scaling only.
++// 20190521 - Updated file naming.
++// 20190516 - Updated docs, fixed workaround, fixed no-scaling quality issue, removed gamma2 and generalized as CasInput*().
++// 20190510 - Made the dispatch example safely round up for images that are not a multiple of 16x16.
++// 20190507 - Fixed typo bug in CAS_DEBUG_CHECKER, fixed sign typo in the docs.
++// 20190503 - Setup temporary workaround for compiler bug.
++// 20190502 - Added argument for 'gamma2' path so input transform in that case runs packed.
++// 20190426 - Improved documentation on format specific cases, etc.
++// 20190425 - Updated/corrected documentation.
++// 20190405 - Added CAS_PACKED_ONLY, misc bug fixes.
++// 20190404 - Updated for the new a.h header.
++//==============================================================================================================================
++// This is the practical limit for the algorithm's scaling ability (quality is limited by 3x3 taps). Example resolutions,
++//  1280x720  -> 1080p = 2.25x area
++//  1536x864  -> 1080p = 1.56x area
++//  1792x1008 -> 1440p = 2.04x area
++//  1920x1080 -> 1440p = 1.78x area
++//  1920x1080 ->    4K =  4.0x area
++//  2048x1152 -> 1440p = 1.56x area
++//  2560x1440 ->    4K = 2.25x area
++//  3072x1728 ->    4K = 1.56x area
++#define CAS_AREA_LIMIT 4.0
++//------------------------------------------------------------------------------------------------------------------------------
++// Pass in output and input resolution in pixels.
++// This returns true if CAS supports scaling in the given configuration.
++AP1 CasSupportScaling(AF1 outX,AF1 outY,AF1 inX,AF1 inY){return ((outX*outY)*ARcpF1(inX*inY))<=CAS_AREA_LIMIT;}
++//==============================================================================================================================
++// Call to setup required constant values (works on CPU or GPU).
++A_STATIC void CasSetup(
++ outAU4 const0,
++ outAU4 const1,
++ AF1 sharpness, // 0 := default (lower ringing), 1 := maximum (higest ringing)
++ AF1 inputSizeInPixelsX,
++ AF1 inputSizeInPixelsY,
++ AF1 outputSizeInPixelsX,
++ AF1 outputSizeInPixelsY){
++  // Scaling terms.
++  const0[0]=AU1_AF1(inputSizeInPixelsX*ARcpF1(outputSizeInPixelsX));
++  const0[1]=AU1_AF1(inputSizeInPixelsY*ARcpF1(outputSizeInPixelsY));
++  const0[2]=AU1_AF1(AF1_(0.5)*inputSizeInPixelsX*ARcpF1(outputSizeInPixelsX)-AF1_(0.5));
++  const0[3]=AU1_AF1(AF1_(0.5)*inputSizeInPixelsY*ARcpF1(outputSizeInPixelsY)-AF1_(0.5));
++  // Sharpness value.
++  AF1 sharp=-ARcpF1(ALerpF1(8.0,5.0,ASatF1(sharpness)));
++  varAF2(hSharp)=initAF2(sharp,0.0);
++  const1[0]=AU1_AF1(sharp);
++  const1[1]=AU1_AH2_AF2(hSharp);
++  const1[2]=AU1_AF1(AF1_(8.0)*inputSizeInPixelsX*ARcpF1(outputSizeInPixelsX));
++  const1[3]=0;}
++////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
++////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
++//_____________________________________________________________/\_______________________________________________________________
++//==============================================================================================================================
++//                                                     NON-PACKED VERSION
++//==============================================================================================================================
++#ifdef A_GPU
++ #ifdef CAS_PACKED_ONLY
++  // Avoid compiler error.
++  AF3 CasLoad(ASU2 p){return AF3(0.0,0.0,0.0);}
++  void CasInput(inout AF1 r,inout AF1 g,inout AF1 b){}
++ #endif
++//------------------------------------------------------------------------------------------------------------------------------
++ void CasFilter(
++ out AF1 pixR, // Output values, non-vector so port between CasFilter() and CasFilterH() is easy.
++ out AF1 pixG,
++ out AF1 pixB,
++ AU2 ip, // Integer pixel position in output.
++ AU4 const0, // Constants generated by CasSetup().
++ AU4 const1,
++ AP1 noScaling){ // Must be a compile-time literal value, true = sharpen only (no resize).
++//------------------------------------------------------------------------------------------------------------------------------
++  // Debug a checker pattern of on/off tiles for visual inspection.
++  #ifdef CAS_DEBUG_CHECKER
++   if((((ip.x^ip.y)>>8u)&1u)==0u){AF3 pix0=CasLoad(ASU2(ip));
++    pixR=pix0.r;pixG=pix0.g;pixB=pix0.b;CasInput(pixR,pixG,pixB);return;}
++  #endif 
++//------------------------------------------------------------------------------------------------------------------------------
++  // No scaling algorithm uses minimal 3x3 pixel neighborhood.
++  if(noScaling){
++   // a b c 
++   // d e f
++   // g h i
++   ASU2 sp=ASU2(ip);
++   AF3 a=CasLoad(sp+ASU2(-1,-1));
++   AF3 b=CasLoad(sp+ASU2( 0,-1));
++   AF3 c=CasLoad(sp+ASU2( 1,-1));
++   AF3 d=CasLoad(sp+ASU2(-1, 0));
++   AF3 e=CasLoad(sp);
++   AF3 f=CasLoad(sp+ASU2( 1, 0));
++   AF3 g=CasLoad(sp+ASU2(-1, 1));
++   AF3 h=CasLoad(sp+ASU2( 0, 1));
++   AF3 i=CasLoad(sp+ASU2( 1, 1));
++   // Run optional input transform.
++   CasInput(a.r,a.g,a.b);
++   CasInput(b.r,b.g,b.b);
++   CasInput(c.r,c.g,c.b);
++   CasInput(d.r,d.g,d.b);
++   CasInput(e.r,e.g,e.b);
++   CasInput(f.r,f.g,f.b);
++   CasInput(g.r,g.g,g.b);
++   CasInput(h.r,h.g,h.b);
++   CasInput(i.r,i.g,i.b);
++   // Soft min and max.
++   //  a b c             b
++   //  d e f * 0.5  +  d e f * 0.5
++   //  g h i             h
++   // These are 2.0x bigger (factored out the extra multiply).
++   AF1 mnR=AMin3F1(AMin3F1(d.r,e.r,f.r),b.r,h.r);
++   AF1 mnG=AMin3F1(AMin3F1(d.g,e.g,f.g),b.g,h.g);
++   AF1 mnB=AMin3F1(AMin3F1(d.b,e.b,f.b),b.b,h.b);
++   #ifdef CAS_BETTER_DIAGONALS
++    AF1 mnR2=AMin3F1(AMin3F1(mnR,a.r,c.r),g.r,i.r);
++    AF1 mnG2=AMin3F1(AMin3F1(mnG,a.g,c.g),g.g,i.g);
++    AF1 mnB2=AMin3F1(AMin3F1(mnB,a.b,c.b),g.b,i.b);
++    mnR=mnR+mnR2;
++    mnG=mnG+mnG2;
++    mnB=mnB+mnB2;
++   #endif
++   AF1 mxR=AMax3F1(AMax3F1(d.r,e.r,f.r),b.r,h.r);
++   AF1 mxG=AMax3F1(AMax3F1(d.g,e.g,f.g),b.g,h.g);
++   AF1 mxB=AMax3F1(AMax3F1(d.b,e.b,f.b),b.b,h.b);
++   #ifdef CAS_BETTER_DIAGONALS
++    AF1 mxR2=AMax3F1(AMax3F1(mxR,a.r,c.r),g.r,i.r);
++    AF1 mxG2=AMax3F1(AMax3F1(mxG,a.g,c.g),g.g,i.g);
++    AF1 mxB2=AMax3F1(AMax3F1(mxB,a.b,c.b),g.b,i.b);
++    mxR=mxR+mxR2;
++    mxG=mxG+mxG2;
++    mxB=mxB+mxB2;
++   #endif
++   // Smooth minimum distance to signal limit divided by smooth max.
++   #ifdef CAS_GO_SLOWER
++    AF1 rcpMR=ARcpF1(mxR);
++    AF1 rcpMG=ARcpF1(mxG);
++    AF1 rcpMB=ARcpF1(mxB);
++   #else
++    AF1 rcpMR=APrxLoRcpF1(mxR);
++    AF1 rcpMG=APrxLoRcpF1(mxG);
++    AF1 rcpMB=APrxLoRcpF1(mxB);
++   #endif
++   #ifdef CAS_BETTER_DIAGONALS
++    AF1 ampR=ASatF1(min(mnR,AF1_(2.0)-mxR)*rcpMR);
++    AF1 ampG=ASatF1(min(mnG,AF1_(2.0)-mxG)*rcpMG);
++    AF1 ampB=ASatF1(min(mnB,AF1_(2.0)-mxB)*rcpMB);
++   #else
++    AF1 ampR=ASatF1(min(mnR,AF1_(1.0)-mxR)*rcpMR);
++    AF1 ampG=ASatF1(min(mnG,AF1_(1.0)-mxG)*rcpMG);
++    AF1 ampB=ASatF1(min(mnB,AF1_(1.0)-mxB)*rcpMB);
++   #endif
++   // Shaping amount of sharpening.
++   #ifdef CAS_GO_SLOWER
++    ampR=sqrt(ampR);
++    ampG=sqrt(ampG);
++    ampB=sqrt(ampB);
++   #else
++    ampR=APrxLoSqrtF1(ampR);
++    ampG=APrxLoSqrtF1(ampG);
++    ampB=APrxLoSqrtF1(ampB);
++   #endif
++   // Filter shape.
++   //  0 w 0
++   //  w 1 w
++   //  0 w 0
++   AF1 peak=AF1_AU1(const1.x);
++   AF1 wR=ampR*peak;
++   AF1 wG=ampG*peak;
++   AF1 wB=ampB*peak;
++   // Filter.
++   #ifndef CAS_SLOW
++    // Using green coef only, depending on dead code removal to strip out the extra overhead.
++    #ifdef CAS_GO_SLOWER
++     AF1 rcpWeight=ARcpF1(AF1_(1.0)+AF1_(4.0)*wG);
++    #else
++     AF1 rcpWeight=APrxMedRcpF1(AF1_(1.0)+AF1_(4.0)*wG);
++    #endif
++    pixR=ASatF1((b.r*wG+d.r*wG+f.r*wG+h.r*wG+e.r)*rcpWeight);
++    pixG=ASatF1((b.g*wG+d.g*wG+f.g*wG+h.g*wG+e.g)*rcpWeight);
++    pixB=ASatF1((b.b*wG+d.b*wG+f.b*wG+h.b*wG+e.b)*rcpWeight);
++   #else
++    #ifdef CAS_GO_SLOWER
++     AF1 rcpWeightR=ARcpF1(AF1_(1.0)+AF1_(4.0)*wR);
++     AF1 rcpWeightG=ARcpF1(AF1_(1.0)+AF1_(4.0)*wG);
++     AF1 rcpWeightB=ARcpF1(AF1_(1.0)+AF1_(4.0)*wB);
++    #else
++     AF1 rcpWeightR=APrxMedRcpF1(AF1_(1.0)+AF1_(4.0)*wR);
++     AF1 rcpWeightG=APrxMedRcpF1(AF1_(1.0)+AF1_(4.0)*wG);
++     AF1 rcpWeightB=APrxMedRcpF1(AF1_(1.0)+AF1_(4.0)*wB);
++    #endif
++    pixR=ASatF1((b.r*wR+d.r*wR+f.r*wR+h.r*wR+e.r)*rcpWeightR);
++    pixG=ASatF1((b.g*wG+d.g*wG+f.g*wG+h.g*wG+e.g)*rcpWeightG);
++    pixB=ASatF1((b.b*wB+d.b*wB+f.b*wB+h.b*wB+e.b)*rcpWeightB);
++   #endif
++   return;}
++//------------------------------------------------------------------------------------------------------------------------------
++  // Scaling algorithm adaptively interpolates between nearest 4 results of the non-scaling algorithm.
++  //  a b c d
++  //  e f g h
++  //  i j k l
++  //  m n o p
++  // Working these 4 results.
++  //  +-----+-----+
++  //  |     |     |
++  //  |  f..|..g  |
++  //  |  .  |  .  |
++  //  +-----+-----+
++  //  |  .  |  .  |
++  //  |  j..|..k  |
++  //  |     |     |
++  //  +-----+-----+
++  AF2 pp=AF2(ip)*AF2_AU2(const0.xy)+AF2_AU2(const0.zw);
++  AF2 fp=floor(pp);
++  pp-=fp;
++  ASU2 sp=ASU2(fp);
++  AF3 a=CasLoad(sp+ASU2(-1,-1));
++  AF3 b=CasLoad(sp+ASU2( 0,-1));
++  AF3 e=CasLoad(sp+ASU2(-1, 0));
++  AF3 f=CasLoad(sp);
++  AF3 c=CasLoad(sp+ASU2( 1,-1));
++  AF3 d=CasLoad(sp+ASU2( 2,-1));
++  AF3 g=CasLoad(sp+ASU2( 1, 0));
++  AF3 h=CasLoad(sp+ASU2( 2, 0));
++  AF3 i=CasLoad(sp+ASU2(-1, 1));
++  AF3 j=CasLoad(sp+ASU2( 0, 1));
++  AF3 m=CasLoad(sp+ASU2(-1, 2));
++  AF3 n=CasLoad(sp+ASU2( 0, 2));
++  AF3 k=CasLoad(sp+ASU2( 1, 1));
++  AF3 l=CasLoad(sp+ASU2( 2, 1));
++  AF3 o=CasLoad(sp+ASU2( 1, 2));
++  AF3 p=CasLoad(sp+ASU2( 2, 2));
++  // Run optional input transform.
++  CasInput(a.r,a.g,a.b);
++  CasInput(b.r,b.g,b.b);
++  CasInput(c.r,c.g,c.b);
++  CasInput(d.r,d.g,d.b);
++  CasInput(e.r,e.g,e.b);
++  CasInput(f.r,f.g,f.b);
++  CasInput(g.r,g.g,g.b);
++  CasInput(h.r,h.g,h.b);
++  CasInput(i.r,i.g,i.b);
++  CasInput(j.r,j.g,j.b);
++  CasInput(k.r,k.g,k.b);
++  CasInput(l.r,l.g,l.b);
++  CasInput(m.r,m.g,m.b);
++  CasInput(n.r,n.g,n.b);
++  CasInput(o.r,o.g,o.b);
++  CasInput(p.r,p.g,p.b);
++  // Soft min and max.
++  // These are 2.0x bigger (factored out the extra multiply).
++  //  a b c             b
++  //  e f g * 0.5  +  e f g * 0.5  [F]
++  //  i j k             j
++  AF1 mnfR=AMin3F1(AMin3F1(b.r,e.r,f.r),g.r,j.r);
++  AF1 mnfG=AMin3F1(AMin3F1(b.g,e.g,f.g),g.g,j.g);
++  AF1 mnfB=AMin3F1(AMin3F1(b.b,e.b,f.b),g.b,j.b);
++  #ifdef CAS_BETTER_DIAGONALS
++   AF1 mnfR2=AMin3F1(AMin3F1(mnfR,a.r,c.r),i.r,k.r);
++   AF1 mnfG2=AMin3F1(AMin3F1(mnfG,a.g,c.g),i.g,k.g);
++   AF1 mnfB2=AMin3F1(AMin3F1(mnfB,a.b,c.b),i.b,k.b);
++   mnfR=mnfR+mnfR2;
++   mnfG=mnfG+mnfG2;
++   mnfB=mnfB+mnfB2;
++  #endif
++  AF1 mxfR=AMax3F1(AMax3F1(b.r,e.r,f.r),g.r,j.r);
++  AF1 mxfG=AMax3F1(AMax3F1(b.g,e.g,f.g),g.g,j.g);
++  AF1 mxfB=AMax3F1(AMax3F1(b.b,e.b,f.b),g.b,j.b);
++  #ifdef CAS_BETTER_DIAGONALS
++   AF1 mxfR2=AMax3F1(AMax3F1(mxfR,a.r,c.r),i.r,k.r);
++   AF1 mxfG2=AMax3F1(AMax3F1(mxfG,a.g,c.g),i.g,k.g);
++   AF1 mxfB2=AMax3F1(AMax3F1(mxfB,a.b,c.b),i.b,k.b);
++   mxfR=mxfR+mxfR2;
++   mxfG=mxfG+mxfG2;
++   mxfB=mxfB+mxfB2;
++  #endif
++  //  b c d             c
++  //  f g h * 0.5  +  f g h * 0.5  [G]
++  //  j k l             k
++  AF1 mngR=AMin3F1(AMin3F1(c.r,f.r,g.r),h.r,k.r);
++  AF1 mngG=AMin3F1(AMin3F1(c.g,f.g,g.g),h.g,k.g);
++  AF1 mngB=AMin3F1(AMin3F1(c.b,f.b,g.b),h.b,k.b);
++  #ifdef CAS_BETTER_DIAGONALS
++   AF1 mngR2=AMin3F1(AMin3F1(mngR,b.r,d.r),j.r,l.r);
++   AF1 mngG2=AMin3F1(AMin3F1(mngG,b.g,d.g),j.g,l.g);
++   AF1 mngB2=AMin3F1(AMin3F1(mngB,b.b,d.b),j.b,l.b);
++   mngR=mngR+mngR2;
++   mngG=mngG+mngG2;
++   mngB=mngB+mngB2;
++  #endif
++  AF1 mxgR=AMax3F1(AMax3F1(c.r,f.r,g.r),h.r,k.r);
++  AF1 mxgG=AMax3F1(AMax3F1(c.g,f.g,g.g),h.g,k.g);
++  AF1 mxgB=AMax3F1(AMax3F1(c.b,f.b,g.b),h.b,k.b);
++  #ifdef CAS_BETTER_DIAGONALS
++   AF1 mxgR2=AMax3F1(AMax3F1(mxgR,b.r,d.r),j.r,l.r);
++   AF1 mxgG2=AMax3F1(AMax3F1(mxgG,b.g,d.g),j.g,l.g);
++   AF1 mxgB2=AMax3F1(AMax3F1(mxgB,b.b,d.b),j.b,l.b);
++   mxgR=mxgR+mxgR2;
++   mxgG=mxgG+mxgG2;
++   mxgB=mxgB+mxgB2;
++  #endif
++  //  e f g             f
++  //  i j k * 0.5  +  i j k * 0.5  [J]
++  //  m n o             n
++  AF1 mnjR=AMin3F1(AMin3F1(f.r,i.r,j.r),k.r,n.r);
++  AF1 mnjG=AMin3F1(AMin3F1(f.g,i.g,j.g),k.g,n.g);
++  AF1 mnjB=AMin3F1(AMin3F1(f.b,i.b,j.b),k.b,n.b);
++  #ifdef CAS_BETTER_DIAGONALS
++   AF1 mnjR2=AMin3F1(AMin3F1(mnjR,e.r,g.r),m.r,o.r);
++   AF1 mnjG2=AMin3F1(AMin3F1(mnjG,e.g,g.g),m.g,o.g);
++   AF1 mnjB2=AMin3F1(AMin3F1(mnjB,e.b,g.b),m.b,o.b);
++   mnjR=mnjR+mnjR2;
++   mnjG=mnjG+mnjG2;
++   mnjB=mnjB+mnjB2;
++  #endif
++  AF1 mxjR=AMax3F1(AMax3F1(f.r,i.r,j.r),k.r,n.r);
++  AF1 mxjG=AMax3F1(AMax3F1(f.g,i.g,j.g),k.g,n.g);
++  AF1 mxjB=AMax3F1(AMax3F1(f.b,i.b,j.b),k.b,n.b);
++  #ifdef CAS_BETTER_DIAGONALS
++   AF1 mxjR2=AMax3F1(AMax3F1(mxjR,e.r,g.r),m.r,o.r);
++   AF1 mxjG2=AMax3F1(AMax3F1(mxjG,e.g,g.g),m.g,o.g);
++   AF1 mxjB2=AMax3F1(AMax3F1(mxjB,e.b,g.b),m.b,o.b);
++   mxjR=mxjR+mxjR2;
++   mxjG=mxjG+mxjG2;
++   mxjB=mxjB+mxjB2;
++  #endif
++  //  f g h             g
++  //  j k l * 0.5  +  j k l * 0.5  [K]
++  //  n o p             o
++  AF1 mnkR=AMin3F1(AMin3F1(g.r,j.r,k.r),l.r,o.r);
++  AF1 mnkG=AMin3F1(AMin3F1(g.g,j.g,k.g),l.g,o.g);
++  AF1 mnkB=AMin3F1(AMin3F1(g.b,j.b,k.b),l.b,o.b);
++  #ifdef CAS_BETTER_DIAGONALS
++   AF1 mnkR2=AMin3F1(AMin3F1(mnkR,f.r,h.r),n.r,p.r);
++   AF1 mnkG2=AMin3F1(AMin3F1(mnkG,f.g,h.g),n.g,p.g);
++   AF1 mnkB2=AMin3F1(AMin3F1(mnkB,f.b,h.b),n.b,p.b);
++   mnkR=mnkR+mnkR2;
++   mnkG=mnkG+mnkG2;
++   mnkB=mnkB+mnkB2;
++  #endif
++  AF1 mxkR=AMax3F1(AMax3F1(g.r,j.r,k.r),l.r,o.r);
++  AF1 mxkG=AMax3F1(AMax3F1(g.g,j.g,k.g),l.g,o.g);
++  AF1 mxkB=AMax3F1(AMax3F1(g.b,j.b,k.b),l.b,o.b);
++  #ifdef CAS_BETTER_DIAGONALS
++   AF1 mxkR2=AMax3F1(AMax3F1(mxkR,f.r,h.r),n.r,p.r);
++   AF1 mxkG2=AMax3F1(AMax3F1(mxkG,f.g,h.g),n.g,p.g);
++   AF1 mxkB2=AMax3F1(AMax3F1(mxkB,f.b,h.b),n.b,p.b);
++   mxkR=mxkR+mxkR2;
++   mxkG=mxkG+mxkG2;
++   mxkB=mxkB+mxkB2;
++  #endif
++  // Smooth minimum distance to signal limit divided by smooth max.
++  #ifdef CAS_GO_SLOWER
++   AF1 rcpMfR=ARcpF1(mxfR);
++   AF1 rcpMfG=ARcpF1(mxfG);
++   AF1 rcpMfB=ARcpF1(mxfB);
++   AF1 rcpMgR=ARcpF1(mxgR);
++   AF1 rcpMgG=ARcpF1(mxgG);
++   AF1 rcpMgB=ARcpF1(mxgB);
++   AF1 rcpMjR=ARcpF1(mxjR);
++   AF1 rcpMjG=ARcpF1(mxjG);
++   AF1 rcpMjB=ARcpF1(mxjB);
++   AF1 rcpMkR=ARcpF1(mxkR);
++   AF1 rcpMkG=ARcpF1(mxkG);
++   AF1 rcpMkB=ARcpF1(mxkB);
++  #else
++   AF1 rcpMfR=APrxLoRcpF1(mxfR);
++   AF1 rcpMfG=APrxLoRcpF1(mxfG);
++   AF1 rcpMfB=APrxLoRcpF1(mxfB);
++   AF1 rcpMgR=APrxLoRcpF1(mxgR);
++   AF1 rcpMgG=APrxLoRcpF1(mxgG);
++   AF1 rcpMgB=APrxLoRcpF1(mxgB);
++   AF1 rcpMjR=APrxLoRcpF1(mxjR);
++   AF1 rcpMjG=APrxLoRcpF1(mxjG);
++   AF1 rcpMjB=APrxLoRcpF1(mxjB);
++   AF1 rcpMkR=APrxLoRcpF1(mxkR);
++   AF1 rcpMkG=APrxLoRcpF1(mxkG);
++   AF1 rcpMkB=APrxLoRcpF1(mxkB);
++  #endif
++  #ifdef CAS_BETTER_DIAGONALS
++   AF1 ampfR=ASatF1(min(mnfR,AF1_(2.0)-mxfR)*rcpMfR);
++   AF1 ampfG=ASatF1(min(mnfG,AF1_(2.0)-mxfG)*rcpMfG);
++   AF1 ampfB=ASatF1(min(mnfB,AF1_(2.0)-mxfB)*rcpMfB);
++   AF1 ampgR=ASatF1(min(mngR,AF1_(2.0)-mxgR)*rcpMgR);
++   AF1 ampgG=ASatF1(min(mngG,AF1_(2.0)-mxgG)*rcpMgG);
++   AF1 ampgB=ASatF1(min(mngB,AF1_(2.0)-mxgB)*rcpMgB);
++   AF1 ampjR=ASatF1(min(mnjR,AF1_(2.0)-mxjR)*rcpMjR);
++   AF1 ampjG=ASatF1(min(mnjG,AF1_(2.0)-mxjG)*rcpMjG);
++   AF1 ampjB=ASatF1(min(mnjB,AF1_(2.0)-mxjB)*rcpMjB);
++   AF1 ampkR=ASatF1(min(mnkR,AF1_(2.0)-mxkR)*rcpMkR);
++   AF1 ampkG=ASatF1(min(mnkG,AF1_(2.0)-mxkG)*rcpMkG);
++   AF1 ampkB=ASatF1(min(mnkB,AF1_(2.0)-mxkB)*rcpMkB);
++  #else
++   AF1 ampfR=ASatF1(min(mnfR,AF1_(1.0)-mxfR)*rcpMfR);
++   AF1 ampfG=ASatF1(min(mnfG,AF1_(1.0)-mxfG)*rcpMfG);
++   AF1 ampfB=ASatF1(min(mnfB,AF1_(1.0)-mxfB)*rcpMfB);
++   AF1 ampgR=ASatF1(min(mngR,AF1_(1.0)-mxgR)*rcpMgR);
++   AF1 ampgG=ASatF1(min(mngG,AF1_(1.0)-mxgG)*rcpMgG);
++   AF1 ampgB=ASatF1(min(mngB,AF1_(1.0)-mxgB)*rcpMgB);
++   AF1 ampjR=ASatF1(min(mnjR,AF1_(1.0)-mxjR)*rcpMjR);
++   AF1 ampjG=ASatF1(min(mnjG,AF1_(1.0)-mxjG)*rcpMjG);
++   AF1 ampjB=ASatF1(min(mnjB,AF1_(1.0)-mxjB)*rcpMjB);
++   AF1 ampkR=ASatF1(min(mnkR,AF1_(1.0)-mxkR)*rcpMkR);
++   AF1 ampkG=ASatF1(min(mnkG,AF1_(1.0)-mxkG)*rcpMkG);
++   AF1 ampkB=ASatF1(min(mnkB,AF1_(1.0)-mxkB)*rcpMkB);
++  #endif
++  // Shaping amount of sharpening.
++  #ifdef CAS_GO_SLOWER
++   ampfR=sqrt(ampfR);
++   ampfG=sqrt(ampfG);
++   ampfB=sqrt(ampfB);
++   ampgR=sqrt(ampgR);
++   ampgG=sqrt(ampgG);
++   ampgB=sqrt(ampgB);
++   ampjR=sqrt(ampjR);
++   ampjG=sqrt(ampjG);
++   ampjB=sqrt(ampjB);
++   ampkR=sqrt(ampkR);
++   ampkG=sqrt(ampkG);
++   ampkB=sqrt(ampkB);
++  #else
++   ampfR=APrxLoSqrtF1(ampfR);
++   ampfG=APrxLoSqrtF1(ampfG);
++   ampfB=APrxLoSqrtF1(ampfB);
++   ampgR=APrxLoSqrtF1(ampgR);
++   ampgG=APrxLoSqrtF1(ampgG);
++   ampgB=APrxLoSqrtF1(ampgB);
++   ampjR=APrxLoSqrtF1(ampjR);
++   ampjG=APrxLoSqrtF1(ampjG);
++   ampjB=APrxLoSqrtF1(ampjB);
++   ampkR=APrxLoSqrtF1(ampkR);
++   ampkG=APrxLoSqrtF1(ampkG);
++   ampkB=APrxLoSqrtF1(ampkB);
++  #endif
++  // Filter shape.
++  //  0 w 0
++  //  w 1 w
++  //  0 w 0
++  AF1 peak=AF1_AU1(const1.x);
++  AF1 wfR=ampfR*peak;
++  AF1 wfG=ampfG*peak;
++  AF1 wfB=ampfB*peak;
++  AF1 wgR=ampgR*peak;
++  AF1 wgG=ampgG*peak;
++  AF1 wgB=ampgB*peak;
++  AF1 wjR=ampjR*peak;
++  AF1 wjG=ampjG*peak;
++  AF1 wjB=ampjB*peak;
++  AF1 wkR=ampkR*peak;
++  AF1 wkG=ampkG*peak;
++  AF1 wkB=ampkB*peak;
++  // Blend between 4 results.
++  //  s t
++  //  u v
++  AF1 s=(AF1_(1.0)-pp.x)*(AF1_(1.0)-pp.y);
++  AF1 t=           pp.x *(AF1_(1.0)-pp.y);
++  AF1 u=(AF1_(1.0)-pp.x)*           pp.y ;
++  AF1 v=           pp.x *           pp.y ;
++  // Thin edges to hide bilinear interpolation (helps diagonals).
++  AF1 thinB=1.0/32.0;
++  #ifdef CAS_GO_SLOWER
++   s*=ARcpF1(thinB+(mxfG-mnfG));
++   t*=ARcpF1(thinB+(mxgG-mngG));
++   u*=ARcpF1(thinB+(mxjG-mnjG));
++   v*=ARcpF1(thinB+(mxkG-mnkG));
++  #else
++   s*=APrxLoRcpF1(thinB+(mxfG-mnfG));
++   t*=APrxLoRcpF1(thinB+(mxgG-mngG));
++   u*=APrxLoRcpF1(thinB+(mxjG-mnjG));
++   v*=APrxLoRcpF1(thinB+(mxkG-mnkG));
++  #endif
++  // Final weighting.
++  //    b c
++  //  e f g h
++  //  i j k l
++  //    n o
++  //  _____  _____  _____  _____
++  //         fs        gt 
++  //
++  //  _____  _____  _____  _____
++  //  fs      s gt  fs  t     gt
++  //         ju        kv
++  //  _____  _____  _____  _____
++  //         fs        gt
++  //  ju      u kv  ju  v     kv
++  //  _____  _____  _____  _____
++  //
++  //         ju        kv
++  AF1 qbeR=wfR*s;
++  AF1 qbeG=wfG*s;
++  AF1 qbeB=wfB*s;
++  AF1 qchR=wgR*t;
++  AF1 qchG=wgG*t;
++  AF1 qchB=wgB*t;
++  AF1 qfR=wgR*t+wjR*u+s;
++  AF1 qfG=wgG*t+wjG*u+s;
++  AF1 qfB=wgB*t+wjB*u+s;
++  AF1 qgR=wfR*s+wkR*v+t;
++  AF1 qgG=wfG*s+wkG*v+t;
++  AF1 qgB=wfB*s+wkB*v+t;
++  AF1 qjR=wfR*s+wkR*v+u;
++  AF1 qjG=wfG*s+wkG*v+u;
++  AF1 qjB=wfB*s+wkB*v+u;
++  AF1 qkR=wgR*t+wjR*u+v;
++  AF1 qkG=wgG*t+wjG*u+v;
++  AF1 qkB=wgB*t+wjB*u+v;
++  AF1 qinR=wjR*u;
++  AF1 qinG=wjG*u;
++  AF1 qinB=wjB*u;
++  AF1 qloR=wkR*v;
++  AF1 qloG=wkG*v;
++  AF1 qloB=wkB*v;
++  // Filter.
++  #ifndef CAS_SLOW
++   // Using green coef only, depending on dead code removal to strip out the extra overhead.
++   #ifdef CAS_GO_SLOWER
++    AF1 rcpWG=ARcpF1(AF1_(2.0)*qbeG+AF1_(2.0)*qchG+AF1_(2.0)*qinG+AF1_(2.0)*qloG+qfG+qgG+qjG+qkG);
++   #else
++    AF1 rcpWG=APrxMedRcpF1(AF1_(2.0)*qbeG+AF1_(2.0)*qchG+AF1_(2.0)*qinG+AF1_(2.0)*qloG+qfG+qgG+qjG+qkG);
++   #endif
++   pixR=ASatF1((b.r*qbeG+e.r*qbeG+c.r*qchG+h.r*qchG+i.r*qinG+n.r*qinG+l.r*qloG+o.r*qloG+f.r*qfG+g.r*qgG+j.r*qjG+k.r*qkG)*rcpWG);
++   pixG=ASatF1((b.g*qbeG+e.g*qbeG+c.g*qchG+h.g*qchG+i.g*qinG+n.g*qinG+l.g*qloG+o.g*qloG+f.g*qfG+g.g*qgG+j.g*qjG+k.g*qkG)*rcpWG);
++   pixB=ASatF1((b.b*qbeG+e.b*qbeG+c.b*qchG+h.b*qchG+i.b*qinG+n.b*qinG+l.b*qloG+o.b*qloG+f.b*qfG+g.b*qgG+j.b*qjG+k.b*qkG)*rcpWG);
++  #else
++   #ifdef CAS_GO_SLOWER
++    AF1 rcpWR=ARcpF1(AF1_(2.0)*qbeR+AF1_(2.0)*qchR+AF1_(2.0)*qinR+AF1_(2.0)*qloR+qfR+qgR+qjR+qkR);
++    AF1 rcpWG=ARcpF1(AF1_(2.0)*qbeG+AF1_(2.0)*qchG+AF1_(2.0)*qinG+AF1_(2.0)*qloG+qfG+qgG+qjG+qkG);
++    AF1 rcpWB=ARcpF1(AF1_(2.0)*qbeB+AF1_(2.0)*qchB+AF1_(2.0)*qinB+AF1_(2.0)*qloB+qfB+qgB+qjB+qkB);
++   #else
++    AF1 rcpWR=APrxMedRcpF1(AF1_(2.0)*qbeR+AF1_(2.0)*qchR+AF1_(2.0)*qinR+AF1_(2.0)*qloR+qfR+qgR+qjR+qkR);
++    AF1 rcpWG=APrxMedRcpF1(AF1_(2.0)*qbeG+AF1_(2.0)*qchG+AF1_(2.0)*qinG+AF1_(2.0)*qloG+qfG+qgG+qjG+qkG);
++    AF1 rcpWB=APrxMedRcpF1(AF1_(2.0)*qbeB+AF1_(2.0)*qchB+AF1_(2.0)*qinB+AF1_(2.0)*qloB+qfB+qgB+qjB+qkB);
++   #endif
++   pixR=ASatF1((b.r*qbeR+e.r*qbeR+c.r*qchR+h.r*qchR+i.r*qinR+n.r*qinR+l.r*qloR+o.r*qloR+f.r*qfR+g.r*qgR+j.r*qjR+k.r*qkR)*rcpWR);
++   pixG=ASatF1((b.g*qbeG+e.g*qbeG+c.g*qchG+h.g*qchG+i.g*qinG+n.g*qinG+l.g*qloG+o.g*qloG+f.g*qfG+g.g*qgG+j.g*qjG+k.g*qkG)*rcpWG);
++   pixB=ASatF1((b.b*qbeB+e.b*qbeB+c.b*qchB+h.b*qchB+i.b*qinB+n.b*qinB+l.b*qloB+o.b*qloB+f.b*qfB+g.b*qgB+j.b*qjB+k.b*qkB)*rcpWB);
++  #endif
++ }
++#endif
++////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
++////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
++//_____________________________________________________________/\_______________________________________________________________
++//==============================================================================================================================
++//                                                       PACKED VERSION
++//==============================================================================================================================
++#if defined(A_GPU) && defined(A_HALF)
++ // Missing a way to do packed re-interpetation, so must disable approximation optimizations.
++ #ifdef A_HLSL
++  #ifndef CAS_GO_SLOWER
++   #define CAS_GO_SLOWER 1
++  #endif
++ #endif
++//==============================================================================================================================
++ // Can be used to convert from packed SOA to AOS for store.
++ void CasDepack(out AH4 pix0,out AH4 pix1,AH2 pixR,AH2 pixG,AH2 pixB){
++  #ifdef A_HLSL
++   // Invoke a slower path for DX only, since it won't allow uninitialized values.
++   pix0.a=pix1.a=0.0;
++  #endif
++  pix0.rgb=AH3(pixR.x,pixG.x,pixB.x);
++  pix1.rgb=AH3(pixR.y,pixG.y,pixB.y);}
++//==============================================================================================================================
++ void CasFilterH(
++ // Output values are for 2 8x8 tiles in a 16x8 region.
++ //  pix<R,G,B>.x = right 8x8 tile
++ //  pix<R,G,B>.y =  left 8x8 tile
++ // This enables later processing to easily be packed as well.
++ out AH2 pixR,
++ out AH2 pixG,
++ out AH2 pixB,
++ AU2 ip, // Integer pixel position in output.
++ AU4 const0, // Constants generated by CasSetup().
++ AU4 const1,
++ AP1 noScaling){ // Must be a compile-time literal value, true = sharpen only (no resize).
++//------------------------------------------------------------------------------------------------------------------------------
++  // Debug a checker pattern of on/off tiles for visual inspection.
++  #ifdef CAS_DEBUG_CHECKER
++   if((((ip.x^ip.y)>>8u)&1u)==0u){AH3 pix0=CasLoadH(ASW2(ip));AH3 pix1=CasLoadH(ASW2(ip)+ASW2(8,0));
++    pixR=AH2(pix0.r,pix1.r);pixG=AH2(pix0.g,pix1.g);pixB=AH2(pix0.b,pix1.b);CasInputH(pixR,pixG,pixB);return;}
++  #endif 
++//------------------------------------------------------------------------------------------------------------------------------
++  // No scaling algorithm uses minimal 3x3 pixel neighborhood.
++  if(noScaling){
++   ASW2 sp0=ASW2(ip);
++   AH3 a0=CasLoadH(sp0+ASW2(-1,-1));
++   AH3 b0=CasLoadH(sp0+ASW2( 0,-1));
++   AH3 c0=CasLoadH(sp0+ASW2( 1,-1));
++   AH3 d0=CasLoadH(sp0+ASW2(-1, 0));
++   AH3 e0=CasLoadH(sp0);
++   AH3 f0=CasLoadH(sp0+ASW2( 1, 0));
++   AH3 g0=CasLoadH(sp0+ASW2(-1, 1));
++   AH3 h0=CasLoadH(sp0+ASW2( 0, 1));
++   AH3 i0=CasLoadH(sp0+ASW2( 1, 1));
++   ASW2 sp1=sp0+ASW2(8,0);
++   AH3 a1=CasLoadH(sp1+ASW2(-1,-1));
++   AH3 b1=CasLoadH(sp1+ASW2( 0,-1));
++   AH3 c1=CasLoadH(sp1+ASW2( 1,-1));
++   AH3 d1=CasLoadH(sp1+ASW2(-1, 0));
++   AH3 e1=CasLoadH(sp1);
++   AH3 f1=CasLoadH(sp1+ASW2( 1, 0));
++   AH3 g1=CasLoadH(sp1+ASW2(-1, 1));
++   AH3 h1=CasLoadH(sp1+ASW2( 0, 1));
++   AH3 i1=CasLoadH(sp1+ASW2( 1, 1));
++   // AOS to SOA conversion.
++   AH2 aR=AH2(a0.r,a1.r);
++   AH2 aG=AH2(a0.g,a1.g);
++   AH2 aB=AH2(a0.b,a1.b);
++   AH2 bR=AH2(b0.r,b1.r);
++   AH2 bG=AH2(b0.g,b1.g);
++   AH2 bB=AH2(b0.b,b1.b);
++   AH2 cR=AH2(c0.r,c1.r);
++   AH2 cG=AH2(c0.g,c1.g);
++   AH2 cB=AH2(c0.b,c1.b);
++   AH2 dR=AH2(d0.r,d1.r);
++   AH2 dG=AH2(d0.g,d1.g);
++   AH2 dB=AH2(d0.b,d1.b);
++   AH2 eR=AH2(e0.r,e1.r);
++   AH2 eG=AH2(e0.g,e1.g);
++   AH2 eB=AH2(e0.b,e1.b);
++   AH2 fR=AH2(f0.r,f1.r);
++   AH2 fG=AH2(f0.g,f1.g);
++   AH2 fB=AH2(f0.b,f1.b);
++   AH2 gR=AH2(g0.r,g1.r);
++   AH2 gG=AH2(g0.g,g1.g);
++   AH2 gB=AH2(g0.b,g1.b);
++   AH2 hR=AH2(h0.r,h1.r);
++   AH2 hG=AH2(h0.g,h1.g);
++   AH2 hB=AH2(h0.b,h1.b);
++   AH2 iR=AH2(i0.r,i1.r);
++   AH2 iG=AH2(i0.g,i1.g);
++   AH2 iB=AH2(i0.b,i1.b);
++   // Run optional input transform.
++   CasInputH(aR,aG,aB);
++   CasInputH(bR,bG,bB);
++   CasInputH(cR,cG,cB);
++   CasInputH(dR,dG,dB);
++   CasInputH(eR,eG,eB);
++   CasInputH(fR,fG,fB);
++   CasInputH(gR,gG,gB);
++   CasInputH(hR,hG,hB);
++   CasInputH(iR,iG,iB);
++   // Soft min and max.
++   AH2 mnR=min(min(fR,hR),min(min(bR,dR),eR));
++   AH2 mnG=min(min(fG,hG),min(min(bG,dG),eG));
++   AH2 mnB=min(min(fB,hB),min(min(bB,dB),eB));
++   #ifdef CAS_BETTER_DIAGONALS
++    AH2 mnR2=min(min(gR,iR),min(min(aR,cR),mnR));
++    AH2 mnG2=min(min(gG,iG),min(min(aG,cG),mnG));
++    AH2 mnB2=min(min(gB,iB),min(min(aB,cB),mnB));
++    mnR=mnR+mnR2;
++    mnG=mnG+mnG2;
++    mnB=mnB+mnB2;
++   #endif
++   AH2 mxR=max(max(fR,hR),max(max(bR,dR),eR));
++   AH2 mxG=max(max(fG,hG),max(max(bG,dG),eG));
++   AH2 mxB=max(max(fB,hB),max(max(bB,dB),eB));
++   #ifdef CAS_BETTER_DIAGONALS
++    AH2 mxR2=max(max(gR,iR),max(max(aR,cR),mxR));
++    AH2 mxG2=max(max(gG,iG),max(max(aG,cG),mxG));
++    AH2 mxB2=max(max(gB,iB),max(max(aB,cB),mxB));
++    mxR=mxR+mxR2;
++    mxG=mxG+mxG2;
++    mxB=mxB+mxB2;
++   #endif
++   // Smooth minimum distance to signal limit divided by smooth max.
++   #ifdef CAS_GO_SLOWER
++    AH2 rcpMR=ARcpH2(mxR);
++    AH2 rcpMG=ARcpH2(mxG);
++    AH2 rcpMB=ARcpH2(mxB);
++   #else
++    AH2 rcpMR=APrxLoRcpH2(mxR);
++    AH2 rcpMG=APrxLoRcpH2(mxG);
++    AH2 rcpMB=APrxLoRcpH2(mxB);
++   #endif
++   #ifdef CAS_BETTER_DIAGONALS
++    AH2 ampR=ASatH2(min(mnR,AH2_(2.0)-mxR)*rcpMR);
++    AH2 ampG=ASatH2(min(mnG,AH2_(2.0)-mxG)*rcpMG);
++    AH2 ampB=ASatH2(min(mnB,AH2_(2.0)-mxB)*rcpMB);
++   #else
++    AH2 ampR=ASatH2(min(mnR,AH2_(1.0)-mxR)*rcpMR);
++    AH2 ampG=ASatH2(min(mnG,AH2_(1.0)-mxG)*rcpMG);
++    AH2 ampB=ASatH2(min(mnB,AH2_(1.0)-mxB)*rcpMB);
++   #endif
++   // Shaping amount of sharpening.
++   #ifdef CAS_GO_SLOWER
++    ampR=sqrt(ampR);
++    ampG=sqrt(ampG);
++    ampB=sqrt(ampB);
++   #else
++    ampR=APrxLoSqrtH2(ampR);
++    ampG=APrxLoSqrtH2(ampG);
++    ampB=APrxLoSqrtH2(ampB);
++   #endif
++   // Filter shape.
++   AH1 peak=AH2_AU1(const1.y).x;
++   AH2 wR=ampR*AH2_(peak);
++   AH2 wG=ampG*AH2_(peak);
++   AH2 wB=ampB*AH2_(peak);
++   // Filter.
++   #ifndef CAS_SLOW
++    #ifdef CAS_GO_SLOWER
++     AH2 rcpWeight=ARcpH2(AH2_(1.0)+AH2_(4.0)*wG);
++    #else
++     AH2 rcpWeight=APrxMedRcpH2(AH2_(1.0)+AH2_(4.0)*wG);
++    #endif
++    pixR=ASatH2((bR*wG+dR*wG+fR*wG+hR*wG+eR)*rcpWeight);
++    pixG=ASatH2((bG*wG+dG*wG+fG*wG+hG*wG+eG)*rcpWeight);
++    pixB=ASatH2((bB*wG+dB*wG+fB*wG+hB*wG+eB)*rcpWeight);
++   #else
++    #ifdef CAS_GO_SLOWER
++     AH2 rcpWeightR=ARcpH2(AH2_(1.0)+AH2_(4.0)*wR);
++     AH2 rcpWeightG=ARcpH2(AH2_(1.0)+AH2_(4.0)*wG);
++     AH2 rcpWeightB=ARcpH2(AH2_(1.0)+AH2_(4.0)*wB);
++    #else
++     AH2 rcpWeightR=APrxMedRcpH2(AH2_(1.0)+AH2_(4.0)*wR);
++     AH2 rcpWeightG=APrxMedRcpH2(AH2_(1.0)+AH2_(4.0)*wG);
++     AH2 rcpWeightB=APrxMedRcpH2(AH2_(1.0)+AH2_(4.0)*wB);
++    #endif
++    pixR=ASatH2((bR*wR+dR*wR+fR*wR+hR*wR+eR)*rcpWeightR);
++    pixG=ASatH2((bG*wG+dG*wG+fG*wG+hG*wG+eG)*rcpWeightG);
++    pixB=ASatH2((bB*wB+dB*wB+fB*wB+hB*wB+eB)*rcpWeightB);
++   #endif
++   return;}
++//------------------------------------------------------------------------------------------------------------------------------
++  // Scaling algorithm adaptively interpolates between nearest 4 results of the non-scaling algorithm.
++  AF2 pp=AF2(ip)*AF2_AU2(const0.xy)+AF2_AU2(const0.zw);
++  // Tile 0.
++  // Fractional position is needed in high precision here.
++  AF2 fp0=floor(pp);
++  AH2 ppX;
++  ppX.x=AH1(pp.x-fp0.x);
++  AH1 ppY=AH1(pp.y-fp0.y);
++  ASW2 sp0=ASW2(fp0);
++  AH3 a0=CasLoadH(sp0+ASW2(-1,-1));
++  AH3 b0=CasLoadH(sp0+ASW2( 0,-1));
++  AH3 e0=CasLoadH(sp0+ASW2(-1, 0));
++  AH3 f0=CasLoadH(sp0);
++  AH3 c0=CasLoadH(sp0+ASW2( 1,-1));
++  AH3 d0=CasLoadH(sp0+ASW2( 2,-1));
++  AH3 g0=CasLoadH(sp0+ASW2( 1, 0));
++  AH3 h0=CasLoadH(sp0+ASW2( 2, 0));
++  AH3 i0=CasLoadH(sp0+ASW2(-1, 1));
++  AH3 j0=CasLoadH(sp0+ASW2( 0, 1));
++  AH3 m0=CasLoadH(sp0+ASW2(-1, 2));
++  AH3 n0=CasLoadH(sp0+ASW2( 0, 2));
++  AH3 k0=CasLoadH(sp0+ASW2( 1, 1));
++  AH3 l0=CasLoadH(sp0+ASW2( 2, 1));
++  AH3 o0=CasLoadH(sp0+ASW2( 1, 2));
++  AH3 p0=CasLoadH(sp0+ASW2( 2, 2));
++  // Tile 1 (offset only in x).
++  AF1 pp1=pp.x+AF1_AU1(const1.z);
++  AF1 fp1=floor(pp1);
++  ppX.y=AH1(pp1-fp1);
++  ASW2 sp1=ASW2(fp1,sp0.y);
++  AH3 a1=CasLoadH(sp1+ASW2(-1,-1));
++  AH3 b1=CasLoadH(sp1+ASW2( 0,-1));
++  AH3 e1=CasLoadH(sp1+ASW2(-1, 0));
++  AH3 f1=CasLoadH(sp1);
++  AH3 c1=CasLoadH(sp1+ASW2( 1,-1));
++  AH3 d1=CasLoadH(sp1+ASW2( 2,-1));
++  AH3 g1=CasLoadH(sp1+ASW2( 1, 0));
++  AH3 h1=CasLoadH(sp1+ASW2( 2, 0));
++  AH3 i1=CasLoadH(sp1+ASW2(-1, 1));
++  AH3 j1=CasLoadH(sp1+ASW2( 0, 1));
++  AH3 m1=CasLoadH(sp1+ASW2(-1, 2));
++  AH3 n1=CasLoadH(sp1+ASW2( 0, 2));
++  AH3 k1=CasLoadH(sp1+ASW2( 1, 1));
++  AH3 l1=CasLoadH(sp1+ASW2( 2, 1));
++  AH3 o1=CasLoadH(sp1+ASW2( 1, 2));
++  AH3 p1=CasLoadH(sp1+ASW2( 2, 2));
++  // AOS to SOA conversion.
++  AH2 aR=AH2(a0.r,a1.r);
++  AH2 aG=AH2(a0.g,a1.g);
++  AH2 aB=AH2(a0.b,a1.b);
++  AH2 bR=AH2(b0.r,b1.r);
++  AH2 bG=AH2(b0.g,b1.g);
++  AH2 bB=AH2(b0.b,b1.b);
++  AH2 cR=AH2(c0.r,c1.r);
++  AH2 cG=AH2(c0.g,c1.g);
++  AH2 cB=AH2(c0.b,c1.b);
++  AH2 dR=AH2(d0.r,d1.r);
++  AH2 dG=AH2(d0.g,d1.g);
++  AH2 dB=AH2(d0.b,d1.b);
++  AH2 eR=AH2(e0.r,e1.r);
++  AH2 eG=AH2(e0.g,e1.g);
++  AH2 eB=AH2(e0.b,e1.b);
++  AH2 fR=AH2(f0.r,f1.r);
++  AH2 fG=AH2(f0.g,f1.g);
++  AH2 fB=AH2(f0.b,f1.b);
++  AH2 gR=AH2(g0.r,g1.r);
++  AH2 gG=AH2(g0.g,g1.g);
++  AH2 gB=AH2(g0.b,g1.b);
++  AH2 hR=AH2(h0.r,h1.r);
++  AH2 hG=AH2(h0.g,h1.g);
++  AH2 hB=AH2(h0.b,h1.b);
++  AH2 iR=AH2(i0.r,i1.r);
++  AH2 iG=AH2(i0.g,i1.g);
++  AH2 iB=AH2(i0.b,i1.b);
++  AH2 jR=AH2(j0.r,j1.r);
++  AH2 jG=AH2(j0.g,j1.g);
++  AH2 jB=AH2(j0.b,j1.b);
++  AH2 kR=AH2(k0.r,k1.r);
++  AH2 kG=AH2(k0.g,k1.g);
++  AH2 kB=AH2(k0.b,k1.b);
++  AH2 lR=AH2(l0.r,l1.r);
++  AH2 lG=AH2(l0.g,l1.g);
++  AH2 lB=AH2(l0.b,l1.b);
++  AH2 mR=AH2(m0.r,m1.r);
++  AH2 mG=AH2(m0.g,m1.g);
++  AH2 mB=AH2(m0.b,m1.b);
++  AH2 nR=AH2(n0.r,n1.r);
++  AH2 nG=AH2(n0.g,n1.g);
++  AH2 nB=AH2(n0.b,n1.b);
++  AH2 oR=AH2(o0.r,o1.r);
++  AH2 oG=AH2(o0.g,o1.g);
++  AH2 oB=AH2(o0.b,o1.b);
++  AH2 pR=AH2(p0.r,p1.r);
++  AH2 pG=AH2(p0.g,p1.g);
++  AH2 pB=AH2(p0.b,p1.b);
++  // Run optional input transform.
++  CasInputH(aR,aG,aB);
++  CasInputH(bR,bG,bB);
++  CasInputH(cR,cG,cB);
++  CasInputH(dR,dG,dB);
++  CasInputH(eR,eG,eB);
++  CasInputH(fR,fG,fB);
++  CasInputH(gR,gG,gB);
++  CasInputH(hR,hG,hB);
++  CasInputH(iR,iG,iB);
++  CasInputH(jR,jG,jB);
++  CasInputH(kR,kG,kB);
++  CasInputH(lR,lG,lB);
++  CasInputH(mR,mG,mB);
++  CasInputH(nR,nG,nB);
++  CasInputH(oR,oG,oB);
++  CasInputH(pR,pG,pB);
++  // Soft min and max.
++  // These are 2.0x bigger (factored out the extra multiply).
++  //  a b c             b
++  //  e f g * 0.5  +  e f g * 0.5  [F]
++  //  i j k             j
++  AH2 mnfR=AMin3H2(AMin3H2(bR,eR,fR),gR,jR);
++  AH2 mnfG=AMin3H2(AMin3H2(bG,eG,fG),gG,jG);
++  AH2 mnfB=AMin3H2(AMin3H2(bB,eB,fB),gB,jB);
++  #ifdef CAS_BETTER_DIAGONALS
++   AH2 mnfR2=AMin3H2(AMin3H2(mnfR,aR,cR),iR,kR);
++   AH2 mnfG2=AMin3H2(AMin3H2(mnfG,aG,cG),iG,kG);
++   AH2 mnfB2=AMin3H2(AMin3H2(mnfB,aB,cB),iB,kB);
++   mnfR=mnfR+mnfR2;
++   mnfG=mnfG+mnfG2;
++   mnfB=mnfB+mnfB2;
++  #endif
++  AH2 mxfR=AMax3H2(AMax3H2(bR,eR,fR),gR,jR);
++  AH2 mxfG=AMax3H2(AMax3H2(bG,eG,fG),gG,jG);
++  AH2 mxfB=AMax3H2(AMax3H2(bB,eB,fB),gB,jB);
++  #ifdef CAS_BETTER_DIAGONALS
++   AH2 mxfR2=AMax3H2(AMax3H2(mxfR,aR,cR),iR,kR);
++   AH2 mxfG2=AMax3H2(AMax3H2(mxfG,aG,cG),iG,kG);
++   AH2 mxfB2=AMax3H2(AMax3H2(mxfB,aB,cB),iB,kB);
++   mxfR=mxfR+mxfR2;
++   mxfG=mxfG+mxfG2;
++   mxfB=mxfB+mxfB2;
++  #endif
++  //  b c d             c
++  //  f g h * 0.5  +  f g h * 0.5  [G]
++  //  j k l             k
++  AH2 mngR=AMin3H2(AMin3H2(cR,fR,gR),hR,kR);
++  AH2 mngG=AMin3H2(AMin3H2(cG,fG,gG),hG,kG);
++  AH2 mngB=AMin3H2(AMin3H2(cB,fB,gB),hB,kB);
++  #ifdef CAS_BETTER_DIAGONALS
++   AH2 mngR2=AMin3H2(AMin3H2(mngR,bR,dR),jR,lR);
++   AH2 mngG2=AMin3H2(AMin3H2(mngG,bG,dG),jG,lG);
++   AH2 mngB2=AMin3H2(AMin3H2(mngB,bB,dB),jB,lB);
++   mngR=mngR+mngR2;
++   mngG=mngG+mngG2;
++   mngB=mngB+mngB2;
++  #endif
++  AH2 mxgR=AMax3H2(AMax3H2(cR,fR,gR),hR,kR);
++  AH2 mxgG=AMax3H2(AMax3H2(cG,fG,gG),hG,kG);
++  AH2 mxgB=AMax3H2(AMax3H2(cB,fB,gB),hB,kB);
++  #ifdef CAS_BETTER_DIAGONALS
++   AH2 mxgR2=AMax3H2(AMax3H2(mxgR,bR,dR),jR,lR);
++   AH2 mxgG2=AMax3H2(AMax3H2(mxgG,bG,dG),jG,lG);
++   AH2 mxgB2=AMax3H2(AMax3H2(mxgB,bB,dB),jB,lB);
++   mxgR=mxgR+mxgR2;
++   mxgG=mxgG+mxgG2;
++   mxgB=mxgB+mxgB2;
++  #endif
++  //  e f g             f
++  //  i j k * 0.5  +  i j k * 0.5  [J]
++  //  m n o             n
++  AH2 mnjR=AMin3H2(AMin3H2(fR,iR,jR),kR,nR);
++  AH2 mnjG=AMin3H2(AMin3H2(fG,iG,jG),kG,nG);
++  AH2 mnjB=AMin3H2(AMin3H2(fB,iB,jB),kB,nB);
++  #ifdef CAS_BETTER_DIAGONALS
++   AH2 mnjR2=AMin3H2(AMin3H2(mnjR,eR,gR),mR,oR);
++   AH2 mnjG2=AMin3H2(AMin3H2(mnjG,eG,gG),mG,oG);
++   AH2 mnjB2=AMin3H2(AMin3H2(mnjB,eB,gB),mB,oB);
++   mnjR=mnjR+mnjR2;
++   mnjG=mnjG+mnjG2;
++   mnjB=mnjB+mnjB2;
++  #endif
++  AH2 mxjR=AMax3H2(AMax3H2(fR,iR,jR),kR,nR);
++  AH2 mxjG=AMax3H2(AMax3H2(fG,iG,jG),kG,nG);
++  AH2 mxjB=AMax3H2(AMax3H2(fB,iB,jB),kB,nB);
++  #ifdef CAS_BETTER_DIAGONALS
++   AH2 mxjR2=AMax3H2(AMax3H2(mxjR,eR,gR),mR,oR);
++   AH2 mxjG2=AMax3H2(AMax3H2(mxjG,eG,gG),mG,oG);
++   AH2 mxjB2=AMax3H2(AMax3H2(mxjB,eB,gB),mB,oB);
++   mxjR=mxjR+mxjR2;
++   mxjG=mxjG+mxjG2;
++   mxjB=mxjB+mxjB2;
++  #endif
++  //  f g h             g
++  //  j k l * 0.5  +  j k l * 0.5  [K]
++  //  n o p             o
++  AH2 mnkR=AMin3H2(AMin3H2(gR,jR,kR),lR,oR);
++  AH2 mnkG=AMin3H2(AMin3H2(gG,jG,kG),lG,oG);
++  AH2 mnkB=AMin3H2(AMin3H2(gB,jB,kB),lB,oB);
++  #ifdef CAS_BETTER_DIAGONALS
++   AH2 mnkR2=AMin3H2(AMin3H2(mnkR,fR,hR),nR,pR);
++   AH2 mnkG2=AMin3H2(AMin3H2(mnkG,fG,hG),nG,pG);
++   AH2 mnkB2=AMin3H2(AMin3H2(mnkB,fB,hB),nB,pB);
++   mnkR=mnkR+mnkR2;
++   mnkG=mnkG+mnkG2;
++   mnkB=mnkB+mnkB2;
++  #endif
++  AH2 mxkR=AMax3H2(AMax3H2(gR,jR,kR),lR,oR);
++  AH2 mxkG=AMax3H2(AMax3H2(gG,jG,kG),lG,oG);
++  AH2 mxkB=AMax3H2(AMax3H2(gB,jB,kB),lB,oB);
++  #ifdef CAS_BETTER_DIAGONALS
++   AH2 mxkR2=AMax3H2(AMax3H2(mxkR,fR,hR),nR,pR);
++   AH2 mxkG2=AMax3H2(AMax3H2(mxkG,fG,hG),nG,pG);
++   AH2 mxkB2=AMax3H2(AMax3H2(mxkB,fB,hB),nB,pB);
++   mxkR=mxkR+mxkR2;
++   mxkG=mxkG+mxkG2;
++   mxkB=mxkB+mxkB2;
++  #endif
++  // Smooth minimum distance to signal limit divided by smooth max.
++  #ifdef CAS_GO_SLOWER
++   AH2 rcpMfR=ARcpH2(mxfR);
++   AH2 rcpMfG=ARcpH2(mxfG);
++   AH2 rcpMfB=ARcpH2(mxfB);
++   AH2 rcpMgR=ARcpH2(mxgR);
++   AH2 rcpMgG=ARcpH2(mxgG);
++   AH2 rcpMgB=ARcpH2(mxgB);
++   AH2 rcpMjR=ARcpH2(mxjR);
++   AH2 rcpMjG=ARcpH2(mxjG);
++   AH2 rcpMjB=ARcpH2(mxjB);
++   AH2 rcpMkR=ARcpH2(mxkR);
++   AH2 rcpMkG=ARcpH2(mxkG);
++   AH2 rcpMkB=ARcpH2(mxkB);
++  #else
++   AH2 rcpMfR=APrxLoRcpH2(mxfR);
++   AH2 rcpMfG=APrxLoRcpH2(mxfG);
++   AH2 rcpMfB=APrxLoRcpH2(mxfB);
++   AH2 rcpMgR=APrxLoRcpH2(mxgR);
++   AH2 rcpMgG=APrxLoRcpH2(mxgG);
++   AH2 rcpMgB=APrxLoRcpH2(mxgB);
++   AH2 rcpMjR=APrxLoRcpH2(mxjR);
++   AH2 rcpMjG=APrxLoRcpH2(mxjG);
++   AH2 rcpMjB=APrxLoRcpH2(mxjB);
++   AH2 rcpMkR=APrxLoRcpH2(mxkR);
++   AH2 rcpMkG=APrxLoRcpH2(mxkG);
++   AH2 rcpMkB=APrxLoRcpH2(mxkB);
++  #endif
++  #ifdef CAS_BETTER_DIAGONALS
++   AH2 ampfR=ASatH2(min(mnfR,AH2_(2.0)-mxfR)*rcpMfR);
++   AH2 ampfG=ASatH2(min(mnfG,AH2_(2.0)-mxfG)*rcpMfG);
++   AH2 ampfB=ASatH2(min(mnfB,AH2_(2.0)-mxfB)*rcpMfB);
++   AH2 ampgR=ASatH2(min(mngR,AH2_(2.0)-mxgR)*rcpMgR);
++   AH2 ampgG=ASatH2(min(mngG,AH2_(2.0)-mxgG)*rcpMgG);
++   AH2 ampgB=ASatH2(min(mngB,AH2_(2.0)-mxgB)*rcpMgB);
++   AH2 ampjR=ASatH2(min(mnjR,AH2_(2.0)-mxjR)*rcpMjR);
++   AH2 ampjG=ASatH2(min(mnjG,AH2_(2.0)-mxjG)*rcpMjG);
++   AH2 ampjB=ASatH2(min(mnjB,AH2_(2.0)-mxjB)*rcpMjB);
++   AH2 ampkR=ASatH2(min(mnkR,AH2_(2.0)-mxkR)*rcpMkR);
++   AH2 ampkG=ASatH2(min(mnkG,AH2_(2.0)-mxkG)*rcpMkG);
++   AH2 ampkB=ASatH2(min(mnkB,AH2_(2.0)-mxkB)*rcpMkB);
++  #else
++   AH2 ampfR=ASatH2(min(mnfR,AH2_(1.0)-mxfR)*rcpMfR);
++   AH2 ampfG=ASatH2(min(mnfG,AH2_(1.0)-mxfG)*rcpMfG);
++   AH2 ampfB=ASatH2(min(mnfB,AH2_(1.0)-mxfB)*rcpMfB);
++   AH2 ampgR=ASatH2(min(mngR,AH2_(1.0)-mxgR)*rcpMgR);
++   AH2 ampgG=ASatH2(min(mngG,AH2_(1.0)-mxgG)*rcpMgG);
++   AH2 ampgB=ASatH2(min(mngB,AH2_(1.0)-mxgB)*rcpMgB);
++   AH2 ampjR=ASatH2(min(mnjR,AH2_(1.0)-mxjR)*rcpMjR);
++   AH2 ampjG=ASatH2(min(mnjG,AH2_(1.0)-mxjG)*rcpMjG);
++   AH2 ampjB=ASatH2(min(mnjB,AH2_(1.0)-mxjB)*rcpMjB);
++   AH2 ampkR=ASatH2(min(mnkR,AH2_(1.0)-mxkR)*rcpMkR);
++   AH2 ampkG=ASatH2(min(mnkG,AH2_(1.0)-mxkG)*rcpMkG);
++   AH2 ampkB=ASatH2(min(mnkB,AH2_(1.0)-mxkB)*rcpMkB);
++  #endif
++  // Shaping amount of sharpening.
++  #ifdef CAS_GO_SLOWER
++   ampfR=sqrt(ampfR);
++   ampfG=sqrt(ampfG);
++   ampfB=sqrt(ampfB);
++   ampgR=sqrt(ampgR);
++   ampgG=sqrt(ampgG);
++   ampgB=sqrt(ampgB);
++   ampjR=sqrt(ampjR);
++   ampjG=sqrt(ampjG);
++   ampjB=sqrt(ampjB);
++   ampkR=sqrt(ampkR);
++   ampkG=sqrt(ampkG);
++   ampkB=sqrt(ampkB);
++  #else
++   ampfR=APrxLoSqrtH2(ampfR);
++   ampfG=APrxLoSqrtH2(ampfG);
++   ampfB=APrxLoSqrtH2(ampfB);
++   ampgR=APrxLoSqrtH2(ampgR);
++   ampgG=APrxLoSqrtH2(ampgG);
++   ampgB=APrxLoSqrtH2(ampgB);
++   ampjR=APrxLoSqrtH2(ampjR);
++   ampjG=APrxLoSqrtH2(ampjG);
++   ampjB=APrxLoSqrtH2(ampjB);
++   ampkR=APrxLoSqrtH2(ampkR);
++   ampkG=APrxLoSqrtH2(ampkG);
++   ampkB=APrxLoSqrtH2(ampkB);
++  #endif
++  // Filter shape.
++  AH1 peak=AH2_AU1(const1.y).x;
++  AH2 wfR=ampfR*AH2_(peak);
++  AH2 wfG=ampfG*AH2_(peak);
++  AH2 wfB=ampfB*AH2_(peak);
++  AH2 wgR=ampgR*AH2_(peak);
++  AH2 wgG=ampgG*AH2_(peak);
++  AH2 wgB=ampgB*AH2_(peak);
++  AH2 wjR=ampjR*AH2_(peak);
++  AH2 wjG=ampjG*AH2_(peak);
++  AH2 wjB=ampjB*AH2_(peak);
++  AH2 wkR=ampkR*AH2_(peak);
++  AH2 wkG=ampkG*AH2_(peak);
++  AH2 wkB=ampkB*AH2_(peak);
++  // Blend between 4 results.
++  AH2 s=(AH2_(1.0)-ppX)*(AH2_(1.0)-AH2_(ppY));
++  AH2 t=           ppX *(AH2_(1.0)-AH2_(ppY));
++  AH2 u=(AH2_(1.0)-ppX)*           AH2_(ppY) ;
++  AH2 v=           ppX *           AH2_(ppY) ;
++  // Thin edges to hide bilinear interpolation (helps diagonals).
++  AH2 thinB=AH2_(1.0/32.0);
++  #ifdef CAS_GO_SLOWER
++   s*=ARcpH2(thinB+(mxfG-mnfG));
++   t*=ARcpH2(thinB+(mxgG-mngG));
++   u*=ARcpH2(thinB+(mxjG-mnjG));
++   v*=ARcpH2(thinB+(mxkG-mnkG));
++  #else
++   s*=APrxLoRcpH2(thinB+(mxfG-mnfG));
++   t*=APrxLoRcpH2(thinB+(mxgG-mngG));
++   u*=APrxLoRcpH2(thinB+(mxjG-mnjG));
++   v*=APrxLoRcpH2(thinB+(mxkG-mnkG));
++  #endif
++  // Final weighting.
++  AH2 qbeR=wfR*s;
++  AH2 qbeG=wfG*s;
++  AH2 qbeB=wfB*s;
++  AH2 qchR=wgR*t;
++  AH2 qchG=wgG*t;
++  AH2 qchB=wgB*t;
++  AH2 qfR=wgR*t+wjR*u+s;
++  AH2 qfG=wgG*t+wjG*u+s;
++  AH2 qfB=wgB*t+wjB*u+s;
++  AH2 qgR=wfR*s+wkR*v+t;
++  AH2 qgG=wfG*s+wkG*v+t;
++  AH2 qgB=wfB*s+wkB*v+t;
++  AH2 qjR=wfR*s+wkR*v+u;
++  AH2 qjG=wfG*s+wkG*v+u;
++  AH2 qjB=wfB*s+wkB*v+u;
++  AH2 qkR=wgR*t+wjR*u+v;
++  AH2 qkG=wgG*t+wjG*u+v;
++  AH2 qkB=wgB*t+wjB*u+v;
++  AH2 qinR=wjR*u;
++  AH2 qinG=wjG*u;
++  AH2 qinB=wjB*u;
++  AH2 qloR=wkR*v;
++  AH2 qloG=wkG*v;
++  AH2 qloB=wkB*v;
++  // Filter.
++  #ifndef CAS_SLOW
++   #ifdef CAS_GO_SLOWER
++    AH2 rcpWG=ARcpH2(AH2_(2.0)*qbeG+AH2_(2.0)*qchG+AH2_(2.0)*qinG+AH2_(2.0)*qloG+qfG+qgG+qjG+qkG);
++   #else
++    AH2 rcpWG=APrxMedRcpH2(AH2_(2.0)*qbeG+AH2_(2.0)*qchG+AH2_(2.0)*qinG+AH2_(2.0)*qloG+qfG+qgG+qjG+qkG);
++   #endif
++   pixR=ASatH2((bR*qbeG+eR*qbeG+cR*qchG+hR*qchG+iR*qinG+nR*qinG+lR*qloG+oR*qloG+fR*qfG+gR*qgG+jR*qjG+kR*qkG)*rcpWG);
++   pixG=ASatH2((bG*qbeG+eG*qbeG+cG*qchG+hG*qchG+iG*qinG+nG*qinG+lG*qloG+oG*qloG+fG*qfG+gG*qgG+jG*qjG+kG*qkG)*rcpWG);
++   pixB=ASatH2((bB*qbeG+eB*qbeG+cB*qchG+hB*qchG+iB*qinG+nB*qinG+lB*qloG+oB*qloG+fB*qfG+gB*qgG+jB*qjG+kB*qkG)*rcpWG);
++  #else
++   #ifdef CAS_GO_SLOWER
++    AH2 rcpWR=ARcpH2(AH2_(2.0)*qbeR+AH2_(2.0)*qchR+AH2_(2.0)*qinR+AH2_(2.0)*qloR+qfR+qgR+qjR+qkR);
++    AH2 rcpWG=ARcpH2(AH2_(2.0)*qbeG+AH2_(2.0)*qchG+AH2_(2.0)*qinG+AH2_(2.0)*qloG+qfG+qgG+qjG+qkG);
++    AH2 rcpWB=ARcpH2(AH2_(2.0)*qbeB+AH2_(2.0)*qchB+AH2_(2.0)*qinB+AH2_(2.0)*qloB+qfB+qgB+qjB+qkB);
++   #else
++    AH2 rcpWR=APrxMedRcpH2(AH2_(2.0)*qbeR+AH2_(2.0)*qchR+AH2_(2.0)*qinR+AH2_(2.0)*qloR+qfR+qgR+qjR+qkR);
++    AH2 rcpWG=APrxMedRcpH2(AH2_(2.0)*qbeG+AH2_(2.0)*qchG+AH2_(2.0)*qinG+AH2_(2.0)*qloG+qfG+qgG+qjG+qkG);
++    AH2 rcpWB=APrxMedRcpH2(AH2_(2.0)*qbeB+AH2_(2.0)*qchB+AH2_(2.0)*qinB+AH2_(2.0)*qloB+qfB+qgB+qjB+qkB);
++   #endif
++   pixR=ASatH2((bR*qbeR+eR*qbeR+cR*qchR+hR*qchR+iR*qinR+nR*qinR+lR*qloR+oR*qloR+fR*qfR+gR*qgR+jR*qjR+kR*qkR)*rcpWR);
++   pixG=ASatH2((bG*qbeG+eG*qbeG+cG*qchG+hG*qchG+iG*qinG+nG*qinG+lG*qloG+oG*qloG+fG*qfG+gG*qgG+jG*qjG+kG*qkG)*rcpWG);
++   pixB=ASatH2((bB*qbeB+eB*qbeB+cB*qchB+hB*qchB+iB*qinB+nB*qinB+lB*qloB+oB*qloB+fB*qfB+gB*qgB+jB*qjB+kB*qkB)*rcpWB);
++  #endif
++ }
++#endif
+diff --git a/src/vulkan/wsi/enhance/third_party/nis/LICENSE.txt b/src/vulkan/wsi/enhance/third_party/nis/LICENSE.txt
+new file mode 100644
+index 0000000..68a4742
+--- /dev/null
++++ b/src/vulkan/wsi/enhance/third_party/nis/LICENSE.txt
+@@ -0,0 +1,20 @@
++// The MIT License(MIT)
++// 
++// Copyright(c) 2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++// 
++// Permission is hereby granted, free of charge, to any person obtaining a copy of
++// this software and associated documentation files(the "Software"), to deal in
++// the Software without restriction, including without limitation the rights to
++// use, copy, modify, merge, publish, distribute, sublicense, and / or sell copies of
++// the Software, and to permit persons to whom the Software is furnished to do so,
++// subject to the following conditions :
++// 
++// The above copyright notice and this permission notice shall be included in all
++// copies or substantial portions of the Software.
++// 
++// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
++// FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.IN NO EVENT SHALL THE AUTHORS OR
++// COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
++// IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
++// CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+\ No newline at end of file
+diff --git a/src/vulkan/wsi/enhance/third_party/nis/NIS_Config.h b/src/vulkan/wsi/enhance/third_party/nis/NIS_Config.h
+new file mode 100644
+index 0000000..b898221
+--- /dev/null
++++ b/src/vulkan/wsi/enhance/third_party/nis/NIS_Config.h
+@@ -0,0 +1,541 @@
++// The MIT License(MIT)
++//
++// Copyright(c) 2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++//
++// Permission is hereby granted, free of charge, to any person obtaining a copy of
++// this software and associated documentation files(the "Software"), to deal in
++// the Software without restriction, including without limitation the rights to
++// use, copy, modify, merge, publish, distribute, sublicense, and / or sell copies of
++// the Software, and to permit persons to whom the Software is furnished to do so,
++// subject to the following conditions :
++//
++// The above copyright notice and this permission notice shall be included in all
++// copies or substantial portions of the Software.
++//
++// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
++// FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.IN NO EVENT SHALL THE AUTHORS OR
++// COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
++// IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
++// CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
++
++//---------------------------------------------------------------------------------
++// NVIDIA Image Scaling SDK  - v1.0.3
++//---------------------------------------------------------------------------------
++// Configuration
++//---------------------------------------------------------------------------------
++
++#pragma once
++
++#include <algorithm>
++#include <cmath>
++#include <cstdint>
++
++#ifndef NIS_ALIGNED
++#if defined(_MSC_VER)
++#define NIS_ALIGNED(x) __declspec(align(x))
++#else
++#if defined(__GNUC__)
++#define NIS_ALIGNED(x) __attribute__ ((aligned(x)))
++#endif
++#endif
++#endif
++
++
++struct NIS_ALIGNED(256) NISConfig
++{
++    float kDetectRatio;
++    float kDetectThres;
++    float kMinContrastRatio;
++    float kRatioNorm;
++
++    float kContrastBoost;
++    float kEps;
++    float kSharpStartY;
++    float kSharpScaleY;
++
++    float kSharpStrengthMin;
++    float kSharpStrengthScale;
++    float kSharpLimitMin;
++    float kSharpLimitScale;
++
++    float kScaleX;
++    float kScaleY;
++    float kDstNormX;
++    float kDstNormY;
++
++    float kSrcNormX;
++    float kSrcNormY;
++
++    uint32_t kInputViewportOriginX;
++    uint32_t kInputViewportOriginY;
++    uint32_t kInputViewportWidth;
++    uint32_t kInputViewportHeight;
++
++    uint32_t kOutputViewportOriginX;
++    uint32_t kOutputViewportOriginY;
++    uint32_t kOutputViewportWidth;
++    uint32_t kOutputViewportHeight;
++
++    float reserved0;
++    float reserved1;
++};
++
++enum class NISHDRMode : uint32_t
++{
++    None = 0,
++    Linear = 1,
++    PQ = 2
++};
++
++enum class NISGPUArchitecture : uint32_t
++{
++    NVIDIA_Generic = 0,
++    AMD_Generic = 1,
++    Intel_Generic = 2,
++    NVIDIA_Generic_fp16 = 3
++};
++
++struct NISOptimizer
++{
++    bool isUpscaling;
++    NISGPUArchitecture gpuArch;
++
++    constexpr NISOptimizer(bool isUpscaling = true, NISGPUArchitecture gpuArch = NISGPUArchitecture::NVIDIA_Generic)
++        : isUpscaling(isUpscaling)
++        , gpuArch(gpuArch)
++    {}
++
++    constexpr uint32_t GetOptimalBlockWidth()
++    {
++        switch (gpuArch) {
++        case NISGPUArchitecture::NVIDIA_Generic:
++            return 32;
++        case NISGPUArchitecture::NVIDIA_Generic_fp16:
++            return 32;
++        case NISGPUArchitecture::AMD_Generic:
++            return 32;
++        case NISGPUArchitecture::Intel_Generic:
++            return 32;
++        }
++        return 32;
++    }
++
++    constexpr uint32_t GetOptimalBlockHeight()
++    {
++        switch (gpuArch) {
++        case NISGPUArchitecture::NVIDIA_Generic:
++            return isUpscaling ? 24 : 32;
++        case NISGPUArchitecture::NVIDIA_Generic_fp16:
++            return isUpscaling ? 32 : 32;
++        case NISGPUArchitecture::AMD_Generic:
++            return isUpscaling ? 24 : 32;
++        case NISGPUArchitecture::Intel_Generic:
++            return isUpscaling ? 24 : 32;
++        }
++        return isUpscaling ? 24 : 32;
++    }
++
++    constexpr uint32_t GetOptimalThreadGroupSize()
++    {
++        switch (gpuArch) {
++        case NISGPUArchitecture::NVIDIA_Generic:
++            return 128;
++        case NISGPUArchitecture::NVIDIA_Generic_fp16:
++            return 128;
++        case NISGPUArchitecture::AMD_Generic:
++            return 256;
++        case NISGPUArchitecture::Intel_Generic:
++            return 256;
++        }
++        return 256;
++    }
++};
++
++
++inline bool NVScalerUpdateConfig(NISConfig& config, float sharpness,
++    uint32_t inputViewportOriginX, uint32_t inputViewportOriginY,
++    uint32_t inputViewportWidth, uint32_t inputViewportHeight,
++    uint32_t inputTextureWidth, uint32_t inputTextureHeight,
++    uint32_t outputViewportOriginX, uint32_t outputViewportOriginY,
++    uint32_t outputViewportWidth, uint32_t outputViewportHeight,
++    uint32_t outputTextureWidth, uint32_t outputTextureHeight,
++    NISHDRMode hdrMode = NISHDRMode::None)
++{
++    // adjust params based on value from sharpness slider
++    sharpness = std::max<float>(std::min<float>(1.f, sharpness), 0.f);
++    float sharpen_slider = sharpness - 0.5f;   // Map 0 to 1 to -0.5 to +0.5
++
++    // Different range for 0 to 50% vs 50% to 100%
++    // The idea is to make sure sharpness of 0% map to no-sharpening,
++    // while also ensuring that sharpness of 100% doesn't cause too much over-sharpening.
++    const float MaxScale = (sharpen_slider >= 0.0f) ? 1.25f : 1.75f;
++    const float MinScale = (sharpen_slider >= 0.0f) ? 1.25f : 1.0f;
++    const float LimitScale = (sharpen_slider >= 0.0f) ? 1.25f : 1.0f;
++
++    float kDetectRatio = 2 * 1127.f / 1024.f;
++
++    // Params for SDR
++    float kDetectThres = 64.0f / 1024.0f;
++    float kMinContrastRatio = 2.0f;
++    float kMaxContrastRatio = 10.0f;
++
++    float kSharpStartY = 0.45f;
++    float kSharpEndY = 0.9f;
++    float kSharpStrengthMin = std::max<float>(0.0f, 0.4f + sharpen_slider * MinScale * 1.2f);
++    float kSharpStrengthMax = 1.6f + sharpen_slider * MaxScale * 1.8f;
++    float kSharpLimitMin = std::max<float>(0.1f, 0.14f + sharpen_slider * LimitScale * 0.32f);
++    float kSharpLimitMax = 0.5f + sharpen_slider * LimitScale * 0.6f;
++
++    if (hdrMode == NISHDRMode::Linear || hdrMode == NISHDRMode::PQ)
++    {
++        kDetectThres = 32.0f / 1024.0f;
++
++        kMinContrastRatio = 1.5f;
++        kMaxContrastRatio = 5.0f;
++
++        kSharpStrengthMin = std::max<float>(0.0f, 0.4f + sharpen_slider * MinScale * 1.1f);
++        kSharpStrengthMax = 2.2f + sharpen_slider * MaxScale * 1.8f;
++        kSharpLimitMin = std::max<float>(0.06f, 0.10f + sharpen_slider * LimitScale * 0.28f);
++        kSharpLimitMax = 0.6f + sharpen_slider * LimitScale * 0.6f;
++
++        if (hdrMode == NISHDRMode::PQ)
++        {
++            kSharpStartY = 0.35f;
++            kSharpEndY = 0.55f;
++        }
++        else
++        {
++            kSharpStartY = 0.3f;
++            kSharpEndY = 0.5f;
++        }
++    }
++
++    float kRatioNorm = 1.0f / (kMaxContrastRatio - kMinContrastRatio);
++    float kSharpScaleY = 1.0f / (kSharpEndY - kSharpStartY);
++    float kSharpStrengthScale = kSharpStrengthMax - kSharpStrengthMin;
++    float kSharpLimitScale = kSharpLimitMax - kSharpLimitMin;
++
++    config.kInputViewportWidth = inputViewportWidth == 0 ? inputTextureWidth : inputViewportWidth;
++    config.kInputViewportHeight = inputViewportHeight == 0 ? inputTextureHeight : inputViewportHeight;
++    config.kOutputViewportWidth = outputViewportWidth == 0 ? outputTextureWidth : outputViewportWidth;
++    config.kOutputViewportHeight = outputViewportHeight == 0 ? outputTextureHeight : outputViewportHeight;
++    if (config.kInputViewportWidth == 0 || config.kInputViewportHeight == 0 ||
++        config.kOutputViewportWidth == 0 || config.kOutputViewportHeight == 0)
++        return false;
++
++    config.kInputViewportOriginX = inputViewportOriginX;
++    config.kInputViewportOriginY = inputViewportOriginY;
++    config.kOutputViewportOriginX = outputViewportOriginX;
++    config.kOutputViewportOriginY = outputViewportOriginY;
++
++    config.kSrcNormX = 1.f / inputTextureWidth;
++    config.kSrcNormY = 1.f / inputTextureHeight;
++    config.kDstNormX = 1.f / outputTextureWidth;
++    config.kDstNormY = 1.f / outputTextureHeight;
++    config.kScaleX = config.kInputViewportWidth / float(config.kOutputViewportWidth);
++    config.kScaleY = config.kInputViewportHeight / float(config.kOutputViewportHeight);
++    config.kDetectRatio = kDetectRatio;
++    config.kDetectThres = kDetectThres;
++    config.kMinContrastRatio = kMinContrastRatio;
++    config.kRatioNorm = kRatioNorm;
++    config.kContrastBoost = 1.0f;
++    config.kEps = 1.0f / 255.0f;
++    config.kSharpStartY = kSharpStartY;
++    config.kSharpScaleY = kSharpScaleY;
++    config.kSharpStrengthMin = kSharpStrengthMin;
++    config.kSharpStrengthScale = kSharpStrengthScale;
++    config.kSharpLimitMin = kSharpLimitMin;
++    config.kSharpLimitScale = kSharpLimitScale;
++
++    if (config.kScaleX < 0.5f || config.kScaleX > 1.f || config.kScaleY < 0.5f || config.kScaleY > 1.f)
++        return false;
++    return true;
++}
++
++
++inline bool NVSharpenUpdateConfig(NISConfig& config, float sharpness,
++    uint32_t inputViewportOriginX, uint32_t inputViewportOriginY,
++    uint32_t inputViewportWidth, uint32_t inputViewportHeight,
++    uint32_t inputTextureWidth, uint32_t inputTextureHeight,
++    uint32_t outputViewportOriginX, uint32_t outputViewportOriginY,
++    NISHDRMode hdrMode = NISHDRMode::None)
++{
++    return NVScalerUpdateConfig(config, sharpness,
++            inputViewportOriginX, inputViewportOriginY, inputViewportWidth, inputViewportHeight, inputTextureWidth, inputTextureHeight,
++            outputViewportOriginX, outputViewportOriginY, inputViewportWidth, inputViewportHeight, inputTextureWidth, inputTextureHeight,
++            hdrMode);
++}
++
++namespace {
++    constexpr size_t kPhaseCount = 64;
++    constexpr size_t kFilterSize = 8;
++
++    constexpr float coef_scale[kPhaseCount][kFilterSize] = {
++        {0.0f,     0.0f,    1.0000f, 0.0f,     0.0f,    0.0f, 0.0f, 0.0f},
++        {0.0029f, -0.0127f, 1.0000f, 0.0132f, -0.0034f, 0.0f, 0.0f, 0.0f},
++        {0.0063f, -0.0249f, 0.9985f, 0.0269f, -0.0068f, 0.0f, 0.0f, 0.0f},
++        {0.0088f, -0.0361f, 0.9956f, 0.0415f, -0.0103f, 0.0005f, 0.0f, 0.0f},
++        {0.0117f, -0.0474f, 0.9932f, 0.0562f, -0.0142f, 0.0005f, 0.0f, 0.0f},
++        {0.0142f, -0.0576f, 0.9897f, 0.0713f, -0.0181f, 0.0005f, 0.0f, 0.0f},
++        {0.0166f, -0.0674f, 0.9844f, 0.0874f, -0.0220f, 0.0010f, 0.0f, 0.0f},
++        {0.0186f, -0.0762f, 0.9785f, 0.1040f, -0.0264f, 0.0015f, 0.0f, 0.0f},
++        {0.0205f, -0.0850f, 0.9727f, 0.1206f, -0.0308f, 0.0020f, 0.0f, 0.0f},
++        {0.0225f, -0.0928f, 0.9648f, 0.1382f, -0.0352f, 0.0024f, 0.0f, 0.0f},
++        {0.0239f, -0.1006f, 0.9575f, 0.1558f, -0.0396f, 0.0029f, 0.0f, 0.0f},
++        {0.0254f, -0.1074f, 0.9487f, 0.1738f, -0.0439f, 0.0034f, 0.0f, 0.0f},
++        {0.0264f, -0.1138f, 0.9390f, 0.1929f, -0.0488f, 0.0044f, 0.0f, 0.0f},
++        {0.0278f, -0.1191f, 0.9282f, 0.2119f, -0.0537f, 0.0049f, 0.0f, 0.0f},
++        {0.0288f, -0.1245f, 0.9170f, 0.2310f, -0.0581f, 0.0059f, 0.0f, 0.0f},
++        {0.0293f, -0.1294f, 0.9058f, 0.2510f, -0.0630f, 0.0063f, 0.0f, 0.0f},
++        {0.0303f, -0.1333f, 0.8926f, 0.2710f, -0.0679f, 0.0073f, 0.0f, 0.0f},
++        {0.0308f, -0.1367f, 0.8789f, 0.2915f, -0.0728f, 0.0083f, 0.0f, 0.0f},
++        {0.0308f, -0.1401f, 0.8657f, 0.3120f, -0.0776f, 0.0093f, 0.0f, 0.0f},
++        {0.0313f, -0.1426f, 0.8506f, 0.3330f, -0.0825f, 0.0103f, 0.0f, 0.0f},
++        {0.0313f, -0.1445f, 0.8354f, 0.3540f, -0.0874f, 0.0112f, 0.0f, 0.0f},
++        {0.0313f, -0.1460f, 0.8193f, 0.3755f, -0.0923f, 0.0122f, 0.0f, 0.0f},
++        {0.0313f, -0.1470f, 0.8022f, 0.3965f, -0.0967f, 0.0137f, 0.0f, 0.0f},
++        {0.0308f, -0.1479f, 0.7856f, 0.4185f, -0.1016f, 0.0146f, 0.0f, 0.0f},
++        {0.0303f, -0.1479f, 0.7681f, 0.4399f, -0.1060f, 0.0156f, 0.0f, 0.0f},
++        {0.0298f, -0.1479f, 0.7505f, 0.4614f, -0.1104f, 0.0166f, 0.0f, 0.0f},
++        {0.0293f, -0.1470f, 0.7314f, 0.4829f, -0.1147f, 0.0181f, 0.0f, 0.0f},
++        {0.0288f, -0.1460f, 0.7119f, 0.5049f, -0.1187f, 0.0190f, 0.0f, 0.0f},
++        {0.0278f, -0.1445f, 0.6929f, 0.5264f, -0.1226f, 0.0200f, 0.0f, 0.0f},
++        {0.0273f, -0.1431f, 0.6724f, 0.5479f, -0.1260f, 0.0215f, 0.0f, 0.0f},
++        {0.0264f, -0.1411f, 0.6528f, 0.5693f, -0.1299f, 0.0225f, 0.0f, 0.0f},
++        {0.0254f, -0.1387f, 0.6323f, 0.5903f, -0.1328f, 0.0234f, 0.0f, 0.0f},
++        {0.0244f, -0.1357f, 0.6113f, 0.6113f, -0.1357f, 0.0244f, 0.0f, 0.0f},
++        {0.0234f, -0.1328f, 0.5903f, 0.6323f, -0.1387f, 0.0254f, 0.0f, 0.0f},
++        {0.0225f, -0.1299f, 0.5693f, 0.6528f, -0.1411f, 0.0264f, 0.0f, 0.0f},
++        {0.0215f, -0.1260f, 0.5479f, 0.6724f, -0.1431f, 0.0273f, 0.0f, 0.0f},
++        {0.0200f, -0.1226f, 0.5264f, 0.6929f, -0.1445f, 0.0278f, 0.0f, 0.0f},
++        {0.0190f, -0.1187f, 0.5049f, 0.7119f, -0.1460f, 0.0288f, 0.0f, 0.0f},
++        {0.0181f, -0.1147f, 0.4829f, 0.7314f, -0.1470f, 0.0293f, 0.0f, 0.0f},
++        {0.0166f, -0.1104f, 0.4614f, 0.7505f, -0.1479f, 0.0298f, 0.0f, 0.0f},
++        {0.0156f, -0.1060f, 0.4399f, 0.7681f, -0.1479f, 0.0303f, 0.0f, 0.0f},
++        {0.0146f, -0.1016f, 0.4185f, 0.7856f, -0.1479f, 0.0308f, 0.0f, 0.0f},
++        {0.0137f, -0.0967f, 0.3965f, 0.8022f, -0.1470f, 0.0313f, 0.0f, 0.0f},
++        {0.0122f, -0.0923f, 0.3755f, 0.8193f, -0.1460f, 0.0313f, 0.0f, 0.0f},
++        {0.0112f, -0.0874f, 0.3540f, 0.8354f, -0.1445f, 0.0313f, 0.0f, 0.0f},
++        {0.0103f, -0.0825f, 0.3330f, 0.8506f, -0.1426f, 0.0313f, 0.0f, 0.0f},
++        {0.0093f, -0.0776f, 0.3120f, 0.8657f, -0.1401f, 0.0308f, 0.0f, 0.0f},
++        {0.0083f, -0.0728f, 0.2915f, 0.8789f, -0.1367f, 0.0308f, 0.0f, 0.0f},
++        {0.0073f, -0.0679f, 0.2710f, 0.8926f, -0.1333f, 0.0303f, 0.0f, 0.0f},
++        {0.0063f, -0.0630f, 0.2510f, 0.9058f, -0.1294f, 0.0293f, 0.0f, 0.0f},
++        {0.0059f, -0.0581f, 0.2310f, 0.9170f, -0.1245f, 0.0288f, 0.0f, 0.0f},
++        {0.0049f, -0.0537f, 0.2119f, 0.9282f, -0.1191f, 0.0278f, 0.0f, 0.0f},
++        {0.0044f, -0.0488f, 0.1929f, 0.9390f, -0.1138f, 0.0264f, 0.0f, 0.0f},
++        {0.0034f, -0.0439f, 0.1738f, 0.9487f, -0.1074f, 0.0254f, 0.0f, 0.0f},
++        {0.0029f, -0.0396f, 0.1558f, 0.9575f, -0.1006f, 0.0239f, 0.0f, 0.0f},
++        {0.0024f, -0.0352f, 0.1382f, 0.9648f, -0.0928f, 0.0225f, 0.0f, 0.0f},
++        {0.0020f, -0.0308f, 0.1206f, 0.9727f, -0.0850f, 0.0205f, 0.0f, 0.0f},
++        {0.0015f, -0.0264f, 0.1040f, 0.9785f, -0.0762f, 0.0186f, 0.0f, 0.0f},
++        {0.0010f, -0.0220f, 0.0874f, 0.9844f, -0.0674f, 0.0166f, 0.0f, 0.0f},
++        {0.0005f, -0.0181f, 0.0713f, 0.9897f, -0.0576f, 0.0142f, 0.0f, 0.0f},
++        {0.0005f, -0.0142f, 0.0562f, 0.9932f, -0.0474f, 0.0117f, 0.0f, 0.0f},
++        {0.0005f, -0.0103f, 0.0415f, 0.9956f, -0.0361f, 0.0088f, 0.0f, 0.0f},
++        {0.0f, -0.0068f, 0.0269f, 0.9985f, -0.0249f, 0.0063f, 0.0f, 0.0f},
++        {0.0f, -0.0034f, 0.0132f, 1.0000f, -0.0127f, 0.0029f, 0.0f, 0.0f}
++    };
++
++    constexpr float coef_usm[kPhaseCount][kFilterSize] = {
++        {0.0f,      -0.6001f, 1.2002f, -0.6001f,  0.0f,  0.0f, 0.0f, 0.0f},
++        {0.0029f, -0.6084f, 1.1987f, -0.5903f, -0.0029f, 0.0f, 0.0f, 0.0f},
++        {0.0049f, -0.6147f, 1.1958f, -0.5791f, -0.0068f, 0.0005f, 0.0f, 0.0f},
++        {0.0073f, -0.6196f, 1.1890f, -0.5659f, -0.0103f, 0.0f, 0.0f, 0.0f},
++        {0.0093f, -0.6235f, 1.1802f, -0.5513f, -0.0151f, 0.0f, 0.0f, 0.0f},
++        {0.0112f, -0.6265f, 1.1699f, -0.5352f, -0.0195f, 0.0005f, 0.0f, 0.0f},
++        {0.0122f, -0.6270f, 1.1582f, -0.5181f, -0.0259f, 0.0005f, 0.0f, 0.0f},
++        {0.0142f, -0.6284f, 1.1455f, -0.5005f, -0.0317f, 0.0005f, 0.0f, 0.0f},
++        {0.0156f, -0.6265f, 1.1274f, -0.4790f, -0.0386f, 0.0005f, 0.0f, 0.0f},
++        {0.0166f, -0.6235f, 1.1089f, -0.4570f, -0.0454f, 0.0010f, 0.0f, 0.0f},
++        {0.0176f, -0.6187f, 1.0879f, -0.4346f, -0.0532f, 0.0010f, 0.0f, 0.0f},
++        {0.0181f, -0.6138f, 1.0659f, -0.4102f, -0.0615f, 0.0015f, 0.0f, 0.0f},
++        {0.0190f, -0.6069f, 1.0405f, -0.3843f, -0.0698f, 0.0015f, 0.0f, 0.0f},
++        {0.0195f, -0.6006f, 1.0161f, -0.3574f, -0.0796f, 0.0020f, 0.0f, 0.0f},
++        {0.0200f, -0.5928f, 0.9893f, -0.3286f, -0.0898f, 0.0024f, 0.0f, 0.0f},
++        {0.0200f, -0.5820f, 0.9580f, -0.2988f, -0.1001f, 0.0029f, 0.0f, 0.0f},
++        {0.0200f, -0.5728f, 0.9292f, -0.2690f, -0.1104f, 0.0034f, 0.0f, 0.0f},
++        {0.0200f, -0.5620f, 0.8975f, -0.2368f, -0.1226f, 0.0039f, 0.0f, 0.0f},
++        {0.0205f, -0.5498f, 0.8643f, -0.2046f, -0.1343f, 0.0044f, 0.0f, 0.0f},
++        {0.0200f, -0.5371f, 0.8301f, -0.1709f, -0.1465f, 0.0049f, 0.0f, 0.0f},
++        {0.0195f, -0.5239f, 0.7944f, -0.1367f, -0.1587f, 0.0054f, 0.0f, 0.0f},
++        {0.0195f, -0.5107f, 0.7598f, -0.1021f, -0.1724f, 0.0059f, 0.0f, 0.0f},
++        {0.0190f, -0.4966f, 0.7231f, -0.0649f, -0.1865f, 0.0063f, 0.0f, 0.0f},
++        {0.0186f, -0.4819f, 0.6846f, -0.0288f, -0.1997f, 0.0068f, 0.0f, 0.0f},
++        {0.0186f, -0.4668f, 0.6460f, 0.0093f, -0.2144f, 0.0073f, 0.0f, 0.0f},
++        {0.0176f, -0.4507f, 0.6055f, 0.0479f, -0.2290f, 0.0083f, 0.0f, 0.0f},
++        {0.0171f, -0.4370f, 0.5693f, 0.0859f, -0.2446f, 0.0088f, 0.0f, 0.0f},
++        {0.0161f, -0.4199f, 0.5283f, 0.1255f, -0.2598f, 0.0098f, 0.0f, 0.0f},
++        {0.0161f, -0.4048f, 0.4883f, 0.1655f, -0.2754f, 0.0103f, 0.0f, 0.0f},
++        {0.0151f, -0.3887f, 0.4497f, 0.2041f, -0.2910f, 0.0107f, 0.0f, 0.0f},
++        {0.0142f, -0.3711f, 0.4072f, 0.2446f, -0.3066f, 0.0117f, 0.0f, 0.0f},
++        {0.0137f, -0.3555f, 0.3672f, 0.2852f, -0.3228f, 0.0122f, 0.0f, 0.0f},
++        {0.0132f, -0.3394f, 0.3262f, 0.3262f, -0.3394f, 0.0132f, 0.0f, 0.0f},
++        {0.0122f, -0.3228f, 0.2852f, 0.3672f, -0.3555f, 0.0137f, 0.0f, 0.0f},
++        {0.0117f, -0.3066f, 0.2446f, 0.4072f, -0.3711f, 0.0142f, 0.0f, 0.0f},
++        {0.0107f, -0.2910f, 0.2041f, 0.4497f, -0.3887f, 0.0151f, 0.0f, 0.0f},
++        {0.0103f, -0.2754f, 0.1655f, 0.4883f, -0.4048f, 0.0161f, 0.0f, 0.0f},
++        {0.0098f, -0.2598f, 0.1255f, 0.5283f, -0.4199f, 0.0161f, 0.0f, 0.0f},
++        {0.0088f, -0.2446f, 0.0859f, 0.5693f, -0.4370f, 0.0171f, 0.0f, 0.0f},
++        {0.0083f, -0.2290f, 0.0479f, 0.6055f, -0.4507f, 0.0176f, 0.0f, 0.0f},
++        {0.0073f, -0.2144f, 0.0093f, 0.6460f, -0.4668f, 0.0186f, 0.0f, 0.0f},
++        {0.0068f, -0.1997f, -0.0288f, 0.6846f, -0.4819f, 0.0186f, 0.0f, 0.0f},
++        {0.0063f, -0.1865f, -0.0649f, 0.7231f, -0.4966f, 0.0190f, 0.0f, 0.0f},
++        {0.0059f, -0.1724f, -0.1021f, 0.7598f, -0.5107f, 0.0195f, 0.0f, 0.0f},
++        {0.0054f, -0.1587f, -0.1367f, 0.7944f, -0.5239f, 0.0195f, 0.0f, 0.0f},
++        {0.0049f, -0.1465f, -0.1709f, 0.8301f, -0.5371f, 0.0200f, 0.0f, 0.0f},
++        {0.0044f, -0.1343f, -0.2046f, 0.8643f, -0.5498f, 0.0205f, 0.0f, 0.0f},
++        {0.0039f, -0.1226f, -0.2368f, 0.8975f, -0.5620f, 0.0200f, 0.0f, 0.0f},
++        {0.0034f, -0.1104f, -0.2690f, 0.9292f, -0.5728f, 0.0200f, 0.0f, 0.0f},
++        {0.0029f, -0.1001f, -0.2988f, 0.9580f, -0.5820f, 0.0200f, 0.0f, 0.0f},
++        {0.0024f, -0.0898f, -0.3286f, 0.9893f, -0.5928f, 0.0200f, 0.0f, 0.0f},
++        {0.0020f, -0.0796f, -0.3574f, 1.0161f, -0.6006f, 0.0195f, 0.0f, 0.0f},
++        {0.0015f, -0.0698f, -0.3843f, 1.0405f, -0.6069f, 0.0190f, 0.0f, 0.0f},
++        {0.0015f, -0.0615f, -0.4102f, 1.0659f, -0.6138f, 0.0181f, 0.0f, 0.0f},
++        {0.0010f, -0.0532f, -0.4346f, 1.0879f, -0.6187f, 0.0176f, 0.0f, 0.0f},
++        {0.0010f, -0.0454f, -0.4570f, 1.1089f, -0.6235f, 0.0166f, 0.0f, 0.0f},
++        {0.0005f, -0.0386f, -0.4790f, 1.1274f, -0.6265f, 0.0156f, 0.0f, 0.0f},
++        {0.0005f, -0.0317f, -0.5005f, 1.1455f, -0.6284f, 0.0142f, 0.0f, 0.0f},
++        {0.0005f, -0.0259f, -0.5181f, 1.1582f, -0.6270f, 0.0122f, 0.0f, 0.0f},
++        {0.0005f, -0.0195f, -0.5352f, 1.1699f, -0.6265f, 0.0112f, 0.0f, 0.0f},
++        {0.0f, -0.0151f, -0.5513f, 1.1802f, -0.6235f, 0.0093f, 0.0f, 0.0f},
++        {0.0f, -0.0103f, -0.5659f, 1.1890f, -0.6196f, 0.0073f, 0.0f, 0.0f},
++        {0.0005f, -0.0068f, -0.5791f, 1.1958f, -0.6147f, 0.0049f, 0.0f, 0.0f},
++        {0.0f, -0.0029f, -0.5903f, 1.1987f, -0.6084f, 0.0029f, 0.0f, 0.0f}
++    };
++
++    constexpr uint16_t coef_scale_fp16[kPhaseCount][kFilterSize] = {
++       { 0, 0, 15360, 0, 0, 0, 0, 0 },
++       { 6640, 41601, 15360, 8898, 39671, 0, 0, 0 },
++       { 7796, 42592, 15357, 9955, 40695, 0, 0, 0 },
++       { 8321, 43167, 15351, 10576, 41286, 4121, 0, 0 },
++       { 8702, 43537, 15346, 11058, 41797, 4121, 0, 0 },
++       { 9029, 43871, 15339, 11408, 42146, 4121, 0, 0 },
++       { 9280, 44112, 15328, 11672, 42402, 5145, 0, 0 },
++       { 9411, 44256, 15316, 11944, 42690, 5669, 0, 0 },
++       { 9535, 44401, 15304, 12216, 42979, 6169, 0, 0 },
++       { 9667, 44528, 15288, 12396, 43137, 6378, 0, 0 },
++       { 9758, 44656, 15273, 12540, 43282, 6640, 0, 0 },
++       { 9857, 44768, 15255, 12688, 43423, 6903, 0, 0 },
++       { 9922, 44872, 15235, 12844, 43583, 7297, 0, 0 },
++       { 10014, 44959, 15213, 13000, 43744, 7429, 0, 0 },
++       { 10079, 45048, 15190, 13156, 43888, 7691, 0, 0 },
++       { 10112, 45092, 15167, 13316, 44040, 7796, 0, 0 },
++       { 10178, 45124, 15140, 13398, 44120, 8058, 0, 0 },
++       { 10211, 45152, 15112, 13482, 44201, 8256, 0, 0 },
++       { 10211, 45180, 15085, 13566, 44279, 8387, 0, 0 },
++       { 10242, 45200, 15054, 13652, 44360, 8518, 0, 0 },
++       { 10242, 45216, 15023, 13738, 44440, 8636, 0, 0 },
++       { 10242, 45228, 14990, 13826, 44520, 8767, 0, 0 },
++       { 10242, 45236, 14955, 13912, 44592, 8964, 0, 0 },
++       { 10211, 45244, 14921, 14002, 44673, 9082, 0, 0 },
++       { 10178, 45244, 14885, 14090, 44745, 9213, 0, 0 },
++       { 10145, 45244, 14849, 14178, 44817, 9280, 0, 0 },
++       { 10112, 45236, 14810, 14266, 44887, 9378, 0, 0 },
++       { 10079, 45228, 14770, 14346, 44953, 9437, 0, 0 },
++       { 10014, 45216, 14731, 14390, 45017, 9503, 0, 0 },
++       { 9981, 45204, 14689, 14434, 45064, 9601, 0, 0 },
++       { 9922, 45188, 14649, 14478, 45096, 9667, 0, 0 },
++       { 9857, 45168, 14607, 14521, 45120, 9726, 0, 0 },
++       { 9791, 45144, 14564, 14564, 45144, 9791, 0, 0 },
++       { 9726, 45120, 14521, 14607, 45168, 9857, 0, 0 },
++       { 9667, 45096, 14478, 14649, 45188, 9922, 0, 0 },
++       { 9601, 45064, 14434, 14689, 45204, 9981, 0, 0 },
++       { 9503, 45017, 14390, 14731, 45216, 10014, 0, 0 },
++       { 9437, 44953, 14346, 14770, 45228, 10079, 0, 0 },
++       { 9378, 44887, 14266, 14810, 45236, 10112, 0, 0 },
++       { 9280, 44817, 14178, 14849, 45244, 10145, 0, 0 },
++       { 9213, 44745, 14090, 14885, 45244, 10178, 0, 0 },
++       { 9082, 44673, 14002, 14921, 45244, 10211, 0, 0 },
++       { 8964, 44592, 13912, 14955, 45236, 10242, 0, 0 },
++       { 8767, 44520, 13826, 14990, 45228, 10242, 0, 0 },
++       { 8636, 44440, 13738, 15023, 45216, 10242, 0, 0 },
++       { 8518, 44360, 13652, 15054, 45200, 10242, 0, 0 },
++       { 8387, 44279, 13566, 15085, 45180, 10211, 0, 0 },
++       { 8256, 44201, 13482, 15112, 45152, 10211, 0, 0 },
++       { 8058, 44120, 13398, 15140, 45124, 10178, 0, 0 },
++       { 7796, 44040, 13316, 15167, 45092, 10112, 0, 0 },
++       { 7691, 43888, 13156, 15190, 45048, 10079, 0, 0 },
++       { 7429, 43744, 13000, 15213, 44959, 10014, 0, 0 },
++       { 7297, 43583, 12844, 15235, 44872, 9922, 0, 0 },
++       { 6903, 43423, 12688, 15255, 44768, 9857, 0, 0 },
++       { 6640, 43282, 12540, 15273, 44656, 9758, 0, 0 },
++       { 6378, 43137, 12396, 15288, 44528, 9667, 0, 0 },
++       { 6169, 42979, 12216, 15304, 44401, 9535, 0, 0 },
++       { 5669, 42690, 11944, 15316, 44256, 9411, 0, 0 },
++       { 5145, 42402, 11672, 15328, 44112, 9280, 0, 0 },
++       { 4121, 42146, 11408, 15339, 43871, 9029, 0, 0 },
++       { 4121, 41797, 11058, 15346, 43537, 8702, 0, 0 },
++       { 4121, 41286, 10576, 15351, 43167, 8321, 0, 0 },
++       { 0, 40695, 9955, 15357, 42592, 7796, 0, 0 },
++       { 0, 39671, 8898, 15360, 41601, 6640, 0, 0 },
++    };
++
++    constexpr uint16_t coef_usm_fp16[kPhaseCount][kFilterSize] = {
++        { 0, 47309, 15565, 47309, 0, 0, 0, 0 },
++        { 6640, 47326, 15563, 47289, 39408, 0, 0, 0 },
++        { 7429, 47339, 15560, 47266, 40695, 4121, 0, 0 },
++        { 8058, 47349, 15554, 47239, 41286, 0, 0, 0 },
++        { 8387, 47357, 15545, 47209, 41915, 0, 0, 0 },
++        { 8636, 47363, 15534, 47176, 42238, 4121, 0, 0 },
++        { 8767, 47364, 15522, 47141, 42657, 4121, 0, 0 },
++        { 9029, 47367, 15509, 47105, 43023, 4121, 0, 0 },
++        { 9213, 47363, 15490, 47018, 43249, 4121, 0, 0 },
++        { 9280, 47357, 15472, 46928, 43472, 5145, 0, 0 },
++        { 9345, 47347, 15450, 46836, 43727, 5145, 0, 0 },
++        { 9378, 47337, 15427, 46736, 43999, 5669, 0, 0 },
++        { 9437, 47323, 15401, 46630, 44152, 5669, 0, 0 },
++        { 9470, 47310, 15376, 46520, 44312, 6169, 0, 0 },
++        { 9503, 47294, 15338, 46402, 44479, 6378, 0, 0 },
++        { 9503, 47272, 15274, 46280, 44648, 6640, 0, 0 },
++        { 9503, 47253, 15215, 46158, 44817, 6903, 0, 0 },
++        { 9503, 47231, 15150, 45972, 45017, 7165, 0, 0 },
++        { 9535, 47206, 15082, 45708, 45132, 7297, 0, 0 },
++        { 9503, 47180, 15012, 45432, 45232, 7429, 0, 0 },
++        { 9470, 47153, 14939, 45152, 45332, 7560, 0, 0 },
++        { 9470, 47126, 14868, 44681, 45444, 7691, 0, 0 },
++        { 9437, 47090, 14793, 44071, 45560, 7796, 0, 0 },
++        { 9411, 47030, 14714, 42847, 45668, 7927, 0, 0 },
++        { 9411, 46968, 14635, 8387, 45788, 8058, 0, 0 },
++        { 9345, 46902, 14552, 10786, 45908, 8256, 0, 0 },
++        { 9313, 46846, 14478, 11647, 46036, 8321, 0, 0 },
++        { 9247, 46776, 14394, 12292, 46120, 8453, 0, 0 },
++        { 9247, 46714, 14288, 12620, 46184, 8518, 0, 0 },
++        { 9147, 46648, 14130, 12936, 46248, 8570, 0, 0 },
++        { 9029, 46576, 13956, 13268, 46312, 8702, 0, 0 },
++        { 8964, 46512, 13792, 13456, 46378, 8767, 0, 0 },
++        { 8898, 46446, 13624, 13624, 46446, 8898, 0, 0 },
++        { 8767, 46378, 13456, 13792, 46512, 8964, 0, 0 },
++        { 8702, 46312, 13268, 13956, 46576, 9029, 0, 0 },
++        { 8570, 46248, 12936, 14130, 46648, 9147, 0, 0 },
++        { 8518, 46184, 12620, 14288, 46714, 9247, 0, 0 },
++        { 8453, 46120, 12292, 14394, 46776, 9247, 0, 0 },
++        { 8321, 46036, 11647, 14478, 46846, 9313, 0, 0 },
++        { 8256, 45908, 10786, 14552, 46902, 9345, 0, 0 },
++        { 8058, 45788, 8387, 14635, 46968, 9411, 0, 0 },
++        { 7927, 45668, 42847, 14714, 47030, 9411, 0, 0 },
++        { 7796, 45560, 44071, 14793, 47090, 9437, 0, 0 },
++        { 7691, 45444, 44681, 14868, 47126, 9470, 0, 0 },
++        { 7560, 45332, 45152, 14939, 47153, 9470, 0, 0 },
++        { 7429, 45232, 45432, 15012, 47180, 9503, 0, 0 },
++        { 7297, 45132, 45708, 15082, 47206, 9535, 0, 0 },
++        { 7165, 45017, 45972, 15150, 47231, 9503, 0, 0 },
++        { 6903, 44817, 46158, 15215, 47253, 9503, 0, 0 },
++        { 6640, 44648, 46280, 15274, 47272, 9503, 0, 0 },
++        { 6378, 44479, 46402, 15338, 47294, 9503, 0, 0 },
++        { 6169, 44312, 46520, 15376, 47310, 9470, 0, 0 },
++        { 5669, 44152, 46630, 15401, 47323, 9437, 0, 0 },
++        { 5669, 43999, 46736, 15427, 47337, 9378, 0, 0 },
++        { 5145, 43727, 46836, 15450, 47347, 9345, 0, 0 },
++        { 5145, 43472, 46928, 15472, 47357, 9280, 0, 0 },
++        { 4121, 43249, 47018, 15490, 47363, 9213, 0, 0 },
++        { 4121, 43023, 47105, 15509, 47367, 9029, 0, 0 },
++        { 4121, 42657, 47141, 15522, 47364, 8767, 0, 0 },
++        { 4121, 42238, 47176, 15534, 47363, 8636, 0, 0 },
++        { 0, 41915, 47209, 15545, 47357, 8387, 0, 0 },
++        { 0, 41286, 47239, 15554, 47349, 8058, 0, 0 },
++        { 4121, 40695, 47266, 15560, 47339, 7429, 0, 0 },
++        { 0, 39408, 47289, 15563, 47326, 6640, 0, 0 },
++    };
++}
+\ No newline at end of file
+diff --git a/src/vulkan/wsi/enhance/third_party/nis/NIS_Scaler.h b/src/vulkan/wsi/enhance/third_party/nis/NIS_Scaler.h
+new file mode 100644
+index 0000000..02f645c
+--- /dev/null
++++ b/src/vulkan/wsi/enhance/third_party/nis/NIS_Scaler.h
+@@ -0,0 +1,1020 @@
++// The MIT License(MIT)
++//
++// Copyright(c) 2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++//
++// Permission is hereby granted, free of charge, to any person obtaining a copy of
++// this software and associated documentation files(the "Software"), to deal in
++// the Software without restriction, including without limitation the rights to
++// use, copy, modify, merge, publish, distribute, sublicense, and / or sell copies of
++// the Software, and to permit persons to whom the Software is furnished to do so,
++// subject to the following conditions :
++//
++// The above copyright notice and this permission notice shall be included in all
++// copies or substantial portions of the Software.
++//
++// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
++// FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.IN NO EVENT SHALL THE AUTHORS OR
++// COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
++// IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
++// CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
++
++//---------------------------------------------------------------------------------
++// NVIDIA Image Scaling SDK  - v1.0.3
++//---------------------------------------------------------------------------------
++// The NVIDIA Image Scaling SDK provides a single spatial scaling and sharpening algorithm
++// for cross-platform support. The scaling algorithm uses a 6-tap scaling filter combined
++// with 4 directional scaling and adaptive sharpening filters, which creates nice smooth images
++// and sharp edges. In addition, the SDK provides a state-of-the-art adaptive directional sharpening algorithm
++// for use in applications where no scaling is required.
++//
++// The directional scaling and sharpening algorithm is named NVScaler while the adaptive-directional-sharpening-only
++// algorithm is named NVSharpen. Both algorithms are provided as compute shaders and
++// developers are free to integrate them in their applications. Note that if you integrate NVScaler, you
++// should NOT integrate NVSharpen, as NVScaler already includes a sharpening pass
++//
++// Pipeline Placement
++// ------------------
++// The call into the NVIDIA Image Scaling shaders must occur during the post-processing phase after tone-mapping.
++// Applying the scaling in linear HDR in-game color-space may result in a sharpening effect that is
++// either not visible or too strong. Since sharpening algorithms can enhance noisy or grainy regions, it is recommended
++// that certain effects such as film grain should occur after NVScaler or NVSharpen. Low-pass filters such as motion blur or
++// light bloom are recommended to be applied before NVScaler or NVSharpen to avoid sharpening attenuation.
++//
++// Color Space and Ranges
++// ----------------------
++// NVIDIA Image Scaling shaders can process color textures stored as either LDR or HDR with the following
++// restrictions:
++// 1) LDR
++//    - The range of color values must be in the [0, 1] range
++//    - The input color texture must be in display-referred color-space after tone mapping and OETF (gamma-correction)
++//      has been applied
++// 2) HDR PQ
++//    - The range of color values must be in the [0, 1] range
++//    - The input color texture must be in display-referred color-space after tone mapping with Rec.2020 PQ OETF applied
++// 3) HDR Linear
++//    - The recommended range of color values is [0, 12.5], where luminance value (as per BT. 709) of
++//      1.0 maps to brightness value of 80nits (sRGB peak) and 12.5 maps to 1000nits
++//    - The input color texture may have luminance values that are either linear and scene-referred or
++//      linear and display-referred (after tone mapping)
++//
++// If the input color texture sent to NVScaler/NVSharpen is in HDR format set NIS_HDR_MODE define to either
++// NIS_HDR_MODE_LINEAR (1) or NIS_HDR_MODE_PQ (2).
++//
++// Supported Texture Formats
++// -------------------------
++// Input and output formats:
++// Input and output formats are expected to be in the rages defined in previous section and should be
++// specified using non-integer data types such as DXGI_FORMAT_R8G8B8A8_UNORM.
++//
++// Coefficients formats:
++// The scaler coefficients and USM coefficients format should be specified using float4 type such as
++// DXGI_FORMAT_R32G32B32A32_FLOAT or DXGI_FORMAT_R16G16B16A16_FLOAT.
++//
++// Resource States, Buffers, and Sampler:
++// The game or application calling NVIDIA Image Scaling SDK shaders must ensure that the textures are in
++// the correct state.
++// - Input color textures must be in pixel shader read state. Shader Resource View (SRV) in DirectX
++// - The output texture must be in read/write state. Unordered Access View (UAV) in DirectX
++// - The coefficients texture for NVScaler must be in read state. Shader Resource View (SRV) in DirectX
++// - The configuration variables must be passed as constant buffer. Constant Buffer View (CBV) in DirectX
++// - The sampler for texture pixel sampling. Linear clamp SamplerState in Direct
++//
++// Adding NVIDIA Image Scaling SDK to a Project
++// --------------------------------------------
++// Include NIS_Scaler.h directly in your application or alternative use the provided NIS_Main.hlsl shader file.
++// Use NIS_Config.h to get the ideal shader dispatch values for your platform, to configure the algorithm constant
++// values (NVScalerUpdateConfig, and NVSharpenUpdateConfig), and to access the algorithm coefficients (coef_scale and coef_USM).
++//
++// Defines:
++// NIS_SCALER: default (1) NVScaler, (0) fast NVSharpen only, no upscaling
++// NIS_HDR_MODE: default (0) disabled, (1) Linear, (2) PQ
++// NIS_BLOCK_WIDTH: pixels per block width. Use GetOptimalBlockWidth query for your platform
++// NIS_BLOCK_HEIGHT: pixels per block height. Use GetOptimalBlockHeight query for your platform
++// NIS_THREAD_GROUP_SIZE: number of threads per group. Use GetOptimalThreadGroupSize query for your platform
++// NIS_USE_HALF_PRECISION: default (0) disabled, (1) enable half pression computation
++// NIS_HLSL: (1) enabled, (0) disabled
++// NIS_HLSL_6_2: default (0) HLSL v5, (1) HLSL v6.2 forces NIS_HLSL=1
++// NIS_GLSL: (1) enabled, (0) disabled
++// NIS_VIEWPORT_SUPPORT: default(0) disabled, (1) enable input/output viewport support
++// NIS_NV12_SUPPORT: default(0) disabled, (1) enable NV12 input
++// NIS_CLAMP_OUTPUT: default(0) disabled, (1) enable output clamp
++//
++// Default NVScaler shader constants:
++// [NIS_BLOCK_WIDTH, NIS_BLOCK_HEIGHT, NIS_THREAD_GROUP_SIZE] = [32, 24, 256]
++//
++// Default NVSharpen shader constants:
++// [NIS_BLOCK_WIDTH, NIS_BLOCK_HEIGHT, NIS_THREAD_GROUP_SIZE] = [32, 32, 256]
++// 
++// NIS_UNROLL: default [unroll]
++// NIS_UNROLL_INNER: default NIS_UNROLL, define in case of a compiler error for inner nested loops
++//---------------------------------------------------------------------------------
++
++// NVScaler enable by default. Set to 0 for NVSharpen only
++#ifndef NIS_SCALER
++#define NIS_SCALER 1
++#endif
++
++// HDR Modes
++#define NIS_HDR_MODE_NONE  0
++#define NIS_HDR_MODE_LINEAR  1
++#define NIS_HDR_MODE_PQ  2
++#ifndef NIS_HDR_MODE
++#define NIS_HDR_MODE NIS_HDR_MODE_NONE
++#endif
++#define kHDRCompressionFactor  0.282842712f
++
++// Viewport support
++#ifndef NIS_VIEWPORT_SUPPORT
++#define NIS_VIEWPORT_SUPPORT 0
++#endif
++
++// HLSL, GLSL
++#if NIS_HLSL==0 && !defined(NIS_GLSL)
++#define NIS_GLSL 1
++#endif
++#if NIS_HLSL_6_2 || (!NIS_GLSL && !NIS_HLSL)
++#if defined(NIS_HLSL)
++#undef NIS_HLSL
++#endif
++#define NIS_HLSL 1
++#endif
++#if NIS_HLSL && NIS_GLSL
++#undef NIS_GLSL
++#define NIS_GLSL 0
++#endif
++
++// Half precision
++#ifndef NIS_USE_HALF_PRECISION
++#define NIS_USE_HALF_PRECISION 0
++#endif
++
++#if NIS_HLSL
++// Generic type and function aliases for HLSL
++#define NVF float
++#define NVF2 float2
++#define NVF3 float3
++#define NVF4 float4
++#define NVI int
++#define NVI2 int2
++#define NVU uint
++#define NVU2 uint2
++#define NVB bool
++#if NIS_USE_HALF_PRECISION
++#if NIS_HLSL_6_2
++#define NVH float16_t
++#define NVH2 float16_t2
++#define NVH3 float16_t3
++#define NVH4 float16_t4
++#else
++#define NVH min16float
++#define NVH2 min16float2
++#define NVH3 min16float3
++#define NVH4 min16float4
++#endif // NIS_HLSL_6_2
++#else // FP32 types
++#define NVH NVF
++#define NVH2 NVF2
++#define NVH3 NVF3
++#define NVH4 NVF4
++#endif // NIS_USE_HALF_PRECISION
++#define NVSHARED groupshared
++#define NVTEX_LOAD(x, pos) x[pos]
++#define NVTEX_SAMPLE(x, sampler, pos) x.SampleLevel(sampler, pos, 0)
++#define NVTEX_SAMPLE_RED(x, sampler, pos) x.GatherRed(sampler, pos)
++#define NVTEX_SAMPLE_GREEN(x, sampler, pos) x.GatherGreen(sampler, pos)
++#define NVTEX_SAMPLE_BLUE(x, sampler, pos) x.GatherBlue(sampler, pos)
++#define NVTEX_STORE(x, pos, v) x[pos] = v
++#ifndef NIS_UNROLL
++#define NIS_UNROLL [unroll]
++#endif
++#endif // NIS_HLSL
++
++// Generic type and function aliases for GLSL
++#if NIS_GLSL
++#define NVF float
++#define NVF2 vec2
++#define NVF3 vec3
++#define NVF4 vec4
++#define NVI int
++#define NVI2 ivec2
++#define NVU uint
++#define NVU2 uvec2
++#define NVB bool
++#if NIS_USE_HALF_PRECISION
++#define NVH float16_t
++#define NVH2 f16vec2
++#define NVH3 f16vec3
++#define NVH4 f16vec4
++#else // FP32 types
++#define NVH NVF
++#define NVH2 NVF2
++#define NVH3 NVF3
++#define NVH4 NVF4
++#endif  // NIS_USE_HALF_PRECISION
++#define NVSHARED shared
++#define NVTEX_LOAD(x, pos) texelFetch(sampler2D(x, samplerLinearClamp), pos, 0)
++#define NVTEX_SAMPLE(x, sampler, pos) textureLod(sampler2D(x, sampler), pos, 0)
++#define NVTEX_SAMPLE_RED(x, sampler, pos) textureGather(sampler2D(x, sampler), pos, 0)
++#define NVTEX_SAMPLE_GREEN(x, sampler, pos) textureGather(sampler2D(x, sampler), pos, 1)
++#define NVTEX_SAMPLE_BLUE(x, sampler, pos) textureGather(sampler2D(x, sampler), pos, 2)
++#define NVTEX_STORE(x, pos, v) imageStore(x, NVI2(pos), v)
++#define saturate(x) clamp(x, 0, 1)
++#define lerp(a, b, x) mix(a, b, x)
++#define GroupMemoryBarrierWithGroupSync() groupMemoryBarrier(); barrier()
++#ifndef NIS_UNROLL
++#define NIS_UNROLL
++#endif
++#endif // NIS_GLSL
++
++#ifndef NIS_UNROLL_INNER
++#define NIS_UNROLL_INNER NIS_UNROLL
++#endif
++
++// Texture gather
++#ifndef NIS_TEXTURE_GATHER
++#define NIS_TEXTURE_GATHER 0
++#endif
++
++// NIS Scaling
++#define NIS_SCALE_INT 1
++#define NIS_SCALE_FLOAT NVF(1.f)
++
++// NIS output clamp
++#if NIS_CLAMP_OUTPUT
++#if NIS_HDR_MODE == NIS_HDR_MODE_LINEAR
++#define NVCLAMP(x) ( clamp(x, 0.0f, 12.5f) )
++#else
++#define NVCLAMP(x) ( saturate(x) )
++#endif
++#else
++#define NVCLAMP(x) (x)
++#endif
++
++NVF getY(NVF3 rgba)
++{
++#if NIS_HDR_MODE == NIS_HDR_MODE_PQ
++    return NVF(0.262f) * rgba.x + NVF(0.678f) * rgba.y + NVF(0.0593f) * rgba.z;
++#elif NIS_HDR_MODE == NIS_HDR_MODE_LINEAR
++    return sqrt(NVF(0.2126f) * rgba.x + NVF(0.7152f) * rgba.y + NVF(0.0722f) * rgba.z) * kHDRCompressionFactor;
++#else
++    return NVF(0.2126f) * rgba.x + NVF(0.7152f) * rgba.y + NVF(0.0722f) * rgba.z;
++#endif
++}
++
++NVF getYLinear(NVF3 rgba)
++{
++    return NVF(0.2126f) * rgba.x + NVF(0.7152f) * rgba.y + NVF(0.0722f) * rgba.z;
++}
++
++NVF3 YUVtoRGB(NVF3 yuv)
++{
++    float y = yuv.x - 16.0f / 255.0f;
++    float u = yuv.y - 128.0f / 255.0f;
++    float v = yuv.z - 128.0f / 255.0f;
++    NVF3 rgb;
++    rgb.x = saturate(1.164f * y + 1.596f * v);
++    rgb.y = saturate(1.164f * y - 0.392f * u - 0.813f * v);
++    rgb.z = saturate(1.164f * y + 2.017f * u);
++    return rgb;
++}
++
++#if NIS_SCALER
++NVF4 GetEdgeMap(NVF p[4][4], NVI i, NVI j)
++#else
++NVF4 GetEdgeMap(NVF p[5][5], NVI i, NVI j)
++#endif
++{
++    const NVF g_0 = abs(p[0 + i][0 + j] + p[0 + i][1 + j] + p[0 + i][2 + j] - p[2 + i][0 + j] - p[2 + i][1 + j] - p[2 + i][2 + j]);
++    const NVF g_45 = abs(p[1 + i][0 + j] + p[0 + i][0 + j] + p[0 + i][1 + j] - p[2 + i][1 + j] - p[2 + i][2 + j] - p[1 + i][2 + j]);
++    const NVF g_90 = abs(p[0 + i][0 + j] + p[1 + i][0 + j] + p[2 + i][0 + j] - p[0 + i][2 + j] - p[1 + i][2 + j] - p[2 + i][2 + j]);
++    const NVF g_135 = abs(p[1 + i][0 + j] + p[2 + i][0 + j] + p[2 + i][1 + j] - p[0 + i][1 + j] - p[0 + i][2 + j] - p[1 + i][2 + j]);
++
++    const NVF g_0_90_max = max(g_0, g_90);
++    const NVF g_0_90_min = min(g_0, g_90);
++    const NVF g_45_135_max = max(g_45, g_135);
++    const NVF g_45_135_min = min(g_45, g_135);
++
++    NVF e_0_90 = 0;
++    NVF e_45_135 = 0;
++
++    if (g_0_90_max + g_45_135_max == 0)
++    {
++        return NVF4(0, 0, 0, 0);
++    }
++
++    e_0_90 = min(g_0_90_max / (g_0_90_max + g_45_135_max), 1.0f);
++    e_45_135 = 1.0f - e_0_90;
++
++    NVB c_0_90 = (g_0_90_max > (g_0_90_min * kDetectRatio)) && (g_0_90_max > kDetectThres) && (g_0_90_max > g_45_135_min);
++    NVB c_45_135 = (g_45_135_max > (g_45_135_min * kDetectRatio)) && (g_45_135_max > kDetectThres) && (g_45_135_max > g_0_90_min);
++    NVB c_g_0_90 = g_0_90_max == g_0;
++    NVB c_g_45_135 = g_45_135_max == g_45;
++
++    NVF f_e_0_90 = (c_0_90 && c_45_135) ? e_0_90 : 1.0f;
++    NVF f_e_45_135 = (c_0_90 && c_45_135) ? e_45_135 : 1.0f;
++
++    NVF weight_0 = (c_0_90 && c_g_0_90) ? f_e_0_90 : 0.0f;
++    NVF weight_90 = (c_0_90 && !c_g_0_90) ? f_e_0_90 : 0.0f;
++    NVF weight_45 = (c_45_135 && c_g_45_135) ? f_e_45_135 : 0.0f;
++    NVF weight_135 = (c_45_135 && !c_g_45_135) ? f_e_45_135 : 0.0f;
++
++    return NVF4(weight_0, weight_90, weight_45, weight_135);
++}
++
++#if NIS_SCALER
++
++#ifndef NIS_BLOCK_WIDTH
++#define NIS_BLOCK_WIDTH 32
++#endif
++#ifndef NIS_BLOCK_HEIGHT
++#define NIS_BLOCK_HEIGHT 24
++#endif
++#ifndef NIS_THREAD_GROUP_SIZE
++#define NIS_THREAD_GROUP_SIZE 256
++#endif
++#define kPhaseCount  64
++#define kFilterSize  6
++#define kSupportSize 6
++#define kPadSize     kSupportSize
++// 'Tile' is the region of source luminance values that we load into shPixelsY.
++// It is the area of source pixels covered by the destination 'Block' plus a
++// 3 pixel border of support pixels.
++#define kTilePitch              (NIS_BLOCK_WIDTH + kPadSize)
++#define kTileSize               (kTilePitch * (NIS_BLOCK_HEIGHT + kPadSize))
++// 'EdgeMap' is the region of source pixels for which edge map vectors are derived.
++// It is the area of source pixels covered by the destination 'Block' plus a
++// 1 pixel border.
++#define kEdgeMapPitch           (NIS_BLOCK_WIDTH + 2)
++#define kEdgeMapSize            (kEdgeMapPitch * (NIS_BLOCK_HEIGHT + 2))
++
++NVSHARED NVF shPixelsY[kTileSize];
++NVSHARED NVH shCoefScaler[kPhaseCount][kFilterSize];
++NVSHARED NVH shCoefUSM[kPhaseCount][kFilterSize];
++NVSHARED NVH4 shEdgeMap[kEdgeMapSize];
++
++void LoadFilterBanksSh(NVI i0) {
++    // Load up filter banks to shared memory
++    // The work is spread over (kPhaseCount * 2) threads
++    NVI i = i0;
++#if( kPhaseCount * 2 > NIS_THREAD_GROUP_SIZE )
++    for (; i < kPhaseCount * 2; i += NIS_THREAD_GROUP_SIZE)
++#else
++    if (i < kPhaseCount * 2)
++#endif
++    {
++        NVI phase = i >> 1;
++        NVI vIdx = i & 1;
++
++        NVH4 v = NVH4(NVTEX_LOAD(coef_scaler, NVI2(vIdx, phase)));
++        NVI filterOffset = vIdx * 4;
++        shCoefScaler[phase][filterOffset + 0] = v.x;
++        shCoefScaler[phase][filterOffset + 1] = v.y;
++        if (vIdx == 0)
++        {
++            shCoefScaler[phase][2] = v.z;
++            shCoefScaler[phase][3] = v.w;
++        }
++
++        v = NVH4(NVTEX_LOAD(coef_usm, NVI2(vIdx, phase)));
++        shCoefUSM[phase][filterOffset + 0] = v.x;
++        shCoefUSM[phase][filterOffset + 1] = v.y;
++        if (vIdx == 0)
++        {
++            shCoefUSM[phase][2] = v.z;
++            shCoefUSM[phase][3] = v.w;
++        }
++    }
++}
++
++
++NVF CalcLTI(NVF p0, NVF p1, NVF p2, NVF p3, NVF p4, NVF p5, NVI phase_index)
++{
++    const NVB selector = (phase_index <= kPhaseCount / 2);
++    NVF sel = selector ? p0 : p3;
++    const NVF a_min = min(min(p1, p2), sel);
++    const NVF a_max = max(max(p1, p2), sel);
++    sel = selector ? p2 : p5;
++    const NVF b_min = min(min(p3, p4), sel);
++    const NVF b_max = max(max(p3, p4), sel);
++
++    const NVF a_cont = a_max - a_min;
++    const NVF b_cont = b_max - b_min;
++
++    const NVF cont_ratio = max(a_cont, b_cont) / (min(a_cont, b_cont) + kEps);
++    return (1.0f - saturate((cont_ratio - kMinContrastRatio) * kRatioNorm)) * kContrastBoost;
++}
++
++NVF4 GetInterpEdgeMap(const NVF4 edge[2][2], NVF phase_frac_x, NVF phase_frac_y)
++{
++    NVF4 h0 = lerp(edge[0][0], edge[0][1], phase_frac_x);
++    NVF4 h1 = lerp(edge[1][0], edge[1][1], phase_frac_x);
++    return lerp(h0, h1, phase_frac_y);
++}
++
++NVF EvalPoly6(const NVF pxl[6], NVI phase_int)
++{
++    NVF y = 0.f;
++    {
++        NIS_UNROLL
++        for (NVI i = 0; i < 6; ++i)
++        {
++            y += shCoefScaler[phase_int][i] * pxl[i];
++        }
++    }
++    NVF y_usm = 0.f;
++    {
++        NIS_UNROLL
++        for (NVI i = 0; i < 6; ++i)
++        {
++            y_usm += shCoefUSM[phase_int][i] * pxl[i];
++        }
++    }
++
++    // let's compute a piece-wise ramp based on luma
++    const NVF y_scale = 1.0f - saturate((y * (1.0f / NIS_SCALE_FLOAT) - kSharpStartY) * kSharpScaleY);
++
++    // scale the ramp to sharpen as a function of luma
++    const NVF y_sharpness = y_scale * kSharpStrengthScale + kSharpStrengthMin;
++
++    y_usm *= y_sharpness;
++
++    // scale the ramp to limit USM as a function of luma
++    const NVF y_sharpness_limit = (y_scale * kSharpLimitScale + kSharpLimitMin) * y;
++
++    y_usm = min(y_sharpness_limit, max(-y_sharpness_limit, y_usm));
++    // reduce ringing
++    y_usm *= CalcLTI(pxl[0], pxl[1], pxl[2], pxl[3], pxl[4], pxl[5], phase_int);
++
++    return y + y_usm;
++}
++
++NVF FilterNormal(const NVF p[6][6], NVI phase_x_frac_int, NVI phase_y_frac_int)
++{
++    NVF h_acc = 0.0f;
++    NIS_UNROLL
++    for (NVI j = 0; j < 6; ++j)
++    {
++        NVF v_acc = 0.0f;
++        NIS_UNROLL
++        for (NVI i = 0; i < 6; ++i)
++        {
++            v_acc += p[i][j] * shCoefScaler[phase_y_frac_int][i];
++        }
++        h_acc += v_acc * shCoefScaler[phase_x_frac_int][j];
++    }
++
++    // let's return the sum unpacked -> we can accumulate it later
++    return h_acc;
++}
++
++NVF AddDirFilters(NVF p[6][6], NVF phase_x_frac, NVF phase_y_frac, NVI phase_x_frac_int, NVI phase_y_frac_int, NVF4 w)
++{
++    NVF f = 0;
++    if (w.x > 0.0f)
++    {
++        // 0 deg filter
++        NVF interp0Deg[6];
++        {
++            NIS_UNROLL
++                for (NVI i = 0; i < 6; ++i)
++                {
++                    interp0Deg[i] = lerp(p[i][2], p[i][3], phase_x_frac);
++                }
++        }
++        f += EvalPoly6(interp0Deg, phase_y_frac_int) * w.x;
++    }
++    if (w.y > 0.0f)
++    {
++        // 90 deg filter
++        NVF interp90Deg[6];
++        {
++            NIS_UNROLL
++                for (NVI i = 0; i < 6; ++i)
++                {
++                    interp90Deg[i] = lerp(p[2][i], p[3][i], phase_y_frac);
++                }
++        }
++
++        f += EvalPoly6(interp90Deg, phase_x_frac_int) * w.y;
++    }
++    if (w.z > 0.0f)
++    {
++        //45 deg filter
++        NVF pphase_b45 = 0.5f + 0.5f * (phase_x_frac - phase_y_frac);
++
++        NVF temp_interp45Deg[7];
++        temp_interp45Deg[1] = lerp(p[2][1], p[1][2], pphase_b45);
++        temp_interp45Deg[3] = lerp(p[3][2], p[2][3], pphase_b45);
++        temp_interp45Deg[5] = lerp(p[4][3], p[3][4], pphase_b45);
++        {
++            pphase_b45 = pphase_b45 - 0.5f;
++            NVF a = (pphase_b45 >= 0.f) ? p[0][2] : p[2][0];
++            NVF b = (pphase_b45 >= 0.f) ? p[1][3] : p[3][1];
++            NVF c = (pphase_b45 >= 0.f) ? p[2][4] : p[4][2];
++            NVF d = (pphase_b45 >= 0.f) ? p[3][5] : p[5][3];
++            temp_interp45Deg[0] = lerp(p[1][1], a, abs(pphase_b45));
++            temp_interp45Deg[2] = lerp(p[2][2], b, abs(pphase_b45));
++            temp_interp45Deg[4] = lerp(p[3][3], c, abs(pphase_b45));
++            temp_interp45Deg[6] = lerp(p[4][4], d, abs(pphase_b45));
++        }
++
++        NVF interp45Deg[6];
++        NVF pphase_p45 = phase_x_frac + phase_y_frac;
++        if (pphase_p45 >= 1)
++        {
++            NIS_UNROLL
++                for (NVI i = 0; i < 6; i++)
++                {
++                    interp45Deg[i] = temp_interp45Deg[i + 1];
++                }
++            pphase_p45 = pphase_p45 - 1;
++        }
++        else
++        {
++            NIS_UNROLL
++                for (NVI i = 0; i < 6; i++)
++                {
++                    interp45Deg[i] = temp_interp45Deg[i];
++                }
++        }
++
++        f += EvalPoly6(interp45Deg, NVI(pphase_p45 * 64)) * w.z;
++    }
++    if (w.w > 0.0f)
++    {
++        //135 deg filter
++        NVF pphase_b135 = 0.5f * (phase_x_frac + phase_y_frac);
++
++        NVF temp_interp135Deg[7];
++        temp_interp135Deg[1] = lerp(p[3][1], p[4][2], pphase_b135);
++        temp_interp135Deg[3] = lerp(p[2][2], p[3][3], pphase_b135);
++        temp_interp135Deg[5] = lerp(p[1][3], p[2][4], pphase_b135);
++        {
++            pphase_b135 = pphase_b135 - 0.5f;
++            NVF a = (pphase_b135 >= 0.f) ? p[5][2] : p[3][0];
++            NVF b = (pphase_b135 >= 0.f) ? p[4][3] : p[2][1];
++            NVF c = (pphase_b135 >= 0.f) ? p[3][4] : p[1][2];
++            NVF d = (pphase_b135 >= 0.f) ? p[2][5] : p[0][3];
++            temp_interp135Deg[0] = lerp(p[4][1], a, abs(pphase_b135));
++            temp_interp135Deg[2] = lerp(p[3][2], b, abs(pphase_b135));
++            temp_interp135Deg[4] = lerp(p[2][3], c, abs(pphase_b135));
++            temp_interp135Deg[6] = lerp(p[1][4], d, abs(pphase_b135));
++        }
++
++        NVF interp135Deg[6];
++        NVF pphase_p135 = 1 + (phase_x_frac - phase_y_frac);
++        if (pphase_p135 >= 1)
++        {
++            NIS_UNROLL
++                for (NVI i = 0; i < 6; ++i)
++                {
++                    interp135Deg[i] = temp_interp135Deg[i + 1];
++                }
++            pphase_p135 = pphase_p135 - 1;
++        }
++        else
++        {
++            NIS_UNROLL
++                for (NVI i = 0; i < 6; ++i)
++                {
++                    interp135Deg[i] = temp_interp135Deg[i];
++                }
++        }
++
++        f += EvalPoly6(interp135Deg, NVI(pphase_p135 * 64)) * w.w;
++    }
++    return f;
++}
++
++
++//-----------------------------------------------------------------------------------------------
++// NVScaler
++//-----------------------------------------------------------------------------------------------
++void NVScaler(NVU2 blockIdx, NVU threadIdx)
++{
++    // Figure out the range of pixels from input image that would be needed to be loaded for this thread-block
++    NVI dstBlockX = NVI(NIS_BLOCK_WIDTH * blockIdx.x);
++    NVI dstBlockY = NVI(NIS_BLOCK_HEIGHT * blockIdx.y);
++
++    const NVI srcBlockStartX = NVI(floor((dstBlockX + 0.5f) * kScaleX - 0.5f));
++    const NVI srcBlockStartY = NVI(floor((dstBlockY + 0.5f) * kScaleY - 0.5f));
++    const NVI srcBlockEndX = NVI(ceil((dstBlockX + NIS_BLOCK_WIDTH + 0.5f) * kScaleX - 0.5f));
++    const NVI srcBlockEndY = NVI(ceil((dstBlockY + NIS_BLOCK_HEIGHT + 0.5f) * kScaleY - 0.5f));
++
++    NVI numTilePixelsX = srcBlockEndX - srcBlockStartX + kSupportSize - 1;
++    NVI numTilePixelsY = srcBlockEndY - srcBlockStartY + kSupportSize - 1;
++
++    // round-up load region to even size since we're loading in 2x2 batches
++    numTilePixelsX += numTilePixelsX & 0x1;
++    numTilePixelsY += numTilePixelsY & 0x1;
++    const NVI numTilePixels = numTilePixelsX * numTilePixelsY;
++
++    // calculate the equivalent values for the edge map
++    const NVI numEdgeMapPixelsX = numTilePixelsX - kSupportSize + 2;
++    const NVI numEdgeMapPixelsY = numTilePixelsY - kSupportSize + 2;
++    const NVI numEdgeMapPixels = numEdgeMapPixelsX * numEdgeMapPixelsY;
++
++    // fill in input luma tile (shPixelsY) in batches of 2x2 pixels
++    // we use texture gather to get extra support necessary
++    // to compute 2x2 edge map outputs too
++    {
++        for (NVU i = threadIdx * 2; i < NVU(numTilePixels) >> 1; i += NIS_THREAD_GROUP_SIZE * 2)
++        {
++            NVU py = (i / numTilePixelsX) * 2;
++            NVU px = i % numTilePixelsX;
++
++            // 0.5 to be in the center of texel
++            // - (kSupportSize - 1) / 2 to shift by the kernel support size
++            NVF kShift = 0.5f - (kSupportSize - 1) / 2;
++#if NIS_VIEWPORT_SUPPORT
++            const NVF tx = (srcBlockStartX + px + kInputViewportOriginX + kShift) * kSrcNormX;
++            const NVF ty = (srcBlockStartY + py + kInputViewportOriginY + kShift) * kSrcNormY;
++#else
++            const NVF tx = (srcBlockStartX + px + kShift) * kSrcNormX;
++            const NVF ty = (srcBlockStartY + py + kShift) * kSrcNormY;
++#endif
++            NVF p[2][2];
++#if NIS_TEXTURE_GATHER
++            {
++                const NVF4 sr = NVTEX_SAMPLE_RED(in_texture, samplerLinearClamp, NVF2(tx, ty));
++                const NVF4 sg = NVTEX_SAMPLE_GREEN(in_texture, samplerLinearClamp, NVF2(tx, ty));
++                const NVF4 sb = NVTEX_SAMPLE_BLUE(in_texture, samplerLinearClamp, NVF2(tx, ty));
++
++                p[0][0] = getY(NVF3(sr.w, sg.w, sb.w));
++                p[0][1] = getY(NVF3(sr.z, sg.z, sb.z));
++                p[1][0] = getY(NVF3(sr.x, sg.x, sb.x));
++                p[1][1] = getY(NVF3(sr.y, sg.y, sb.y));
++            }
++#else
++            NIS_UNROLL_INNER
++            for (NVI j = 0; j < 2; j++)
++            {
++                NIS_UNROLL_INNER
++                for (NVI k = 0; k < 2; k++)
++                {
++#if NIS_NV12_SUPPORT
++                    p[j][k] = NVTEX_SAMPLE(in_texture_y, samplerLinearClamp, NVF2(tx + k * kSrcNormX, ty + j * kSrcNormY));
++#else
++                    const NVF4 px = NVTEX_SAMPLE(in_texture, samplerLinearClamp, NVF2(tx + k * kSrcNormX, ty + j * kSrcNormY));
++                    p[j][k] = getY(px.xyz);
++#endif
++                }
++            }
++#endif
++            const NVU idx = py * kTilePitch + px;
++            shPixelsY[idx] = NVH(p[0][0]);
++            shPixelsY[idx + 1] = NVH(p[0][1]);
++            shPixelsY[idx + kTilePitch] = NVH(p[1][0]);
++            shPixelsY[idx + kTilePitch + 1] = NVH(p[1][1]);
++        }
++    }
++    GroupMemoryBarrierWithGroupSync();
++    {
++        // fill in the edge map of 2x2 pixels
++        for (NVU i = threadIdx * 2; i < NVU(numEdgeMapPixels) >> 1; i += NIS_THREAD_GROUP_SIZE * 2)
++        {
++            NVU py = (i / numEdgeMapPixelsX) * 2;
++            NVU px = i % numEdgeMapPixelsX;
++
++            const NVU edgeMapIdx = py * kEdgeMapPitch + px;
++
++            NVU tileCornerIdx = (py + 1) * kTilePitch + px + 1;
++            NVF p[4][4];
++            NIS_UNROLL_INNER
++            for (NVI j = 0; j < 4; j++)
++            {
++                NIS_UNROLL_INNER
++                for (NVI k = 0; k < 4; k++)
++                {
++                    p[j][k] = shPixelsY[tileCornerIdx + j * kTilePitch + k];
++                }
++            }
++
++            shEdgeMap[edgeMapIdx] = NVH4(GetEdgeMap(p, 0, 0));
++            shEdgeMap[edgeMapIdx + 1] = NVH4(GetEdgeMap(p, 0, 1));
++            shEdgeMap[edgeMapIdx + kEdgeMapPitch] = NVH4(GetEdgeMap(p, 1, 0));
++            shEdgeMap[edgeMapIdx + kEdgeMapPitch + 1] = NVH4(GetEdgeMap(p, 1, 1));
++        }
++    }
++    LoadFilterBanksSh(NVI(threadIdx));
++    GroupMemoryBarrierWithGroupSync();
++
++    // output coord within a tile
++    const NVI2 pos = NVI2(NVU(threadIdx) % NVU(NIS_BLOCK_WIDTH), NVU(threadIdx) / NVU(NIS_BLOCK_WIDTH));
++    // x coord inside the output image
++    const NVI dstX = dstBlockX + pos.x;
++    // x coord inside the input image
++    const NVF srcX = (0.5f + dstX) * kScaleX - 0.5f;
++    // nearest integer part
++    const NVI px = NVI(floor(srcX) - srcBlockStartX);
++    // fractional part
++    const NVF fx = srcX - floor(srcX);
++    // discretized phase
++    const NVI fx_int = NVI(fx * kPhaseCount);
++#if NIS_VIEWPORT_SUPPORT
++    if (NVU(srcX) > kInputViewportWidth || NVU(dstX) > kOutputViewportWidth)
++    {
++        return;
++    }
++#endif
++    for (NVI k = 0; k < NIS_BLOCK_WIDTH * NIS_BLOCK_HEIGHT / NIS_THREAD_GROUP_SIZE; ++k)
++    {
++        // y coord inside the output image
++        const NVI dstY = dstBlockY + pos.y + k * (NIS_THREAD_GROUP_SIZE / NIS_BLOCK_WIDTH);
++        // y coord inside the input image
++        const NVF srcY = (0.5f + dstY) * kScaleY - 0.5f;
++#if NIS_VIEWPORT_SUPPORT
++        if (!(NVU(srcY) > kInputViewportHeight || NVU(dstY) > kOutputViewportHeight))
++#endif
++        {
++            // nearest integer part
++            const NVI py = NVI(floor(srcY) - srcBlockStartY);
++            // fractional part
++            const NVF fy = srcY - floor(srcY);
++            // discretized phase
++            const NVI fy_int = NVI(fy * kPhaseCount);
++
++            // generate weights for directional filters
++            const NVI startEdgeMapIdx = py * kEdgeMapPitch + px;
++            NVF4 edge[2][2];
++            NIS_UNROLL
++            for (NVI i = 0; i < 2; i++)
++            {
++                NIS_UNROLL
++                for (NVI j = 0; j < 2; j++)
++                {
++                    // need to shift edge map sampling since it's a 2x2 centered inside 6x6 grid
++                    edge[i][j] = shEdgeMap[startEdgeMapIdx + (i * kEdgeMapPitch) + j];
++                }
++            }
++            const NVF4 w = GetInterpEdgeMap(edge, fx, fy) * NIS_SCALE_INT;
++
++            // load 6x6 support to regs
++            const NVI startTileIdx = py * kTilePitch + px;
++            NVF p[6][6];
++            {
++                NIS_UNROLL
++                for (NVI i = 0; i < 6; ++i)
++                {
++                    NIS_UNROLL
++                    for (NVI j = 0; j < 6; ++j)
++                    {
++                        p[i][j] = shPixelsY[startTileIdx + i * kTilePitch + j];
++                    }
++                }
++            }
++
++            // weigth for luma
++            const NVF baseWeight = NIS_SCALE_FLOAT - w.x - w.y - w.z - w.w;
++
++            // final luma is a weighted product of directional & normal filters
++            NVF opY = 0;
++
++            // get traditional scaler filter output
++            opY += FilterNormal(p, fx_int, fy_int) * baseWeight;
++
++            // get directional filter bank output
++            opY += AddDirFilters(p, fx, fy, fx_int, fy_int, w);
++
++#if NIS_VIEWPORT_SUPPORT
++            NVF2 coord = NVF2((srcX + kInputViewportOriginX + 0.5f) * kSrcNormX, (srcY + kInputViewportOriginY + 0.5f) * kSrcNormY);
++            NVF2 dstCoord = NVF2(dstX + kOutputViewportOriginX, dstY + kOutputViewportOriginY);
++#else
++            NVF2 coord = NVF2((srcX + 0.5f) * kSrcNormX, (srcY + 0.5f) * kSrcNormY);
++            NVF2 dstCoord = NVF2(dstX, dstY);
++#endif
++            // do bilinear tap for chroma upscaling
++#if NIS_NV12_SUPPORT
++            NVF y = NVTEX_SAMPLE(in_texture_y, samplerLinearClamp, coord);
++            NVF2 uv = NVTEX_SAMPLE(in_texture_uv, samplerLinearClamp, coord);
++            NVF4 op = NVF4(YUVtoRGB(NVF3(y, uv)), 1.0f);
++#else
++            NVF4 op = NVTEX_SAMPLE(in_texture, samplerLinearClamp, coord);
++            NVF y = getY(NVF3(op.x, op.y, op.z));
++#endif
++
++#if NIS_HDR_MODE == NIS_HDR_MODE_LINEAR
++            const NVF kEps = 1e-4f;
++            const NVF kNorm = 1.0f / (NIS_SCALE_FLOAT * kHDRCompressionFactor);
++            const NVF opYN = max(opY, 0.0f) * kNorm;
++            const NVF corr = (opYN * opYN + kEps) / (max(getYLinear(NVF3(op.x, op.y, op.z)), 0.0f) + kEps);
++            op.x *= corr;
++            op.y *= corr;
++            op.z *= corr;
++#else
++            const NVF corr = opY * (1.0f / NIS_SCALE_FLOAT) - y;
++            op.x += corr;
++            op.y += corr;
++            op.z += corr;
++#endif
++            NVTEX_STORE(out_texture, dstCoord, NVCLAMP(op));
++        }
++    }
++}
++#else
++
++#ifndef NIS_BLOCK_WIDTH
++#define NIS_BLOCK_WIDTH 32
++#endif
++#ifndef NIS_BLOCK_HEIGHT
++#define NIS_BLOCK_HEIGHT 32
++#endif
++#ifndef NIS_THREAD_GROUP_SIZE
++#define NIS_THREAD_GROUP_SIZE 256
++#endif
++
++#define kSupportSize 5
++#define kNumPixelsX  (NIS_BLOCK_WIDTH + kSupportSize + 1)
++#define kNumPixelsY  (NIS_BLOCK_HEIGHT + kSupportSize + 1)
++
++NVSHARED NVF shPixelsY[kNumPixelsY][kNumPixelsX];
++
++NVF CalcLTIFast(const NVF y[5])
++{
++    const NVF a_min = min(min(y[0], y[1]), y[2]);
++    const NVF a_max = max(max(y[0], y[1]), y[2]);
++
++    const NVF b_min = min(min(y[2], y[3]), y[4]);
++    const NVF b_max = max(max(y[2], y[3]), y[4]);
++
++    const NVF a_cont = a_max - a_min;
++    const NVF b_cont = b_max - b_min;
++
++    const NVF cont_ratio = max(a_cont, b_cont) / (min(a_cont, b_cont) + kEps);
++    return (1.0f - saturate((cont_ratio - kMinContrastRatio) * kRatioNorm)) * kContrastBoost;
++}
++
++NVF EvalUSM(const NVF pxl[5], const NVF sharpnessStrength, const NVF sharpnessLimit)
++{
++    // USM profile
++    NVF y_usm = -0.6001f * pxl[1] + 1.2002f * pxl[2] - 0.6001f * pxl[3];
++    // boost USM profile
++    y_usm *= sharpnessStrength;
++    // clamp to the limit
++    y_usm = min(sharpnessLimit, max(-sharpnessLimit, y_usm));
++    // reduce ringing
++    y_usm *= CalcLTIFast(pxl);
++
++    return y_usm;
++}
++
++NVF4 GetDirUSM(const NVF p[5][5])
++{
++    // sharpness boost & limit are the same for all directions
++    const NVF scaleY = 1.0f - saturate((p[2][2] - kSharpStartY) * kSharpScaleY);
++    // scale the ramp to sharpen as a function of luma
++    const NVF sharpnessStrength = scaleY * kSharpStrengthScale + kSharpStrengthMin;
++    // scale the ramp to limit USM as a function of luma
++    const NVF sharpnessLimit = (scaleY * kSharpLimitScale + kSharpLimitMin) * p[2][2];
++
++    NVF4 rval;
++    // 0 deg filter
++    NVF interp0Deg[5];
++    {
++        for (NVI i = 0; i < 5; ++i)
++        {
++            interp0Deg[i] = p[i][2];
++        }
++    }
++
++    rval.x = EvalUSM(interp0Deg, sharpnessStrength, sharpnessLimit);
++
++    // 90 deg filter
++    NVF interp90Deg[5];
++    {
++        for (NVI i = 0; i < 5; ++i)
++        {
++            interp90Deg[i] = p[2][i];
++        }
++    }
++
++    rval.y = EvalUSM(interp90Deg, sharpnessStrength, sharpnessLimit);
++
++    //45 deg filter
++    NVF interp45Deg[5];
++    interp45Deg[0] = p[1][1];
++    interp45Deg[1] = lerp(p[2][1], p[1][2], 0.5f);
++    interp45Deg[2] = p[2][2];
++    interp45Deg[3] = lerp(p[3][2], p[2][3], 0.5f);
++    interp45Deg[4] = p[3][3];
++
++    rval.z = EvalUSM(interp45Deg, sharpnessStrength, sharpnessLimit);
++
++    //135 deg filter
++    NVF interp135Deg[5];
++    interp135Deg[0] = p[3][1];
++    interp135Deg[1] = lerp(p[3][2], p[2][1], 0.5f);
++    interp135Deg[2] = p[2][2];
++    interp135Deg[3] = lerp(p[2][3], p[1][2], 0.5f);
++    interp135Deg[4] = p[1][3];
++
++    rval.w = EvalUSM(interp135Deg, sharpnessStrength, sharpnessLimit);
++    return rval;
++}
++
++//-----------------------------------------------------------------------------------------------
++// NVSharpen
++//-----------------------------------------------------------------------------------------------
++void NVSharpen(NVU2 blockIdx, NVU threadIdx)
++{
++    const NVI dstBlockX = NVI(NIS_BLOCK_WIDTH * blockIdx.x);
++    const NVI dstBlockY = NVI(NIS_BLOCK_HEIGHT * blockIdx.y);
++
++    // fill in input luma tile in batches of 2x2 pixels
++    // we use texture gather to get extra support necessary
++    // to compute 2x2 edge map outputs too
++    const NVF kShift = 0.5f - kSupportSize / 2;
++
++    for (NVI i = NVI(threadIdx) * 2; i < kNumPixelsX * kNumPixelsY / 2; i += NIS_THREAD_GROUP_SIZE * 2)
++    {
++        NVU2 pos = NVU2(NVU(i) % NVU(kNumPixelsX), NVU(i) / NVU(kNumPixelsX) * 2);
++        NIS_UNROLL
++        for (NVI dy = 0; dy < 2; dy++)
++        {
++            NIS_UNROLL
++            for (NVI dx = 0; dx < 2; dx++)
++            {
++#if NIS_VIEWPORT_SUPPORT
++                const NVF tx = (dstBlockX + pos.x + kInputViewportOriginX + dx + kShift) * kSrcNormX;
++                const NVF ty = (dstBlockY + pos.y + kInputViewportOriginY + dy + kShift) * kSrcNormY;
++#else
++                const NVF tx = (dstBlockX + pos.x + dx + kShift) * kSrcNormX;
++                const NVF ty = (dstBlockY + pos.y + dy + kShift) * kSrcNormY;
++#endif
++#if NIS_NV12_SUPPORT
++                shPixelsY[pos.y + dy][pos.x + dx] = NVTEX_SAMPLE(in_texture_y, samplerLinearClamp, NVF2(tx, ty));
++#else
++                const NVF4 px = NVTEX_SAMPLE(in_texture, samplerLinearClamp, NVF2(tx, ty));
++                shPixelsY[pos.y + dy][pos.x + dx] = getY(px.xyz);
++#endif
++            }
++        }
++    }
++
++    GroupMemoryBarrierWithGroupSync();
++
++    for (NVI k = NVI(threadIdx); k < NIS_BLOCK_WIDTH * NIS_BLOCK_HEIGHT; k += NIS_THREAD_GROUP_SIZE)
++    {
++        const NVI2 pos = NVI2(NVU(k) % NVU(NIS_BLOCK_WIDTH), NVU(k) / NVU(NIS_BLOCK_WIDTH));
++
++        // load 5x5 support to regs
++        NVF p[5][5];
++        NIS_UNROLL
++        for (NVI i = 0; i < 5; ++i)
++        {
++            NIS_UNROLL
++            for (NVI j = 0; j < 5; ++j)
++            {
++                p[i][j] = shPixelsY[pos.y + i][pos.x + j];
++            }
++        }
++
++        // get directional filter bank output
++        NVF4 dirUSM = GetDirUSM(p);
++
++        // generate weights for directional filters
++        NVF4 w = GetEdgeMap(p, kSupportSize / 2 - 1, kSupportSize / 2 - 1);
++
++        // final USM is a weighted sum filter outputs
++        const NVF usmY = (dirUSM.x * w.x + dirUSM.y * w.y + dirUSM.z * w.z + dirUSM.w * w.w);
++
++        // do bilinear tap and correct rgb texel so it produces new sharpened luma
++        const NVI dstX = dstBlockX + pos.x;
++        const NVI dstY = dstBlockY + pos.y;
++
++#if NIS_VIEWPORT_SUPPORT
++        NVF2 coord = NVF2((dstX + kInputViewportOriginX + 0.5f) * kSrcNormX, (dstY + kInputViewportOriginY + 0.5f) * kSrcNormY);
++        NVF2 dstCoord = NVF2(dstX + kOutputViewportOriginX, dstY + kOutputViewportOriginY);
++        if (!(NVU(dstX) > kOutputViewportWidth || NVU(dstY) > kOutputViewportHeight))
++#else
++        NVF2 coord = NVF2((dstX + 0.5f) * kSrcNormX, (dstY + 0.5f) * kSrcNormY);
++        NVF2 dstCoord = NVF2(dstX, dstY);
++#endif
++        {
++#if NIS_NV12_SUPPORT
++            NVF y = NVTEX_SAMPLE(in_texture_y, samplerLinearClamp, coord);
++            NVF2 uv = NVTEX_SAMPLE(in_texture_uv, samplerLinearClamp, coord);
++            NVF4 op = NVF4(YUVtoRGB(NVF3(y, uv)), 1.0f);
++#else
++            NVF4 op = NVTEX_SAMPLE(in_texture, samplerLinearClamp, coord);
++#endif
++#if NIS_HDR_MODE == NIS_HDR_MODE_LINEAR
++            const NVF kEps = 1e-4f * kHDRCompressionFactor * kHDRCompressionFactor;
++            NVF newY = p[2][2] + usmY;
++            newY = max(newY, 0.0f);
++            const NVF oldY = p[2][2];
++            const NVF corr = (newY * newY + kEps) / (oldY * oldY + kEps);
++            op.x *= corr;
++            op.y *= corr;
++            op.z *= corr;
++#else
++            op.x += usmY;
++            op.y += usmY;
++            op.z += usmY;
++#endif
++            NVTEX_STORE(out_texture, dstCoord, NVCLAMP(op));
++        }
++    }
++}
++#endif
+\ No newline at end of file
+diff --git a/src/vulkan/wsi/enhance/third_party/sgsr/LICENSE b/src/vulkan/wsi/enhance/third_party/sgsr/LICENSE
+new file mode 100644
+index 0000000..d9d513c
+--- /dev/null
++++ b/src/vulkan/wsi/enhance/third_party/sgsr/LICENSE
+@@ -0,0 +1,29 @@
++Copyright (c) 2023, Qualcomm Innovation Center, Inc. All rights reserved.
++
++Redistribution and use in source and binary forms, with or without
++modification, are permitted provided that the following conditions are met:
++
++1. Redistributions of source code must retain the above copyright notice,
++   this list of conditions and the following disclaimer.
++
++2. Redistributions in binary form must reproduce the above copyright notice,
++   this list of conditions and the following disclaimer in the documentation
++   and/or other materials provided with the distribution.
++
++3. Neither the name of the copyright holder nor the names of its contributors
++   may be used to endorse or promote products derived from this software
++   without specific prior written permission.
++
++THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
++AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
++LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
++CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
++SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
++INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
++CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
++ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
++POSSIBILITY OF SUCH DAMAGE.
++
++SPDX-License-Identifier: BSD-3-Clause
+\ No newline at end of file
+diff --git a/src/vulkan/wsi/enhance/third_party/sgsr/sgsr1_shader_mobile_edge_direction.frag b/src/vulkan/wsi/enhance/third_party/sgsr/sgsr1_shader_mobile_edge_direction.frag
+new file mode 100644
+index 0000000..d2df646
+--- /dev/null
++++ b/src/vulkan/wsi/enhance/third_party/sgsr/sgsr1_shader_mobile_edge_direction.frag
+@@ -0,0 +1,176 @@
++#version 300 es
++
++//============================================================================================================
++//
++//
++//                  Copyright (c) 2025, Qualcomm Innovation Center, Inc. All rights reserved.
++//                              SPDX-License-Identifier: BSD-3-Clause
++//
++//============================================================================================================
++
++precision mediump float;
++precision highp int;
++
++////////////////////////
++// USER CONFIGURATION //
++////////////////////////
++
++/*
++* Operation modes:
++* RGBA -> 1
++* RGBY -> 3
++* LERP -> 4
++*/
++#define OperationMode 1
++
++/*
++* If set, will use edge direction to improve visual quality
++* Expect a minimal cost increase
++*/
++// #define UseEdgeDirection
++
++#define EdgeThreshold 8.0/255.0
++
++#define EdgeSharpness 2.0
++
++// #define UseUniformBlock
++
++////////////////////////
++////////////////////////
++////////////////////////
++
++#if defined(UseUniformBlock)
++layout (set=0, binding = 0) uniform UniformBlock
++{
++	highp vec4 ViewportInfo[1];
++};
++layout(set = 0, binding = 1) uniform mediump sampler2D ps0;
++#else
++uniform highp vec4 ViewportInfo[1];
++uniform mediump sampler2D ps0;
++#endif
++
++layout(location=0) in highp vec4 in_TEXCOORD0;
++layout(location=0) out vec4 out_Target0;
++
++float fastLanczos2(float x)
++{
++	float wA = x-4.0;
++	float wB = x*wA-wA;
++	wA *= wA;
++	return wB*wA;
++}
++
++#if defined(UseEdgeDirection)
++vec2 weightY(float dx, float dy, float c, vec3 data)
++#else
++vec2 weightY(float dx, float dy, float c, float data)
++#endif
++{
++#if defined(UseEdgeDirection)
++	float std = data.x;
++	vec2 dir = data.yz;
++
++	float edgeDis = ((dx*dir.y)+(dy*dir.x));
++	float x = (((dx*dx)+(dy*dy))+((edgeDis*edgeDis)*((clamp(((c*c)*std),0.0,1.0)*0.7)+-1.0)));
++#else
++	float std = data;
++	float x = ((dx*dx)+(dy* dy))* 0.55 + clamp(abs(c)*std, 0.0, 1.0);
++#endif
++
++	float w = fastLanczos2(x);
++	return vec2(w, w * c);	
++}
++
++vec2 edgeDirection(vec4 left, vec4 right)
++{
++	vec2 dir;
++	float RxLz = (right.x + (-left.z));
++	float RwLy = (right.w + (-left.y));
++	vec2 delta;
++	delta.x = (RxLz + RwLy);
++	delta.y = (RxLz + (-RwLy));
++	float lengthInv = inversesqrt((delta.x * delta.x+ 3.075740e-05) + (delta.y * delta.y));
++	dir.x = (delta.x * lengthInv);
++	dir.y = (delta.y * lengthInv);
++	return dir;
++}
++
++void main()
++{
++	vec4 color;
++	if(OperationMode == 1)
++		color.xyz = textureLod(ps0,in_TEXCOORD0.xy,0.0).xyz;
++	else
++		color.xyzw = textureLod(ps0,in_TEXCOORD0.xy,0.0).xyzw;
++
++	highp float xCenter;
++	xCenter = abs(in_TEXCOORD0.x+-0.5);
++	highp float yCenter;
++	yCenter = abs(in_TEXCOORD0.y+-0.5);
++
++	//todo: config the SR region based on needs
++	//if ( OperationMode!=4 && xCenter*xCenter+yCenter*yCenter<=0.4 * 0.4)
++	if ( OperationMode!=4)
++	{
++		highp vec2 imgCoord = ((in_TEXCOORD0.xy*ViewportInfo[0].zw)+vec2(-0.5,0.5));
++		highp vec2 imgCoordPixel = floor(imgCoord);
++		highp vec2 coord = (imgCoordPixel*ViewportInfo[0].xy);
++		vec2 pl = (imgCoord+(-imgCoordPixel));
++		vec4  left = textureGather(ps0,coord, OperationMode);
++
++		float edgeVote = abs(left.z - left.y) + abs(color[OperationMode] - left.y)  + abs(color[OperationMode] - left.z) ;
++		if(edgeVote > EdgeThreshold)
++		{
++			coord.x += ViewportInfo[0].x;
++
++			vec4 right = textureGather(ps0,coord + highp vec2(ViewportInfo[0].x, 0.0), OperationMode);
++			vec4 upDown;
++			upDown.xy = textureGather(ps0,coord + highp vec2(0.0, -ViewportInfo[0].y),OperationMode).wz;
++			upDown.zw  = textureGather(ps0,coord+ highp vec2(0.0, ViewportInfo[0].y), OperationMode).yx;
++
++			float mean = (left.y+left.z+right.x+right.w)*0.25;
++			left = left - vec4(mean);
++			right = right - vec4(mean);
++			upDown = upDown - vec4(mean);
++			color.w =color[OperationMode] - mean;
++
++			float sum = (((((abs(left.x)+abs(left.y))+abs(left.z))+abs(left.w))+(((abs(right.x)+abs(right.y))+abs(right.z))+abs(right.w)))+(((abs(upDown.x)+abs(upDown.y))+abs(upDown.z))+abs(upDown.w)));				
++			float sumMean = 1.014185e+01/sum;
++			float std = (sumMean*sumMean);	
++
++#if defined(UseEdgeDirection)
++			vec3 data = vec3(std, edgeDirection(left, right));
++#else
++			float data = std;
++#endif
++			vec2 aWY = weightY(pl.x, pl.y+1.0, upDown.x,data);				
++			aWY += weightY(pl.x-1.0, pl.y+1.0, upDown.y,data);
++			aWY += weightY(pl.x-1.0, pl.y-2.0, upDown.z,data);
++			aWY += weightY(pl.x, pl.y-2.0, upDown.w,data);			
++			aWY += weightY(pl.x+1.0, pl.y-1.0, left.x,data);
++			aWY += weightY(pl.x, pl.y-1.0, left.y,data);
++			aWY += weightY(pl.x, pl.y, left.z,data);
++			aWY += weightY(pl.x+1.0, pl.y, left.w,data);
++			aWY += weightY(pl.x-1.0, pl.y-1.0, right.x,data);
++			aWY += weightY(pl.x-2.0, pl.y-1.0, right.y,data);
++			aWY += weightY(pl.x-2.0, pl.y, right.z,data);
++			aWY += weightY(pl.x-1.0, pl.y, right.w,data);
++
++			float finalY = aWY.y/aWY.x;
++			float maxY = max(max(left.y,left.z),max(right.x,right.w));
++			float minY = min(min(left.y,left.z),min(right.x,right.w));
++			float deltaY = clamp(EdgeSharpness*finalY, minY, maxY) -color.w;			
++			
++			//smooth high contrast input
++			deltaY = clamp(deltaY, -23.0 / 255.0, 23.0 / 255.0);
++
++			color.x = clamp((color.x+deltaY),0.0,1.0);
++			color.y = clamp((color.y+deltaY),0.0,1.0);
++			color.z = clamp((color.z+deltaY),0.0,1.0);
++		}
++	}
++
++	color.w = 1.0;  //assume alpha channel is not used
++	out_Target0.xyzw = color;
++}
+\ No newline at end of file
+diff --git a/src/vulkan/wsi/enhance/third_party/xbr/LICENSE.txt b/src/vulkan/wsi/enhance/third_party/xbr/LICENSE.txt
+new file mode 100644
+index 0000000..95c0ff6
+--- /dev/null
++++ b/src/vulkan/wsi/enhance/third_party/xbr/LICENSE.txt
+@@ -0,0 +1,25 @@
++From the header of xbr-lv2-standalone.slang (libretro/slang-shaders, edge-smoothing/xbr/shaders):
++
++Hyllian's xBR-lv2 Shader
++
++Copyright (C) 2011-2022 Hyllian - sergiogdb@gmail.com
++
++Permission is hereby granted, free of charge, to any person obtaining a
++copy of this software and associated documentation files (the
++"Software"), to deal in the Software without restriction, including
++without limitation the rights to use, copy, modify, merge, publish,
++distribute, sublicense, and/or sell copies of the Software, and to permit
++persons to whom the Software is furnished to do so, subject to the
++following conditions:
++
++The above copyright notice and this permission notice shall be included in
++all copies or substantial portions of the Software.
++
++THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
++THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
++DEALINGS IN THE SOFTWARE.
++
+diff --git a/src/vulkan/wsi/enhance/third_party/xbr/xbr-lv2-standalone.slang b/src/vulkan/wsi/enhance/third_party/xbr/xbr-lv2-standalone.slang
+new file mode 100644
+index 0000000..68d0216
+--- /dev/null
++++ b/src/vulkan/wsi/enhance/third_party/xbr/xbr-lv2-standalone.slang
+@@ -0,0 +1,309 @@
++#version 450
++
++/*
++   Hyllian's xBR-lv2 Shader
++
++   Copyright (C) 2011-2022 Hyllian - sergiogdb@gmail.com
++
++   Permission is hereby granted, free of charge, to any person obtaining a
++   copy of this software and associated documentation files (the
++   "Software"), to deal in the Software without restriction, including
++   without limitation the rights to use, copy, modify, merge, publish,
++   distribute, sublicense, and/or sell copies of the Software, and to permit
++   persons to whom the Software is furnished to do so, subject to the
++   following conditions:
++
++   The above copyright notice and this permission notice shall be included in
++   all copies or substantial portions of the Software.
++
++   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++   FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
++   THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++   LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++   FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
++   DEALINGS IN THE SOFTWARE.
++
++   Incorporates some of the ideas from SABR shader. Thanks to Joshua Street.
++*/
++
++layout(push_constant) uniform Push
++{
++	vec4 SourceSize;
++	vec4 OriginalSize;
++	vec4 OutputSize;
++	uint FrameCount;
++	float XBR_EQ_THRESHOLD;
++	float XBR_LV2_COEFFICIENT;
++	float XBR_BLENDING;
++} params;
++
++#pragma parameter XBR_EQ_THRESHOLD "COLOR DISTINCTION THRESHOLD" 0.32 0.0 1.0 0.01
++#pragma parameter XBR_LV2_COEFFICIENT "SMOOTHNESS THRESHOLD" 0.30 0.0 1.0 0.1
++#pragma parameter XBR_BLENDING "BLENDING [ NOBLEND | AA ]" 1.0 0.0 1.0 1.0
++
++#define XBR_EQ_THRESHOLD params.XBR_EQ_THRESHOLD
++#define XBR_LV2_COEFFICIENT params.XBR_LV2_COEFFICIENT
++#define XBR_BLENDING params.XBR_BLENDING
++
++layout(std140, set = 0, binding = 0) uniform UBO
++{
++	mat4 MVP;
++} global;
++
++// Uncomment just one of the three params below to choose the corner detection
++//#define CORNER_A
++//#define CORNER_B
++#define CORNER_C
++
++#define lv2_cf (XBR_LV2_COEFFICIENT + 2.0)
++#define saturate(c) clamp(c, 0.0, 1.0)
++
++const  vec4 Ao = vec4( 1.0, -1.0, -1.0, 1.0 );
++const  vec4 Bo = vec4( 1.0,  1.0, -1.0,-1.0 );
++const  vec4 Co = vec4( 1.5,  0.5, -0.5, 0.5 );
++const  vec4 Ax = vec4( 1.0, -1.0, -1.0, 1.0 );
++const  vec4 Bx = vec4( 0.5,  2.0, -0.5,-2.0 );
++const  vec4 Cx = vec4( 1.0,  1.0, -0.5, 0.0 );
++const  vec4 Ay = vec4( 1.0, -1.0, -1.0, 1.0 );
++const  vec4 By = vec4( 2.0,  0.5, -2.0,-0.5 );
++const  vec4 Cy = vec4( 2.0,  0.0, -1.0, 0.5 );
++const  vec4 Ci = vec4(0.25, 0.25, 0.25, 0.25);
++
++const vec3 v2f = vec3( 65536, 256, 1); // vec to float encode
++const vec3 Y = vec3(0.2627, 0.6780, 0.0593);
++
++// Return if A components are less than or equal B ones.
++vec4 LTE(vec4 A, vec4 B)
++{
++    return step(A, B);
++}
++
++// Return if A components are less than B ones.
++vec4 LT(vec4 A, vec4 B)
++{
++    return vec4(lessThan(A, B));
++}
++
++// Return logically inverted vector components. BEWARE: Only works with 0.0 or 1.0 components.
++vec4 NOT(vec4 A)
++{
++    return (vec4(1.0) - A);
++}
++
++// Compare two vectors and return their components are different.
++vec4 diff(vec4 A, vec4 B)
++{
++    return vec4(notEqual(A, B));
++}
++
++float dist(vec3 A, vec3 B)
++{
++    return dot(abs(A-B), Y);
++}
++
++// Calculate color distance between two vectors of four pixels
++vec4 dist4(mat4x3 A, mat4x3 B)
++{
++    return vec4(dist(A[0],B[0]), dist(A[1],B[1]), dist(A[2],B[2]), dist(A[3],B[3]));
++}
++
++// Tests if color components are under a threshold. In this case they are considered 'equal'.
++vec4 eq(mat4x3 A, mat4x3 B)
++{
++    return (step(dist4(A, B), vec4(XBR_EQ_THRESHOLD)));
++}
++
++// Determine if two vector components are NOT equal based on a threshold.
++vec4 neq(mat4x3 A, mat4x3 B)
++{
++    return (vec4(1.0, 1.0, 1.0, 1.0) - eq(A, B));
++}
++
++// Calculate weighted distance among pixels in some directions.
++vec4 weighted_distance(mat4x3 a, mat4x3 b, mat4x3 c, mat4x3 d, mat4x3 e, mat4x3 f, mat4x3 g, mat4x3 h)
++{
++    return (dist4(a,b) + dist4(a,c) + dist4(d,e) + dist4(d,f) + 4.0*dist4(g,h));
++}
++
++
++#pragma stage vertex
++layout(location = 0) in vec4 Position;
++layout(location = 1) in vec2 TexCoord;
++layout(location = 0) out vec2 texCoord;
++layout(location = 1) out vec4 t1;
++layout(location = 2) out vec4 t2;
++layout(location = 3) out vec4 t3;
++layout(location = 4) out vec4 t4;
++layout(location = 5) out vec4 t5;
++layout(location = 6) out vec4 t6;
++layout(location = 7) out vec4 t7;
++layout(location = 8) out float aa_factor;
++
++void main()
++{
++   gl_Position = global.MVP * Position;
++   texCoord = TexCoord * 1.0001;
++
++   aa_factor = 2.0*params.OutputSize.z * params.SourceSize.x;
++
++   float dx = params.SourceSize.z;
++   float dy = params.SourceSize.w;
++
++   //    A1 B1 C1
++   // A0  A  B  C C4
++   // D0  D  E  F F4
++   // G0  G  H  I I4
++   //    G5 H5 I5
++
++   t1 = texCoord.xxxy + vec4( -dx, 0, dx,-2.0*dy); // A1 B1 C1
++   t2 = texCoord.xxxy + vec4( -dx, 0, dx,    -dy); //  A  B  C
++   t3 = texCoord.xxxy + vec4( -dx, 0, dx,      0); //  D  E  F
++   t4 = texCoord.xxxy + vec4( -dx, 0, dx,     dy); //  G  H  I
++   t5 = texCoord.xxxy + vec4( -dx, 0, dx, 2.0*dy); // G5 H5 I5
++   t6 = texCoord.xyyy + vec4(-2.0*dx,-dy, 0,  dy); // A0 D0 G0
++   t7 = texCoord.xyyy + vec4( 2.0*dx,-dy, 0,  dy); // C4 F4 I4
++}
++
++#pragma stage fragment
++layout(location = 0) in vec2 texCoord;
++layout(location = 1) in vec4 t1;
++layout(location = 2) in vec4 t2;
++layout(location = 3) in vec4 t3;
++layout(location = 4) in vec4 t4;
++layout(location = 5) in vec4 t5;
++layout(location = 6) in vec4 t6;
++layout(location = 7) in vec4 t7;
++layout(location = 8) in float aa_factor;
++layout(location = 0) out vec4 FragColor;
++layout(set = 0, binding = 2) uniform sampler2D Source;
++
++void main()
++{
++    vec4 edri, edr, edr_l, edr_u, px; // px = pixel, edr = edge detection rule
++    vec4 irlv0, irlv1, irlv2l, irlv2u;
++    vec4 fx, fx_l, fx_u; // inequations of straight lines.
++    vec3 res1, res2;
++    vec4 fx45i, fx45, fx30, fx60;
++
++    vec2 fp  = fract(texCoord*params.SourceSize.xy);
++
++    vec3 A1 = texture(Source, t1.xw ).xyz;
++    vec3 B1 = texture(Source, t1.yw ).xyz;
++    vec3 C1 = texture(Source, t1.zw ).xyz;
++    vec3 A  = texture(Source, t2.xw ).xyz;
++    vec3 B  = texture(Source, t2.yw ).xyz;
++    vec3 C  = texture(Source, t2.zw ).xyz;
++    vec3 D  = texture(Source, t3.xw ).xyz;
++    vec3 E  = texture(Source, t3.yw ).xyz;
++    vec3 F  = texture(Source, t3.zw ).xyz;
++    vec3 G  = texture(Source, t4.xw ).xyz;
++    vec3 H  = texture(Source, t4.yw ).xyz;
++    vec3 I  = texture(Source, t4.zw ).xyz;
++    vec3 G5 = texture(Source, t5.xw ).xyz;
++    vec3 H5 = texture(Source, t5.yw ).xyz;
++    vec3 I5 = texture(Source, t5.zw ).xyz;
++    vec3 A0 = texture(Source, t6.xy ).xyz;
++    vec3 D0 = texture(Source, t6.xz ).xyz;
++    vec3 G0 = texture(Source, t6.xw ).xyz;
++    vec3 C4 = texture(Source, t7.xy ).xyz;
++    vec3 F4 = texture(Source, t7.xz ).xyz;
++    vec3 I4 = texture(Source, t7.xw ).xyz;
++
++    mat4x3 b  = mat4x3(B, D, H, F);
++    mat4x3 c  = mat4x3(C, A, G, I);
++    mat4x3 d  = mat4x3(D, H, F, B);
++    mat4x3 e  = mat4x3(E, E, E, E);
++    mat4x3 f  = mat4x3(F, B, D, H);
++    mat4x3 g  = mat4x3(G, I, C, A);
++    mat4x3 h  = mat4x3(H, F, B, D);
++    mat4x3 i  = mat4x3(I, C, A, G);
++
++    mat4x3 i4 = mat4x3(I4, C1, A0, G5);
++    mat4x3 i5 = mat4x3(I5, C4, A1, G0);
++    mat4x3 h5 = mat4x3(H5, F4, B1, D0);
++    mat4x3 f4 = mat4x3(F4, B1, D0, H5);
++
++    vec4 b_   = v2f * b;
++    vec4 c_   = v2f * c;
++    vec4 d_   = b_.yzwx;
++    vec4 e_   = v2f * e;
++    vec4 f_   = b_.wxyz;
++    vec4 g_   = c_.zwxy;
++    vec4 h_   = b_.zwxy;
++    vec4 i_   = c_.wxyz;
++
++    vec4 i4_  = v2f * i4;
++    vec4 i5_  = v2f * i5;
++    vec4 h5_  = v2f * h5;
++    vec4 f4_  = h5_.yzwx;
++
++    // These inequations define the line below which interpolation occurs.
++    fx    = ( Ao*fp.y + Bo*fp.x );
++    fx_l  = ( Ax*fp.y + Bx*fp.x );
++    fx_u  = ( Ay*fp.y + By*fp.x );
++
++    irlv0 = diff(e_,f_) * diff(e_,h_);
++    irlv1 = irlv0;
++
++#ifdef CORNER_B
++    irlv1      = saturate(irlv0 * ( neq(f,b) * neq(h,d) + eq(e,i) * neq(f,i4) * neq(h,i5) + eq(e,g) + eq(e,c) ) );
++#endif
++#ifdef CORNER_C
++    irlv1     = saturate(irlv0  * ( neq(f,b) * neq(f,c) + neq(h,d) * neq(h,g) + eq(e,i) * (neq(f,f4) * neq(f,i4) + neq(h,h5) * neq(h,i5)) + eq(e,g) + eq(e,c)) );
++#endif
++
++    irlv2l = diff(e_,g_) * diff( d_, g_);
++    irlv2u = diff(e_,c_) * diff( b_, c_);
++
++    if (XBR_BLENDING == 1.0) {
++        vec4 delta  = vec4(aa_factor);
++        vec4 deltaL = vec4(0.5, 1.0, 0.5, 1.0) * aa_factor;
++        vec4 deltaU = deltaL.yxwz;
++
++        fx45i = saturate( 0.5 + (fx   - Co - Ci) / delta  );
++        fx45  = saturate( 0.5 + (fx   - Co     ) / delta  );
++        fx30  = saturate( 0.5 + (fx_l - Cx     ) / deltaL );
++        fx60  = saturate( 0.5 + (fx_u - Cy     ) / deltaU );
++    }
++    else {
++        fx45i = LT( Co + Ci, fx   );
++        fx45  = LT(      Co, fx   );
++        fx30  = LT(      Cx, fx_l );
++        fx60  = LT(      Cy, fx_u );
++    }
++       
++    vec4 wd1 = weighted_distance( e, c,  g, i, h5, f4, h, f);
++    vec4 wd2 = weighted_distance( h, d, i5, f, i4,  b, e, i);
++
++    vec4 d_fg = dist4(f, g);
++    vec4 d_hc = dist4(h, c);
++
++    edri      = LTE(wd1, wd2) * irlv0;
++    edr       = LT( wd1, wd2) * irlv1 * NOT(edri.yzwx * edri.wxyz);
++    edr_l     = LTE( lv2_cf * d_fg, d_hc ) * irlv2l * edr * (NOT(edri.yzwx) * eq(e, c));
++    edr_u     = LTE( lv2_cf * d_hc, d_fg ) * irlv2u * edr * (NOT(edri.wxyz) * eq(e, g));
++
++    fx45i = edri   * fx45i;
++    fx45  = edr    * fx45;
++    fx30  = edr_l  * fx30;
++    fx60  = edr_u  * fx60;
++
++    px = LTE(dist4(e,f), dist4(e,h));
++
++    vec4 maximos = max(max(fx30, fx60), max(fx45, fx45i));
++
++    res1 = mix(E, mix(H, F, px.x), maximos.x);
++    res2 = mix(E, mix(B, D, px.z), maximos.z);
++
++    vec3 res1a = mix(res1, res2, step(dist(E, res1), dist(E, res2)));
++
++    res1 = mix(E, mix(F, B, px.y), maximos.y);
++    res2 = mix(E, mix(D, H, px.w), maximos.w);
++
++    vec3 res1b = mix(res1, res2, step(dist(E, res1), dist(E, res2)));
++
++    vec3 res = mix(res1a, res1b, step(dist(E, res1a), dist(E, res1b)));
++
++    FragColor = vec4(res, 1.0);
++}

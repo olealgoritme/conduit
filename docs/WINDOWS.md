@@ -297,8 +297,10 @@ serial driver (the one the QEMU guest agent uses); the app opens
 `\\.\Global\org.conduit.stats.0`.
 
 **Install and uninstall.** The driver package copies the exe, the context
-menu's `conduit_shell_menu.dll` and `ConduitShellMenu.msix` to
-`Program Files\Conduit` and registers the logon task `ConduitGpuTray`;
+menu's `conduit_shell_menu.dll` and `ConduitShellMenu.msix`, and
+`Install-OptiScaler.ps1` with `optiscaler-manifest.txt` (run by the tray's
+per-game OptiScaler menu, [optiscaler.md](../guest/windows/docs/optiscaler.md))
+to `Program Files\Conduit` and registers the logon task `ConduitGpuTray`;
 `Uninstall-Helios.ps1` stops the app and removes the task, the folder, the
 Send to shortcut and the context menu package. Run as administrator without
 the package, the exe can

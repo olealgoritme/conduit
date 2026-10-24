@@ -209,6 +209,12 @@ public static extern bool FreeLibrary(IntPtr module);
         Copy-Required $ShellMenuDll $shellMenuOut
         Assert-HeliosPeArchitecture $shellMenuOut x64
     }
+    # The tray's per-game OptiScaler menu runs Install-OptiScaler.ps1 from its
+    # own folder. OptiScaler itself (GPL-3.0) is never packaged: the script
+    # downloads the release its manifest pins.
+    foreach ($name in @("Install-OptiScaler.ps1", "optiscaler-manifest.txt")) {
+        Copy-Required (Join-Path $packageSource $name) (Join-Path $payload "tray\$name")
+    }
 }
 
 if ($WinFspMsi) {

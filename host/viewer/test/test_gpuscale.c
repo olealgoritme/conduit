@@ -281,6 +281,94 @@ int main(void)
               "back to dma-buf targets after the cursor");
     }
     /*
+     * TWO SCALERS IN ONE PROCESS, as the viewer has them: the cursor copier
+     * (opened at start-up) and the frame scaler (opened later, by the first
+     * frame or QUERY_FORMAT the display does not take).  Each has its own
+     * EGL display and context; a pass on one must not run in the other's
+     * context -- with the other open, and again after it closed (which
+     * leaves no context current at all).  The cursor image drawn as a black
+     * square after a guest driver reinstall was this.
+     */
+    {
+        static uint32_t mem[64 * 64];
+        struct gbm_bo *cur = gbm_bo_create(dev, 64, 64, GBM_FORMAT_ARGB8888,
+                                           GBM_BO_USE_LINEAR);
+        struct nb_gs_draw d = {
+            .src_key = 6, .target = 0, .dw = 64, .dh = 64, .sw = 64, .sh = 64,
+            .nearest = true, .alpha = true,
+        };
+        struct nb_gs *other = NULL;
+        void *cmap = NULL;
+        uint32_t cst;
+        uint8_t *c;
+
+        CHECK(cur != NULL, "second cursor buffer");
+        c = cur ? gbm_bo_map(cur, 0, 0, 64, 64, GBM_BO_TRANSFER_WRITE, &cst,
+                             &cmap) : NULL;
+        CHECK(c != NULL, "map the second cursor buffer");
+        for (int y = 0; c && y < 64; y++) {
+            for (int x = 0; x < 64; x++) {
+                *(uint32_t *)(c + (size_t)y * cst + (size_t)x * 4) =
+                    x < 32 ? 0x00000000u : 0xffffffffu;
+            }
+        }
+        if (c) {
+            gbm_bo_unmap(cur, cmap);
+        }
+        /*
+         * The order the viewer has: this scaler copies a first cursor (its
+         * read-back targets made then), the other one opens later and makes
+         * its frame targets (XRGB8888 dma-bufs), and the next cursor is
+         * copied with the other one open -- then again once it closed.
+         */
+        CHECK(nb_gs_targets_readback(g, 64, 64, why, sizeof(why)) ==
+              NB_GS_TARGETS, "cursor read-back targets: %s", why);
+        other = NULL;
+        for (int round = 0; round < 3 && cur; round++) {
+            static const char *const when[3] = {
+                "alone", "with the frame scaler open", "after it closed",
+            };
+
+            if (round == 1) {
+                struct nb_gs_target ot[NB_GS_TARGETS];
+
+                other = nb_gs_open(node, 0, GBM_FORMAT_XRGB8888, 0, why,
+                                   sizeof(why));
+                CHECK(other != NULL, "a second scaler: %s", why);
+                CHECK(!other || nb_gs_targets(other, TW, TH, NULL, NULL, NULL,
+                                              NULL, 0, ot, why, sizeof(why)) ==
+                      NB_GS_TARGETS, "its frame targets: %s", why);
+            } else if (round == 2 && other) {
+                nb_gs_close(other);
+                other = NULL;
+            }
+            memset(mem, 0x5a, sizeof(mem));
+            nb_gs_src_drop(g, 6);
+            CHECK(nb_gs_src(g, 6, gbm_bo_get_fd(cur), 64, 64,
+                            gbm_bo_get_stride(cur), 0, GBM_FORMAT_ARGB8888,
+                            0) >= 0, "import %s", when[round]);
+            CHECK(nb_gs_draw(g, &d, 1000000, NULL) == 0, "draw %s",
+                  when[round]);
+            CHECK(nb_gs_readback(g, 0, mem) == 0, "read back %s",
+                  when[round]);
+            CHECK(mem[10 * 64 + 10] == 0x00000000u &&
+                  mem[10 * 64 + 50] == 0xffffffffu,
+                  "the cursor, transparent where it is (not another "
+                  "context's opaque target), %s: %08x %08x", when[round],
+                  mem[10 * 64 + 10], mem[10 * 64 + 50]);
+        }
+        if (other) {
+            nb_gs_close(other);
+        }
+        nb_gs_src_drop(g, 6);
+        if (cur) {
+            gbm_bo_destroy(cur);
+        }
+        CHECK(nb_gs_targets(g, TW, TH, NULL, NULL, NULL, NULL, 0, tg, why,
+                            sizeof(why)) == NB_GS_TARGETS,
+              "back to dma-buf targets after two scalers");
+    }
+    /*
      * TEST_GPUSCALE_BENCH=WxH: the per-frame cost at a real output size (a
      * 1600x900-class source stretched over the output), 500 draws, of the
      * gpu-copy level (the pass into dma-buf targets) and of the readback

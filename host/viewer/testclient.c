@@ -196,7 +196,7 @@ int main(int argc, char **argv)
     int tc_keep_fd = -1;
     struct nvkvm_broker_cmd tc_attach;
     int bad_two = 0, bad_reserved = 0, bad_commit_fd = 0;
-    int quiet_after = 0, caps_clipboard = 0, cursor_mode = 0;
+    int quiet_after = 0, caps_clipboard = 0, cursor_mode = 0, cursor_pos = 0;
 
     /* Line-buffered: this tool is normally watched live and normally ended
      * with Ctrl-C or timeout(1), and a fully buffered pipe would throw away
@@ -208,7 +208,7 @@ int main(int argc, char **argv)
                         "       [--bad-size H|--bad-fourcc|--alpha-fourcc|--bad-dim|"
                         "--bad-fd|--bad-frame|--bad-two-fds|--bad-reserved|"
                         "--bad-commit-fd|--caps-clipboard|--shm|--bad-unsealed|"
-                        "--cursor|--bad-cursor]\n",
+                        "--cursor|--bad-cursor|--cursor-pos|--bad-cursor-pos]\n",
                         argv[0]);
         return 2;
     }
@@ -236,6 +236,8 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--caps-clipboard")){ caps_clipboard = 1; }
         else if (!strcmp(a, "--cursor"))       { cursor_mode = 1; }
         else if (!strcmp(a, "--bad-cursor"))   { cursor_mode = 2; }
+        else if (!strcmp(a, "--cursor-pos"))   { cursor_pos = 1; }
+        else if (!strcmp(a, "--bad-cursor-pos")) { cursor_pos = 2; }
         else { fprintf(stderr, "unknown option %s\n", a); return 2; }
     }
     if (!pw) { pw = 640; }
@@ -291,7 +293,8 @@ int main(int argc, char **argv)
         if (p.type == NVKVM_BROKER_EV_HELLO) {
             printf("  proto v%u caps 0x%x: kbd=%d abs=%d rel=%d lock=%d "
                    "total-grab=%d focus=%d fs=%d dmabuf=%d modifiers=%d "
-                   "release=%d cursor=%d mode-hints=%d\n", p.w0, p.w1,
+                   "release=%d cursor=%d mode-hints=%d cursor-pos=%d\n",
+                   p.w0, p.w1,
                    !!(p.w1 & NVKVM_BROKER_CAP_KEYBOARD),
                    !!(p.w1 & NVKVM_BROKER_CAP_ABS_POINTER),
                    !!(p.w1 & NVKVM_BROKER_CAP_REL_POINTER),
@@ -303,7 +306,8 @@ int main(int argc, char **argv)
                    !!(p.w1 & NVKVM_BROKER_CAP_MODIFIERS),
                    !!(p.w1 & NVKVM_BROKER_CAP_RELEASE),
                    !!(p.w1 & NVKVM_BROKER_CAP_CURSOR),
-                   !!(p.w1 & NVKVM_BROKER_CAP_MODE_HINTS));
+                   !!(p.w1 & NVKVM_BROKER_CAP_MODE_HINTS),
+                   !!(p.w1 & NVKVM_BROKER_CAP_CURSOR_POS));
             if (p.w0 != NVKVM_BROKER_PROTO_VERSION) {
                 fprintf(stderr, "protocol version mismatch: broker %u, this "
                         "client %u\n", p.w0, NVKVM_BROKER_PROTO_VERSION);
@@ -380,6 +384,23 @@ int main(int argc, char **argv)
                 printf("  -> CURSOR hide\n");
                 send_cmd(sock, &hide, NULL, 0, sizeof(hide));
             }
+        }
+
+        if (cursor_pos) {
+            /*
+             * Conduit CMD_CURSOR_POS: the guest's pointer at (-5, 700), x and
+             * y as int32 in width/height.  --bad-cursor-pos also sets a buffer
+             * field, which is a protocol violation.
+             */
+            struct nvkvm_broker_cmd cp = {
+                .type = NVKVM_BROKER_CMD_CURSOR_POS,
+                .width = (uint32_t)(int32_t)-5, .height = 700, .seq = 1,
+                .stride = cursor_pos == 2 ? 4 : 0,
+            };
+
+            printf("  -> CURSOR_POS -5,700%s\n",
+                   cursor_pos == 2 ? " (with a stride)" : "");
+            send_cmd(sock, &cp, NULL, 0, sizeof(cp));
         }
 
         if (ww && wh) {
