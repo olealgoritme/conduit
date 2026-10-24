@@ -34,11 +34,13 @@ For example, in a Steam game's launch options:
 VKD3D_SHADER_CACHE_PATH=0 NVK_DISPATCH_CAPTURE=88825d04f9c554c6,94b6df807719aaad NVK_DISPATCH_CAPTURE_DELAY_S=40 NVK_DISPATCH_CAPTURE_POST=1 %command%
 ```
 
-A draw is captured when the bound fragment shader matches: a direct `vkCmdDraw` or `vkCmdDrawIndexed`
-with a vertex and a fragment shader, single sample, inside dynamic rendering (vkd3d-proton's render passes).
-The capture holds both shaders, their resources, the attachments' contents, the indices the draw reads, every
-vertex buffer an attribute reads (as bound, up to 256 MiB each) and the pipeline state with the vertex input
-layout.
+A draw is captured when the bound fragment shader matches: `vkCmdDraw`, `vkCmdDrawIndexed` or their
+indirect and indirect-count forms (vkd3d-proton's `ExecuteIndirect` without state changes), with a vertex
+and a fragment shader, single sample, inside dynamic rendering (vkd3d-proton's render passes). The capture
+holds both shaders, their resources, the attachments' contents, the indices the draw reads (the whole bound
+index buffer for an indirect draw), every vertex buffer an attribute reads (as bound, up to 256 MiB each),
+for an indirect draw its records and count as they were when it ran, and the pipeline state with the vertex
+input layout. Hashes: use the DXIL source hash; a code hash changes with every NAK change.
 
 Each capture goes to `<dir>\<hash>-p<pid>-<n>\` once the command buffer that recorded it is reset (a few
 frames after the dispatch). `<dir>\nvk-dcap.log` lists the scanned shaders, the recorded and written
@@ -112,7 +114,8 @@ A capture is a directory: `manifest.json`, `shader.spv` (the SPIR-V the pipeline
 `kind` (`draw`), `vs_spirv` (`vs.spv`), `vs_src_hash`, `vs_code_hash` and `draw` (vertex and instance
 counts, first vertex and instance, topology, rasterization, depth bias, viewport, scissor, render area,
 layers, sample mask, alpha to coverage, `depth`, `stencil` and `blend` state with the attachments' formats,
-`indexed`, `index_count`, `first_index`, `vertex_offset`, `index_type`, `vertex_input` with the bindings'
+`indexed`, `index_count`, `first_index`, `vertex_offset`, `index_type`, `indirect`, `indirect_count`,
+`draw_count` (records, or at most that many with a count), `stride`, `vertex_input` with the bindings'
 strides, input rates and divisors and the attributes' locations, bindings, formats and offsets),
 `bindings`
 (every resource variable: set, binding, descriptor type, array, writable, image dimension, NVK's binding
@@ -130,7 +133,9 @@ layout) and `resources`:
 An attachment of a draw is an `image` with `role` (`color`, `depth` or `stencil`), `attachment` (the color
 attachment index) and `attachment_format`, without set and binding. The index buffer is a `buffer` with
 `role` `index` that starts at the draw's first index (the replay draws from index 0); a vertex buffer is a
-`buffer` with `role` `vertex` and `attachment` = its binding, from its bound offset.
+`buffer` with `role` `vertex` and `attachment` = its binding, from its bound offset. An indirect draw's
+records are a `buffer` with `role` `indirect`, its count one with `role` `count`; its index buffer starts
+at the bound offset (the records hold the first indices).
 
 `push_offset` and `add` on a descriptor say where its index came from (push constant word plus constant).
 With `NVK_DISPATCH_CAPTURE_POST=1`, every resource the shader may write also has `r<N>.post.bin`, its
@@ -139,7 +144,8 @@ contents after NVK ran the dispatch.
 ## Limits
 
 - Direct and indirect `vkCmdDispatch`; not device-generated commands (ExecuteIndirect on DGC).
-- Draws: direct `vkCmdDraw` and `vkCmdDrawIndexed` (not indirect or multi-draws), no tessellation,
+- Draws: `vkCmdDraw[Indexed]`, `vkCmdDraw[Indexed]Indirect[Count]` (not multi-draws or device-generated
+  commands, which are logged), no tessellation,
   geometry or mesh shaders, single sample, no multiview; one viewport and scissor.
 - Descriptor indices must be a push constant word plus a constant (vkd3d-proton's heap indexing) or
   constant; root buffer addresses must be loaded straight from a push constant. What the scan could not

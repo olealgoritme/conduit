@@ -52,7 +52,8 @@
  X(vkCreateFence) X(vkWaitForFences) X(vkResetFences) X(vkDeviceWaitIdle) \
  X(vkCreatePipelineCache) X(vkGetPipelineCacheData) \
  X(vkCreateGraphicsPipelines) X(vkCmdBeginRendering) X(vkCmdEndRendering) X(vkCmdDraw) X(vkCmdSetViewport) \
- X(vkCmdSetScissor) X(vkCmdDrawIndexed) X(vkCmdBindIndexBuffer) X(vkCmdBindVertexBuffers)
+ X(vkCmdSetScissor) X(vkCmdDrawIndexed) X(vkCmdBindIndexBuffer) X(vkCmdBindVertexBuffers) X(vkCmdDrawIndirect) \
+ X(vkCmdDrawIndexedIndirect) X(vkCmdDrawIndirectCount) X(vkCmdDrawIndexedIndirectCount)
 #define X(n) static PFN_##n n;
 VKFUNCS(X)
 #undef X
@@ -164,7 +165,7 @@ struct res {
     VkBuffer pristine; /* device-local copy of the captured bytes of a writable resource, for resets */
     VkBuffer rb; uint8_t *rb_map;
     /* draws: an attachment (1 color, 2 depth, 3 stencil), its index and view format; or the index buffer (4), a
-     * vertex buffer (5, attachment = its binding) */
+     * vertex buffer (5, attachment = its binding), the indirect records (6), the draw count (7) */
     int role; uint32_t attachment; VkFormat att_format; VkImageAspectFlags att_aspects; int att_shared;
 };
 
@@ -229,7 +230,8 @@ static void load_manifest(struct json *m)
         {
             const char *role = jstr(j, "role", "");
             r->role = !strcmp(role, "color") ? 1 : !strcmp(role, "depth") ? 2 : !strcmp(role, "stencil") ? 3 :
-                      !strcmp(role, "index") ? 4 : !strcmp(role, "vertex") ? 5 : 0;
+                      !strcmp(role, "index") ? 4 : !strcmp(role, "vertex") ? 5 : !strcmp(role, "indirect") ? 6 :
+                      !strcmp(role, "count") ? 7 : 0;
             r->attachment = (uint32_t)jnum(j, "attachment", 0);
             r->att_format = (VkFormat)jnum(j, "attachment_format", 0);
         }
@@ -563,7 +565,8 @@ static void create_resources(uint8_t *push)
             r->buf = make_buffer(r->alloc_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
                                  VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                                  VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
-                                 VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, NULL);
+                                 VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
+                                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, NULL);
             make_stage(r, r->alloc_size);
             if (r->kind == R_BDA && r->push_offset >= 0 && r->push_offset + 8 <= 256) {
                 VkBufferDeviceAddressInfo bi = { VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, NULL, r->buf };
@@ -781,7 +784,20 @@ static void record_draw(VkCommandBuffer cb)
     int indexed = (int)jnum(d, "indexed", 0);
     for (int i = 0; indexed && i < NR; i++)
         if (R[i].role == 4 && R[i].buf) vkCmdBindIndexBuffer(cb, R[i].buf, 0, (VkIndexType)jnum(d, "index_type", 0));
-    if (indexed)
+    VkBuffer ind = VK_NULL_HANDLE, cnt = VK_NULL_HANDLE;
+    for (int i = 0; i < NR; i++) {
+        if (R[i].role == 6) ind = R[i].buf;
+        if (R[i].role == 7) cnt = R[i].buf;
+    }
+    if (jnum(d, "indirect", 0) && ind) {
+        /* the captured records (the index buffer from its start: the records' first indices) */
+        uint32_t n = (uint32_t)jnum(d, "draw_count", 1), stride = (uint32_t)jnum(d, "stride", 20);
+        if (jnum(d, "indirect_count", 0) && cnt) {
+            if (indexed) vkCmdDrawIndexedIndirectCount(cb, ind, 0, cnt, 0, n, stride);
+            else vkCmdDrawIndirectCount(cb, ind, 0, cnt, 0, n, stride);
+        } else if (indexed) vkCmdDrawIndexedIndirect(cb, ind, 0, n, stride);
+        else vkCmdDrawIndirect(cb, ind, 0, n, stride);
+    } else if (indexed)
         /* the index resource starts at the draw's first index */
         vkCmdDrawIndexed(cb, (uint32_t)jnum(d, "index_count", 0), (uint32_t)jnum(d, "instance_count", 1), 0,
                          (int32_t)jnum(d, "vertex_offset", 0), (uint32_t)jnum(d, "first_instance", 0));
@@ -1023,7 +1039,10 @@ int main(int argc, char **argv)
     uint64_t all = 0xcbf29ce484222325ull;
     if (g_draw)
         printf("%s on %s: draw of %u %s x %u instances, area %ux%u, %d resources (%d writable, %d not captured), "
-               "%.1f MiB, pipeline %.1f ms\n", g_hash, g_pp.deviceName, (uint32_t)jnum(g_dj, "vertex_count", 0),
+               "%.1f MiB, pipeline %.1f ms\n", g_hash, g_pp.deviceName,
+               jnum(g_dj, "indirect", 0) ? (uint32_t)jnum(g_dj, "draw_count", 0) : (uint32_t)jnum(g_dj, "vertex_count", 0),
+               jnum(g_dj, "indirect", 0) ? (jnum(g_dj, "indirect_count", 0) ? "indirect records (at most)" :
+                                            "indirect records") :
                jnum(g_dj, "indexed", 0) ? "indices" : "vertices",
                (uint32_t)jnum(g_dj, "instance_count", 0), (uint32_t)jarr(g_dj, "render_area", 2, 0),
                (uint32_t)jarr(g_dj, "render_area", 3, 0), NR, nwrite, nerr, bytes / 1048576.0, g_compile_ms);
