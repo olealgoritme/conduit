@@ -126,14 +126,15 @@ static VkImageView make_tex(VkDevice dev, VkPhysicalDeviceMemoryProperties *mp, 
 }
 
 int main(int argc, char **argv) {
-    int repeats = 20; uint32_t n = 65536; const char *only = NULL; uint32_t iters = 0, batch = 1;
+    int repeats = 20; uint32_t n = 65536; const char *only = NULL; uint32_t iters = 0, batch = 1; int overlap = 0;
     for (int a = 1; a < argc; a++) {
         if (!strcmp(argv[a], "-r") && a + 1 < argc) repeats = atoi(argv[++a]);
         else if (!strcmp(argv[a], "-n") && a + 1 < argc) n = (uint32_t)atoi(argv[++a]) & ~63u;
         else if (!strcmp(argv[a], "-t") && a + 1 < argc) only = argv[++a];
         else if (!strcmp(argv[a], "--time") && a + 1 < argc) iters = (uint32_t)atoi(argv[++a]);
         else if (!strcmp(argv[a], "--batch") && a + 1 < argc) batch = (uint32_t)atoi(argv[++a]);
-        else { fprintf(stderr, "usage: naktest [-r REPEATS] [-n INVOCATIONS] [-t NAME_PREFIX] [--time ITERATIONS] [--batch N]\n"); return 2; }
+        else if (!strcmp(argv[a], "--overlap")) overlap = 1;
+        else { fprintf(stderr, "usage: naktest [-r REPEATS] [-n INVOCATIONS] [-t NAME_PREFIX] [--time ITERATIONS] [--batch N] [--overlap]\n"); return 2; }
     if (batch < 1) batch = 1;
     }
     /* --time: the lat_* tests' loops run ITERATIONS times and each dispatch is
@@ -146,7 +147,7 @@ int main(int argc, char **argv) {
     if (!load_vk()) { fprintf(stderr, "no Vulkan loader\n"); return 2; }
     const char *knobs[] = { "NAK_TEX_UHANDLE", "NAK_LAT", "NAK_LAT_NV", "NAK_LDCU_INDEX", "NVK_QUERY_VRAM", "NVK_RM_PERF_BOOST", "NVK_RM_DESC_TABLE_VRAM", "NVK_RM_UPLOAD_VRAM", "NAK_BAR_SHARE", "NAK_IF_CONVERT", "NAK_UADDR_PIN", "NAK_PLOP_FOLD", "NAK_IMM_CSE",
                             "NAK_PHI_AVOID", "NAK_WEAK_MEM", "NAK_VEC_CSE", "NAK_UNROLL_MAX", "NAK_BSSY_RECONVERGENT", "NAK_NIR_FLATTEN", "NAK_OCC_TARGET", "MESA_SHADER_CACHE_DISABLE" };
-    printf("naktest: %u invocations, %d repeats, %u dispatches per timestamp pair; environment:", n, repeats, batch);
+    printf("naktest: %u invocations, %d repeats, %u dispatches per timestamp pair%s; environment:", n, repeats, batch, overlap ? " without barriers" : "");
     for (size_t k = 0; k < sizeof(knobs) / sizeof(knobs[0]); k++) { const char *v = getenv(knobs[k]); if (v) printf(" %s=%s", knobs[k], v); }
     printf("\n");
 
@@ -261,7 +262,9 @@ int main(int argc, char **argv) {
              * the time per dispatch over N separates the per-dispatch cost
              * from the cost of the two timestamps */
             for (uint32_t d = 0; d < batch; d++) {
-                if (d > 0) {
+                /* --overlap: no barrier, so the driver and the GPU may run
+                 * the dispatches concurrently (each writes the same values) */
+                if (d > 0 && !overlap) {
                     VkMemoryBarrier mb = { VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL,
                                            VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT };
                     vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,

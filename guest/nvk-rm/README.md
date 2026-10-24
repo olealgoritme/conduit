@@ -121,6 +121,7 @@ Patch numbers are file numbers in the directory named in the patch tables.
 | `NAK_SCHED_SPILL_ROOM` | 1 on Windows, 0 elsewhere | when one block of a shader cannot be scheduled within the register target, the other blocks may still use registers up to the limit in the pre-RA schedule instead of staying at the peak of their original order, so that the `NAK_SCHED_MLP` schedule (memory, texture and MUFU results used later) fits there instead of falling back to the plain one (common 95) |
 | `NAK_SCHED_DELAY_WEIGHT` | 16 on Windows, 1 elsewhere | 1-64: under register pressure in the pre-RA schedule, the cost of a cycle an instruction would wait for a result, against 64 for a register over the limit (common 95) |
 | `NAK_RA_VEC_EVICT` | 1 on Windows, 0 elsewhere | when no aligned range is free for a vector destination, register allocation evicts the range with the fewest values and no memory, texture or MUFU result from the last 64 instructions (1) or the lowest range without such a result (2), instead of the lowest range, which often holds the previous load's result: its copy then waits for that load and the loads run one at a time (common 97) |
+| `NAK_UNROLL_DYN` | 0 | 2-8: innermost loops whose trip count is only known at run time ("body; if (i + off == n) break", n defined before the loop, ALU and reorderable loads only) run that many iterations per pass of the loop when a guard shows none of the first ones ends it, one otherwise; a shader it changed is also compiled without it and the unrolled one is kept unless it has fewer warps; `tools/naktest` dynloop tests (common 100) |
 | `NAK_REMAT_LD_COST`, `NAK_OCC_GPRS` | 4, 0 | the cost of a rematerialized load in the spiller and in `NAK_OCC_TARGET`'s estimate (a memory fill is 8); a fixed register target for every shader above it, for one-shader sweeps with `dispatch-replay` (common 89) |
 | `NAK_LOOP_CONT_SYNC` | 0 | 1 syncs lanes at the end of every divergent loop iteration; off, loops without a continue skip that sync (common 75) |
 | `NAK_UNROLL_MAX` | 32 | most iterations NIR fully unrolls a loop with a known trip count (common 65) |
@@ -432,6 +433,7 @@ backend. Numbers are file numbers (there is no 0016 or 0025).
 | 0097 | NAK: `NAK_RA_VEC_EVICT` (vector destinations evict the cheapest aligned range, not the one the previous load went to) |
 | 0098 | NAK, nvkmd/rm: Windows defaults `NAK_SCHED_SPILL_ROOM` 1, `NAK_SCHED_DELAY_WEIGHT` 16, `NAK_RA_VEC_EVICT` 1, `NVK_RM_PERF_BOOST` 1 |
 | 0099 | NVK: `NVK_QUERY_VRAM` (query pools in CPU-mapped VRAM, off) |
+| 0100 | NAK: `NAK_UNROLL_DYN` (off: unroll loops with a run-time trip count by N, with a guard and the original loop body as the remainder path) |
 
 ## Per-draw cost (common 0001-0007)
 

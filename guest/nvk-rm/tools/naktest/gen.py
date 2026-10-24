@@ -297,6 +297,28 @@ def lat_tests():
 
 lat_tests()
 
+
+def emit_dynloop(name, m_g, m_c):
+    # A loop whose trip count is only known at run time, in the shape
+    # NAK_UNROLL_DYN unrolls: the body, then the exit test on the
+    # incremented counter.  m == 0 skips the loop
+    body = ["y = y * 3u + (k ^ 40503u);", "z = z ^ (y >> 7u);", "y = y + (z << 3u);",
+            "z = z * 2246822519u + y;"]
+    glsl = ["uint y = inp[i]; uint z = inp[i] * 2654435761u;", f"uint m = {m_g};",
+            "if (m > 0u) {", "  uint k = 0u;", "  while (true) {"] + ["    " + x for x in body] + \
+           ["    uint k1 = k + 1u;", "    if (k1 == m) break;", "    k = k1;", "  }", "}", "outp[i] = y ^ z;"]
+    cc = ["uint32_t y = in[i]; uint32_t z = in[i] * 2654435761u;", f"uint32_t m = {m_c};",
+          "if (m > 0u) {", "  uint32_t k = 0u;", "  while (1) {"] + ["    " + x for x in body] + \
+         ["    uint32_t k1 = k + 1u;", "    if (k1 == m) break;", "    k = k1;", "  }", "}", "return y ^ z;"]
+    emit(name, "dynloop", glsl, cc)
+
+
+# Trip counts around 4 and 8 (NAK_UNROLL_DYN=4 / 8), 0, 1, a large one and a
+# different one per lane; pc.u[1] >> 16 is 0 but not known at compile time
+for K in (0, 1, 3, 4, 5, 7, 8, 9, 16, 37, 1000):
+    emit_dynloop(f"dynloop{K}", f"{K}u + (pc.u[1] >> 16u)", f"{K}u + (pc[1] >> 16u)")
+emit_dynloop("dynloop_lane", "1u + (inp[i] % 20u) + (pc.u[1] >> 16u)", "1u + (in[i] % 20u) + (pc[1] >> 16u)")
+
 for v in range(4):
     emit_float(f"fma{v}", 256)
 for v in range(3):
