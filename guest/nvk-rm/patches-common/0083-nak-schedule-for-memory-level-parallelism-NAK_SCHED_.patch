@@ -1,8 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Ole Algoritme <olealgoritme@gmail.com>
 Date: Sat, 24 Oct 2026 01:42:59 +0200
-Subject: [PATCH] nak: schedule for memory-level parallelism (NAK_SCHED_MLP, on
- on Windows)
+Subject: [PATCH] nak: schedule for memory-level parallelism (NAK_SCHED_MLP)
 
 NAK's prepass scheduler puts a load about ten instructions above its
 use, even when the load does not depend on the computation in between.
@@ -40,16 +39,14 @@ Causes, and what NAK_SCHED_MLP changes:
   target falls back to the plain schedule for the same target, so the
   knob does not cross an occupancy cliff.
 
-The knob (0-3; default 3 on Windows, 0 elsewhere) is part of
-nak_knobs_key() (bits 18-19) and so of NVK's shader cache key.
+The knob (0-3, default 0) is part of nak_knobs_key() (bits 18-19) and so
+of NVK's shader cache key.
 
-Steel Nomad (D3D12, RTX 5090 in a Windows guest, 400 W, with 0082):
-77.8 fps at 0, 80.9 at 1, 81.0 at 3. SM issue goes from 38.7% to 41.9%
-and warps per SM from 43.6 to 45.5. In tools/dispcost, a 5-workgroup
+RTX 5090 in a Windows guest, with 0082: in tools/dispcost, a 5-workgroup
 dispatch after a UAV barrier costs 1.46 us ("mid") and 2.41 us ("big")
-at 3, against 2.35 and 6.15 us at 0 (NVIDIA: 1.41 and 2.39). Level 3
-spills less than level 1 in the corpus's compute shaders (2 against 18),
-so it is the Windows default.
+at 3, against 2.35 and 6.15 us at 0 (NVIDIA: 1.41 and 2.39). Steel Nomad
+(D3D12, 400 W) runs at 84.5 fps at 3 and 85.1-85.3 at 0, so the knob
+stays off by default.
 
 Offline (drm-shim, GB202), the test shader at level 3 has 28 of 28 loads
 in flight at 40 GPRs and 48 warps, against 1 of 28 at level 0. On the
@@ -139,14 +136,14 @@ index 46c1634..c0c48f1 100644
                      }
                      None => {
 diff --git a/src/nouveau/compiler/nak/knobs.rs b/src/nouveau/compiler/nak/knobs.rs
-index 7ac2fbc..05b39cb 100644
+index 7ac2fbc..8216ee5 100644
 --- a/src/nouveau/compiler/nak/knobs.rs
 +++ b/src/nouveau/compiler/nak/knobs.rs
 @@ -64,6 +64,11 @@
  //!   in convergent control flow, where its uniform values can use the
  //!   uniform datapath (nak_nir_lower_early_exit.c).  0 keeps the divergent
  //!   if or the loop around the whole body
-+//! - NAK_SCHED_MLP (0-3; default 3 on Windows, 0 elsewhere): global, local
++//! - NAK_SCHED_MLP (0-3, default 0): global, local
 +//!   and texture accesses are modeled with their real latencies in the
 +//!   instruction schedulers, so independent loads issue early and stay in
 +//!   flight together; scoreboards are shared when all six are busy
@@ -160,7 +157,7 @@ index 7ac2fbc..05b39cb 100644
  static EARLY_EXIT: OnceLock<bool> = OnceLock::new();
 +static SCHED_MLP: OnceLock<u32> = OnceLock::new();
 +
-+/// NAK_SCHED_MLP (0-3; default 3 on Windows, 0 elsewhere): memory-level
++/// NAK_SCHED_MLP (0-3, default 0): memory-level
 +/// parallelism in the instruction schedulers.  Without it the prepass never
 +/// delays an instruction by an edge latency and global, local and texture
 +/// accesses count as 32 cycles, so a load sits about ten instructions above
@@ -170,11 +167,11 @@ index 7ac2fbc..05b39cb 100644
 +/// accesses are not ordered against other memory operations, and a
 +/// variable-latency instruction that finds all six scoreboards busy shares
 +/// one (as NAK_BAR_SHARE); 2: 640 / 480 cycles; 3: also hoists accesses as
-+/// far as their operands allow while registers are free.  Steel Nomad
-+/// (D3D12, RTX 5090 in a Windows guest): 77.8 fps with 0, 80.9 with 1, 81.0
-+/// with 3 (fewer compute spills than 1 in the corpus)
++/// far as their operands allow while registers are free.  Short-grid
++/// dispatches after a barrier run at NVIDIA's speed with 3; Steel Nomad is
++/// unchanged, so it stays opt-in
 +pub fn sched_mlp() -> u32 {
-+    let dflt = if cfg!(target_os = "windows") { 3 } else { 0 };
++    let dflt = 0;
 +    let v = SCHED_MLP.get_or_init(|| match env::var("NAK_SCHED_MLP") {
 +        Ok(s) => match s.trim().parse::<u32>() {
 +            Ok(v) if v <= 3 => v,
