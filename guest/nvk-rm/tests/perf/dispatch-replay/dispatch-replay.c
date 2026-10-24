@@ -115,10 +115,10 @@ static uint64_t fnv64(const void *data, uint64_t n, uint64_t h)
 
 /* ------------------------------------------------------------------------------------------- options */
 static struct {
-    int n, warm, reset, compile_only, list, robust, verbose;
+    int n, warm, reset, compile_only, list, robust, verbose, no_draw;
     const char *dev, *dump, *csv, *label, *dump_cache;
     int grid_override; uint32_t grid[3];
-} O = { 15, 5, 1, 0, 0, 1, 0, NULL, NULL, NULL, NULL, NULL, 0, { 0, 0, 0 } };
+} O = { 15, 5, 1, 0, 0, 1, 0, 0, NULL, NULL, NULL, NULL, NULL, 0, { 0, 0, 0 } };
 
 static void usage(void)
 {
@@ -127,6 +127,7 @@ static void usage(void)
         "  -n N            timed dispatches (default 15; the median is reported)\n"
         "  -w N            warm-up dispatches before them (default 5)\n"
         "  --no-reset      do not restore writable resources before each dispatch\n"
+        "  --no-draw       draws: time the render pass alone (attachment load and store), without the draw\n"
         "  --dev STR       device whose name contains STR (default: first NVIDIA-vendor device)\n"
         "  --list          list the devices and exit\n"
         "  --dump DIR      write what the shader may write, after the last dispatch, as DIR/r<N>.out.bin\n"
@@ -774,6 +775,7 @@ static void record_draw(VkCommandBuffer cb)
                     { (uint32_t)jarr(d, "scissor", 2, 1), (uint32_t)jarr(d, "scissor", 3, 1) } };
     vkCmdSetViewport(cb, 0, 1, &v);
     vkCmdSetScissor(cb, 0, 1, &sc);
+    if (O.no_draw) { vkCmdEndRendering(cb); return; } /* the render pass alone: attachment load and store */
     for (int i = 0; i < NR; i++) {
         struct res *r = &R[i];
         if (r->role == 5 && r->buf) {
@@ -936,6 +938,7 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--label") && i + 1 < argc) O.label = argv[++i];
         else if (!strcmp(a, "--grid") && i + 1 < argc) { O.grid_override = sscanf(argv[++i], "%u,%u,%u", &O.grid[0], &O.grid[1], &O.grid[2]) == 3; }
         else if (!strcmp(a, "--no-robust")) O.robust = 0;
+        else if (!strcmp(a, "--no-draw")) O.no_draw = 1;
         else if (!strcmp(a, "--compile-only")) O.compile_only = 1;
         else if (!strcmp(a, "--dump-cache") && i + 1 < argc) O.dump_cache = argv[++i];
         else if (!strcmp(a, "-v")) O.verbose = 1;
