@@ -22,6 +22,7 @@
 #include <direct.h>
 #else
 #include <dlfcn.h>
+#include <dirent.h>
 #include <sys/stat.h>
 #include <time.h>
 #endif
@@ -115,15 +116,16 @@ static uint64_t fnv64(const void *data, uint64_t n, uint64_t h)
 
 /* ------------------------------------------------------------------------------------------- options */
 static struct {
-    int n, warm, reset, compile_only, list, robust, verbose, no_draw, split, ts_only;
-    const char *dev, *dump, *csv, *label, *dump_cache;
+    int n, warm, reset, compile_only, list, robust, verbose, no_draw, split, ts_only, seq, seq_barriers;
+    const char *dev, *dump, *csv, *label, *dump_cache, *seq_dir; int seq_id; int evict_mb;
     int grid_override; uint32_t grid[3];
-} O = { 15, 5, 1, 0, 0, 1, 0, 0, 0, 0, NULL, NULL, NULL, NULL, NULL, 0, { 0, 0, 0 } };
+} O = { 15, 5, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, NULL, NULL, NULL, NULL, NULL, NULL, 0, 0, 0, { 0, 0, 0 } };
 
 static void usage(void)
 {
     fprintf(stderr,
         "usage: dispatch-replay [options] CAPTURE_DIR\n"
+        "       dispatch-replay --seq [options] CAPTURE_DIR...  (the dispatches of an NVK_DISPATCH_CAPTURE_SEQ sequence)\n"
         "  -n N            timed dispatches (default 15; the median is reported)\n"
         "  -w N            warm-up dispatches before them (default 5)\n"
         "  --no-reset      do not restore writable resources before each dispatch\n"
@@ -139,6 +141,13 @@ static void usage(void)
         "  --no-robust     do not enable robustBufferAccess / robustness2 (vkd3d-proton enables them)\n"
         "  --compile-only  create the pipeline and exit (works with drm-shim)\n"
         "  --dump-cache F  create the pipeline with an empty pipeline cache and write its data to F\n"
+        "  --seq           replay several dispatch captures of one sequence (manifest \"sequence\") in their order in one\n"
+        "                  command buffer, a compute barrier where the game had a pipeline barrier; the time is per sequence\n"
+        "  --seq-barriers M  with --seq: captured (default), all (a barrier between every two dispatches) or none\n"
+        "  --seq-dir PARENT  with --seq: every capture directory under PARENT that belongs to a sequence (instead of\n"
+        "                  listing them); --seq-id ID picks one sequence when PARENT holds several (default: the largest)\n"
+        "  --evict MB      before each timed repeat (outside the timestamps), write and read a buffer of MB MiB, so that\n"
+        "                  the caches no longer hold the dispatch's data, as in a frame (the L2 of an RTX 5090: 96 MiB)\n"
         "  -v              print every resource\n");
     exit(2);
 }
@@ -170,6 +179,8 @@ struct res {
     /* draws: an attachment (1 color, 2 depth, 3 stencil), its index and view format; or the index buffer (4), a
      * vertex buffer (5, attachment = its binding), the indirect records (6), the draw count (7) */
     int role; uint32_t attachment; VkFormat att_format; VkImageAspectFlags att_aspects; int att_shared;
+    /* --seq: the same resource as resource same_id of capture same_capture of the sequence */
+    uint32_t same_capture, same_id; int shared;
 };
 
 struct binding {
@@ -230,6 +241,10 @@ static void load_manifest(struct json *m)
         r->push_offset = jget(j, "push_offset") ? (int)jnum(j, "push_offset", -1) : -1;
         r->writable = jbool(j, "writable", 0);
         r->file = jstr(j, "file", NULL); r->size = ju64(j, "size", 0); r->note = jstr(j, "note", NULL);
+        if (jget(j, "same_as")) {
+            r->same_capture = (uint32_t)jnum(jget(j, "same_as"), "capture", 0);
+            r->same_id = (uint32_t)jnum(jget(j, "same_as"), "resource", 0);
+        }
         {
             const char *role = jstr(j, "role", "");
             r->role = !strcmp(role, "color") ? 1 : !strcmp(role, "depth") ? 2 : !strcmp(role, "stencil") ? 3 :
@@ -546,6 +561,14 @@ static void create_resources(uint8_t *push)
 {
     for (int i = 0; i < NR; i++) {
         struct res *r = &R[i];
+        if (r->shared) { /* --seq: an earlier capture's resource; only its address goes into the push constants */
+            if (r->kind == R_BDA && r->push_offset >= 0 && r->push_offset + 8 <= 256 && r->buf) {
+                VkBufferDeviceAddressInfo bi = { VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, NULL, r->buf };
+                uint64_t va = vkGetBufferDeviceAddress(g_dev, &bi);
+                memcpy(push + r->push_offset, &va, 8);
+            }
+            continue;
+        }
         switch (r->kind) {
         case R_IMAGE:
             if (r->role) create_attachment(r); else create_image(r);
@@ -601,6 +624,7 @@ static void record_restore(VkCommandBuffer cb, int writable_only)
     for (int i = 0; i < NR; i++) {
         struct res *r = &R[i];
         if (writable_only && !r->writable) continue;
+        if (r->shared) continue;
         VkBuffer src = writable_only && r->pristine ? r->pristine : r->stage;
         if (r->kind == R_IMAGE) {
             VkBufferImageCopy rg[MAX_SUB]; copy_regions(r, rg);
@@ -616,7 +640,7 @@ static void upload_all(void)
 {
     VkCommandBuffer cb = begin_cmd();
     VkImageMemoryBarrier ib[MAX_RES]; uint32_t nib = 0;
-    for (int i = 0; i < NR; i++) if (R[i].kind == R_IMAGE && !R[i].att_shared)
+    for (int i = 0; i < NR; i++) if (R[i].kind == R_IMAGE && !R[i].att_shared && !R[i].shared)
         ib[nib++] = (VkImageMemoryBarrier){ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
             VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, R[i].img,
             { R[i].role ? R[i].att_aspects : R[i].aspect, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS } };
@@ -624,7 +648,7 @@ static void upload_all(void)
     record_restore(cb, 0);
     for (int i = 0; i < NR; i++) {
         struct res *r = &R[i];
-        if (!r->writable || !r->stage) continue;
+        if (!r->writable || !r->stage || r->shared) continue;
         r->pristine = make_buffer(r->stage_size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                                   VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, NULL);
         VkBufferCopy c = { 0, 0, r->stage_size };
@@ -930,6 +954,263 @@ static void write_descriptors(void)
 /* ------------------------------------------------------------------------------------------- run */
 static int cmp_d(const void *a, const void *b) { double x = *(const double *)a, y = *(const double *)b; return x < y ? -1 : x > y; }
 
+/* --evict: two device-local buffers of O.evict_mb MiB; a fill of one and a copy of it into the other, behind
+ * full barriers, push everything else out of the L2 */
+static VkBuffer g_ev[2];
+static void record_evict(VkCommandBuffer cb)
+{
+    if (O.evict_mb <= 0) return;
+    const uint64_t n = (uint64_t)O.evict_mb << 20;
+    if (!g_ev[0])
+        for (int k = 0; k < 2; k++)
+            g_ev[k] = make_buffer(n, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                  VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, NULL);
+    static uint32_t v = 1;
+    full_barrier(cb);
+    vkCmdFillBuffer(cb, g_ev[0], 0, n, v++);
+    full_barrier(cb);
+    VkBufferCopy c = { 0, 0, n };
+    vkCmdCopyBuffer(cb, g_ev[0], g_ev[1], 1, &c);
+    full_barrier(cb);
+}
+
+/* --seq: the dispatches of one NVK_DISPATCH_CAPTURE_SEQ sequence, each with its own captured resources (no
+ * data flows from one to the next: every dispatch reads the inputs it had in the game), replayed in their
+ * order in one command buffer, with a compute-to-compute barrier where the game recorded a pipeline barrier;
+ * dispatches without a barrier between them may run concurrently, as in the game */
+struct seq_item {
+    char *dir; uint32_t index; int barrier; char hash[32];
+    VkPipeline pipe; VkPipelineLayout pl; VkDescriptorSet sets[8]; uint32_t nsets;
+    uint8_t push[256]; uint32_t push_size; uint32_t base[3], grid[3];
+    uint32_t capture; struct res *res; int nres; /* the capture's resources, for later captures' "same_as" */
+};
+
+static int cmp_seq(const void *a, const void *b)
+{
+    const struct seq_item *x = a, *y = b;
+    return x->index < y->index ? -1 : x->index > y->index;
+}
+
+static void compute_barrier(VkCommandBuffer cb)
+{
+    VkMemoryBarrier mb = { VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_SHADER_WRITE_BIT,
+                           VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT };
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL,
+                         0, NULL);
+}
+
+/* --seq-dir: the subdirectories of parent whose manifest has a "sequence" section, of the sequence --seq-id
+ * names or, by default, of the sequence with the most of them */
+static char **seq_dir_list(const char *parent, int *n_out)
+{
+    int cap = 64, n = 0; char **names = malloc(sizeof(char *) * (size_t)cap);
+#ifdef _WIN32
+    char pat[1024]; snprintf(pat, sizeof pat, "%s\\*", parent);
+    WIN32_FIND_DATAA fd; HANDLE h = FindFirstFileA(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE) die("cannot list %s", parent);
+    do {
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || fd.cFileName[0] == '.') continue;
+        if (n == cap) { cap *= 2; names = realloc(names, sizeof(char *) * (size_t)cap); }
+        names[n++] = strdup(fd.cFileName);
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+#else
+    DIR *dp = opendir(parent); if (!dp) die("cannot list %s", parent);
+    struct dirent *e;
+    while ((e = readdir(dp))) {
+        if (e->d_name[0] == '.') continue;
+        if (n == cap) { cap *= 2; names = realloc(names, sizeof(char *) * (size_t)cap); }
+        names[n++] = strdup(e->d_name);
+    }
+    closedir(dp);
+#endif
+    char **paths = malloc(sizeof(char *) * (size_t)(n ? n : 1)); uint32_t *ids = calloc((size_t)(n ? n : 1), sizeof *ids);
+    int np = 0;
+    for (int k = 0; k < n; k++) {
+        char path[1024]; snprintf(path, sizeof path, "%s/%s/manifest.json", parent, names[k]);
+        FILE *f = fopen(path, "rb"); if (!f) continue;
+        fseek(f, 0, SEEK_END); long len = ftell(f); fseek(f, 0, SEEK_SET);
+        char *t = malloc((size_t)len + 1); size_t got = fread(t, 1, (size_t)len, f); t[got] = 0; fclose(f);
+        struct json *m = json_parse(t);
+        const struct json *sq = m ? jget(m, "sequence") : NULL;
+        uint32_t id = sq ? (uint32_t)jnum(sq, "id", 0) : 0;
+        if (!id) continue;
+        char *d = malloc(strlen(parent) + strlen(names[k]) + 2); sprintf(d, "%s/%s", parent, names[k]);
+        paths[np] = d; ids[np] = id; np++;
+    }
+    uint32_t want = (uint32_t)O.seq_id;
+    if (!want) {
+        int best = 0;
+        for (int k = 0; k < np; k++) {
+            int c = 0; for (int q = 0; q < np; q++) c += ids[q] == ids[k];
+            if (c > best) { best = c; want = ids[k]; }
+        }
+    }
+    int nseq = 0; uint32_t seen[64]; int ns = 0;
+    for (int k = 0; k < np; k++) {
+        int dup = 0; for (int q = 0; q < ns; q++) dup |= seen[q] == ids[k];
+        if (!dup && ns < 64) seen[ns++] = ids[k];
+    }
+    if (ns > 1) {
+        fprintf(stderr, "%s holds %d sequences:", parent, ns);
+        for (int q = 0; q < ns; q++) {
+            int c = 0; for (int k = 0; k < np; k++) c += ids[k] == seen[q];
+            fprintf(stderr, " %u (%d dispatches)", seen[q], c);
+        }
+        fprintf(stderr, "; replaying %u (--seq-id picks another)\n", want);
+    }
+    char **out = malloc(sizeof(char *) * (size_t)(np ? np : 1));
+    for (int k = 0; k < np; k++) if (ids[k] == want) out[nseq++] = paths[k];
+    if (!nseq) die("no sequence capture under %s", parent);
+    *n_out = nseq;
+    return out;
+}
+
+struct dir_index { char *dir; uint32_t index; };
+static int cmp_dir_index(const void *a, const void *b)
+{
+    const struct dir_index *x = a, *y = b;
+    return x->index < y->index ? -1 : x->index > y->index;
+}
+
+static int run_seq(int ndirs, char **dirs)
+{
+    /* In sequence order, so that a "same_as" always refers to a capture loaded before */
+    {
+        struct dir_index *di = calloc((size_t)ndirs, sizeof *di);
+        for (int d = 0; d < ndirs; d++) {
+            g_dir = dirs[d];
+            char *t = read_file("manifest.json", NULL, 1);
+            struct json *m = json_parse(t);
+            di[d].dir = dirs[d];
+            di[d].index = m && jget(m, "sequence") ? (uint32_t)jnum(jget(m, "sequence"), "index", 0) : 0;
+        }
+        qsort(di, (size_t)ndirs, sizeof *di, cmp_dir_index);
+        for (int d = 0; d < ndirs; d++) dirs[d] = di[d].dir;
+        free(di);
+    }
+    struct seq_item *S = calloc((size_t)ndirs, sizeof *S);
+    uint32_t seq_id = 0;
+    create_device();
+    double compile_ms = 0; uint64_t bytes = 0; int nres = 0, nerr = 0;
+    for (int d = 0; d < ndirs; d++) {
+        struct seq_item *it = &S[d];
+        it->dir = dirs[d]; g_dir = dirs[d];
+        char *text = read_file("manifest.json", NULL, 1);
+        struct json *m = json_parse(text);
+        if (!m || strcmp(jstr(m, "format", ""), "nvk-dispatch-capture")) die("%s: not an nvk-dispatch-capture manifest", g_dir);
+        if (!strcmp(jstr(m, "kind", "dispatch"), "draw")) die("%s: --seq replays dispatches only", g_dir);
+        const struct json *sq = jget(m, "sequence");
+        if (!sq || jnum(sq, "id", 0) == 0) die("%s: not part of a sequence (NVK_DISPATCH_CAPTURE_SEQ)", g_dir);
+        if (seq_id == 0) seq_id = (uint32_t)jnum(sq, "id", 0);
+        else if ((uint32_t)jnum(sq, "id", 0) != seq_id) die("%s: sequence %u, not %u", g_dir, (uint32_t)jnum(sq, "id", 0), seq_id);
+        it->index = (uint32_t)jnum(sq, "index", 0); it->barrier = jbool(sq, "barrier_before", 0);
+        snprintf(it->hash, sizeof it->hash, "%s", jstr(m, "src_hash", "?"));
+        snprintf(g_hash, sizeof g_hash, "%s", it->hash);
+        uint64_t spv_size = 0; uint32_t *spv = read_file(jstr(m, "spirv", "shader.spv"), &spv_size, 1);
+        { uint64_t n = 0; uint8_t *pp = read_file(jstr(m, "push", "push.bin"), &n, 1); memcpy(it->push, pp, n < 256 ? n : 256); free(pp); }
+        it->push_size = (uint32_t)jnum(m, "push_size", 0);
+        for (int k = 0; k < 3; k++) {
+            it->grid[k] = (uint32_t)(jidx(jget(m, "grid"), k) ? jidx(jget(m, "grid"), k)->num : 1);
+            it->base[k] = (uint32_t)(jidx(jget(m, "base_group"), k) ? jidx(jget(m, "base_group"), k)->num : 0);
+        }
+        if (jbool(m, "indirect", 0)) fprintf(stderr, "%s: indirect dispatch, replayed with its captured grid %ux%ux%u\n",
+                                             g_dir, it->grid[0], it->grid[1], it->grid[2]);
+        NR = 0; NB = 0; memset(B, 0, sizeof B);
+        load_manifest(m);
+        it->capture = (uint32_t)jnum(m, "capture", 0);
+        /* resources an earlier capture of the sequence has: share its objects */
+        int nshared = 0;
+        for (int k = 0; k < NR; k++) {
+            struct res *r = &R[k];
+            if (!r->same_capture) continue;
+            const struct res *o = NULL;
+            for (int e = 0; e < d && !o; e++)
+                if (S[e].capture == r->same_capture)
+                    for (int q = 0; q < S[e].nres; q++)
+                        if (S[e].res[q].id == (int)r->same_id) { o = &S[e].res[q]; break; }
+            if (!o) { fprintf(stderr, "%s: r%03d: capture %u is not in the list; the resource stays empty\n", g_dir, r->id,
+                              r->same_capture); continue; }
+            r->img = o->img; r->buf = o->buf; r->bview = o->bview; r->alloc_size = o->alloc_size;
+            if (!r->sampler) r->sampler = o->sampler;
+            /* an image view of its own (same image, possibly another view type or swizzle): reuse the view */
+            r->view = o->view;
+            r->shared = 1; nshared++;
+        }
+        if (nshared) fprintf(stderr, "%s: %d resources shared with earlier dispatches\n", g_dir, nshared);
+        create_pipeline(spv, spv_size, it->push_size);
+        compile_ms += g_compile_ms;
+        create_resources(it->push);
+        upload_all();
+        write_descriptors();
+        for (int k = 0; k < NR; k++) { bytes += R[k].size; nerr += R[k].kind == R_ERROR; }
+        nres += NR;
+        it->nres = NR; it->res = malloc(sizeof(struct res) * (size_t)NR); memcpy(it->res, R, sizeof(struct res) * (size_t)NR);
+        it->pipe = g_pipe; it->pl = g_pl; it->nsets = g_nsets; memcpy(it->sets, g_sets, sizeof it->sets);
+    }
+    qsort(S, (size_t)ndirs, sizeof *S, cmp_seq);
+    for (int d = 0; d < ndirs; d++)
+        if (S[d].index != S[0].index + (uint32_t)d)
+            fprintf(stderr, "warning: sequence %u: dispatch %u is missing\n", seq_id, S[0].index + (uint32_t)d);
+    int nbar = 0;
+    for (int d = 1; d < ndirs; d++) nbar += O.seq_barriers == 1 ? 1 : O.seq_barriers == 2 ? 0 : S[d].barrier;
+
+    const uint32_t total = (uint32_t)(O.warm + O.n);
+    if (total > 4096) die("too many repeats");
+    VkQueryPoolCreateInfo qpi = { VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, NULL, 0, VK_QUERY_TYPE_TIMESTAMP, 2 * total, 0 };
+    VkQueryPool qp; VK(vkCreateQueryPool(g_dev, &qpi, NULL, &qp));
+    VkCommandBuffer cb = begin_cmd();
+    vkCmdResetQueryPool(cb, qp, 0, 2 * total);
+    for (uint32_t r = 0; r < total; r++) {
+        record_evict(cb);
+        full_barrier(cb);
+        vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, qp, 2 * r);
+        for (int d = 0; d < ndirs; d++) {
+            const struct seq_item *it = &S[d];
+            int bar = O.seq_barriers == 1 ? d > 0 : O.seq_barriers == 2 ? 0 : (d > 0 && it->barrier);
+            if (bar) compute_barrier(cb);
+            vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, it->pipe);
+            for (uint32_t s2 = 0; s2 < it->nsets; s2++)
+                vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, it->pl, s2, 1, &it->sets[s2], 0, NULL);
+            if (it->push_size) vkCmdPushConstants(cb, it->pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, (it->push_size + 3) & ~3u, it->push);
+            vkCmdDispatchBase(cb, it->base[0], it->base[1], it->base[2], it->grid[0], it->grid[1], it->grid[2]);
+        }
+        vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, qp, 2 * r + 1);
+    }
+    full_barrier(cb);
+    double t0 = now_ms();
+    submit_wait(cb);
+    double wall = now_ms() - t0;
+    uint64_t ts[2 * 4096];
+    VK(vkGetQueryPoolResults(g_dev, qp, 0, 2 * total, sizeof(uint64_t) * 2 * total, ts, sizeof(uint64_t),
+                             VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT));
+    double *us = calloc(O.n, sizeof *us), sum = 0;
+    for (int k = 0; k < O.n; k++) {
+        uint32_t r = (uint32_t)(O.warm + k);
+        us[k] = (double)(ts[2 * r + 1] - ts[2 * r]) * g_pp.limits.timestampPeriod / 1000.0;
+        sum += us[k];
+    }
+    qsort(us, O.n, sizeof *us, cmp_d);
+    double med = O.n % 2 ? us[O.n / 2] : 0.5 * (us[O.n / 2 - 1] + us[O.n / 2]);
+    const char *bm = O.seq_barriers == 1 ? "all" : O.seq_barriers == 2 ? "none" : "captured";
+    printf("sequence %u on %s: %d dispatches (indices %u..%u), %d barriers (%s), %d resources (%d not captured), "
+           "%.1f MiB, pipelines %.1f ms\n", seq_id, g_pp.deviceName, ndirs, S[0].index, S[ndirs - 1].index, nbar, bm,
+           nres, nerr, bytes / 1048576.0, compile_ms);
+    printf("gpu_us median %.2f min %.2f mean %.2f max %.2f per sequence (n=%d, warm-up %d%s), %.2f per dispatch, wall %.1f ms\n",
+           med, us[0], sum / O.n, us[O.n - 1], O.n, O.warm, O.evict_mb > 0 ? ", caches evicted before each" : "",
+           med / ndirs, wall);
+    if (O.csv) {
+        FILE *f = fopen(O.csv, "a");
+        if (f) {
+            fprintf(f, "seq%u\t%s\t%d.dispatches.%d.barriers.%s%s\t%.2f\t%.2f\t%.2f\t%.2f\t%d\tnoreset\t-\t%.1f\n", seq_id,
+                    O.label ? O.label : g_pp.deviceName, ndirs, nbar, bm, O.evict_mb > 0 ? ".evict" : "", med, us[0], sum / O.n, us[O.n - 1], O.n, compile_ms);
+            fclose(f);
+        }
+    }
+    vkDeviceWaitIdle(g_dev);
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -952,9 +1233,27 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--compile-only")) O.compile_only = 1;
         else if (!strcmp(a, "--dump-cache") && i + 1 < argc) O.dump_cache = argv[++i];
         else if (!strcmp(a, "-v")) O.verbose = 1;
+        else if (!strcmp(a, "--seq")) O.seq = 1;
+        else if (!strcmp(a, "--evict") && i + 1 < argc) O.evict_mb = atoi(argv[++i]);
+        else if (!strcmp(a, "--seq-dir") && i + 1 < argc) { O.seq = 1; O.seq_dir = argv[++i]; }
+        else if (!strcmp(a, "--seq-id") && i + 1 < argc) O.seq_id = atoi(argv[++i]);
+        else if (!strcmp(a, "--seq-barriers") && i + 1 < argc) {
+            const char *v = argv[++i];
+            O.seq_barriers = !strcmp(v, "all") ? 1 : !strcmp(v, "none") ? 2 : 0;
+        }
         else usage();
     }
     if (O.list) { create_device(); return 0; }
+    if (O.seq && O.seq_dir) {
+        int n = 0; char **dirs = seq_dir_list(O.seq_dir, &n);
+        return run_seq(n, dirs);
+    }
+    if (O.seq) {
+        if (i >= argc) usage();
+        if (O.n < 1) O.n = 1;
+        if (O.warm < 0) O.warm = 0;
+        return run_seq(argc - i, argv + i);
+    }
     if (i != argc - 1) usage();
     g_dir = argv[i];
     if (O.n < 1) O.n = 1;
@@ -1013,6 +1312,7 @@ int main(int argc, char **argv)
     if (push_size) vkCmdPushConstants(cb, g_pl, g_stages, 0, (push_size + 3) & ~3u, push);
     for (uint32_t it = 0; it < total; it++) {
         if (O.reset) { full_barrier(cb); record_restore(cb, 1); }
+        record_evict(cb);
         full_barrier(cb);
         if (g_draw && O.ts_only) { /* an untimed empty pass, then nothing between the timestamps */
             int nd = O.no_draw; O.no_draw = 1; record_draw(cb, VK_NULL_HANDLE, 0); O.no_draw = nd;
