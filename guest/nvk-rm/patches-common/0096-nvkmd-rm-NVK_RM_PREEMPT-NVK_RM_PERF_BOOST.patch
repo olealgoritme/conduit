@@ -1,0 +1,77 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Sat, 24 Oct 2026 10:02:54 +0200
+Subject: [PATCH] nvkmd/rm: NVK_RM_PREEMPT, NVK_RM_PERF_BOOST
+
+NVIDIA's driver sets the compute context-switch preemption mode of every
+channel it creates (GR_SET_CTXSW_PREEMPTION_MODE, compute CTA, after the
+engine objects) and asks for a performance boost to the maximum for two
+seconds after each TSG (PERF_BOOST), as an RM call trace of its Vulkan
+driver shows.  NVK leaves both at RM's defaults.  For A/B:
+NVK_RM_PREEMPT=0/1/2 sets the compute mode (WFI/CTA/CILP) and
+NVK_RM_PERF_BOOST=1 boosts; the results are logged.
+---
+ src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c | 47 ++++++++++++++++++++++
+ 1 file changed, 47 insertions(+)
+
+diff --git a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c
+index 8761ab8..f588bb5 100644
+--- a/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c
++++ b/src/nouveau/vulkan/nvkmd/rm/nvkmd_rm_ctx.c
+@@ -1236,6 +1236,53 @@ nvkmd_rm_create_exec_ctx(struct nvkmd_rm_dev *dev,
+       }
+    }
+ 
++   /* Context-switch preemption mode and a performance boost, as NVIDIA's
++    * driver requests them for every channel it creates (observed with an
++    * RM call trace of its Vulkan driver: GR_SET_CTXSW_PREEMPTION_MODE with
++    * compute CTA after the engine objects, PERF_BOOST to max for 2 s after
++    * the TSG).  For A/B: NVK_RM_PREEMPT=0/1/2 sets the compute mode
++    * (WFI/CTA/CILP), NVK_RM_PERF_BOOST=1 boosts; unset leaves RM's
++    * defaults.  Refusals are logged.
++    */
++   if (!vdec) {
++      const int64_t pm = debug_get_num_option("NVK_RM_PREEMPT", -1);
++      if (pm >= 0 && pm <= 2) {
++         struct {
++            NvU32 flags;
++            NvHandle hChannel;
++            NvU32 gfxpPreemptMode;
++            NvU32 cilpPreemptMode;
++            NvU32 routeFlags;
++            NvU32 pad;
++            NvU64 route;
++         } pp = {
++            .flags = 1, /* FLAGS_CILP_SET */
++            .hChannel = async ? ctx->h_channel : ctx->h_tsg,
++            .cilpPreemptMode = (NvU32)pm,
++         };
++         STATIC_ASSERT(sizeof(pp) == 32);
++         int ret = lib->control(dev->client, dev->h_subdevice,
++                                0x20801210 /* GR_SET_CTXSW_PREEMPTION_MODE */,
++                                &pp, sizeof(pp));
++         if (ret != 0 && !async) {
++            pp.hChannel = ctx->h_channel;
++            ret = lib->control(dev->client, dev->h_subdevice, 0x20801210,
++                               &pp, sizeof(pp));
++         }
++         mesa_logi("NVK: compute preemption mode %" PRId64 " (%s): ret %d",
++                   pm, async ? "async channel" : "TSG", ret);
++      }
++      if (debug_get_bool_option("NVK_RM_PERF_BOOST", false)) {
++         struct { NvU32 flags; NvU32 duration; } pb = {
++            .flags = 2, /* CMD_BOOST_TO_MAX */
++            .duration = 2,
++         };
++         int ret = lib->control(dev->client, dev->h_subdevice,
++                                0x2080200a /* PERF_BOOST */, &pb, sizeof(pb));
++         mesa_logi("NVK: perf boost: ret %d", ret);
++      }
++   }
++
+    ctx->put = ctx->kicked_put = 0;
+ 
+    /* The first graphics context's TSG is the one async compute contexts
+-- 
+2.43.0
+

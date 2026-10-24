@@ -93,6 +93,9 @@ Patch numbers are file numbers in the directory named in the patch tables.
 | `NVK_RM_RING_YIELD_MS` | 4 | how long a full-ring wait yields before it sleeps |
 | `NVK_RM_HIRES_SLEEP` | 1 | sleeps on a high-resolution waitable timer instead of `os_time_sleep` |
 | `NVK_RM_TIMESLICE_US`, `NVK_RM_INTERLEAVE` | unset (RM defaults) | GR runlist timeslice and interleave level of each context's TSG |
+| `NVK_RM_PERF_BOOST` | 1 on Windows, 0 elsewhere | a performance boost to the maximum for 2 s when each context is created (`NV2080_CTRL_CMD_PERF_BOOST`), as NVIDIA's driver requests it (common 96) |
+| `NVK_RM_PREEMPT` | unset (RM's default) | 0/1/2: compute context-switch preemption mode WFI/CTA/CILP of each context (`NV2080_CTRL_CMD_GR_SET_CTXSW_PREEMPTION_MODE`; NVIDIA's driver sets CTA), for A/B (common 96) |
+| `NVK_QUERY_VRAM` | 0 | query pools in CPU-mapped VRAM instead of system memory, for A/B of the cost of timestamps (common 99) |
 | **Shader compiler (NAK)** | | all part of the shader cache key; per-shader statistics with `NVK_SHADER_STATS=1` |
 | `NAK_OCC_TARGET` | 1 | rematerialization in the spiller and a per-shader register target that trades a few cheap spills for more warps (common 56) |
 | `NAK_GPR_CAP` | unset (no cap) | caps registers per thread for every stage; spills what does not fit (common 55) |
@@ -115,6 +118,9 @@ Patch numbers are file numbers in the directory named in the patch tables.
 | `NAK_UNIFORM_HOIST` | 0 | uniform values that NAK would keep in GPRs because they are computed in divergent control flow move to the nearest uniform dominating block (UGPRs): 1, ALU and constant buffer loads; 2, only constant buffer loads and their address computations; a shader the hoist changed is also compiled without it and the variant with more warps (or fewer static cycles) is kept (common 92) |
 | `NAK_LDCU_INDEX` | 0 | SM100+: a constant buffer load whose offset is a uniform value is a uniform LDCU c[N][URx], the reference compiler's form for descriptor loads, instead of a per-lane LDC with the offset copied to a GPR and the result copied back with R2UR; bindless constant buffers only from SM120 (common 93) |
 | `NAK_LAT_NV` | 1 on Windows, 0 elsewhere | SM120 RAW latencies as the reference compiler's SM120 code waits them: the SM100 latency (4 cycles FMA, ALU, IMAD, HFMA2 and uniform chains, 5 FMA/ALU cross pairs, 13 execution guards), plus one only between two ALU-pipe instructions when either is a dual-issue op (MOV, SEL, ISETP, FSETP, FMNMX), for predicate readers other than guards and for memory instructions reading a uniform register; overrides `NAK_LAT`; `tools/naktest --time` measures the chains (common 94) |
+| `NAK_SCHED_SPILL_ROOM` | 1 on Windows, 0 elsewhere | when one block of a shader cannot be scheduled within the register target, the other blocks may still use registers up to the limit in the pre-RA schedule instead of staying at the peak of their original order, so that the `NAK_SCHED_MLP` schedule (memory, texture and MUFU results used later) fits there instead of falling back to the plain one (common 95) |
+| `NAK_SCHED_DELAY_WEIGHT` | 16 on Windows, 1 elsewhere | 1-64: under register pressure in the pre-RA schedule, the cost of a cycle an instruction would wait for a result, against 64 for a register over the limit (common 95) |
+| `NAK_RA_VEC_EVICT` | 1 on Windows, 0 elsewhere | when no aligned range is free for a vector destination, register allocation evicts the range with the fewest values and no memory, texture or MUFU result from the last 64 instructions (1) or the lowest range without such a result (2), instead of the lowest range, which often holds the previous load's result: its copy then waits for that load and the loads run one at a time (common 97) |
 | `NAK_REMAT_LD_COST`, `NAK_OCC_GPRS` | 4, 0 | the cost of a rematerialized load in the spiller and in `NAK_OCC_TARGET`'s estimate (a memory fill is 8); a fixed register target for every shader above it, for one-shader sweeps with `dispatch-replay` (common 89) |
 | `NAK_LOOP_CONT_SYNC` | 0 | 1 syncs lanes at the end of every divergent loop iteration; off, loops without a continue skip that sync (common 75) |
 | `NAK_UNROLL_MAX` | 32 | most iterations NIR fully unrolls a loop with a known trip count (common 65) |
@@ -421,6 +427,11 @@ backend. Numbers are file numbers (there is no 0016 or 0025).
 | 0092 | NAK: `NAK_UNIFORM_HOIST` (default off): uniform ALU instructions and constant buffer loads in divergent control flow move to the nearest uniform dominator, where they get UGPRs (constants copied along; no global memory or subgroup operations); a shader the hoist changed is compiled both ways and the one with more warps per SM, or as many and fewer static cycles, is kept |
 | 0093 | NAK: `NAK_TEX_UHANDLE=3` (the early exit runs before texture lowering, so texture instructions behind a compute shader's bounds check are in convergent control flow when the uniform handle form is chosen) and `NAK_LDCU_INDEX` (default off; SM100+ LDCU with a UGPR offset for constant buffer loads with a uniform offset) |
 | 0094 | NAK: `NAK_LAT_NV` (default on on Windows): SM120 RAW latencies as in the reference compiler's code instead of the SM100 latency plus one everywhere |
+| 0095 | NAK: `NAK_SCHED_SPILL_ROOM` and `NAK_SCHED_DELAY_WEIGHT` (pre-RA schedule: blocks below the register limit keep the memory-level-parallel schedule when another block spills; the weight of waiting cycles under register pressure) |
+| 0096 | nvkmd/rm: `NVK_RM_PERF_BOOST` and `NVK_RM_PREEMPT` (the perf boost and the compute preemption mode NVIDIA's driver requests for each context) |
+| 0097 | NAK: `NAK_RA_VEC_EVICT` (vector destinations evict the cheapest aligned range, not the one the previous load went to) |
+| 0098 | NAK, nvkmd/rm: Windows defaults `NAK_SCHED_SPILL_ROOM` 1, `NAK_SCHED_DELAY_WEIGHT` 16, `NAK_RA_VEC_EVICT` 1, `NVK_RM_PERF_BOOST` 1 |
+| 0099 | NVK: `NVK_QUERY_VRAM` (query pools in CPU-mapped VRAM, off) |
 
 ## Per-draw cost (common 0001-0007)
 

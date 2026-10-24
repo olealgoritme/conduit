@@ -1650,6 +1650,16 @@ class = "debug"
 read = "physical device enumeration"
 effect = "Path of the librmclient library NVK loads; unset uses the library next to the driver."
 
+[env.NAK_SCHED_SPILL_ROOM]
+class = "tuning"
+read = "shader compilation"
+effect = "1 (the default on Windows): when one block of a shader cannot be scheduled within the register target, the other blocks may still use registers up to the limit in the pre-RA schedule, so that they keep the schedule with memory, texture and MUFU results used later instead of falling back to the plain one; 0: they stay at the peak of their original order."
+
+[env.NVK_QUERY_VRAM]
+class = "experiment"
+read = "query pool creation"
+effect = "1 puts query pools in CPU-mapped VRAM instead of system memory, for A/B of the cost of timestamps and other reports."
+
 [env.NVK_RM_ASYNC_COMPUTE]
 class = "tuning"
 read = "physical device enumeration"
@@ -1781,6 +1791,16 @@ default_note = "1 (on)"
 class = "tuning"
 read = "device creation"
 effect = "1 lets small system-memory allocations share pinned slabs; 0 gives each its own allocation."
+
+[env.NVK_RM_PERF_BOOST]
+class = "tuning"
+read = "exec context creation"
+effect = "1 (the default on Windows) asks RM for a performance boost to the maximum for 2 s when a context is created, as NVIDIA's driver does for every context; 0 leaves the clocks to RM's governor."
+
+[env.NVK_RM_PREEMPT]
+class = "experiment"
+read = "exec context creation"
+effect = "0/1/2 sets the compute context-switch preemption mode of the context (WFI/CTA/CILP; NVIDIA's driver sets CTA); unset leaves RM's default."
 
 [env.NVK_RM_TIMESLICE_US]
 class = "experiment"
