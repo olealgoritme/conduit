@@ -5,6 +5,10 @@
 // speed, at a capped frame rate like an fps-locked game.
 //
 //   d3d11_enhance_pattern.exe [seconds=10] [width=1280 height=720] [fps cap=60]
+//                             [resize WxH]
+//
+// With a resize size, the swap chain is resized to it half way through
+// (ResizeBuffers), as a game does when its resolution changes.
 //
 // On DXVK on NVK (HELIOS_ICD=nvk, HELIOS_NVK_ICD=<test vulkan_nouveau.dll>)
 // with MESA_WSI_ENHANCE_SCALER / MESA_WSI_ENHANCE_FG set, DXVK's Vulkan
@@ -18,7 +22,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <mmsystem.h>
-#include <d3d11.h>
+#include <d3d11_1.h>
 #include <d3dcompiler.h>
 #include <dxgi1_2.h>
 
@@ -61,9 +65,11 @@ static ID3DBlob* compile(const char* entry, const char* target) {
 
 int main(int argc, char** argv) {
   const int seconds = argc > 1 ? std::atoi(argv[1]) : 10;
-  const UINT width = argc > 3 ? std::atoi(argv[2]) : 1280;
-  const UINT height = argc > 3 ? std::atoi(argv[3]) : 720;
+  UINT width = argc > 3 ? std::atoi(argv[2]) : 1280;
+  UINT height = argc > 3 ? std::atoi(argv[3]) : 720;
   const double cap = argc > 4 ? std::atof(argv[4]) : 60.0;
+  unsigned rw = 0, rh = 0;
+  if (argc > 5) std::sscanf(argv[5], "%ux%u", &rw, &rh);
 
   timeBeginPeriod(1);
   SetProcessDPIAware();
@@ -122,6 +128,14 @@ int main(int argc, char** argv) {
   cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
   ID3D11Buffer* cb = nullptr;
   dev->CreateBuffer(&cbd, nullptr, &cb);
+  D3D11_RASTERIZER_DESC rsd = {};
+  rsd.FillMode = D3D11_FILL_SOLID;
+  rsd.CullMode = D3D11_CULL_NONE;
+  rsd.DepthClipEnable = TRUE;
+  ID3D11RasterizerState* rs = nullptr;
+  dev->CreateRasterizerState(&rsd, &rs);
+  ID3D11DeviceContext1* ctx1 = nullptr;
+  ctx->QueryInterface(__uuidof(ID3D11DeviceContext1), (void**)&ctx1);
 
   LARGE_INTEGER freq, start, now;
   QueryPerformanceFrequency(&freq);
@@ -147,6 +161,14 @@ int main(int argc, char** argv) {
       t = secs();
     }
 
+    if (rw && t >= seconds / 2.0) {
+      ctx->OMSetRenderTargets(0, nullptr, nullptr);
+      hr = sc->ResizeBuffers(0, rw, rh, DXGI_FORMAT_UNKNOWN, 0);
+      std::printf("ResizeBuffers(%ux%u): 0x%08lx\n", rw, rh, (unsigned long)hr);
+      width = rw;
+      height = rh;
+      rw = 0;
+    }
     ID3D11Texture2D* bb = nullptr;
     sc->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&bb);
     ID3D11RenderTargetView* rtv = nullptr;
@@ -171,7 +193,20 @@ int main(int argc, char** argv) {
     ctx->VSSetShader(vs, nullptr, 0);
     ctx->VSSetConstantBuffers(0, 1, &cb);
     ctx->PSSetShader(ps, nullptr, 0);
+    ctx->RSSetState(rs);
     ctx->Draw(36, 0);
+    if (ctx1) {
+      /* a static "HUD" bar, and a white bar moving at 0.5 widths per second */
+      const float red[4] = {0.9f, 0.1f, 0.1f, 1.0f};
+      const D3D11_RECT hud = {16, 16, LONG(16 + width / 6), LONG(16 + height / 16)};
+      ctx1->ClearView(rtv, red, &hud, 1);
+      const double ph = std::fmod(t * 0.5, 2.0);
+      const LONG bw = LONG(width / 16);
+      const LONG x = LONG((ph < 1.0 ? ph : 2.0 - ph) * double(width - bw));
+      const float white[4] = {1, 1, 1, 1};
+      const D3D11_RECT bar = {x, LONG(height * 3 / 4), x + bw, LONG(height * 3 / 4 + height / 8)};
+      ctx1->ClearView(rtv, white, &bar, 1);
+    }
     rtv->Release();
     bb->Release();
     const double p0 = secs();
