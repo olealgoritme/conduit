@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Ole Algoritme <olealgoritme@gmail.com>
-Date: Sat, 24 Oct 2026 07:49:49 +0200
+Date: Sat, 24 Oct 2026 07:59:42 +0200
 Subject: [PATCH] nak: uniform texture handles, f16 pairing, occupancy-target
  knobs
 
@@ -12,7 +12,9 @@ second source vector, as in the reference compiler's code: a UGPR pair
 (texture index, sampler index) unpacked from NVK's handle, and only with the scalar source form
 (.SCR: one or two components per source register, four in all), which
 also saves the copies that build contiguous vectors.  An instruction
-with more source components keeps the handle in its second vector.  Legalization brings the handle back to
+with more source components, or in divergent control flow (where NAK
+keeps the handle in a GPR), keeps the handle in its second vector; each
+handle is unpacked once per block.  Legalization brings the handle back to
 a UGPR with R2UR if NAK moved it to a GPR.
 
 NAK_REMAT_LD_COST (1-63, default 4): what a rematerialized load costs in
@@ -31,25 +33,46 @@ that many elements with a dynamic index become if/else trees of selects
 (nir_lower_indirect_derefs_to_if_else_trees) instead of scratch loads
 and stores.
 
+NAK_OCC_FS (default off): NAK_OCC_TARGET values a fragment shader's
+warps linearly up to 48 per SM instead of by the square root up to 32.
+
 All of them are in nak_knobs_key2(), so in NVK's pipeline cache keys.
 ---
- src/nouveau/compiler/nak/from_nir.rs       |  48 +++++++-
+ src/nouveau/compiler/nak/from_nir.rs       |  58 +++++++++-
  src/nouveau/compiler/nak/ir.rs             |  31 +++++-
- src/nouveau/compiler/nak/knobs.rs          |  92 ++++++++++++++++
+ src/nouveau/compiler/nak/knobs.rs          | 106 +++++++++++++++++-
  src/nouveau/compiler/nak/nvdisasm_tests.rs |   3 +
- src/nouveau/compiler/nak/occ_target.rs     |  17 +++
+ src/nouveau/compiler/nak/occ_target.rs     |  26 ++++-
  src/nouveau/compiler/nak/sm70_encode.rs    |  50 +++++++--
  src/nouveau/compiler/nak/spill_remat.rs    |   3 +-
  src/nouveau/compiler/nak_nir.c             | 122 +++++++++++++++++++++
- src/nouveau/compiler/nak_nir_lower_tex.c   |  46 ++++++++
+ src/nouveau/compiler/nak_nir_lower_tex.c   |  51 +++++++++
  src/nouveau/compiler/nak_private.h         |   3 +
- 10 files changed, 403 insertions(+), 12 deletions(-)
+ 10 files changed, 438 insertions(+), 15 deletions(-)
 
 diff --git a/src/nouveau/compiler/nak/from_nir.rs b/src/nouveau/compiler/nak/from_nir.rs
-index dac9df5..ab5c742 100644
+index dac9df5..4bb0eeb 100644
 --- a/src/nouveau/compiler/nak/from_nir.rs
 +++ b/src/nouveau/compiler/nak/from_nir.rs
-@@ -1994,12 +1994,55 @@ impl<'a> ShaderFromNir<'a> {
+@@ -387,6 +387,9 @@ struct ShaderFromNir<'a> {
+     end_block_id: u32,
+     ssa_map: FxHashMap<u32, Vec<SSAValue>>,
+     saturated: FxHashSet<*const nir_def>,
++    /// NAK_TEX_UHANDLE: the (texture, sampler) UGPR pairs unpacked in the
++    /// current block, by the handle's SSA index (cleared per block)
++    tex_handle_pairs: FxHashMap<u32, SSARef>,
+     /// Only made for NAK_DEBUG=annotate: on Windows a memstream is a file
+     /// in %TEMP%, which a sandboxed process may not create.
+     nir_instr_printer: Option<NirInstrPrinter>,
+@@ -430,6 +433,7 @@ impl<'a> ShaderFromNir<'a> {
+             end_block_id: 0,
+             ssa_map: Default::default(),
+             saturated: Default::default(),
++            tex_handle_pairs: Default::default(),
+             nir_instr_printer: None,
+         }
+     }
+@@ -1994,12 +1998,60 @@ impl<'a> ShaderFromNir<'a> {
              _ => panic!("Unsupported texture dimension: {}", tex.sampler_dim),
          };
  
@@ -84,6 +107,9 @@ index dac9df5..ab5c742 100644
 +                    });
 +                    u
 +                };
++                if let Some(pair) = self.tex_handle_pairs.get(&h.idx()) {
++                    pair.clone().into()
++                } else {
 +                let pair = b.alloc_ssa_vec(RegFile::UGPR, 2);
 +                b.push_op(OpLop3 {
 +                    dst: pair[0].into(),
@@ -100,13 +126,15 @@ index dac9df5..ab5c742 100644
 +                    data_type: IntType::U32,
 +                    dst_high: false,
 +                });
++                self.tex_handle_pairs.insert(h.idx(), pair.clone());
 +                pair.into()
++                }
 +            }
 +        };
  
          let flags: nak_nir_tex_flags =
              unsafe { std::mem::transmute_copy(&tex.backend_flags) };
-@@ -2162,6 +2205,7 @@ impl<'a> ShaderFromNir<'a> {
+@@ -2162,6 +2214,7 @@ impl<'a> ShaderFromNir<'a> {
                      nodep: flags.nodep(),
                      channel_mask,
                      scalar: flags.scalar(),
@@ -114,7 +142,7 @@ index dac9df5..ab5c742 100644
                  });
              } else if tex.op == nir_texop_tg4 {
                  b.push_op(OpTld4 {
-@@ -2177,6 +2221,7 @@ impl<'a> ShaderFromNir<'a> {
+@@ -2177,6 +2230,7 @@ impl<'a> ShaderFromNir<'a> {
                      nodep: flags.nodep(),
                      channel_mask,
                      scalar: flags.scalar(),
@@ -122,7 +150,7 @@ index dac9df5..ab5c742 100644
                  });
              } else {
                  assert!(offset_mode != TexOffsetMode::PerPx);
-@@ -2194,6 +2239,7 @@ impl<'a> ShaderFromNir<'a> {
+@@ -2194,6 +2248,7 @@ impl<'a> ShaderFromNir<'a> {
                      nodep: flags.nodep(),
                      channel_mask,
                      scalar: flags.scalar(),
@@ -130,6 +158,14 @@ index dac9df5..ab5c742 100644
                  });
              }
          }
+@@ -4393,6 +4448,7 @@ impl<'a> ShaderFromNir<'a> {
+     ) {
+         let sm = self.sm;
+         let mut b = SSAInstrBuilder::new(sm, ssa_alloc);
++        self.tex_handle_pairs.clear();
+ 
+         if self.sm.sm() >= 70 && nb.index == 0 && self.nir.info.shared_size > 0
+         {
 diff --git a/src/nouveau/compiler/nak/ir.rs b/src/nouveau/compiler/nak/ir.rs
 index a66fcde..9bcb3bf 100644
 --- a/src/nouveau/compiler/nak/ir.rs
@@ -208,10 +244,10 @@ index a66fcde..9bcb3bf 100644
  }
  impl_display_for_op!(OpTld4);
 diff --git a/src/nouveau/compiler/nak/knobs.rs b/src/nouveau/compiler/nak/knobs.rs
-index b5759bb..3810a18 100644
+index b5759bb..f70a121 100644
 --- a/src/nouveau/compiler/nak/knobs.rs
 +++ b/src/nouveau/compiler/nak/knobs.rs
-@@ -103,6 +103,11 @@ static BAR_SHARE: OnceLock<bool> = OnceLock::new();
+@@ -103,6 +103,12 @@ static BAR_SHARE: OnceLock<bool> = OnceLock::new();
  static LAT_MASK: OnceLock<u32> = OnceLock::new();
  static UNROLL_MAX: OnceLock<u32> = OnceLock::new();
  static VEC_CSE: OnceLock<bool> = OnceLock::new();
@@ -220,10 +256,11 @@ index b5759bb..3810a18 100644
 +static OCC_GPRS: OnceLock<u32> = OnceLock::new();
 +static F16_PAIR: OnceLock<bool> = OnceLock::new();
 +static TEMP_IF_ELSE: OnceLock<u32> = OnceLock::new();
++static OCC_FS: OnceLock<bool> = OnceLock::new();
  static WEAK_MEM: OnceLock<bool> = OnceLock::new();
  static UNIFORM_ATOMICS: OnceLock<bool> = OnceLock::new();
  static F16_CVT: OnceLock<bool> = OnceLock::new();
-@@ -135,6 +140,87 @@ pub extern "C" fn nak_knob_gcm() -> u32 {
+@@ -135,6 +141,95 @@ pub extern "C" fn nak_knob_gcm() -> u32 {
      gcm()
  }
  
@@ -291,6 +328,14 @@ index b5759bb..3810a18 100644
 +    temp_if_else()
 +}
 +
++/// NAK_OCC_FS (default off): NAK_OCC_TARGET values the warps of a fragment
++/// shader linearly up to 48 per SM instead of by the square root up to 32
++/// (occ_target.rs): texture-latency-bound fragment shaders gain from every
++/// warp (64f4175a: 72 -> 56 GPRs, 28 -> 36 warps, 7.6% faster)
++pub fn occ_fs() -> bool {
++    *OCC_FS.get_or_init(|| parse("NAK_OCC_FS", env::var("NAK_OCC_FS"), false))
++}
++
 +/// NAK_REMAT_LD_COST (1-63, default 4): what a rematerialized global or
 +/// constant load costs in the spiller and in the occupancy target's dry run
 +/// (spill_remat::op_cost).  A memory fill costs 8; a reload that is a load
@@ -311,7 +356,15 @@ index b5759bb..3810a18 100644
  /// NAK_SCHED_ILP (default off): the prepass enters an instruction in its
  /// future-ready set at the cycle its edge latencies give, as NAK_SCHED_MLP
  /// does, but keeps the plain latency model.  Without it a producer is ready
-@@ -186,6 +272,12 @@ pub extern "C" fn nak_knobs_key2() -> u32 {
+@@ -179,13 +274,22 @@ pub fn sched_free() -> i32 {
+ /// NAK_FSET_BF, NAK_SCHED_ILP
+ #[unsafe(no_mangle)]
+ pub extern "C" fn nak_knobs_key2() -> u32 {
+-    u32::from(ra_lru())
++    let key = u32::from(ra_lru())
+         | (u32::from(reuse()) << 1)
+         | (u32::from(sm120_yield()) << 2)
+         | ((sched_free() as u32) << 3)
          | (u32::from(fset_bf()) << 8)
          | (u32::from(sched_ilp()) << 9)
          | (gcm() << 10)
@@ -321,6 +374,9 @@ index b5759bb..3810a18 100644
 +        | (u32::from(f16_pair()) << 28)
 +        // 0, 2..64 as 0, 1..6 in three bits
 +        | ((if temp_if_else() == 0 { 0 } else { temp_if_else().trailing_zeros() }) << 29)
++        ;
++    // no free bit left: NAK_OCC_FS is mixed in
++    key ^ if occ_fs() { 0x9e37_79b9 } else { 0 }
  }
  
  /// NAK_YIELD (default off, experimental, SM120): control bit 109 set on
@@ -353,7 +409,7 @@ index 846a1f6..51a9b29 100644
                  c.push(
                      instr,
 diff --git a/src/nouveau/compiler/nak/occ_target.rs b/src/nouveau/compiler/nak/occ_target.rs
-index 48ca45c..18095ba 100644
+index 48ca45c..0b4fb13 100644
 --- a/src/nouveau/compiler/nak/occ_target.rs
 +++ b/src/nouveau/compiler/nak/occ_target.rs
 @@ -158,6 +158,23 @@ impl Shader<'_> {
@@ -380,6 +436,25 @@ index 48ca45c..18095ba 100644
          // Occupancy cliffs below the natural count
          let mut cands = Vec::new();
          let mut a = natural;
+@@ -184,11 +201,16 @@ impl Shader<'_> {
+         let work = max(work, 1) as f64;
+ 
+         let num_ugprs = self.sm.num_regs(RegFile::UGPR);
+-        let sat = |w: u32| f64::from(min(w, SATURATION_WARPS));
++        // NAK_OCC_FS: fragment shaders gain from every warp up to 48
++        let fs_linear = crate::knobs::occ_fs()
++            && matches!(self.info.stage, ShaderStageInfo::Fragment(_));
++        let sat_warps = if fs_linear { 48 } else { SATURATION_WARPS };
++        let sat = |w: u32| f64::from(min(w, sat_warps));
+         let mut best: Option<(f64, u32)> = None;
+         for a in cands {
+             let warps = self.occupancy(a);
+-            let benefit = (sat(warps) / sat(w0)).sqrt();
++            let ratio = sat(warps) / sat(w0);
++            let benefit = if fs_linear { ratio } else { ratio.sqrt() };
+             if benefit <= MIN_GAIN {
+                 continue;
+             }
 diff --git a/src/nouveau/compiler/nak/sm70_encode.rs b/src/nouveau/compiler/nak/sm70_encode.rs
 index f0af793..7ad9a55 100644
 --- a/src/nouveau/compiler/nak/sm70_encode.rs
@@ -653,7 +728,7 @@ index b577050..8d4d464 100644
        OPT(nir, nir_lower_vars_to_explicit_types, nir_var_function_temp,
            glsl_get_natural_size_align_bytes);
 diff --git a/src/nouveau/compiler/nak_nir_lower_tex.c b/src/nouveau/compiler/nak_nir_lower_tex.c
-index 8343644..c2efc5f 100644
+index 8343644..5d54e18 100644
 --- a/src/nouveau/compiler/nak_nir_lower_tex.c
 +++ b/src/nouveau/compiler/nak_nir_lower_tex.c
 @@ -215,6 +215,12 @@ lower_tex(nir_builder *b, nir_tex_instr *tex, const struct nak_compiler *nak)
@@ -669,7 +744,7 @@ index 8343644..c2efc5f 100644
     /* Combine sampler and texture into one if needed */
     if (samp_h != NULL && samp_h != tex_h) {
        tex_h = nir_ior(b, nir_iand_imm(b, tex_h,  0x000fffff),
-@@ -227,6 +233,20 @@ lower_tex(nir_builder *b, nir_tex_instr *tex, const struct nak_compiler *nak)
+@@ -227,6 +233,25 @@ lower_tex(nir_builder *b, nir_tex_instr *tex, const struct nak_compiler *nak)
        tex_h = NULL;
     }
  
@@ -682,7 +757,12 @@ index 8343644..c2efc5f 100644
 +   const bool uh_op = uh_knob >= 2 ? texop_supports_scalar(tex, nak) :
 +                      uh_knob == 1 && (tex->op == nir_texop_txf ||
 +                                       tex->op == nir_texop_txf_ms);
-+   if (tex_h != NULL && uniform_h && nak->sm >= 100 && uh_op) {
++   /* Only in uniform control flow: in divergent control flow NAK keeps the
++    * handle in a GPR and every texture instruction would need R2UR and the
++    * unpack (88825d04: 121 R2UR, +22% time)
++    */
++   if (tex_h != NULL && uniform_h && !tex->instr.block->divergent &&
++       nak->sm >= 100 && uh_op) {
 +      uhandle = tex_h;
 +      tex_h = NULL;
 +   }
@@ -690,7 +770,7 @@ index 8343644..c2efc5f 100644
     /* Array index is treated separately, so pull it off if we have one. */
     nir_def *arr_idx = NULL;
     unsigned coord_components = tex->coord_components;
-@@ -375,7 +395,30 @@ lower_tex(nir_builder *b, nir_tex_instr *tex, const struct nak_compiler *nak)
+@@ -375,7 +400,30 @@ lower_tex(nir_builder *b, nir_tex_instr *tex, const struct nak_compiler *nak)
              PUSH(src1, ms_idx);
        }
  
@@ -721,7 +801,7 @@ index 8343644..c2efc5f 100644
  
        nir_tex_instr_add_src(tex, nir_tex_src_backend1,
                              nir_vec(b, src0, src0_comps));
-@@ -443,6 +486,9 @@ lower_tex(nir_builder *b, nir_tex_instr *tex, const struct nak_compiler *nak)
+@@ -443,6 +491,9 @@ lower_tex(nir_builder *b, nir_tex_instr *tex, const struct nak_compiler *nak)
        UNREACHABLE("Unsupported shader model");
     }
  
