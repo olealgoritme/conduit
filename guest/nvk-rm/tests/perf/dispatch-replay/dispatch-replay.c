@@ -174,6 +174,8 @@ struct res {
     /* draws: an attachment (1 color, 2 depth, 3 stencil), its index and view format; or the index buffer (4), a
      * vertex buffer (5, attachment = its binding), the indirect records (6), the draw count (7) */
     int role; uint32_t attachment; VkFormat att_format; VkImageAspectFlags att_aspects; int att_shared;
+    /* --seq: the same resource as resource same_id of capture same_capture of the sequence */
+    uint32_t same_capture, same_id; int shared;
 };
 
 struct binding {
@@ -234,6 +236,10 @@ static void load_manifest(struct json *m)
         r->push_offset = jget(j, "push_offset") ? (int)jnum(j, "push_offset", -1) : -1;
         r->writable = jbool(j, "writable", 0);
         r->file = jstr(j, "file", NULL); r->size = ju64(j, "size", 0); r->note = jstr(j, "note", NULL);
+        if (jget(j, "same_as")) {
+            r->same_capture = (uint32_t)jnum(jget(j, "same_as"), "capture", 0);
+            r->same_id = (uint32_t)jnum(jget(j, "same_as"), "resource", 0);
+        }
         {
             const char *role = jstr(j, "role", "");
             r->role = !strcmp(role, "color") ? 1 : !strcmp(role, "depth") ? 2 : !strcmp(role, "stencil") ? 3 :
@@ -550,6 +556,14 @@ static void create_resources(uint8_t *push)
 {
     for (int i = 0; i < NR; i++) {
         struct res *r = &R[i];
+        if (r->shared) { /* --seq: an earlier capture's resource; only its address goes into the push constants */
+            if (r->kind == R_BDA && r->push_offset >= 0 && r->push_offset + 8 <= 256 && r->buf) {
+                VkBufferDeviceAddressInfo bi = { VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, NULL, r->buf };
+                uint64_t va = vkGetBufferDeviceAddress(g_dev, &bi);
+                memcpy(push + r->push_offset, &va, 8);
+            }
+            continue;
+        }
         switch (r->kind) {
         case R_IMAGE:
             if (r->role) create_attachment(r); else create_image(r);
@@ -605,6 +619,7 @@ static void record_restore(VkCommandBuffer cb, int writable_only)
     for (int i = 0; i < NR; i++) {
         struct res *r = &R[i];
         if (writable_only && !r->writable) continue;
+        if (r->shared) continue;
         VkBuffer src = writable_only && r->pristine ? r->pristine : r->stage;
         if (r->kind == R_IMAGE) {
             VkBufferImageCopy rg[MAX_SUB]; copy_regions(r, rg);
@@ -620,7 +635,7 @@ static void upload_all(void)
 {
     VkCommandBuffer cb = begin_cmd();
     VkImageMemoryBarrier ib[MAX_RES]; uint32_t nib = 0;
-    for (int i = 0; i < NR; i++) if (R[i].kind == R_IMAGE && !R[i].att_shared)
+    for (int i = 0; i < NR; i++) if (R[i].kind == R_IMAGE && !R[i].att_shared && !R[i].shared)
         ib[nib++] = (VkImageMemoryBarrier){ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
             VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, R[i].img,
             { R[i].role ? R[i].att_aspects : R[i].aspect, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS } };
@@ -628,7 +643,7 @@ static void upload_all(void)
     record_restore(cb, 0);
     for (int i = 0; i < NR; i++) {
         struct res *r = &R[i];
-        if (!r->writable || !r->stage) continue;
+        if (!r->writable || !r->stage || r->shared) continue;
         r->pristine = make_buffer(r->stage_size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                                   VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, NULL);
         VkBufferCopy c = { 0, 0, r->stage_size };
@@ -942,6 +957,7 @@ struct seq_item {
     char *dir; uint32_t index; int barrier; char hash[32];
     VkPipeline pipe; VkPipelineLayout pl; VkDescriptorSet sets[8]; uint32_t nsets;
     uint8_t push[256]; uint32_t push_size; uint32_t base[3], grid[3];
+    uint32_t capture; struct res *res; int nres; /* the capture's resources, for later captures' "same_as" */
 };
 
 static int cmp_seq(const void *a, const void *b)
@@ -989,6 +1005,26 @@ static int run_seq(int ndirs, char **dirs)
                                              g_dir, it->grid[0], it->grid[1], it->grid[2]);
         NR = 0; NB = 0; memset(B, 0, sizeof B);
         load_manifest(m);
+        it->capture = (uint32_t)jnum(m, "capture", 0);
+        /* resources an earlier capture of the sequence has: share its objects */
+        int nshared = 0;
+        for (int k = 0; k < NR; k++) {
+            struct res *r = &R[k];
+            if (!r->same_capture) continue;
+            const struct res *o = NULL;
+            for (int e = 0; e < d && !o; e++)
+                if (S[e].capture == r->same_capture)
+                    for (int q = 0; q < S[e].nres; q++)
+                        if (S[e].res[q].id == (int)r->same_id) { o = &S[e].res[q]; break; }
+            if (!o) { fprintf(stderr, "%s: r%03d: capture %u is not in the list; the resource stays empty\n", g_dir, r->id,
+                              r->same_capture); continue; }
+            r->img = o->img; r->buf = o->buf; r->bview = o->bview; r->alloc_size = o->alloc_size;
+            if (!r->sampler) r->sampler = o->sampler;
+            /* an image view of its own (same image, possibly another view type or swizzle): reuse the view */
+            r->view = o->view;
+            r->shared = 1; nshared++;
+        }
+        if (nshared) fprintf(stderr, "%s: %d resources shared with earlier dispatches\n", g_dir, nshared);
         create_pipeline(spv, spv_size, it->push_size);
         compile_ms += g_compile_ms;
         create_resources(it->push);
@@ -996,6 +1032,7 @@ static int run_seq(int ndirs, char **dirs)
         write_descriptors();
         for (int k = 0; k < NR; k++) { bytes += R[k].size; nerr += R[k].kind == R_ERROR; }
         nres += NR;
+        it->nres = NR; it->res = malloc(sizeof(struct res) * (size_t)NR); memcpy(it->res, R, sizeof(struct res) * (size_t)NR);
         it->pipe = g_pipe; it->pl = g_pl; it->nsets = g_nsets; memcpy(it->sets, g_sets, sizeof it->sets);
     }
     qsort(S, (size_t)ndirs, sizeof *S, cmp_seq);
