@@ -19,6 +19,7 @@ predicated code) on the GPU before any of them is turned on by default.
 | `uniform0-2` | a chain on push constants only (uniform datapath) |
 | `loads8..32` | 8 to 32 independent loads in flight, consumed in shuffled order (scoreboards) |
 | `wgsync` | invocations of a workgroup exchange values through the storage buffer around barriers (`NAK_WEAK_MEM`) |
+| `tld_arr_lod`, `tex_arr_lod`, `tex_arr_off`, `tld4_arr`, `tld4_arr_off`, `tex_dc_arr`, `tex_dc_arr_off` | texel fetches, explicit-level samples, gathers and depth compares from a 2D array texture and a depth texture whose handles come from the descriptor set: the source layouts (2+1, 2+2 and 5 components) that `NAK_TEX_UHANDLE` turns into the scalar form with the handle in a uniform register |
 
 ## Build and run
 
@@ -34,6 +35,7 @@ naktest.exe
 set NAK_LAT=95 & naktest.exe
 set NAK_BAR_SHARE=1 & naktest.exe
 set NAK_WEAK_MEM=1 & naktest.exe
+set NAK_TEX_UHANDLE=1 & naktest.exe
 set NAK_LAT=128 & naktest.exe      rem unsafe upper bound: failures expected
 ```
 
