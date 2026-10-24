@@ -29,8 +29,8 @@ Classes:
 |---|---:|---:|---:|---:|---:|---:|
 | KMD: service key | 7 | 27 | 26 | 28 | 12 | 100 |
 | UMDs and ICD policy: `HKLM\SOFTWARE\Helios` | 20 | 19 | 25 | 11 | 0 | 75 |
-| Environment variables | 8 | 33 | 102 | 31 | 0 | 174 |
-| All | 35 | 79 | 153 | 70 | 12 | 349 |
+| Environment variables | 8 | 33 | 104 | 31 | 0 | 176 |
+| All | 35 | 79 | 155 | 70 | 12 | 351 |
 
 ## What the installation writes
 
@@ -339,7 +339,7 @@ Per-process: they act only on the process whose environment carries them (and it
 | `NVK_UBO_DESC_CBUF` | `false` / `true` (differs by read site); 0 on Windows, 1 elsewhere | physical device creation | 1 promotes uniform buffer descriptors to bound constant buffers as upstream NVK does; 0 keeps them as descriptors. | [0051-nvk-on-Windows-UBO-descriptors-are-not-promoted-to-b.patch:88](../guest/nvk-rm/patches-windows/0051-nvk-on-Windows-UBO-descriptors-are-not-promoted-to-b.patch#L88), [0051-nvk-on-Windows-UBO-descriptors-are-not-promoted-to-b.patch:90](../guest/nvk-rm/patches-windows/0051-nvk-on-Windows-UBO-descriptors-are-not-promoted-to-b.patch#L90) |
 | `NVK_ZERO_PAGE_VRAM` | `true` | device creation | 1 places the zero page that null descriptors and buffers read in VRAM; 0 keeps it in system memory. | [0041-nvk-null-vertex-buffers-and-the-zero-page-in-VRAM.patch:94](../guest/nvk-rm/patches-common/0041-nvk-null-vertex-buffers-and-the-zero-page-in-VRAM.patch#L94) |
 
-### Debug / diagnostic (102)
+### Debug / diagnostic (104)
 
 | Name | Default (code) | Read | Effect | Source |
 |---|---|---|---|---|
@@ -423,6 +423,8 @@ Per-process: they act only on the process whose environment carries them (and it
 | `NVK_PASS_DUMP_FILE` | `unset` | once per process | Path of the NVK_PASS_PROFILE=5 dump file; unset uses a default file under the Helios log directory. | [0039-nvk-NVK_PASS_PROFILE-5-dumps-one-render-pass-s-draws.patch:393](../guest/nvk-rm/patches-common/0039-nvk-NVK_PASS_PROFILE-5-dumps-one-render-pass-s-draws.patch#L393) |
 | `NVK_PASS_PROFILE` | `0` | device creation | GPU time per render pass and command buffer: 0 off, 1 timings, higher levels add work outside passes, ZCULL counters (3), method histograms (4) and a single-pass draw dump (5). | [0023-nvk-NVK_PASS_PROFILE-times-work-outside-render-passe.patch:733](../guest/nvk-rm/patches-common/0023-nvk-NVK_PASS_PROFILE-times-work-outside-render-passe.patch#L733) |
 | `NVK_PASS_PROFILE_FILE` | `unset` | device creation | Full path the NVK_PASS_PROFILE and NVK_DISPATCH_PROFILE lines are written to; unset uses a default file under the Helios log directory on Windows. | [0010-nvk-GPU-time-per-render-pass-and-command-buffer-behi.patch:391](../guest/nvk-rm/patches-common/0010-nvk-GPU-time-per-render-pass-and-command-buffer-behi.patch#L391) |
+| `NVK_PUSH_DUMP_FILE` | `unset` | when the NVK_PUSH_DUMP_WINDOW window opens | With NVK_PUSH_DUMP_WINDOW: the file the window's pushbuffers are printed to. Unset: nvk-push-&lt;pid&gt;.txt in the current directory. | [0090-nvk-NVK_PUSH_DUMP_WINDOW-the-pushbuffers-of-a-time-w.patch:60](../guest/nvk-rm/patches-common/0090-nvk-NVK_PUSH_DUMP_WINDOW-the-pushbuffers-of-a-time-w.patch#L60) |
+| `NVK_PUSH_DUMP_WINDOW` | `unset` | first submit (once per process) | START_S,DURATION_MS: every pushbuffer executed from START_S seconds after the first submit for DURATION_MS milliseconds is printed to NVK_PUSH_DUMP_FILE with its submit time and context: one or two frames of a game instead of NVK_DEBUG=push_dump for the whole run. | [0090-nvk-NVK_PUSH_DUMP_WINDOW-the-pushbuffers-of-a-time-w.patch:44](../guest/nvk-rm/patches-common/0090-nvk-NVK_PUSH_DUMP_WINDOW-the-pushbuffers-of-a-time-w.patch#L44) |
 | `NVK_RM_COMPRESS_CLEAR` | `unset` | per memory allocation | Nonzero clears compressible memory once through its compressible address at allocation, so no page keeps an earlier owner's compression state. | [0015-nvk-nvk-rm-compression-diagnostics-and-a-clear-on-al.patch:43](../guest/nvk-rm/patches-common/0015-nvk-nvk-rm-compression-diagnostics-and-a-clear-on-al.patch#L43), [0015-nvk-nvk-rm-compression-diagnostics-and-a-clear-on-al.patch:44](../guest/nvk-rm/patches-common/0015-nvk-nvk-rm-compression-diagnostics-and-a-clear-on-al.patch#L44) |
 | `NVK_RM_COMPRESS_TYPE_SCOPE` | `unset` | per image memory requirements query | attachments offers the compressible memory type only to images that are compressed themselves (a diagnostic that departs from the spec); unset offers it to all optimal-tiling images. | [0015-nvk-nvk-rm-compression-diagnostics-and-a-clear-on-al.patch:72](../guest/nvk-rm/patches-common/0015-nvk-nvk-rm-compression-diagnostics-and-a-clear-on-al.patch#L72) |
 | `NVK_RM_COMPRESS_UPGRADE` | `true` | first compressible VA bind (once per process) | 0 keeps images that are bound to compressible memory without being compressed themselves on the uncompressed kind on their own VA; 1 gives them the compressible kind. See [README](../guest/nvk-rm/README.md). | [0015-nvk-nvk-rm-compression-diagnostics-and-a-clear-on-al.patch:96](../guest/nvk-rm/patches-common/0015-nvk-nvk-rm-compression-diagnostics-and-a-clear-on-al.patch#L96) |

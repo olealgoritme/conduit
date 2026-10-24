@@ -1502,6 +1502,16 @@ class = "debug"
 read = "device creation; the file is checked at most every 250 ms"
 effect = "With NVK_DISPATCH_CAPTURE: path of a file whose creation arms the capture (after the delay), to pick the moment in a running game; unset: armed by the delay alone."
 
+[env.NVK_PUSH_DUMP_WINDOW]
+class = "debug"
+read = "first submit (once per process)"
+effect = "START_S,DURATION_MS: every pushbuffer executed from START_S seconds after the first submit for DURATION_MS milliseconds is printed to NVK_PUSH_DUMP_FILE with its submit time and context: one or two frames of a game instead of NVK_DEBUG=push_dump for the whole run."
+
+[env.NVK_PUSH_DUMP_FILE]
+class = "debug"
+read = "when the NVK_PUSH_DUMP_WINDOW window opens"
+effect = "With NVK_PUSH_DUMP_WINDOW: the file the window's pushbuffers are printed to. Unset: nvk-push-<pid>.txt in the current directory."
+
 [env.NVK_DISPATCH_PROFILE]
 class = "debug"
 read = "device creation"
