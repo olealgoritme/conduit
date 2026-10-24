@@ -1,4 +1,4 @@
-/* dispatch-replay: run one captured compute dispatch (NVK_DISPATCH_CAPTURE) on any Vulkan driver.
+/* dispatch-replay: run one captured compute dispatch or draw (NVK_DISPATCH_CAPTURE) on any Vulkan driver.
  *
  * Loads a capture directory (manifest.json, shader.spv, push.bin, r<N>.bin), creates every resource the
  * shader reads with the captured format, size and contents, builds the compute pipeline from the captured
@@ -7,6 +7,10 @@
  * time per dispatch (timestamps; median of N) and a checksum of everything the shader may write.
  * Writable resources are restored to the captured contents before every dispatch (--no-reset: not), so
  * every dispatch, and the checksum, start from the captured state.
+ *
+ * A draw capture ("kind": "draw") is replayed as the same draw: a graphics pipeline from the captured
+ * vertex and fragment shaders with the captured state, dynamic rendering into attachments with the
+ * captured formats and contents (load and store), timed from before the render pass to after it.
  *
  *   dispatch-replay [options] CAPTURE_DIR
  *
@@ -46,7 +50,10 @@
  X(vkCmdPipelineBarrier) X(vkCmdCopyBuffer) X(vkCmdCopyBufferToImage) X(vkCmdCopyImageToBuffer) X(vkCmdFillBuffer) \
  X(vkCmdResetQueryPool) X(vkCmdWriteTimestamp) X(vkCreateQueryPool) X(vkGetQueryPoolResults) X(vkQueueSubmit) \
  X(vkCreateFence) X(vkWaitForFences) X(vkResetFences) X(vkDeviceWaitIdle) \
- X(vkCreatePipelineCache) X(vkGetPipelineCacheData)
+ X(vkCreatePipelineCache) X(vkGetPipelineCacheData) \
+ X(vkCreateGraphicsPipelines) X(vkCmdBeginRendering) X(vkCmdEndRendering) X(vkCmdDraw) X(vkCmdSetViewport) \
+ X(vkCmdSetScissor) X(vkCmdDrawIndexed) X(vkCmdBindIndexBuffer) X(vkCmdBindVertexBuffers) X(vkCmdDrawIndirect) \
+ X(vkCmdDrawIndexedIndirect) X(vkCmdDrawIndirectCount) X(vkCmdDrawIndexedIndirectCount)
 #define X(n) static PFN_##n n;
 VKFUNCS(X)
 #undef X
@@ -108,10 +115,10 @@ static uint64_t fnv64(const void *data, uint64_t n, uint64_t h)
 
 /* ------------------------------------------------------------------------------------------- options */
 static struct {
-    int n, warm, reset, compile_only, list, robust, verbose;
+    int n, warm, reset, compile_only, list, robust, verbose, no_draw, split, ts_only;
     const char *dev, *dump, *csv, *label, *dump_cache;
     int grid_override; uint32_t grid[3];
-} O = { 15, 5, 1, 0, 0, 1, 0, NULL, NULL, NULL, NULL, NULL, 0, { 0, 0, 0 } };
+} O = { 15, 5, 1, 0, 0, 1, 0, 0, 0, 0, NULL, NULL, NULL, NULL, NULL, 0, { 0, 0, 0 } };
 
 static void usage(void)
 {
@@ -120,6 +127,9 @@ static void usage(void)
         "  -n N            timed dispatches (default 15; the median is reported)\n"
         "  -w N            warm-up dispatches before them (default 5)\n"
         "  --no-reset      do not restore writable resources before each dispatch\n"
+        "  --no-draw       draws: time the render pass alone (attachment load and store), without the draw\n"
+        "  --split         draws: also timestamps inside the render pass: begin, draw, end reported apart\n"
+        "  --ts-only       draws: two timestamps with nothing between them, after an untimed empty render pass\n"
         "  --dev STR       device whose name contains STR (default: first NVIDIA-vendor device)\n"
         "  --list          list the devices and exit\n"
         "  --dump DIR      write what the shader may write, after the last dispatch, as DIR/r<N>.out.bin\n"
@@ -157,6 +167,9 @@ struct res {
     VkBuffer stage; uint8_t *stage_map; uint64_t alloc_size, stage_size;
     VkBuffer pristine; /* device-local copy of the captured bytes of a writable resource, for resets */
     VkBuffer rb; uint8_t *rb_map;
+    /* draws: an attachment (1 color, 2 depth, 3 stencil), its index and view format; or the index buffer (4), a
+     * vertex buffer (5, attachment = its binding), the indirect records (6), the draw count (7) */
+    int role; uint32_t attachment; VkFormat att_format; VkImageAspectFlags att_aspects; int att_shared;
 };
 
 struct binding {
@@ -217,6 +230,14 @@ static void load_manifest(struct json *m)
         r->push_offset = jget(j, "push_offset") ? (int)jnum(j, "push_offset", -1) : -1;
         r->writable = jbool(j, "writable", 0);
         r->file = jstr(j, "file", NULL); r->size = ju64(j, "size", 0); r->note = jstr(j, "note", NULL);
+        {
+            const char *role = jstr(j, "role", "");
+            r->role = !strcmp(role, "color") ? 1 : !strcmp(role, "depth") ? 2 : !strcmp(role, "stencil") ? 3 :
+                      !strcmp(role, "index") ? 4 : !strcmp(role, "vertex") ? 5 : !strcmp(role, "indirect") ? 6 :
+                      !strcmp(role, "count") ? 7 : 0;
+            r->attachment = (uint32_t)jnum(j, "attachment", 0);
+            r->att_format = (VkFormat)jnum(j, "attachment_format", 0);
+        }
         if (r->kind == R_IMAGE) {
             r->itype = (VkImageType)jnum(j, "image_type", 1); r->vtype = (VkImageViewType)jnum(j, "view_type", 1);
             r->ifmt = (VkFormat)jnum(j, "image_format", 0); r->vfmt = (VkFormat)jnum(j, "view_format", 0);
@@ -359,6 +380,8 @@ static void create_device(void)
     if (have_md) exts[nexts++] = "VK_EXT_mutable_descriptor_type"; else if (have_vmd) exts[nexts++] = "VK_VALVE_mutable_descriptor_type";
     if (have_fc2) exts[nexts++] = "VK_KHR_shader_float_controls2";
     if (have_rb2) exts[nexts++] = "VK_EXT_robustness2";
+    int have_vad = has_ext(ep, ne, "VK_EXT_vertex_attribute_divisor"); /* draws with instance step rates */
+    if (have_vad) exts[nexts++] = "VK_EXT_vertex_attribute_divisor";
     free(ep);
 
     struct { VkStructureType s; void *p; VkBool32 fc2; } fc2f = { (VkStructureType)1000528000, NULL, 0 };
@@ -366,6 +389,9 @@ static void create_device(void)
     VkPhysicalDeviceMutableDescriptorTypeFeaturesEXT mdf = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MUTABLE_DESCRIPTOR_TYPE_FEATURES_EXT,
                                                              have_rb2 ? (void *)&rb2 : (have_fc2 ? (void *)&fc2f : NULL) };
     VkPhysicalDeviceVulkan13Features f13 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, (have_md || have_vmd) ? (void *)&mdf : mdf.pNext };
+    VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT vadf = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT,
+                                                               f13.pNext };
+    if (have_vad) f13.pNext = &vadf;
     VkPhysicalDeviceVulkan12Features f12 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &f13 };
     VkPhysicalDeviceVulkan11Features f11 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, &f12 };
     VkPhysicalDeviceFeatures2 f2 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &f11 };
@@ -441,6 +467,40 @@ static void create_image(struct res *r)
     VK(vkCreateImageView(g_dev, &vc, NULL, &r->view));
 }
 
+/* A color, depth or stencil attachment: an image of the captured image format (depth and stencil of one
+ * depth/stencil image share it), a view of the attachment format */
+static void create_attachment(struct res *r)
+{
+    if (r->role == 3 || r->role == 2) {
+        for (int i = 0; i < NR; i++) {
+            struct res *o = &R[i];
+            if (o != r && (o->role == 2 || o->role == 3) && o->img && o->ifmt == r->ifmt) {
+                r->img = o->img; r->view = o->view; r->att_aspects = o->att_aspects; r->att_shared = 1; return;
+            }
+        }
+    }
+    VkImageUsageFlags usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+        (r->role == 1 ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT : VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT);
+    VkImageCreateFlags flags = r->role == 1 && r->att_format != r->ifmt ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0;
+    VkImageCreateInfo ic = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, NULL, flags, VK_IMAGE_TYPE_2D, r->ifmt,
+                             { r->ext[0], r->ext[1], 1 }, r->mips, r->layers, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
+                             usage, VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED };
+    VK(vkCreateImage(g_dev, &ic, NULL, &r->img));
+    VkMemoryRequirements mr; vkGetImageMemoryRequirements(g_dev, r->img, &mr);
+    VkMemoryAllocateInfo ai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, mr.size,
+                                mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) };
+    VkDeviceMemory m; VK(vkAllocateMemory(g_dev, &ai, NULL, &m)); VK(vkBindImageMemory(g_dev, r->img, m, 0));
+    VkImageAspectFlags aspects = r->role == 1 ? VK_IMAGE_ASPECT_COLOR_BIT : 0;
+    if (r->role != 1)
+        for (int i = 0; i < NR; i++)
+            if ((R[i].role == 2 || R[i].role == 3) && R[i].ifmt == r->ifmt) aspects |= R[i].aspect;
+    r->att_aspects = aspects;
+    VkImageViewCreateInfo vc = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, NULL, 0, r->img,
+                                 r->layers > 1 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D,
+                                 r->role == 1 ? r->att_format : r->ifmt, { 0, 0, 0, 0 }, { aspects, 0, 1, 0, r->layers } };
+    VK(vkCreateImageView(g_dev, &vc, NULL, &r->view));
+}
+
 static void create_sampler(struct res *r)
 {
     const struct json *s = r->samp;
@@ -488,7 +548,7 @@ static void create_resources(uint8_t *push)
         struct res *r = &R[i];
         switch (r->kind) {
         case R_IMAGE:
-            create_image(r);
+            if (r->role) create_attachment(r); else create_image(r);
             make_stage(r, r->size);
             if (r->samp) create_sampler(r);
             break;
@@ -507,7 +567,9 @@ static void create_resources(uint8_t *push)
             r->alloc_size = align_up(want ? want : 16, 256);
             r->buf = make_buffer(r->alloc_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
                                  VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
-                                 VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, NULL);
+                                 VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+                                 VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
+                                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, NULL);
             make_stage(r, r->alloc_size);
             if (r->kind == R_BDA && r->push_offset >= 0 && r->push_offset + 8 <= 256) {
                 VkBufferDeviceAddressInfo bi = { VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, NULL, r->buf };
@@ -554,10 +616,10 @@ static void upload_all(void)
 {
     VkCommandBuffer cb = begin_cmd();
     VkImageMemoryBarrier ib[MAX_RES]; uint32_t nib = 0;
-    for (int i = 0; i < NR; i++) if (R[i].kind == R_IMAGE)
+    for (int i = 0; i < NR; i++) if (R[i].kind == R_IMAGE && !R[i].att_shared)
         ib[nib++] = (VkImageMemoryBarrier){ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
             VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, R[i].img,
-            { R[i].aspect, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS } };
+            { R[i].role ? R[i].att_aspects : R[i].aspect, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS } };
     if (nib) vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, nib, ib);
     record_restore(cb, 0);
     for (int i = 0; i < NR; i++) {
@@ -575,6 +637,185 @@ static void upload_all(void)
 /* ------------------------------------------------------------------------------------------- pipeline */
 static VkPipelineLayout g_pl; static VkPipeline g_pipe; static VkDescriptorSet g_sets[8]; static uint32_t g_nsets;
 static double g_compile_ms;
+
+/* Draw captures */
+static int g_draw;
+static VkShaderStageFlags g_stages = VK_SHADER_STAGE_COMPUTE_BIT;
+static const struct json *g_dj; /* the manifest's "draw" object */
+static uint32_t *g_vs; static uint64_t g_vs_size;
+
+static double jarr(const struct json *o, const char *key, int i, double dflt)
+{
+    const struct json *a = jget(o, key);
+    return a && jidx(a, i) ? jidx(a, i)->num : dflt;
+}
+
+/* The draw's pipeline: the captured vertex shader and fragment shader (fs), the captured fixed-function
+ * state, dynamic rendering with the attachments' formats */
+static void create_graphics_pipeline(VkShaderModule fs)
+{
+    const struct json *d = g_dj;
+    VkShaderModuleCreateInfo vci = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, (size_t)g_vs_size, g_vs };
+    VkShaderModule vs; VK(vkCreateShaderModule(g_dev, &vci, NULL, &vs));
+    VkPipelineShaderStageCreateInfo st[2] = {
+        { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_VERTEX_BIT, vs, "main", NULL },
+        { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_FRAGMENT_BIT, fs, "main", NULL } };
+    VkPipelineVertexInputStateCreateInfo vi = { VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
+    VkVertexInputBindingDescription vib[32]; VkVertexInputAttributeDescription via[32];
+    VkVertexInputBindingDivisorDescriptionEXT vid[32]; uint32_t nvid = 0;
+    VkPipelineVertexInputDivisorStateCreateInfoEXT vdiv = { VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_DIVISOR_STATE_CREATE_INFO_EXT };
+    {
+        const struct json *vj = jget(d, "vertex_input"), *bs = jget(vj, "bindings"), *as = jget(vj, "attributes");
+        for (int i = 0; bs && i < bs->n && i < 32; i++) {
+            const struct json *b = jidx(bs, i);
+            vib[i] = (VkVertexInputBindingDescription){ (uint32_t)jnum(b, "binding", 0), (uint32_t)jnum(b, "stride", 0),
+                                                        (VkVertexInputRate)jnum(b, "input_rate", 0) };
+            uint32_t div = (uint32_t)jnum(b, "divisor", 1);
+            if (vib[i].inputRate == VK_VERTEX_INPUT_RATE_INSTANCE && div != 1)
+                vid[nvid++] = (VkVertexInputBindingDivisorDescriptionEXT){ vib[i].binding, div };
+            vi.vertexBindingDescriptionCount = (uint32_t)i + 1;
+        }
+        for (int i = 0; as && i < as->n && i < 32; i++) {
+            const struct json *a = jidx(as, i);
+            via[i] = (VkVertexInputAttributeDescription){ (uint32_t)jnum(a, "location", 0), (uint32_t)jnum(a, "binding", 0),
+                                                          (VkFormat)jnum(a, "format", 0), (uint32_t)jnum(a, "offset", 0) };
+            vi.vertexAttributeDescriptionCount = (uint32_t)i + 1;
+        }
+        vi.pVertexBindingDescriptions = vib; vi.pVertexAttributeDescriptions = via;
+        if (nvid) { vdiv.vertexBindingDivisorCount = nvid; vdiv.pVertexBindingDivisors = vid; vi.pNext = &vdiv; }
+    }
+    VkPipelineInputAssemblyStateCreateInfo ia = { VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, NULL, 0,
+        (VkPrimitiveTopology)jnum(d, "topology", VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST), (VkBool32)jnum(d, "primitive_restart", 0) };
+    VkPipelineViewportStateCreateInfo vp = { VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, NULL, 0, 1, NULL, 1, NULL };
+    VkPipelineRasterizationStateCreateInfo rs = { VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO, NULL, 0,
+        (VkBool32)jnum(d, "depth_clamp", 0), (VkBool32)jnum(d, "rasterizer_discard", 0), (VkPolygonMode)jnum(d, "polygon_mode", 0),
+        (VkCullModeFlags)jnum(d, "cull_mode", 0), (VkFrontFace)jnum(d, "front_face", 0), (VkBool32)jarr(d, "depth_bias", 0, 0),
+        (float)jarr(d, "depth_bias", 1, 0), (float)jarr(d, "depth_bias", 3, 0), (float)jarr(d, "depth_bias", 2, 0), 1.0f };
+    VkSampleMask smask = (VkSampleMask)jnum(d, "sample_mask", 0xffff) | 0xffff0000u;
+    VkPipelineMultisampleStateCreateInfo ms = { VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, NULL, 0,
+        VK_SAMPLE_COUNT_1_BIT, VK_FALSE, 0, &smask, (VkBool32)jnum(d, "alpha_to_coverage", 0), VK_FALSE };
+    const struct json *dj = jget(d, "depth"), *sj = jget(d, "stencil");
+    VkStencilOpState so[2];
+    for (int i = 0; i < 2; i++) {
+        const struct json *f = jget(sj, i ? "back" : "front");
+        so[i] = (VkStencilOpState){ (VkStencilOp)jnum(f, "fail", 0), (VkStencilOp)jnum(f, "pass", 0), (VkStencilOp)jnum(f, "depth_fail", 0),
+                                    (VkCompareOp)jnum(f, "compare", 7), (uint32_t)jnum(f, "compare_mask", 0xff),
+                                    (uint32_t)jnum(f, "write_mask", 0xff), (uint32_t)jnum(f, "reference", 0) };
+    }
+    VkFormat dfmt = VK_FORMAT_UNDEFINED, sfmt = VK_FORMAT_UNDEFINED;
+    for (int i = 0; i < NR; i++) {
+        if (R[i].role == 2 && R[i].kind == R_IMAGE) dfmt = R[i].ifmt;
+        if (R[i].role == 3 && R[i].kind == R_IMAGE) sfmt = R[i].ifmt;
+    }
+    VkPipelineDepthStencilStateCreateInfo ds = { VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO, NULL, 0,
+        (VkBool32)(dfmt && jnum(dj, "test", 0)), (VkBool32)(dfmt && jnum(dj, "write", 0)), (VkCompareOp)jnum(dj, "compare_op", 7),
+        (VkBool32)(dfmt && jarr(dj, "bounds_test", 0, 0)), (VkBool32)(sfmt && jnum(sj, "test", 0)), so[0], so[1],
+        (float)jarr(dj, "bounds_test", 1, 0), (float)jarr(dj, "bounds_test", 2, 1) };
+    const struct json *bj = jget(d, "blend"), *ba = jget(bj, "attachments");
+    uint32_t ncol = ba ? (uint32_t)ba->n : 0; if (ncol > 8) ncol = 8;
+    VkPipelineColorBlendAttachmentState cba[8]; VkFormat cfmt[8];
+    uint32_t cwe = (uint32_t)jnum(bj, "color_write_enables", 0xff);
+    for (uint32_t i = 0; i < ncol; i++) {
+        const struct json *a = jidx(ba, (int)i);
+        cfmt[i] = (VkFormat)jnum(a, "format", 0);
+        cba[i] = (VkPipelineColorBlendAttachmentState){ (VkBool32)jnum(a, "enable", 0), (VkBlendFactor)jnum(a, "src_color", 1),
+            (VkBlendFactor)jnum(a, "dst_color", 0), (VkBlendOp)jnum(a, "color_op", 0), (VkBlendFactor)jnum(a, "src_alpha", 1),
+            (VkBlendFactor)jnum(a, "dst_alpha", 0), (VkBlendOp)jnum(a, "alpha_op", 0),
+            (cwe & (1u << i)) ? (VkColorComponentFlags)jnum(a, "write_mask", 0xf) : 0 };
+        /* an attachment the pass has no image for is left out of rendering, not of the pipeline */
+    }
+    VkPipelineColorBlendStateCreateInfo cb = { VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, NULL, 0,
+        (VkBool32)jnum(bj, "logic_op_enable", 0), (VkLogicOp)jnum(bj, "logic_op", 0), ncol, cba,
+        { (float)jarr(bj, "constants", 0, 0), (float)jarr(bj, "constants", 1, 0), (float)jarr(bj, "constants", 2, 0),
+          (float)jarr(bj, "constants", 3, 0) } };
+    VkDynamicState dyn[2] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+    VkPipelineDynamicStateCreateInfo dy = { VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, NULL, 0, 2, dyn };
+    VkPipelineRenderingCreateInfo ri = { VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, NULL, 0, ncol, cfmt,
+        dfmt ? (VkFormat)jnum(dj, "format", dfmt) : VK_FORMAT_UNDEFINED, sfmt ? (VkFormat)jnum(sj, "format", sfmt) : VK_FORMAT_UNDEFINED };
+    if (ri.depthAttachmentFormat == VK_FORMAT_UNDEFINED && dfmt) ri.depthAttachmentFormat = dfmt;
+    if (ri.stencilAttachmentFormat == VK_FORMAT_UNDEFINED && sfmt) ri.stencilAttachmentFormat = sfmt;
+    VkGraphicsPipelineCreateInfo gci = { VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &ri, 0, 2, st, &vi, &ia, NULL, &vp, &rs,
+                                         &ms, &ds, &cb, &dy, g_pl, VK_NULL_HANDLE, 0, VK_NULL_HANDLE, 0 };
+    double t0 = now_ms();
+    VK(vkCreateGraphicsPipelines(g_dev, VK_NULL_HANDLE, 1, &gci, NULL, &g_pipe));
+    g_compile_ms = now_ms() - t0;
+}
+
+/* One replay of the draw: render pass (load, store) with the captured area, viewport and scissor */
+static void record_draw(VkCommandBuffer cb, VkQueryPool qs, uint32_t q)
+{
+    const struct json *d = g_dj;
+    VkRenderingAttachmentInfo ca[8]; uint32_t ncol = 0;
+    VkRenderingAttachmentInfo da = { VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO }, sa = da;
+    int have_d = 0, have_s = 0;
+    const struct json *ba = jget(jget(d, "blend"), "attachments");
+    ncol = ba ? (uint32_t)ba->n : 0; if (ncol > 8) ncol = 8;
+    for (uint32_t i = 0; i < ncol; i++)
+        ca[i] = (VkRenderingAttachmentInfo){ VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, NULL, VK_NULL_HANDLE,
+            VK_IMAGE_LAYOUT_GENERAL, 0, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED, VK_ATTACHMENT_LOAD_OP_LOAD,
+            VK_ATTACHMENT_STORE_OP_STORE, { { { 0 } } } };
+    for (int i = 0; i < NR; i++) {
+        struct res *r = &R[i];
+        if (!r->role || !r->view) continue;
+        VkRenderingAttachmentInfo *a = r->role == 1 ? (r->attachment < ncol ? &ca[r->attachment] : NULL) :
+                                       r->role == 2 ? &da : &sa;
+        if (!a) continue;
+        a->imageView = r->view; a->imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        a->loadOp = VK_ATTACHMENT_LOAD_OP_LOAD; a->storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        if (r->role == 2) have_d = 1;
+        if (r->role == 3) have_s = 1;
+    }
+    VkRenderingInfo ri = { VK_STRUCTURE_TYPE_RENDERING_INFO, NULL, 0,
+        { { (int32_t)jarr(d, "render_area", 0, 0), (int32_t)jarr(d, "render_area", 1, 0) },
+          { (uint32_t)jarr(d, "render_area", 2, 1), (uint32_t)jarr(d, "render_area", 3, 1) } },
+        (uint32_t)jnum(d, "layers", 1) ? (uint32_t)jnum(d, "layers", 1) : 1, 0, ncol, ca,
+        have_d ? &da : NULL, have_s ? &sa : NULL };
+    vkCmdBeginRendering(cb, &ri);
+    if (qs) vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, qs, q);
+    VkViewport v = { (float)jarr(d, "viewport", 0, 0), (float)jarr(d, "viewport", 1, 0), (float)jarr(d, "viewport", 2, 1),
+                     (float)jarr(d, "viewport", 3, 1), (float)jarr(d, "viewport", 4, 0), (float)jarr(d, "viewport", 5, 1) };
+    VkRect2D sc = { { (int32_t)jarr(d, "scissor", 0, 0), (int32_t)jarr(d, "scissor", 1, 0) },
+                    { (uint32_t)jarr(d, "scissor", 2, 1), (uint32_t)jarr(d, "scissor", 3, 1) } };
+    vkCmdSetViewport(cb, 0, 1, &v);
+    vkCmdSetScissor(cb, 0, 1, &sc);
+    if (O.no_draw) { /* the render pass alone: attachment load and store */
+        if (qs) vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, qs, q + 1);
+        vkCmdEndRendering(cb);
+        return;
+    }
+    for (int i = 0; i < NR; i++) {
+        struct res *r = &R[i];
+        if (r->role == 5 && r->buf) {
+            VkDeviceSize o = 0;
+            vkCmdBindVertexBuffers(cb, r->attachment, 1, &r->buf, &o);
+        }
+    }
+    int indexed = (int)jnum(d, "indexed", 0);
+    for (int i = 0; indexed && i < NR; i++)
+        if (R[i].role == 4 && R[i].buf) vkCmdBindIndexBuffer(cb, R[i].buf, 0, (VkIndexType)jnum(d, "index_type", 0));
+    VkBuffer ind = VK_NULL_HANDLE, cnt = VK_NULL_HANDLE;
+    for (int i = 0; i < NR; i++) {
+        if (R[i].role == 6) ind = R[i].buf;
+        if (R[i].role == 7) cnt = R[i].buf;
+    }
+    if (jnum(d, "indirect", 0) && ind) {
+        /* the captured records (the index buffer from its start: the records' first indices) */
+        uint32_t n = (uint32_t)jnum(d, "draw_count", 1), stride = (uint32_t)jnum(d, "stride", 20);
+        if (jnum(d, "indirect_count", 0) && cnt) {
+            if (indexed) vkCmdDrawIndexedIndirectCount(cb, ind, 0, cnt, 0, n, stride);
+            else vkCmdDrawIndirectCount(cb, ind, 0, cnt, 0, n, stride);
+        } else if (indexed) vkCmdDrawIndexedIndirect(cb, ind, 0, n, stride);
+        else vkCmdDrawIndirect(cb, ind, 0, n, stride);
+    } else if (indexed)
+        /* the index resource starts at the draw's first index */
+        vkCmdDrawIndexed(cb, (uint32_t)jnum(d, "index_count", 0), (uint32_t)jnum(d, "instance_count", 1), 0,
+                         (int32_t)jnum(d, "vertex_offset", 0), (uint32_t)jnum(d, "first_instance", 0));
+    else
+        vkCmdDraw(cb, (uint32_t)jnum(d, "vertex_count", 3), (uint32_t)jnum(d, "instance_count", 1),
+                  (uint32_t)jnum(d, "first_vertex", 0), (uint32_t)jnum(d, "first_instance", 0));
+    if (qs) vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, qs, q + 1);
+    vkCmdEndRendering(cb);
+}
 
 static void create_pipeline(const uint32_t *spv, uint64_t spv_size, uint32_t push_size)
 {
@@ -599,7 +840,7 @@ static void create_pipeline(const uint32_t *spv, uint64_t spv_size, uint32_t pus
                 if (!have) mtypes[nl][nt++] = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
             }
             lb[nl] = (VkDescriptorSetLayoutBinding){ b->binding, mut ? VK_DESCRIPTOR_TYPE_MUTABLE_EXT : b->types[0], b->count,
-                                                     VK_SHADER_STAGE_COMPUTE_BIT, NULL };
+                                                     g_stages, NULL };
             ml[nl] = (VkMutableDescriptorTypeListEXT){ mut ? (uint32_t)nt : 0, mut ? mtypes[nl] : NULL };
             fl[nl] = VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT;
             if (b->array && (mut || b->types[0] != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER)) { fl[nl] |= VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT; uab = 1; }
@@ -627,11 +868,12 @@ static void create_pipeline(const uint32_t *spv, uint64_t spv_size, uint32_t pus
         VkDescriptorSetAllocateInfo dai = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, NULL, pool, 1, &sl[s] };
         VK(vkAllocateDescriptorSets(g_dev, &dai, &g_sets[s]));
     }
-    VkPushConstantRange pcr = { VK_SHADER_STAGE_COMPUTE_BIT, 0, (push_size + 3) & ~3u };
+    VkPushConstantRange pcr = { g_stages, 0, (push_size + 3) & ~3u };
     VkPipelineLayoutCreateInfo plci = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, NULL, 0, g_nsets, sl, push_size ? 1 : 0, &pcr };
     VK(vkCreatePipelineLayout(g_dev, &plci, NULL, &g_pl));
     VkShaderModuleCreateInfo smci = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, (size_t)spv_size, spv };
     VkShaderModule sm; VK(vkCreateShaderModule(g_dev, &smci, NULL, &sm));
+    if (g_draw) { create_graphics_pipeline(sm); return; }
     VkComputePipelineCreateInfo cpci = { VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, NULL, 0,
         { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_COMPUTE_BIT, sm, "main", NULL },
         g_pl, VK_NULL_HANDLE, 0 };
@@ -704,6 +946,9 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--label") && i + 1 < argc) O.label = argv[++i];
         else if (!strcmp(a, "--grid") && i + 1 < argc) { O.grid_override = sscanf(argv[++i], "%u,%u,%u", &O.grid[0], &O.grid[1], &O.grid[2]) == 3; }
         else if (!strcmp(a, "--no-robust")) O.robust = 0;
+        else if (!strcmp(a, "--no-draw")) O.no_draw = 1;
+        else if (!strcmp(a, "--split")) O.split = 1;
+        else if (!strcmp(a, "--ts-only")) O.ts_only = 1;
         else if (!strcmp(a, "--compile-only")) O.compile_only = 1;
         else if (!strcmp(a, "--dump-cache") && i + 1 < argc) O.dump_cache = argv[++i];
         else if (!strcmp(a, "-v")) O.verbose = 1;
@@ -732,6 +977,11 @@ int main(int argc, char **argv)
     uint32_t base[3];
     for (int k = 0; k < 3; k++) base[k] = (uint32_t)(jidx(jget(m, "base_group"), k) ? jidx(jget(m, "base_group"), k)->num : 0);
     if (O.grid_override) memcpy(grid, O.grid, sizeof grid);
+    if (!strcmp(jstr(m, "kind", "dispatch"), "draw")) {
+        g_draw = 1; g_stages = VK_SHADER_STAGE_ALL_GRAPHICS; g_dj = jget(m, "draw");
+        if (!g_dj) die("draw capture without a draw section");
+        g_vs = read_file(jstr(m, "vs_spirv", "vs.spv"), &g_vs_size, 1);
+    }
     const char *unsup = jstr(m, "unsupported", "");
     if (unsup[0]) fprintf(stderr, "warning: the capture lists unsupported accesses: %s\n", unsup);
     load_manifest(m);
@@ -752,16 +1002,24 @@ int main(int argc, char **argv)
     const uint32_t total = (uint32_t)(O.warm + O.n);
     VkQueryPoolCreateInfo qpi = { VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, NULL, 0, VK_QUERY_TYPE_TIMESTAMP, 2 * total, 0 };
     VkQueryPool qp; VK(vkCreateQueryPool(g_dev, &qpi, NULL, &qp));
+    VkQueryPool qs = VK_NULL_HANDLE; /* --split: after the render pass begins, before it ends */
+    if (O.split && g_draw) VK(vkCreateQueryPool(g_dev, &qpi, NULL, &qs));
     VkCommandBuffer cb = begin_cmd();
     vkCmdResetQueryPool(cb, qp, 0, 2 * total);
-    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_pipe);
-    for (uint32_t s = 0; s < g_nsets; s++) vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_pl, s, 1, &g_sets[s], 0, NULL);
-    if (push_size) vkCmdPushConstants(cb, g_pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, (push_size + 3) & ~3u, push);
+    if (qs) vkCmdResetQueryPool(cb, qs, 0, 2 * total);
+    const VkPipelineBindPoint bp = g_draw ? VK_PIPELINE_BIND_POINT_GRAPHICS : VK_PIPELINE_BIND_POINT_COMPUTE;
+    vkCmdBindPipeline(cb, bp, g_pipe);
+    for (uint32_t s = 0; s < g_nsets; s++) vkCmdBindDescriptorSets(cb, bp, g_pl, s, 1, &g_sets[s], 0, NULL);
+    if (push_size) vkCmdPushConstants(cb, g_pl, g_stages, 0, (push_size + 3) & ~3u, push);
     for (uint32_t it = 0; it < total; it++) {
         if (O.reset) { full_barrier(cb); record_restore(cb, 1); }
         full_barrier(cb);
+        if (g_draw && O.ts_only) { /* an untimed empty pass, then nothing between the timestamps */
+            int nd = O.no_draw; O.no_draw = 1; record_draw(cb, VK_NULL_HANDLE, 0); O.no_draw = nd;
+        }
         vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, qp, 2 * it);
-        vkCmdDispatchBase(cb, base[0], base[1], base[2], grid[0], grid[1], grid[2]);
+        if (g_draw && !O.ts_only) record_draw(cb, qs, 2 * it);
+        else if (!g_draw) vkCmdDispatchBase(cb, base[0], base[1], base[2], grid[0], grid[1], grid[2]);
         vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, qp, 2 * it + 1);
     }
     full_barrier(cb);
@@ -793,11 +1051,41 @@ int main(int argc, char **argv)
         sum += us[k];
     }
     double cold = O.warm > 0 ? (double)(ts[1] - ts[0]) * g_pp.limits.timestampPeriod / 1000.0 : us[0];
+    if (qs) { /* --split: begin, inside, end of the render pass */
+        static uint64_t ti[2 * 4096];
+        VK(vkGetQueryPoolResults(g_dev, qs, 0, 2 * total, sizeof(uint64_t) * 2 * total, ti, sizeof(uint64_t),
+                                 VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT));
+        double *seg[3]; const char *nm[3] = { "begin", "inside", "end" };
+        for (int g = 0; g < 3; g++) seg[g] = calloc(O.n, sizeof(double));
+        for (int k = 0; k < O.n; k++) {
+            uint32_t it = (uint32_t)(O.warm + k);
+            const double tp = g_pp.limits.timestampPeriod / 1000.0;
+            seg[0][k] = (double)(ti[2 * it] - ts[2 * it]) * tp;
+            seg[1][k] = (double)(ti[2 * it + 1] - ti[2 * it]) * tp;
+            seg[2][k] = (double)(ts[2 * it + 1] - ti[2 * it + 1]) * tp;
+        }
+        printf("split_us");
+        for (int g = 0; g < 3; g++) {
+            qsort(seg[g], O.n, sizeof(double), cmp_d);
+            printf(" %s %.2f", nm[g], O.n % 2 ? seg[g][O.n / 2] : 0.5 * (seg[g][O.n / 2 - 1] + seg[g][O.n / 2]));
+        }
+        printf(" (medians)\n");
+    }
     qsort(us, O.n, sizeof *us, cmp_d);
     double med = O.n % 2 ? us[O.n / 2] : 0.5 * (us[O.n / 2 - 1] + us[O.n / 2]);
 
     /* Checksums of what the shader may write (after the last dispatch, from the captured state with resets) */
     uint64_t all = 0xcbf29ce484222325ull;
+    if (g_draw)
+        printf("%s on %s: draw of %u %s x %u instances, area %ux%u, %d resources (%d writable, %d not captured), "
+               "%.1f MiB, pipeline %.1f ms\n", g_hash, g_pp.deviceName,
+               jnum(g_dj, "indirect", 0) ? (uint32_t)jnum(g_dj, "draw_count", 0) : (uint32_t)jnum(g_dj, "vertex_count", 0),
+               jnum(g_dj, "indirect", 0) ? (jnum(g_dj, "indirect_count", 0) ? "indirect records (at most)" :
+                                            "indirect records") :
+               jnum(g_dj, "indexed", 0) ? "indices" : "vertices",
+               (uint32_t)jnum(g_dj, "instance_count", 0), (uint32_t)jarr(g_dj, "render_area", 2, 0),
+               (uint32_t)jarr(g_dj, "render_area", 3, 0), NR, nwrite, nerr, bytes / 1048576.0, g_compile_ms);
+    else
     printf("%s on %s: grid %ux%ux%u local %ux%ux%u, %d resources (%d writable, %d not captured), %.1f MiB, pipeline %.1f ms\n",
            g_hash, g_pp.deviceName, grid[0], grid[1], grid[2], local[0], local[1], local[2], NR, nwrite, nerr,
            bytes / 1048576.0, g_compile_ms);
@@ -814,7 +1102,10 @@ int main(int argc, char **argv)
         uint64_t n = r->kind == R_IMAGE ? r->size : r->size; /* the captured bytes (buffers: the captured range) */
         uint64_t h = fnv64(r->rb_map, n, 0xcbf29ce484222325ull);
         all = fnv64(&h, sizeof h, all);
-        if (r->kind == R_IMAGE)
+        if (r->kind == R_IMAGE && r->role)
+            printf("checksum r%03d %016" PRIx64 "  %s attachment %u format %d %ux%u\n", r->id, h,
+                   r->role == 1 ? "color" : r->role == 2 ? "depth" : "stencil", r->attachment, (int)r->att_format, r->ext[0], r->ext[1]);
+        else if (r->kind == R_IMAGE)
             printf("checksum r%03d %016" PRIx64 "  %s set %u binding %u [%u] format %d %ux%ux%u mips %u layers %u\n", r->id, h,
                    kind_name[r->kind], r->set, r->binding, r->index, (int)r->vfmt, r->ext[0], r->ext[1], r->ext[2], r->mips, r->layers);
         else
@@ -829,8 +1120,12 @@ int main(int argc, char **argv)
     if (O.csv) {
         FILE *f = fopen(O.csv, "a");
         if (f) {
-            fprintf(f, "%s\t%s\t%u.%u.%u\t%.2f\t%.2f\t%.2f\t%.2f\t%d\t%s\t%016" PRIx64 "\t%.1f\n", g_hash,
-                    O.label ? O.label : g_pp.deviceName, grid[0], grid[1], grid[2], med, us[0], sum / O.n, us[O.n - 1], O.n,
+            char gs[48];
+            if (g_draw) snprintf(gs, sizeof gs, "draw.%ux%u", (uint32_t)jarr(g_dj, "render_area", 2, 0),
+                                 (uint32_t)jarr(g_dj, "render_area", 3, 0));
+            else snprintf(gs, sizeof gs, "%u.%u.%u", grid[0], grid[1], grid[2]);
+            fprintf(f, "%s\t%s\t%s\t%.2f\t%.2f\t%.2f\t%.2f\t%d\t%s\t%016" PRIx64 "\t%.1f\n", g_hash,
+                    O.label ? O.label : g_pp.deviceName, gs, med, us[0], sum / O.n, us[O.n - 1], O.n,
                     O.reset ? "reset" : "noreset", all, g_compile_ms);
             fclose(f);
         }

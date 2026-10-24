@@ -68,6 +68,7 @@ Patch numbers are file numbers in the directory named in the patch tables.
 | `NVK_MME_PACK_INSTR`, `NVK_SKIP_DRAWID`, `NVK_BLACKWELL_MME_MEMBAR` | 0, 0, 1 | MME/indirect-draw A/B levers (common 26, 29) |
 | `NVK_DISPATCH_INDIRECT_PREFETCH` | 0 | only the first indirect dispatch argument copy after a barrier is a no-prefetch GPFIFO entry; the default makes every copy one (2 per indirect dispatch) (common 82) |
 | `NVK_BARRIER_DEDUP` | 0 | a barrier whose storage-write flush already invalidated the shader data caches emits no second GLOBAL_DATA invalidate (common 82) |
+| `NVK_MME_LAZY_WFI` | 0 | the host WFI and system memory barrier that a barrier with indirect-command (or conditional rendering, transform feedback counter, descriptor buffer) reads asks for go before the next command that reads memory through the MME or the pushbuffer DMA, not at the barrier (common 91) |
 | **Memory** | | |
 | `NVK_RM_BAR_MB` | 0 | the DEVICE_LOCAL \| HOST_VISIBLE heap through BAR1: 0 off, -1 all of BAR1, N MiB caps it (common 30) |
 | `NVK_RM_DESC_TABLE_VRAM` | 0 | descriptor tables/pools in CPU-mapped VRAM (common 26, 52) |
@@ -154,7 +155,8 @@ file per process.
 | `NVK_PASS_PROFILE=4` | adds the 24 most written 3D methods per pass and bind counts |
 | `NVK_PASS_PROFILE=5` | dumps the draws of one render pass matching `NVK_PASS_DUMP`, after `NVK_PASS_DUMP_DELAY_S` (20) s (`nvk-prepass-dump-<pid>.txt`) |
 | `NVK_DISPATCH_PROFILE=1` | GPU time of every dispatch per compute shader (vkd3d-proton DXIL hash, code hash, workgroup size), with grids (indirect arguments read back), GPRs and warps, every two seconds, in the `NVK_PASS_PROFILE` file; alone or with `NVK_PASS_PROFILE`; each dispatch waits for idle before and after it |
-| `NVK_DISPATCH_CAPTURE=<hash>[,...]` | captures one dispatch of each listed compute shader (DXIL hash as `NVK_DISPATCH_PROFILE` prints it) with its SPIR-V, push constants, grid and the contents of every image, buffer, sampler and root buffer address it reads, for replaying it outside the game; after `NVK_DISPATCH_CAPTURE_DELAY_S` (20) s and, if set, once the file `NVK_DISPATCH_CAPTURE_TRIGGER` exists; `_SKIP`, `_COUNT`, `_POST=1` (outputs too), `_MAX_MB`; written to `NVK_DISPATCH_CAPTURE_DIR` (`%ProgramData%\Helios\dcap`), one directory per capture, log `nvk-dcap.log` |
+| `NVK_DISPATCH_CAPTURE=<hash>[,...]` | captures one dispatch of each listed compute shader, or one draw with each listed fragment shader (DXIL hash as `NVK_DISPATCH_PROFILE` prints it, or the 8-digit code hash), with its SPIR-V, push constants, grid and the contents of every image, buffer, sampler and root buffer address it reads, for replaying it outside the game; after `NVK_DISPATCH_CAPTURE_DELAY_S` (20) s and, if set, once the file `NVK_DISPATCH_CAPTURE_TRIGGER` exists; `_SKIP`, `_COUNT`, `_POST=1` (outputs too), `_MAX_MB`; written to `NVK_DISPATCH_CAPTURE_DIR` (`%ProgramData%\Helios\dcap`), one directory per capture, log `nvk-dcap.log` |
+| `NVK_PUSH_DUMP_WINDOW=S,MS` | the pushbuffers of MS milliseconds from S seconds after the first submit, to `NVK_PUSH_DUMP_FILE` (`nvk-push-<pid>.txt`) |
 | `NVK_SHADER_STATS=1` | NAK statistics of every uploaded shader (`nvk-shaders-<pid>.txt`) |
 | `NVK_WAIT_STATS=1` | CPU wait counts and times per site, woken and timed-out waits, once a second (`nvk-waits-<pid>.txt`) |
 | `NVK_DEBUG=vm` | VA and memory alloc/free/bind lines with times, threads and freeing call stacks (`NVK_VM_LOG`, else `nvk-vm-<pid>.log` in `%TEMP%`) |
@@ -234,10 +236,13 @@ and on NVIDIA's driver.
 `NVK_DISPATCH_CAPTURE=<hash>[,...]` writes one dispatch of each listed
 compute shader (the `src` hash the profile prints) with its SPIR-V, push
 constants, grid and the contents of every image, buffer, sampler and root
-buffer address it reads. `tests/perf/dispatch-replay/` replays such a capture
-on any Vulkan driver (NVK in the guest, NVIDIA's driver on a Linux host),
-times the dispatch alone and compares what two drivers wrote; its README has
-the knobs, the capture format and the limits.
+buffer address it reads. A listed fragment shader (DXIL hash or 8-digit code
+hash) captures a direct draw with it instead (common 0088): both shaders, their
+resources, the attachments and the pipeline state.
+`tests/perf/dispatch-replay/` replays such a capture on any Vulkan driver (NVK
+in the guest, NVIDIA's driver on a Linux host), times the dispatch or draw
+alone and compares what two drivers wrote; its README has the knobs, the
+capture format and the limits.
 
 ## `patches/`: the RM backend
 
@@ -414,7 +419,10 @@ backend. Numbers are file numbers (there is no 0016 or 0025).
 | 0083 | NAK: `NAK_SCHED_MLP` (0-3, default 3 on Windows, 0 elsewhere): the prepass enters an instruction in its future-ready set at the cycle its edge latencies give (it used the graph's static cycle, so no latency ever delayed anything), memory/texture latencies of an L2 round trip, level 3 hoists accesses ahead of everything else while registers are free (prepass and post-RA), read-only accesses unordered against other memory operations, shared scoreboards when all six are busy; the occupancy target is chosen on the plain schedule and a unit that does not fit its register target keeps the plain schedule; part of the shader cache key |
 | 0086 | NAK, experimental, off by default: `NAK_RA_LRU` (LRU register choice and GPRs up to the occupancy cliff, so the post-RA scheduler has fewer false dependencies), `NAK_YIELD` (SM120 control bit 109 as the reference compiler sets it), `NAK_REUSE` (operand reuse-cache bits with the reference compiler's opcode/operand mapping), `NAK_SCHED_FREE`; these knobs go into `nak_knobs_key2()`, which NVK adds to the pipeline cache UUID and the disk cache identity |
 | 0087 | NAK, off by default: `NAK_SCHED_ILP` (the prepass's future-ready set uses the cycle its edge latencies give, with the plain latency model; plain schedule where it does not fit the register target), `NAK_FSET_BF` (b2f32 of a single-use 32-bit float comparison becomes slt/sge/seq/sne, emitted as FSET.BF) |
+| 0088 | `NVK_DISPATCH_CAPTURE` captures draws: a listed hash that matches the bound fragment shader (DXIL source hash or code hash) captures a `vkCmdDraw`, `vkCmdDrawIndexed` or their indirect and indirect-count forms with both shaders' SPIR-V, their descriptors and root buffers, the color, depth and stencil attachments, the index and vertex buffers and the pipeline state with the vertex input layout (`"kind": "draw"`, `vs.spv`), for `dispatch-replay`; the common runtime gets `vk_device::graphics_spirv_hook` and graphics shaders their SPIR-V source hash. A capture whose staging with the outputs cannot be mapped is made without them |
 | 0089 | NAK: `NAK_TEX_UHANDLE` (default 2 on Windows; SM100+: uniform bindless texture handles in the TLD (1) or TEX/TLD/TLD4 (2) uniform register field, opcodes 0xf66/0xf60/0xf63, as a UGPR pair (texture index, sampler index), only with the scalar source form, at most four source components split 2+2; more keep the handle in the second vector; legalization restores the pair to UGPRs with R2UR if NAK moved it), `NAK_F16_PAIR` (paired f2f16 conversions as seeds for nir_opt_vectorize), `NAK_TEMP_IF_ELSE` (small indexed local arrays as selects instead of scratch), `NAK_OCC_FS` (default on on Windows: linear warp benefit for fragment shaders in the occupancy target); off by default: `NAK_REMAT_LD_COST` and `NAK_OCC_GPRS` (occupancy-target experiments); all in `nak_knobs_key2()` |
+| 0090 | `NVK_PUSH_DUMP_WINDOW="START_S,DURATION_MS"`: the pushbuffers executed in that window after the first submit, with their submit times, to `NVK_PUSH_DUMP_FILE` (`nvk-push-<pid>.txt`): one or two frames of a game instead of `NVK_DEBUG=push_dump` for the whole run |
+| 0091 | `NVK_MME_LAZY_WFI` (default off): the host WFI and system memory barrier of an MME-data invalidate (a barrier whose destination includes indirect command, conditional rendering, transform feedback counter or descriptor buffer reads, as vkd3d-proton's full barrier at every ExecuteCommandLists) go before the next command that reads memory through the MME or the pushbuffer DMA instead of at the barrier; every command buffer starts with one pending |
 
 ## Per-draw cost (common 0001-0007)
 
