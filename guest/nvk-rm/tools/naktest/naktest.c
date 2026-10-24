@@ -10,7 +10,7 @@
 // wrongly (NAK_BAR_SHARE) makes a consumer read a stale register, and the
 // output differs.  Run it with the knobs under test set in the environment:
 //
-//   naktest [-r REPEATS] [-n INVOCATIONS] [-t NAME_PREFIX] [--time ITERATIONS]
+//   naktest [-r REPEATS] [-n INVOCATIONS] [-t NAME_PREFIX] [--time ITERATIONS] [--batch N]
 //
 // Exit status 0: every test passed; 1: a mismatch; 2: no device / setup error.
 #ifdef _WIN32
@@ -126,13 +126,15 @@ static VkImageView make_tex(VkDevice dev, VkPhysicalDeviceMemoryProperties *mp, 
 }
 
 int main(int argc, char **argv) {
-    int repeats = 20; uint32_t n = 65536; const char *only = NULL; uint32_t iters = 0;
+    int repeats = 20; uint32_t n = 65536; const char *only = NULL; uint32_t iters = 0, batch = 1;
     for (int a = 1; a < argc; a++) {
         if (!strcmp(argv[a], "-r") && a + 1 < argc) repeats = atoi(argv[++a]);
         else if (!strcmp(argv[a], "-n") && a + 1 < argc) n = (uint32_t)atoi(argv[++a]) & ~63u;
         else if (!strcmp(argv[a], "-t") && a + 1 < argc) only = argv[++a];
         else if (!strcmp(argv[a], "--time") && a + 1 < argc) iters = (uint32_t)atoi(argv[++a]);
-        else { fprintf(stderr, "usage: naktest [-r REPEATS] [-n INVOCATIONS] [-t NAME_PREFIX] [--time ITERATIONS]\n"); return 2; }
+        else if (!strcmp(argv[a], "--batch") && a + 1 < argc) batch = (uint32_t)atoi(argv[++a]);
+        else { fprintf(stderr, "usage: naktest [-r REPEATS] [-n INVOCATIONS] [-t NAME_PREFIX] [--time ITERATIONS] [--batch N]\n"); return 2; }
+    if (batch < 1) batch = 1;
     }
     /* --time: the lat_* tests' loops run ITERATIONS times and each dispatch is
      * timed; with one workgroup per SM (-n 64 * SMs) a warp's dependent chain
@@ -142,9 +144,9 @@ int main(int argc, char **argv) {
     if (iters && !only) only = "lat_";
     const double mhz = getenv("NAKTEST_MHZ") ? atof(getenv("NAKTEST_MHZ")) : 1900.0;
     if (!load_vk()) { fprintf(stderr, "no Vulkan loader\n"); return 2; }
-    const char *knobs[] = { "NAK_TEX_UHANDLE", "NAK_LAT", "NAK_LAT_NV", "NAK_LDCU_INDEX", "NAK_BAR_SHARE", "NAK_IF_CONVERT", "NAK_UADDR_PIN", "NAK_PLOP_FOLD", "NAK_IMM_CSE",
+    const char *knobs[] = { "NAK_TEX_UHANDLE", "NAK_LAT", "NAK_LAT_NV", "NAK_LDCU_INDEX", "NVK_QUERY_VRAM", "NVK_RM_PERF_BOOST", "NVK_RM_DESC_TABLE_VRAM", "NVK_RM_UPLOAD_VRAM", "NAK_BAR_SHARE", "NAK_IF_CONVERT", "NAK_UADDR_PIN", "NAK_PLOP_FOLD", "NAK_IMM_CSE",
                             "NAK_PHI_AVOID", "NAK_WEAK_MEM", "NAK_VEC_CSE", "NAK_UNROLL_MAX", "NAK_BSSY_RECONVERGENT", "NAK_NIR_FLATTEN", "NAK_OCC_TARGET", "MESA_SHADER_CACHE_DISABLE" };
-    printf("naktest: %u invocations, %d repeats; environment:", n, repeats);
+    printf("naktest: %u invocations, %d repeats, %u dispatches per timestamp pair; environment:", n, repeats, batch);
     for (size_t k = 0; k < sizeof(knobs) / sizeof(knobs[0]); k++) { const char *v = getenv(knobs[k]); if (v) printf(" %s=%s", knobs[k], v); }
     printf("\n");
 
@@ -254,14 +256,26 @@ int main(int argc, char **argv) {
             vkCmdPushConstants(cb, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, 32, pc);
             vkCmdResetQueryPool(cb, qp, 0, 2);
             vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, qp, 0);
-            vkCmdDispatch(cb, n / 64, 1, 1);
+            /* --batch N: N dispatches between the timestamps, each after a
+             * compute-to-compute barrier, so they run one after the other:
+             * the time per dispatch over N separates the per-dispatch cost
+             * from the cost of the two timestamps */
+            for (uint32_t d = 0; d < batch; d++) {
+                if (d > 0) {
+                    VkMemoryBarrier mb = { VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL,
+                                           VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT };
+                    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                         0, 1, &mb, 0, NULL, 0, NULL);
+                }
+                vkCmdDispatch(cb, n / 64, 1, 1);
+            }
             vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, qp, 1);
             CHK(vkEndCommandBuffer(cb));
             VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, 0, NULL, NULL, 1, &cb };
             CHK(vkQueueSubmit(q, 1, &si, VK_NULL_HANDLE)); CHK(vkQueueWaitIdle(q));
             uint64_t ts[2] = { 0, 0 };
             CHK(vkGetQueryPoolResults(dev, qp, 0, 2, sizeof ts, ts, 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT));
-            gpu_us[r] = (double)(ts[1] - ts[0]) * pp.limits.timestampPeriod / 1000.0;
+            gpu_us[r] = (double)(ts[1] - ts[0]) * pp.limits.timestampPeriod / 1000.0 / batch;
             const uint32_t step = iters ? 17 : 1;
             for (uint32_t i = 0; i < n; i += step) expect[i] = T->ref(ptr[0], i, pc);
             for (uint32_t i = 0; i < n; i += step) if (ptr[1][i] != expect[i]) {
