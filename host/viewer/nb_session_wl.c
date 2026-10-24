@@ -54,6 +54,7 @@
 #include "nb_overlay.h"
 #include "nb_relacc.h"
 #include "nb_gpuscale.h"
+#include "nb_sprite.h"
 #include "nb_pace.h"
 #include "nb_latch.h"
 #include "nb_blit.h"
@@ -870,6 +871,7 @@ struct nb_wl {
     struct nb_rect        spr_at;       /* where it was put, window coords */
     bool      spr_mapped;
     bool      spr_kick;             /* (un)mapped: the picture must repaint */
+    struct nb_rect spr_dmg;         /* ...this much of it, window coords   */
     bool      gpos_valid;           /* a guest pointer position is known   */
     bool      gpos_seen;            /* the guest reported one (this client)*/
     int       gpos_x, gpos_y;       /* ...in guest pixels, the hotspot's   */
@@ -3333,7 +3335,9 @@ static int wl_commit(struct nb_session *s, struct nb_sink *sink)
     bd_layout(w);
     wl_surf_commit(w, target);
     wl_main_settle(w);          /* the letterbox's parent state, if it moved */
-    w->spr_kick = false;        /* the frame repaints the drawn cursor too */
+    /* The drawn cursor came or went in this frame: the area it covers may lie
+     * over the bars, outside the frame's damage. */
+    spr_kick_now(w);
     if (!w->has_content) {
         w->has_content = true;  /* mapped now: a window property can stick */
         wl_hypr_sync(w);
@@ -3535,7 +3539,6 @@ static void wl_nudge(struct nb_wl *w)
     nb_pace_committed(&w->pace, now, armed);
     nb_pace_flushed(&w->pace, wl_display_flush(w->dpy) < 0 && errno == EAGAIN);
     w->nudge_pending = false;
-    w->spr_kick = false;
     w->st_nudges++;
 }
 
@@ -5294,6 +5297,8 @@ static void kbd_enter(void *d, struct wl_keyboard *k, uint32_t serial,
         }
     }
     wl_clip_flush_pending(w);
+    spr_update(w);              /* the drawn cursor, back under a grab */
+    spr_kick_now(w);
 }
 static void kbd_leave(void *d, struct wl_keyboard *k, uint32_t serial,
                       struct wl_surface *s)
@@ -5305,6 +5310,9 @@ static void kbd_leave(void *d, struct wl_keyboard *k, uint32_t serial,
     if (w->sink) {
         nb_sink_focus(w->sink, false);
     }
+    /* Unfocused, the guest gets no input: no guest cursor drawn either. */
+    spr_update(w);
+    spr_kick_now(w);
 }
 static void kbd_key(void *d, struct wl_keyboard *k, uint32_t serial,
                     uint32_t time, uint32_t key, uint32_t state)
@@ -5479,6 +5487,7 @@ static void ptr_enter(void *d, struct wl_pointer *p, uint32_t serial,
         w->ptr_wy += w->off_y;
     }
     cur_apply(w, serial);
+    spr_kick_now(w);            /* the drawn cursor, back under a grab */
     if (w->sink) {
         nb_sink_pointer(w->sink, true);
     }
@@ -5492,6 +5501,9 @@ static void ptr_leave(void *d, struct wl_pointer *p, uint32_t serial,
     struct nb_wl *w = d;
 
     w->ptr_on_content = false;
+    /* The pointer is not over the guest: neither is the drawn cursor. */
+    spr_update(w);
+    spr_kick_now(w);
 
     if (w->ptr_on_menu || w->ptr_on_btn) {
         if (w->ptr_on_menu) {
@@ -8914,12 +8926,19 @@ static void spr_update(struct nb_wl *w)
 {
     struct wl_buffer *buf;
     struct nb_rect r;
-    bool want;
+    struct nb_spr_in in = {
+        .grabbed = w->grabbed,
+        .focused = w->focused,
+        .ptr_in = w->ptr_on_content,
+        .shown = w->gc_on && !w->gc_broken,
+        .image = w->gc_cur >= 0 && w->gc[w->gc_cur].valid &&
+                 w->gc[w->gc_cur].buf && w->spr_surf && w->spr_vp,
+        .pos = w->gpos_valid,
+        .frame = w->current >= 0 && w->buf_w > 0 && w->buf_h > 0,
+        .ui = w->ui.open || w->dlg_open,
+    };
+    bool want = nb_spr_want(&in);
 
-    want = w->grabbed && w->gc_on && !w->gc_broken && w->gpos_valid &&
-           w->gc_cur >= 0 && w->gc[w->gc_cur].valid && w->gc[w->gc_cur].buf &&
-           w->current >= 0 && w->buf_w > 0 && w->buf_h > 0 && !w->ui.open &&
-           !w->dlg_open && w->spr_surf && w->spr_vp;
     if (want) {
         want = nb_view_cursor_rect(&w->place, w->buf_w, w->buf_h, w->gpos_x,
                                    w->gpos_y, (int)w->gc_hx, (int)w->gc_hy,
@@ -8928,11 +8947,22 @@ static void spr_update(struct nb_wl *w)
     }
     if (!want) {
         if (w->spr_mapped) {
-            /* Unmapping the anchor unmaps the cursor with it. */
+            /*
+             * Both surfaces lose their buffer, the cursor first: a
+             * compositor may draw a subsurface whose parent was unmapped
+             * as long as it still has a buffer.  Then the area it covered
+             * is damaged on the window's own surface (spr_kick_now): one
+             * that repaints only what a commit damages -- Hyprland -- kept
+             * the cursor's last pixels on screen after the ungrab.
+             */
+            wl_surface_attach(w->spr_surf, NULL, 0, 0);
+            wl_surface_commit(w->spr_surf);
             wl_surface_attach(w->spr_anchor, NULL, 0, 0);
             wl_surface_commit(w->spr_anchor);
             w->spr_mapped = false;
+            w->spr_buf = NULL;
             w->spr_kick = true;
+            nb_spr_damage_add(&w->spr_dmg, &w->spr_at);
             wl_display_flush(w->dpy);
         }
         return;
@@ -8954,6 +8984,7 @@ static void spr_update(struct nb_wl *w)
             wl_surface_attach(w->spr_anchor, w->spr_anchor_buf, 0, 0);
             wl_surface_damage_buffer(w->spr_anchor, 0, 0, 1, 1);
             w->spr_kick = true;
+            nb_spr_damage_add(&w->spr_dmg, &r);
         }
         wl_surface_commit(w->spr_anchor);
         w->spr_mapped = true;
@@ -8973,11 +9004,19 @@ static void spr_update(struct nb_wl *w)
  */
 static void spr_kick_now(struct nb_wl *w)
 {
+    struct nb_rect d = w->spr_dmg;
+
     if (!w->spr_kick || !w->surf) {
         return;
     }
     w->spr_kick = false;
-    wl_surface_damage_buffer(w->surf, 0, 0, 1, 1);
+    w->spr_dmg = (struct nb_rect){ 0, 0, 0, 0 };
+    /* Surface coordinates: the window's, which the cursor was placed in. */
+    if (d.w > 0 && d.h > 0) {
+        wl_surface_damage(w->surf, d.x, d.y, d.w, d.h);
+    } else {
+        wl_surface_damage(w->surf, 0, 0, 1, 1);
+    }
     wl_surface_commit(w->surf);
     wl_display_flush(w->dpy);
 }

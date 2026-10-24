@@ -175,15 +175,19 @@ hides its cursor (a game) gets no host pointer over the picture.
   image, so the viewer draws the guest cursor itself, where the guest says
   its pointer is (`CMD_CURSOR_POS`; a Windows guest reports it while a
   grabbed viewer draws it). It starts where the host pointer was when the
-  grab began, and is drawn only while the guest shows a cursor: under a game
-  that hides it nothing is drawn. The overlay says `CURSOR VIEWER` while it
+  grab began, and is drawn only while the guest shows a cursor, the window
+  has the keyboard and the pointer is over the picture: under a game that
+  hides it nothing is drawn, and a release, a focus loss or the pointer
+  leaving takes it away at once. The overlay says `CURSOR VIEWER` while it
   is drawn. A guest that reports no position (a Linux guest, an older Windows
   driver) shows no cursor under grab.
   - Wayland: a subsurface over the picture with the cursor's buffer,
     scaled like the picture, with no input region. A move commits only the
-    cursor's own parent (a 1x1 transparent subsurface), never the picture;
-    when the cursor appears or goes the window's surface is committed once,
-    nothing attached, so every compositor repaints. It is unmapped when not
+    cursor's own parent (a 1x1 transparent subsurface), never the picture.
+    When it goes, both surfaces lose their buffer; when it appears or goes,
+    the window's surface is committed once, nothing attached, with the area
+    the cursor covers damaged, so a compositor that repaints only damage
+    repaints it. It is unmapped when not
     drawn, so the picture can be scanned out directly again; while it is
     drawn it is listed among the direct scanout blockers. While tearing in
     fullscreen it moves with a cursor nudge (below).
