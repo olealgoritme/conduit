@@ -1,0 +1,30 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "Thomas H.P. Andersen" <phomes@gmail.com>
+Date: Sun, 18 Oct 2026 15:29:31 +0200
+Subject: [PATCH] nak: use correct src_type for OpBSSy bar_in
+
+bar_in is not Pred but Bar
+
+Reviewed-by: Mel Henning <mhenning@darkrefraction.com>
+Part-of: <https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/45351>
+(cherry picked from commit 61f3a1d01fcb9285f961521c2cd6125bc95075e4)
+---
+ src/nouveau/compiler/nak/ir.rs | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/nouveau/compiler/nak/ir.rs b/src/nouveau/compiler/nak/ir.rs
+index a66fcdee..28dc58c8 100644
+--- a/src/nouveau/compiler/nak/ir.rs
++++ b/src/nouveau/compiler/nak/ir.rs
+@@ -7117,7 +7117,7 @@ pub struct OpBSSy {
+     #[dst_type(Bar)]
+     pub bar_out: Dst,
+ 
+-    #[src_type(Pred)]
++    #[src_type(Bar)]
+     pub bar_in: Src,
+ 
+     #[src_type(Pred)]
+-- 
+2.43.0
+
