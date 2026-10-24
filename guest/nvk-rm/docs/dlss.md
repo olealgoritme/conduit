@@ -31,7 +31,7 @@ default|dlss|fsr|xess` pick between them.
 | NVK: `NVK_CUBIN_TRACE` (patches-common 0103) | done |
 | Host tool `nvk-cubin-cache.py` (PTX to sm_120 SASS) | done; all 261 PTX-only modules of the 310.9.16 DLLs compile on the host, none with anything NVK refuses |
 | `conduit upscaler`, ctl op `upscaler`, tray, viewer menu row | done, unit tests |
-| `Install-OptiScaler.ps1` (per-game, user-downloaded OptiScaler) | written, not run |
+| `Install-OptiScaler.ps1` (per game; downloads a pinned, hash-checked OptiScaler release) and the tray's per-game OptiScaler menu ([optiscaler.md](../../windows/docs/optiscaler.md)) | script run in a guest with a dummy game, not with a game; tray unit tests |
 | NGX runtime install (host's signed `nvngx.dll`, `_nvngx.dll`): `Install-Dlss.ps1` / `Uninstall-Dlss.ps1` | `Install-Dlss.ps1` run in the guest (`-SystemNvapi -Log`); `Uninstall-Dlss.ps1` not run |
 | nvapi64 for NGX: dxvk-nvapi + `third_party/patches/dxvk-nvapi` 0001-0004, `tools/build-dxvk-nvapi.sh` | builds (MinGW, 64-bit); runs in the guest for Vulkan (NGX finds the GPU, Blackwell) |
 | D3D12 DLSS: engine-object meta-commands in the D3D12 driver (`umd12/src/forward12/dlss12.rs`) + nvapi 0004 | done, host `cargo check`, not run |
@@ -325,20 +325,13 @@ preset for OptiScaler games with an NVIDIA host.
 ## OptiScaler
 
 OptiScaler (github.com/optiscaler/OptiScaler) is **GPL-3.0**: Conduit neither
-ships nor links it. The user downloads a release, extracts it (7-Zip) and runs,
-in an elevated PowerShell in the guest:
-
-```powershell
-.\Install-OptiScaler.ps1 -Game 'G:\...\Game.exe' -Source "$env:USERPROFILE\Downloads\OptiScaler_0.9.4"
-.\Install-OptiScaler.ps1 -Game 'G:\...\Game.exe' -Uninstall
-```
-
-(`guest/windows/packaging/windows/Install-OptiScaler.ps1`; copy it in with
-`conduit cp`.) It copies the release next to the game as `dxgi.dll`
-(`-Proxy winmm|version|...` when the game has its own), refuses to replace
-files without `-Force`, lists what it copied in `conduit-optiscaler.txt` for
-`-Uninstall`, and registers the game's `OptiScaler.ini` for the upscaler
-setting. Not for online games with anti-cheat.
+ships nor links it. `Install-OptiScaler.ps1` downloads the release pinned in
+`optiscaler-manifest.txt` from GitHub, checks its SHA-256 and copies it next
+to one game; the tray's **Profile for <exe>** > **OptiScaler** menu runs it
+(install, remove, upscaler, frame generation). It refuses games with
+anti-cheat and never changes a running game. With this page's DLSS setup in
+place, a new install picks DLSS as the output and the guest's nvapi64.dll;
+otherwise FSR 3.1. Details: [optiscaler.md](../../windows/docs/optiscaler.md).
 
 How it runs on our stack (from OptiScaler's documentation; not run yet):
 
@@ -420,7 +413,7 @@ Run:
   `tools/umd12-host-check.sh`.
 
 Not run: a game; D3D12 DLSS; GPUs before Blackwell; the tray on Windows;
-`Install-OptiScaler.ps1`, `Uninstall-Dlss.ps1`.
+`Uninstall-Dlss.ps1`; OptiScaler in a game.
 
 ## Guest test plan
 

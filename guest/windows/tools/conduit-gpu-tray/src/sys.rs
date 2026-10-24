@@ -313,7 +313,7 @@ pub fn autostart_enabled() -> bool {
 }
 
 /// `%ProgramFiles%\Conduit`, from the known folder (not the environment).
-fn install_dir() -> Option<String> {
+pub fn install_dir() -> Option<String> {
     let _com = crate::apps::ComGuard::new();
     let pf = crate::apps::known_folder(&windows_sys::Win32::UI::Shell::FOLDERID_ProgramFiles)?;
     Some(gpu_tray::policy::install_dir(&pf.to_string_lossy()))
@@ -643,7 +643,8 @@ pub fn enhance_remove_profile(exe: &str) -> bool {
     }
 }
 
-/// The executables of the visible, titled top-level windows, front to back
+/// The executables (full paths) of the visible, titled top-level windows,
+/// front to back
 pub fn windowed_exes() -> Vec<String> {
     use windows_sys::Win32::Foundation::{CloseHandle, BOOL, HWND, LPARAM};
     use windows_sys::Win32::System::Threading::{
@@ -670,10 +671,7 @@ pub fn windowed_exes() -> Vec<String> {
         let mut buf = [0u16; 1024];
         let mut len = buf.len() as u32;
         if QueryFullProcessImageNameW(p, 0, buf.as_mut_ptr(), &mut len) != 0 {
-            let path = String::from_utf16_lossy(&buf[..len as usize]);
-            if let Some(name) = path.rsplit('\\').next() {
-                out.push(name.to_string());
-            }
+            out.push(String::from_utf16_lossy(&buf[..len as usize]));
         }
         CloseHandle(p);
         1
@@ -681,4 +679,181 @@ pub fn windowed_exes() -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     unsafe { EnumWindows(Some(each), &mut out as *mut Vec<String> as LPARAM) };
     out
+}
+
+// ---- OptiScaler per game (gpu_tray::optiscaler) --------------------------
+
+/// The full image paths of the running processes this process may query.
+pub fn process_paths() -> Vec<String> {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    let mut out = Vec::new();
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snap == INVALID_HANDLE_VALUE {
+            return out;
+        }
+        let mut e: PROCESSENTRY32W = std::mem::zeroed();
+        e.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        let mut ok = Process32FirstW(snap, &mut e);
+        while ok != 0 {
+            let p = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, e.th32ProcessID);
+            if !p.is_null() {
+                let mut buf = [0u16; 1024];
+                let mut len = buf.len() as u32;
+                if QueryFullProcessImageNameW(p, 0, buf.as_mut_ptr(), &mut len) != 0 {
+                    out.push(String::from_utf16_lossy(&buf[..len as usize]));
+                }
+                CloseHandle(p);
+            }
+            ok = Process32NextW(snap, &mut e);
+        }
+        CloseHandle(snap);
+    }
+    out
+}
+
+/// Install-OptiScaler.ps1 next to this exe, when this exe is the installed
+/// one (in `%ProgramFiles%\Conduit`, which only administrators change: the
+/// script runs elevated) and the script and its manifest are there.
+pub fn optiscaler_script(exe: &str) -> Option<String> {
+    let dir = install_dir()?;
+    if !gpu_tray::policy::is_under(exe, &dir) {
+        return None;
+    }
+    let here = std::path::Path::new(exe).parent()?;
+    let script = here.join(gpu_tray::optiscaler::SCRIPT);
+    let manifest = here.join("optiscaler-manifest.txt");
+    (script.is_file() && manifest.is_file()).then(|| script.to_string_lossy().into_owned())
+}
+
+/// The names of the files and folders in `dir`.
+pub fn dir_names(dir: &str) -> Vec<String> {
+    std::fs::read_dir(dir)
+        .map(|it| {
+            it.filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A small text file, when it is there.
+pub fn read_text(path: &str) -> Option<String> {
+    let b = std::fs::read(path).ok()?;
+    (b.len() < 1 << 20).then(|| String::from_utf8_lossy(&b).into_owned())
+}
+
+/// Games with OptiScaler from the script: (exe name, exe path), from the
+/// folders listed under HKLM\SOFTWARE\Helios\OptiScaler and their markers.
+pub fn optiscaler_games() -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for (dir, _) in sz_values(HKEY_LOCAL_MACHINE, OPTISCALER_GAMES) {
+        let marker = format!(
+            "{}\\{}",
+            dir.trim_end_matches('\\'),
+            gpu_tray::optiscaler::MARKER
+        );
+        let Some(m) = read_text(&marker).map(|t| gpu_tray::optiscaler::parse_marker(&t)) else {
+            continue;
+        };
+        let Some(exe) = m
+            .exe
+            .filter(|e| gpu_tray::enhance::profile_key(e).is_some())
+        else {
+            continue;
+        };
+        let path = format!("{}\\{exe}", dir.trim_end_matches('\\'));
+        if std::path::Path::new(&path).is_file() {
+            out.push((exe, path));
+        }
+    }
+    out
+}
+
+/// Install-Dlss.ps1's setup is in place (as the script checks it): the NGX
+/// runtime in %ProgramData%\Helios\ngx, `Dlss` = 1, nvapi64.dll in System32
+/// or next to the game.
+pub fn dlss_ready(game_dir: &str) -> bool {
+    let pd = {
+        let _com = crate::apps::ComGuard::new();
+        crate::apps::known_folder(&windows_sys::Win32::UI::Shell::FOLDERID_ProgramData)
+    };
+    let Some(pd) = pd else {
+        return false;
+    };
+    let ngx = pd.join("Helios").join("ngx");
+    let dlss = get(HKEY_LOCAL_MACHINE, HELIOS, "Dlss")
+        .and_then(|b| Some(u32::from_le_bytes(b.get(..4)?.try_into().ok()?)))
+        == Some(1);
+    dlss && ngx.join("nvngx.dll").is_file()
+        && ngx.join("_nvngx.dll").is_file()
+        && (system32("nvapi64.dll").is_file()
+            || std::path::Path::new(game_dir).join("nvapi64.dll").is_file())
+}
+
+/// Runs Install-OptiScaler.ps1 with `args` and waits for it: directly when
+/// this process is elevated (its output comes back), else through one UAC
+/// prompt (only the exit code). (exit code, output)
+pub fn run_optiscaler(script: &str, args: &[String]) -> (Option<i32>, String) {
+    let ps = system32(r"WindowsPowerShell\v1.0\powershell.exe");
+    let full = gpu_tray::optiscaler::powershell_args(script, args);
+    if elevated() {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        return match std::process::Command::new(&ps)
+            .args(&full)
+            .stdin(std::process::Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+        {
+            Ok(o) => (
+                o.status.code(),
+                format!(
+                    "{}\n{}",
+                    String::from_utf8_lossy(&o.stdout),
+                    String::from_utf8_lossy(&o.stderr)
+                ),
+            ),
+            Err(e) => (
+                None,
+                format!("Install-OptiScaler: cannot start PowerShell: {e}"),
+            ),
+        };
+    }
+    use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+    use windows_sys::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
+    use windows_sys::Win32::UI::Shell::{
+        ShellExecuteExW, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
+    };
+    let params: Vec<String> = full.iter().map(|a| gpu_tray::procs::quote_arg(a)).collect();
+    let verb = wide("runas");
+    let file = wide(&ps.to_string_lossy());
+    let params = wide(&params.join(" "));
+    let mut sei: SHELLEXECUTEINFOW = unsafe { std::mem::zeroed() };
+    sei.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
+    sei.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC;
+    sei.lpVerb = verb.as_ptr();
+    sei.lpFile = file.as_ptr();
+    sei.lpParameters = params.as_ptr();
+    sei.nShow = 0; // SW_HIDE
+    unsafe {
+        if ShellExecuteExW(&mut sei) == 0 || sei.hProcess.is_null() {
+            return (
+                None,
+                "Install-OptiScaler: not started (administrator rights refused?)".into(),
+            );
+        }
+        let mut code = 1u32;
+        let done = WaitForSingleObject(sei.hProcess, 60 * 60 * 1000) == WAIT_OBJECT_0
+            && GetExitCodeProcess(sei.hProcess, &mut code) != 0;
+        CloseHandle(sei.hProcess);
+        (done.then_some(code as i32), String::new())
+    }
 }
