@@ -1,0 +1,153 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Sat, 24 Oct 2026 09:06:31 +0200
+Subject: [PATCH] nak: NAK_TEX_UHANDLE=3 (early exit before texture lowering),
+ NAK_LDCU_INDEX
+
+NAK_TEX_UHANDLE=3: in compute shaders the early exit (NAK_EARLY_EXIT) runs
+before nak_nir_lower_tex, so that the texture instructions behind a bounds
+check are in convergent control flow when the uniform handle form is
+chosen.  Before, the whole shader body was still inside the divergent if
+(or the loop that never iterates) at that point and the handle stayed in a
+GPR.
+
+NAK_LDCU_INDEX: on SM100+ a constant buffer load whose offset is a
+uniform value is LDCU c[N][URx] (the form the reference compiler uses for
+descriptor loads), instead of LDC with the offset copied to a GPR and the
+result copied back with R2UR.  Bindless constant buffers only from SM120.
+---
+ src/nouveau/compiler/nak/knobs.rs | 22 ++++++++++++++++++----
+ src/nouveau/compiler/nak/sm70.rs  | 18 +++++++++++++++++-
+ src/nouveau/compiler/nak_nir.c    | 16 +++++++++++++++-
+ 3 files changed, 50 insertions(+), 6 deletions(-)
+
+diff --git a/src/nouveau/compiler/nak/knobs.rs b/src/nouveau/compiler/nak/knobs.rs
+index 54ad20b..3016bb5 100644
+--- a/src/nouveau/compiler/nak/knobs.rs
++++ b/src/nouveau/compiler/nak/knobs.rs
+@@ -123,6 +123,7 @@ static SCHED_FREE: OnceLock<i32> = OnceLock::new();
+ static FSET_BF: OnceLock<bool> = OnceLock::new();
+ static SCHED_ILP: OnceLock<bool> = OnceLock::new();
+ static GCM: OnceLock<u32> = OnceLock::new();
++static LDCU_INDEX: OnceLock<bool> = OnceLock::new();
+ 
+ /// NAK_GCM (0-3, default 0): nir_opt_gcm with value numbering after NAK's
+ /// NIR optimization loop; 2 also sinks ALU instructions back towards their
+@@ -142,20 +143,23 @@ pub extern "C" fn nak_knob_gcm() -> u32 {
+     gcm()
+ }
+ 
+-/// NAK_TEX_UHANDLE (0-2, default 2 on Windows, 0 elsewhere, SM100+): a
++/// NAK_TEX_UHANDLE (0-3, default 2 on Windows, 0 elsewhere, SM100+): a
+ /// bindless texture handle that
+ /// is the same in every lane goes in the instruction's uniform register
+ /// field, a UGPR pair (texture index, sampler index), with the scalar source
+ /// form (.SCR), as in the reference compiler's code, instead of the second
+ /// source vector: fewer copies to build contiguous source vectors.  1: texel
+-/// fetches (TLD) only; 2: TEX, TLD and TLD4 (nak_nir_lower_tex.c,
+-/// from_nir.rs, sm70_encode.rs)
++/// fetches (TLD) only; 2: TEX, TLD and TLD4; 3: as 2, and in compute
++/// shaders the early exit (NAK_EARLY_EXIT) runs before texture lowering, so
++/// that the texture instructions behind a bounds check are in convergent
++/// control flow when the handle form is chosen (nak_nir_lower_tex.c,
++/// nak_nir.c, from_nir.rs, sm70_encode.rs)
+ pub fn tex_uhandle() -> u32 {
+     // Steel Nomad (405.140): 1612706b -8%, +0.4% fps with NAK_OCC_FS
+     let dflt = if cfg!(target_os = "windows") { 2 } else { 0 };
+     *TEX_UHANDLE.get_or_init(|| match env::var("NAK_TEX_UHANDLE") {
+         Ok(s) => match s.trim().parse::<u32>() {
+-            Ok(v) if v <= 2 => v,
++            Ok(v) if v <= 3 => v,
+             _ => dflt,
+         },
+         Err(_) => dflt,
+@@ -180,6 +184,15 @@ fn parse_u32(name: &str, default: u32, max: u32) -> u32 {
+     }
+ }
+ 
++/// NAK_LDCU_INDEX (default off): on SM100+, a constant buffer load whose
++/// offset is a uniform register value is a uniform LDCU c[N][URx] (the
++/// form the reference compiler uses for descriptor loads) instead of a
++/// per-lane LDC with the offset copied to a GPR and the result copied back
++/// with R2UR (sm70.rs)
++pub fn ldcu_index() -> bool {
++    *LDCU_INDEX.get_or_init(|| parse("NAK_LDCU_INDEX", env::var("NAK_LDCU_INDEX"), false))
++}
++
+ /// NAK_F16_PAIR (default off): independent scalar 32-to-16-bit float
+ /// conversions in a block are paired into one 2-wide conversion (one
+ /// F2FP.PACK_AB), so the 16-bit math that follows reads the lanes of one
+@@ -338,6 +351,7 @@ pub extern "C" fn nak_knobs_key2() -> u32 {
+     // no free bit left: NAK_OCC_FS is mixed in
+     key ^ if occ_fs() { 0x9e37_79b9 } else { 0 }
+         ^ uniform_hoist().wrapping_mul(0x85eb_ca6b)
++        ^ if ldcu_index() { 0xc2b2_ae35 } else { 0 }
+ }
+ 
+ /// NAK_YIELD (default off, experimental, SM120): control bit 109 set on
+diff --git a/src/nouveau/compiler/nak/sm70.rs b/src/nouveau/compiler/nak/sm70.rs
+index 24d70b0..72838e8 100644
+--- a/src/nouveau/compiler/nak/sm70.rs
++++ b/src/nouveau/compiler/nak/sm70.rs
+@@ -146,7 +146,23 @@ impl ShaderModel for ShaderModel70 {
+             | Op::Unpin(_)
+             | Op::Ldcg(_) => true,
+             Op::F2FP(_) => self.sm() >= 86,
+-            Op::Ldc(op) => op.offset.is_zero(),
++            Op::Ldc(op) => {
++                // NAK_LDCU_INDEX: on SM100+ LDCU takes a UGPR offset (the
++                // reference compiler's code loads descriptors with
++                // LDCU c[N][URx+imm]); bindless cbufs only from SM120
++                op.offset.is_zero()
++                    || (crate::knobs::ldcu_index()
++                        && self.sm() >= 100
++                        && op.mode == LdcMode::Indexed
++                        && match &op.cb.src_ref {
++                            SrcRef::CBuf(cb) => match cb.buf {
++                                CBuf::Binding(_) => true,
++                                CBuf::BindlessUGPR(_) => self.sm() >= 120,
++                                _ => false,
++                            },
++                            _ => false,
++                        })
++            }
+             Op::FAdd(_)
+             | Op::FFma(_)
+             | Op::FMnMx(_)
+diff --git a/src/nouveau/compiler/nak_nir.c b/src/nouveau/compiler/nak_nir.c
+index 9d7e5d6..1431e23 100644
+--- a/src/nouveau/compiler/nak_nir.c
++++ b/src/nouveau/compiler/nak_nir.c
+@@ -1998,6 +1998,20 @@ nak_postprocess_nir(nir_shader *nir,
+       nak_optimize_nir(nir, nak);
+    }
+ 
++   /* NAK_TEX_UHANDLE=3: the early exit first, so that the texture
++    * instructions behind a compute shader's bounds check are in convergent
++    * control flow when nak_nir_lower_tex chooses the uniform handle form
++    */
++   bool early_exit_done = false;
++   if (nak->sm >= 100 && nak_knob_tex_uhandle() >= 3 && nak_knob_early_exit()) {
++      if (OPT(nir, nak_nir_lower_early_exit)) {
++         OPT(nir, nir_opt_constant_folding);
++         OPT(nir, nir_opt_dead_cf);
++         nir_divergence_analysis(nir);
++         early_exit_done = true;
++      }
++   }
++
+    OPT(nir, nak_nir_lower_tex, nak);
+    OPT(nir, nir_lower_idiv, NULL);
+ 
+@@ -2134,7 +2148,7 @@ nak_postprocess_nir(nir_shader *nir,
+     * shader runs in convergent control flow (NAK_EARLY_EXIT).
+     */
+    if (nak->sm >= 70 && nak_knob_early_exit()) {
+-      if (OPT(nir, nak_nir_lower_early_exit)) {
++      if (OPT(nir, nak_nir_lower_early_exit) || early_exit_done) {
+          OPT(nir, nir_opt_constant_folding);
+          OPT(nir, nir_opt_dead_cf);
+          /* Addresses used in blocks that are now convergent can take the
+-- 
+2.43.0
+
