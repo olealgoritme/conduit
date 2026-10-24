@@ -117,9 +117,9 @@ static uint64_t fnv64(const void *data, uint64_t n, uint64_t h)
 /* ------------------------------------------------------------------------------------------- options */
 static struct {
     int n, warm, reset, compile_only, list, robust, verbose, no_draw, split, ts_only, seq, seq_barriers;
-    const char *dev, *dump, *csv, *label, *dump_cache, *seq_dir; int seq_id;
+    const char *dev, *dump, *csv, *label, *dump_cache, *seq_dir; int seq_id; int evict_mb;
     int grid_override; uint32_t grid[3];
-} O = { 15, 5, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, NULL, NULL, NULL, NULL, NULL, NULL, 0, 0, { 0, 0, 0 } };
+} O = { 15, 5, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, NULL, NULL, NULL, NULL, NULL, NULL, 0, 0, 0, { 0, 0, 0 } };
 
 static void usage(void)
 {
@@ -146,6 +146,8 @@ static void usage(void)
         "  --seq-barriers M  with --seq: captured (default), all (a barrier between every two dispatches) or none\n"
         "  --seq-dir PARENT  with --seq: every capture directory under PARENT that belongs to a sequence (instead of\n"
         "                  listing them); --seq-id ID picks one sequence when PARENT holds several (default: the largest)\n"
+        "  --evict MB      before each timed repeat (outside the timestamps), write and read a buffer of MB MiB, so that\n"
+        "                  the caches no longer hold the dispatch's data, as in a frame (the L2 of an RTX 5090: 96 MiB)\n"
         "  -v              print every resource\n");
     exit(2);
 }
@@ -952,6 +954,26 @@ static void write_descriptors(void)
 /* ------------------------------------------------------------------------------------------- run */
 static int cmp_d(const void *a, const void *b) { double x = *(const double *)a, y = *(const double *)b; return x < y ? -1 : x > y; }
 
+/* --evict: two device-local buffers of O.evict_mb MiB; a fill of one and a copy of it into the other, behind
+ * full barriers, push everything else out of the L2 */
+static VkBuffer g_ev[2];
+static void record_evict(VkCommandBuffer cb)
+{
+    if (O.evict_mb <= 0) return;
+    const uint64_t n = (uint64_t)O.evict_mb << 20;
+    if (!g_ev[0])
+        for (int k = 0; k < 2; k++)
+            g_ev[k] = make_buffer(n, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                  VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, NULL);
+    static uint32_t v = 1;
+    full_barrier(cb);
+    vkCmdFillBuffer(cb, g_ev[0], 0, n, v++);
+    full_barrier(cb);
+    VkBufferCopy c = { 0, 0, n };
+    vkCmdCopyBuffer(cb, g_ev[0], g_ev[1], 1, &c);
+    full_barrier(cb);
+}
+
 /* --seq: the dispatches of one NVK_DISPATCH_CAPTURE_SEQ sequence, each with its own captured resources (no
  * data flows from one to the next: every dispatch reads the inputs it had in the game), replayed in their
  * order in one command buffer, with a compute-to-compute barrier where the game recorded a pipeline barrier;
@@ -1140,6 +1162,7 @@ static int run_seq(int ndirs, char **dirs)
     VkCommandBuffer cb = begin_cmd();
     vkCmdResetQueryPool(cb, qp, 0, 2 * total);
     for (uint32_t r = 0; r < total; r++) {
+        record_evict(cb);
         full_barrier(cb);
         vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, qp, 2 * r);
         for (int d = 0; d < ndirs; d++) {
@@ -1173,13 +1196,14 @@ static int run_seq(int ndirs, char **dirs)
     printf("sequence %u on %s: %d dispatches (indices %u..%u), %d barriers (%s), %d resources (%d not captured), "
            "%.1f MiB, pipelines %.1f ms\n", seq_id, g_pp.deviceName, ndirs, S[0].index, S[ndirs - 1].index, nbar, bm,
            nres, nerr, bytes / 1048576.0, compile_ms);
-    printf("gpu_us median %.2f min %.2f mean %.2f max %.2f per sequence (n=%d, warm-up %d), %.2f per dispatch, wall %.1f ms\n",
-           med, us[0], sum / O.n, us[O.n - 1], O.n, O.warm, med / ndirs, wall);
+    printf("gpu_us median %.2f min %.2f mean %.2f max %.2f per sequence (n=%d, warm-up %d%s), %.2f per dispatch, wall %.1f ms\n",
+           med, us[0], sum / O.n, us[O.n - 1], O.n, O.warm, O.evict_mb > 0 ? ", caches evicted before each" : "",
+           med / ndirs, wall);
     if (O.csv) {
         FILE *f = fopen(O.csv, "a");
         if (f) {
-            fprintf(f, "seq%u\t%s\t%d.dispatches.%d.barriers.%s\t%.2f\t%.2f\t%.2f\t%.2f\t%d\tnoreset\t-\t%.1f\n", seq_id,
-                    O.label ? O.label : g_pp.deviceName, ndirs, nbar, bm, med, us[0], sum / O.n, us[O.n - 1], O.n, compile_ms);
+            fprintf(f, "seq%u\t%s\t%d.dispatches.%d.barriers.%s%s\t%.2f\t%.2f\t%.2f\t%.2f\t%d\tnoreset\t-\t%.1f\n", seq_id,
+                    O.label ? O.label : g_pp.deviceName, ndirs, nbar, bm, O.evict_mb > 0 ? ".evict" : "", med, us[0], sum / O.n, us[O.n - 1], O.n, compile_ms);
             fclose(f);
         }
     }
@@ -1210,6 +1234,7 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--dump-cache") && i + 1 < argc) O.dump_cache = argv[++i];
         else if (!strcmp(a, "-v")) O.verbose = 1;
         else if (!strcmp(a, "--seq")) O.seq = 1;
+        else if (!strcmp(a, "--evict") && i + 1 < argc) O.evict_mb = atoi(argv[++i]);
         else if (!strcmp(a, "--seq-dir") && i + 1 < argc) { O.seq = 1; O.seq_dir = argv[++i]; }
         else if (!strcmp(a, "--seq-id") && i + 1 < argc) O.seq_id = atoi(argv[++i]);
         else if (!strcmp(a, "--seq-barriers") && i + 1 < argc) {
@@ -1287,6 +1312,7 @@ int main(int argc, char **argv)
     if (push_size) vkCmdPushConstants(cb, g_pl, g_stages, 0, (push_size + 3) & ~3u, push);
     for (uint32_t it = 0; it < total; it++) {
         if (O.reset) { full_barrier(cb); record_restore(cb, 1); }
+        record_evict(cb);
         full_barrier(cb);
         if (g_draw && O.ts_only) { /* an untimed empty pass, then nothing between the timestamps */
             int nd = O.no_draw; O.no_draw = 1; record_draw(cb, VK_NULL_HANDLE, 0); O.no_draw = nd;
