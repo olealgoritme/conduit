@@ -13,6 +13,8 @@
 //! `vkGetPhysicalDeviceMemoryProperties` lists the card's heaps, and the largest
 //! `DEVICE_LOCAL` one is its video memory. (A second `DEVICE_LOCAL` heap, the BAR-visible slice
 //! some drivers list, overlaps the first and is never added to it.)
+//! A backend VRAM limit bounds the reported capacity even when a larger registry
+//! override or host heap is available.
 
 /// `VK_MEMORY_HEAP_DEVICE_LOCAL_BIT`.
 pub const MEMORY_HEAP_DEVICE_LOCAL: u32 = 0x1;
@@ -54,6 +56,8 @@ pub enum Source {
     /// The virtio host-visible window length: the fallback when the Venus device could not tell.
     /// It is address space for blobs, not the card's memory.
     HostVisibleWindow,
+    /// The VRAM limit enforced by the backend.
+    BackendLimit,
     /// Nothing usable: the legacy one-GiB aperture+BAR topology.
     None,
 }
@@ -65,6 +69,7 @@ impl Source {
             Self::Registry => 1,
             Self::DeviceLocalHeap => 2,
             Self::HostVisibleWindow => 3,
+            Self::BackendLimit => 4,
             Self::None => 0,
         }
     }
@@ -73,11 +78,11 @@ impl Source {
 /// The resolved capacity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Resolved {
-    /// MiB; 0 selects the legacy topology. An explicit registry value is passed through unchanged
-    /// (an out-of-range one is refused, and counted, where the segment is built).
+    /// MiB; 0 selects the legacy topology. An invalid registry value is passed
+    /// through for the segment builder to reject.
     pub mb: u32,
     pub source: Source,
-    /// The host GPU was bigger than [`MAX_MB`] and the value is the cap.
+    /// The selected capacity exceeded [`MAX_MB`] and the value is the cap.
     pub clamped: bool,
     /// An automatic source existed but its size was unusable (`VidVBad` carries it, in MiB).
     pub bad_mb: Option<u32>,
@@ -85,8 +90,31 @@ pub struct Resolved {
 
 /// Resolve `VidMmVramMB`. `knob` is the registry value ([`AUTO`] when absent);
 /// `device_local_heap` the host GPU's video memory from [`device_local_heap_bytes`];
-/// `host_visible` the exact length the virtio host-visible shared-memory capability reports.
-pub fn resolve(knob: u32, device_local_heap: Option<u64>, host_visible: Option<u64>) -> Resolved {
+/// `host_visible` the exact length the virtio host-visible shared-memory capability reports;
+/// `backend_limit_mb` the enforced VRAM limit, or 0 when unlimited or unavailable.
+pub fn resolve(
+    knob: u32,
+    device_local_heap: Option<u64>,
+    host_visible: Option<u64>,
+    backend_limit_mb: u64,
+) -> Resolved {
+    let mut resolved = resolve_capacity(knob, device_local_heap, host_visible);
+    if backend_limit_mb == 0 || (knob != AUTO && !(MIN_MB..=MAX_MB).contains(&knob)) {
+        return resolved;
+    }
+    if resolved.mb == 0 || u64::from(resolved.mb) > backend_limit_mb {
+        resolved.mb = backend_limit_mb.min(u64::from(MAX_MB)) as u32;
+        resolved.source = Source::BackendLimit;
+        resolved.clamped = backend_limit_mb > u64::from(MAX_MB);
+    }
+    resolved
+}
+
+fn resolve_capacity(
+    knob: u32,
+    device_local_heap: Option<u64>,
+    host_visible: Option<u64>,
+) -> Resolved {
     if knob != AUTO {
         return Resolved {
             mb: knob,
@@ -189,7 +217,7 @@ mod tests {
     #[test]
     fn auto_reports_the_card_not_the_window() {
         // The defect: an 8 GiB Venus window made a 32 GiB card report 8 GiB.
-        let r = resolve(AUTO, Some(32_109 * MIB), Some(8 * GIB));
+        let r = resolve(AUTO, Some(32_109 * MIB), Some(8 * GIB), 0);
         assert_eq!(r.mb, 32_109);
         assert_eq!(r.source, Source::DeviceLocalHeap);
         assert!(!r.clamped);
@@ -205,52 +233,52 @@ mod tests {
             Some(64 * GIB),
             Some(GIB + 1),
         ] {
-            assert_eq!(resolve(AUTO, Some(24 * GIB), window).mb, 24 * 1024);
+            assert_eq!(resolve(AUTO, Some(24 * GIB), window, 0).mb, 24 * 1024);
         }
     }
 
     #[test]
     fn auto_keeps_a_card_smaller_than_the_window_at_its_own_size() {
-        let r = resolve(AUTO, Some(8 * GIB - 100 * MIB), Some(16 * GIB));
+        let r = resolve(AUTO, Some(8 * GIB - 100 * MIB), Some(16 * GIB), 0);
         assert_eq!(r.mb, 8 * 1024 - 100);
         assert_eq!(r.source, Source::DeviceLocalHeap);
     }
 
     #[test]
     fn a_bigger_card_is_capped() {
-        let r = resolve(AUTO, Some(96 * GIB), Some(8 * GIB));
+        let r = resolve(AUTO, Some(96 * GIB), Some(8 * GIB), 0);
         assert_eq!(r.mb, MAX_MB);
         assert!(r.clamped);
         assert_eq!(r.source, Source::DeviceLocalHeap);
-        let r = resolve(AUTO, Some(u64::MAX), None);
+        let r = resolve(AUTO, Some(u64::MAX), None, 0);
         assert_eq!(r.mb, MAX_MB);
         assert!(r.clamped);
     }
 
     #[test]
     fn the_cap_itself_is_not_clamped() {
-        let r = resolve(AUTO, Some(64 * GIB), None);
+        let r = resolve(AUTO, Some(64 * GIB), None, 0);
         assert_eq!(r.mb, MAX_MB);
         assert!(!r.clamped);
     }
 
     #[test]
     fn a_tiny_heap_falls_through_to_the_window() {
-        let r = resolve(AUTO, Some(128 * MIB), Some(8 * GIB));
+        let r = resolve(AUTO, Some(128 * MIB), Some(8 * GIB), 0);
         assert_eq!(r.mb, 8 * 1024);
         assert_eq!(r.source, Source::HostVisibleWindow);
     }
 
     #[test]
     fn minimum_heap_is_accepted() {
-        let r = resolve(AUTO, Some(256 * MIB), None);
+        let r = resolve(AUTO, Some(256 * MIB), None, 0);
         assert_eq!(r.mb, MIN_MB);
         assert_eq!(r.source, Source::DeviceLocalHeap);
     }
 
     #[test]
     fn without_a_heap_auto_is_the_window_as_before() {
-        let r = resolve(AUTO, None, Some(6 * GIB));
+        let r = resolve(AUTO, None, Some(6 * GIB), 0);
         assert_eq!(r.mb, 6 * 1024);
         assert_eq!(r.source, Source::HostVisibleWindow);
         assert_eq!(r.bad_mb, None);
@@ -258,7 +286,7 @@ mod tests {
 
     #[test]
     fn without_either_auto_is_the_legacy_topology() {
-        let r = resolve(AUTO, None, None);
+        let r = resolve(AUTO, None, None, 0);
         assert_eq!(r.mb, 0);
         assert_eq!(r.source, Source::None);
         assert_eq!(r.bad_mb, None);
@@ -267,20 +295,23 @@ mod tests {
     #[test]
     fn an_unusable_window_is_reported_bad() {
         // Not a whole number of MiB.
-        let r = resolve(AUTO, None, Some(GIB + 1));
+        let r = resolve(AUTO, None, Some(GIB + 1), 0);
         assert_eq!(r.mb, 0);
         assert_eq!(r.bad_mb, Some(1024));
         // Below the minimum and above the maximum.
-        assert_eq!(resolve(AUTO, None, Some(128 * MIB)).mb, 0);
-        assert_eq!(resolve(AUTO, None, Some(128 * MIB)).bad_mb, Some(128));
-        assert_eq!(resolve(AUTO, None, Some(128 * GIB)).mb, 0);
-        assert_eq!(resolve(AUTO, None, Some(u64::MAX)).bad_mb, Some(u32::MAX));
+        assert_eq!(resolve(AUTO, None, Some(128 * MIB), 0).mb, 0);
+        assert_eq!(resolve(AUTO, None, Some(128 * MIB), 0).bad_mb, Some(128));
+        assert_eq!(resolve(AUTO, None, Some(128 * GIB), 0).mb, 0);
+        assert_eq!(
+            resolve(AUTO, None, Some(u64::MAX), 0).bad_mb,
+            Some(u32::MAX)
+        );
     }
 
     #[test]
-    fn an_explicit_value_always_wins() {
+    fn an_explicit_value_wins_without_a_backend_limit() {
         for knob in [0, 256, 4096, 24_576, 65_536, 70_000] {
-            let r = resolve(knob, Some(32_109 * MIB), Some(8 * GIB));
+            let r = resolve(knob, Some(32_109 * MIB), Some(8 * GIB), 0);
             assert_eq!(r.mb, knob);
             assert_eq!(r.source, Source::Registry);
             assert!(!r.clamped);
@@ -290,7 +321,7 @@ mod tests {
 
     #[test]
     fn explicit_zero_is_the_legacy_topology_even_with_a_heap() {
-        assert_eq!(resolve(0, Some(32 * GIB), Some(8 * GIB)).mb, 0);
+        assert_eq!(resolve(0, Some(32 * GIB), Some(8 * GIB), 0).mb, 0);
     }
 
     #[test]
@@ -300,11 +331,80 @@ mod tests {
             Source::Registry.code(),
             Source::DeviceLocalHeap.code(),
             Source::HostVisibleWindow.code(),
+            Source::BackendLimit.code(),
         ];
         for (i, a) in codes.iter().enumerate() {
             for b in &codes[i + 1..] {
                 assert_ne!(a, b);
             }
         }
+    }
+
+    #[test]
+    fn backend_limit_caps_the_host_heap() {
+        let r = resolve(AUTO, Some(12 * GIB), Some(8 * GIB), 6144);
+        assert_eq!(r.mb, 6144);
+        assert_eq!(r.source, Source::BackendLimit);
+        assert!(!r.clamped);
+    }
+
+    #[test]
+    fn backend_limit_caps_the_window_fallback() {
+        let r = resolve(AUTO, None, Some(8 * GIB), 6144);
+        assert_eq!(r.mb, 6144);
+        assert_eq!(r.source, Source::BackendLimit);
+    }
+
+    #[test]
+    fn backend_limit_supplies_capacity_without_a_heap_or_window() {
+        let r = resolve(AUTO, None, None, 6144);
+        assert_eq!(r.mb, 6144);
+        assert_eq!(r.source, Source::BackendLimit);
+    }
+
+    #[test]
+    fn backend_limit_never_enlarges_a_smaller_heap() {
+        let r = resolve(AUTO, Some(4 * GIB), Some(8 * GIB), 6144);
+        assert_eq!(r.mb, 4096);
+        assert_eq!(r.source, Source::DeviceLocalHeap);
+    }
+
+    #[test]
+    fn registry_override_cannot_exceed_the_backend_limit() {
+        let r = resolve(12 * 1024, Some(12 * GIB), Some(8 * GIB), 6144);
+        assert_eq!(r.mb, 6144);
+        assert_eq!(r.source, Source::BackendLimit);
+        let r = resolve(4096, Some(12 * GIB), Some(8 * GIB), 6144);
+        assert_eq!(r.mb, 4096);
+        assert_eq!(r.source, Source::Registry);
+    }
+
+    #[test]
+    fn backend_limit_preserves_legacy_and_invalid_overrides() {
+        for knob in [0, 128, 70_000] {
+            let r = resolve(knob, Some(12 * GIB), Some(8 * GIB), 6144);
+            assert_eq!(r.mb, knob);
+            assert_eq!(r.source, Source::Registry);
+        }
+    }
+
+    #[test]
+    fn unlimited_or_large_backend_limits_do_not_wrap_or_change_capacity() {
+        for limit in [0, 12 * 1024, u64::MAX] {
+            let r = resolve(AUTO, Some(12 * GIB), Some(8 * GIB), limit);
+            assert_eq!(r.mb, 12 * 1024);
+            assert_eq!(r.source, Source::DeviceLocalHeap);
+        }
+        let r = resolve(AUTO, None, None, u64::MAX);
+        assert_eq!(r.mb, MAX_MB);
+        assert_eq!(r.source, Source::BackendLimit);
+        assert!(r.clamped);
+    }
+
+    #[test]
+    fn a_small_backend_limit_is_not_rounded_up() {
+        let r = resolve(AUTO, Some(12 * GIB), Some(8 * GIB), 128);
+        assert_eq!(r.mb, 128);
+        assert_eq!(r.source, Source::BackendLimit);
     }
 }

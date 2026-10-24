@@ -155,9 +155,9 @@ pub const FEATURE_RMCTRL_SEGMENTS: u32 = 1 << 0;
 /// Device configuration space.
 ///
 /// Mirrors `struct conduit_gpu_config` up to 4016 bytes, which the driver
-/// asserts, with `num_fd_translations` at offset 3880. The guest reads no
-/// further: `vram_limit_mib` after it is for the VMM. The whole must fit in
-/// one page.
+/// asserts, with `num_fd_translations` at offset 3880. The Windows guest also
+/// reads the optional `vram_limit_mib` field when the config is long enough.
+/// The whole must fit in one page.
 ///
 /// This replaced a 24-byte struct whose first field was `num_gpus`. The driver
 /// reads `num_gpus` from offset 32 and rejects zero, so it read past the end of
@@ -191,9 +191,8 @@ pub struct VirtioGpuNvConfig {
     /// enforcing the limit the VMM was configured with: a limit is a flag on
     /// a process the VMM did not start, and a missing flag would otherwise be
     /// a guest with the whole card. Appended, so a backend from before it
-    /// serves 4016 bytes and a VMM reads the absence as 0. The guest driver
-    /// never reads it: a VMM from before it exposes 4016 bytes, and a guest
-    /// read past those BUGs in virtio_cread_bytes.
+    /// serves 4016 bytes and a VMM reads the absence as 0. Windows checks the
+    /// config length before reading this field; the Linux guest does not read it.
     pub vram_limit_mib: u64,
     /// The display's preferred mode, valid only when `features` carries
     /// [`protocol::messages::NVGPU_CFG_DISPLAY`] (docs/SCANOUT.md). Appended,

@@ -134,6 +134,8 @@ const CONDUIT_OPTIONAL_FEATURES: u64 = helios_protocol::CONDUIT_OPTIONAL_FEATURE
 /// Byte offset of `features` in the device config (`VirtioGpuNvConfig`, right
 /// after `num_fd_translations` at 3880).
 const CONDUIT_CFG_FEATURES_OFFSET: usize = 3884;
+/// Byte offset of `VirtioGpuNvConfig::vram_limit_mib`.
+const CONDUIT_CFG_VRAM_LIMIT_OFFSET: usize = 4016;
 /// `NVGPU_CFG_VENUS`: the device serves `GpuCmd` (set only with `--venus`).
 const CONDUIT_CFG_VENUS: u32 = 1 << 10;
 /// One page of contiguous DMA scratch for `init`'s inline polled round-trip.
@@ -2905,6 +2907,22 @@ fn negotiate_features(transport: &mut PciTransport, optional: u64) -> Result<u64
 impl VirtioGpu {
     pub(crate) fn control_space_epoch(&self) -> u64 {
         self.control_space_epoch
+    }
+
+    /// The backend's enforced VRAM limit, or 0 for an unlimited/older backend.
+    pub(crate) fn vram_limit_mib(&self) -> u64 {
+        // VirtIO config reads guarantee only 4-byte alignment, including u64 fields.
+        self.transport
+            .read_consistent(|| {
+                let lo: u32 = self
+                    .transport
+                    .read_config_space(CONDUIT_CFG_VRAM_LIMIT_OFFSET)?;
+                let hi: u32 = self
+                    .transport
+                    .read_config_space(CONDUIT_CFG_VRAM_LIMIT_OFFSET + 4)?;
+                Ok(u64::from(lo) | (u64::from(hi) << 32))
+            })
+            .unwrap_or(0)
     }
 
     /// Bring the virtio-gpu device online and prove it with `GET_DISPLAY_INFO`.
