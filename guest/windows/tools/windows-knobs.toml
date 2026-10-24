@@ -1366,6 +1366,11 @@ class = "tuning"
 read = "device creation (once per process)"
 effect = "On by default (unset or 1); 0 turns it off. Rematerialization in NAK's GPR spiller (cheap values such as constants, constant-buffer and constant-memory loads, thread/CTA IDs and short ALU chains are recomputed at reloads instead of going to local memory; constant-memory loads through a constant-buffer address reload with one LDG from a UGPR copy of the address) and a per-shader register target: after scheduling, NAK estimates the cost of spilling down to each lower register count that gives more warps per SM (workgroup and shared memory limits included) and uses the one with the best estimated gain, never one that needs more than a few memory spills or any inside a loop. A NAK_GPR_CAP for a stage overrides the target of that stage and then spills with rematerialization. Part of the shader cache key."
 
+[env.NAK_SCHED_MLP]
+class = "tuning"
+read = "first shader compile (once per process)"
+effect = "0-3, default 3 on Windows and 0 elsewhere. 1-3: NAK's schedulers model global, local and texture latency as an L2 round trip instead of 32 cycles, so independent loads issue early and stay in flight together, and read-only accesses are not ordered against stores; 3 also hoists them as far as their operands allow. A unit that does not fit its register target keeps the plain schedule, so it never costs occupancy. Part of the shader cache key."
+
 [env.NAK_IMM_CSE]
 class = "tuning"
 read = "first shader compile (once per process)"
