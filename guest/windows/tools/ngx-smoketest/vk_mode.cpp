@@ -376,6 +376,413 @@ static int finish()
     return failures() ? 1 : 0;
 }
 
+/* ---- --cutest: CUDA kernel checks (cutest.ptx) ---- */
+
+static PFN_vkCreateCuModuleNVX pCreateCuModule;
+static PFN_vkDestroyCuModuleNVX pDestroyCuModule;
+static PFN_vkCreateCuFunctionNVX pCreateCuFunction;
+static PFN_vkDestroyCuFunctionNVX pDestroyCuFunction;
+static PFN_vkCmdCuLaunchKernelNVX pCmdCuLaunchKernel;
+static PFN_vkGetImageViewHandleNVX pGetImageViewHandle;
+static PFN_vkGetBufferDeviceAddress pGetBufferDeviceAddress;
+static PFN_vkCreateSampler pCreateSampler;
+static PFN_vkDestroySampler pDestroySampler;
+
+struct DevBuf {
+    Buf b;
+    uint64_t addr;
+};
+
+// Host-visible buffer with a device address, zeroed.
+static bool create_dev_buffer(DevBuf *d, VkDeviceSize size)
+{
+    Buf *b = &d->b;
+    b->size = size;
+    VkBufferCreateInfo ci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    ci.size = size;
+    ci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+               VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    if (!vkcheck("vkCreateBuffer", vkCreateBuffer(dev, &ci, NULL, &b->buf)))
+        return false;
+    VkMemoryRequirements mr;
+    vkGetBufferMemoryRequirements(dev, b->buf, &mr);
+    VkMemoryAllocateFlagsInfo fi = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
+    fi.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    ai.pNext = &fi;
+    ai.allocationSize = mr.size;
+    const VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    if (!find_mem(mr.memoryTypeBits, want, &ai.memoryTypeIndex)) {
+        fail("no host-visible coherent memory for a device-address buffer");
+        return false;
+    }
+    b->coherent = true;
+    if (!vkcheck("vkAllocateMemory(dev buffer)", vkAllocateMemory(dev, &ai, NULL, &b->mem)) ||
+        !vkcheck("vkBindBufferMemory", vkBindBufferMemory(dev, b->buf, b->mem, 0)) ||
+        !vkcheck("vkMapMemory", vkMapMemory(dev, b->mem, 0, VK_WHOLE_SIZE, 0, &b->map)))
+        return false;
+    memset(b->map, 0, (size_t)size);
+    VkBufferDeviceAddressInfo bi = {VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+    bi.buffer = b->buf;
+    d->addr = pGetBufferDeviceAddress(dev, &bi);
+    return d->addr != 0;
+}
+
+static void destroy_dev_buffer(DevBuf *d)
+{
+    if (d->b.buf) vkDestroyBuffer(dev, d->b.buf, NULL);
+    if (d->b.mem) vkFreeMemory(dev, d->b.mem, NULL);
+    memset(d, 0, sizeof(*d));
+}
+
+static void destroy_img(Img *im)
+{
+    if (im->view) vkDestroyImageView(dev, im->view, NULL);
+    if (im->img) vkDestroyImage(dev, im->img, NULL);
+    if (im->mem) vkFreeMemory(dev, im->mem, NULL);
+    memset(im, 0, sizeof(*im));
+}
+
+static bool read_file(const char *path, char **data, size_t *size)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f)
+        return false;
+    fseek(f, 0, SEEK_END);
+    long n = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (n <= 0) {
+        fclose(f);
+        return false;
+    }
+    *data = (char *)malloc((size_t)n + 1);
+    *size = fread(*data, 1, (size_t)n, f);
+    (*data)[*size] = 0;
+    fclose(f);
+    return *size == (size_t)n;
+}
+
+// One launch, submitted and waited for. params: one pointer per parameter;
+// packed (non-NULL): all parameters in one buffer through
+// CU_LAUNCH_PARAM_BUFFER_POINTER, as NGX passes them.
+static bool cu_launch(VkCuFunctionNVX fn, const char *name, uint32_t gx, uint32_t gy, uint32_t bx, uint32_t by,
+                      const void *const *params, uint32_t nparams, const void *packed, size_t packed_size)
+{
+    begin_cmd();
+    VkCuLaunchInfoNVX li = {VK_STRUCTURE_TYPE_CU_LAUNCH_INFO_NVX};
+    li.function = fn;
+    li.gridDimX = gx;
+    li.gridDimY = gy;
+    li.gridDimZ = 1;
+    li.blockDimX = bx;
+    li.blockDimY = by;
+    li.blockDimZ = 1;
+    size_t psize = packed_size;
+    const void *extras[] = {(const void *)1, packed, (const void *)2, &psize, (const void *)0};
+    if (packed) {
+        li.extraCount = 1;
+        li.pExtras = extras;
+    } else {
+        li.paramCount = nparams;
+        li.pParams = params;
+    }
+    pCmdCuLaunchKernel(cmd, &li);
+    memory_barrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_WRITE_BIT,
+                   VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                   VK_ACCESS_HOST_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT);
+    return submit_wait(name, NULL);
+}
+
+// Compares n dwords; prints the first few mismatches. True if all match.
+static bool cu_expect(const char *what, const uint32_t *got, const uint32_t *want, unsigned n)
+{
+    unsigned bad = 0;
+    for (unsigned i = 0; i < n; i++) {
+        if (got[i] == want[i])
+            continue;
+        if (bad < 6)
+            out("       %s[%u] = 0x%08x, expected 0x%08x", what, i, got[i], want[i]);
+        bad++;
+    }
+    if (bad)
+        fail("%s: %u of %u values wrong", what, bad, n);
+    else
+        ok("%s: all %u values right", what, n);
+    return bad == 0;
+}
+
+static uint32_t f2u(float f)
+{
+    uint32_t u;
+    memcpy(&u, &f, 4);
+    return u;
+}
+
+int run_cutest_kernels()
+{
+    step("cutest setup");
+#define GETD(var, name)                                         \
+    var = (decltype(var))vkGetDeviceProcAddr(dev, name);        \
+    if (!var) { fail("vkGetDeviceProcAddr(%s) = NULL", name); return 1; }
+    GETD(pCreateCuModule, "vkCreateCuModuleNVX")
+    GETD(pDestroyCuModule, "vkDestroyCuModuleNVX")
+    GETD(pCreateCuFunction, "vkCreateCuFunctionNVX")
+    GETD(pDestroyCuFunction, "vkDestroyCuFunctionNVX")
+    GETD(pCmdCuLaunchKernel, "vkCmdCuLaunchKernelNVX")
+    GETD(pGetImageViewHandle, "vkGetImageViewHandleNVX")
+    GETD(pGetBufferDeviceAddress, "vkGetBufferDeviceAddress")
+    GETD(pCreateSampler, "vkCreateSampler")
+    GETD(pDestroySampler, "vkDestroySampler")
+#undef GETD
+    char *data = NULL;
+    size_t size = 0;
+    if (!read_file(g_opt.cutest, &data, &size)) {
+        fail("cannot read %s", g_opt.cutest);
+        return 1;
+    }
+    // PTX goes in as text (NVK takes its SASS from the cubin cache), a
+    // cubin as is.
+    VkCuModuleCreateInfoNVX mci = {VK_STRUCTURE_TYPE_CU_MODULE_CREATE_INFO_NVX};
+    mci.dataSize = (size >= 4 && !memcmp(data, "\x7f" "ELF", 4)) ? size : size + 1;
+    mci.pData = data;
+    VkCuModuleNVX module = VK_NULL_HANDLE;
+    if (!vkcheck("vkCreateCuModuleNVX", pCreateCuModule(dev, &mci, NULL, &module)))
+        return 1;
+    ok("module from %s (%zu bytes)", g_opt.cutest, size);
+
+    const char *names[] = {"k_consts", "k_local", "k_shared", "k_tex", "k_tld", "k_surf", "k_async", "k_mma"};
+    enum { K_CONSTS, K_LOCAL, K_SHARED, K_TEX, K_TLD, K_SURF, K_ASYNC, K_MMA, K_COUNT };
+    VkCuFunctionNVX fn[K_COUNT] = {};
+    for (int i = 0; i < K_COUNT; i++) {
+        VkCuFunctionCreateInfoNVX fci = {VK_STRUCTURE_TYPE_CU_FUNCTION_CREATE_INFO_NVX};
+        fci.module = module;
+        fci.pName = names[i];
+        char what[64];
+        snprintf(what, sizeof(what), "vkCreateCuFunctionNVX(%s)", names[i]);
+        if (!vkcheck(what, pCreateCuFunction(dev, &fci, NULL, &fn[i])))
+            return 1;
+    }
+
+    DevBuf outb = {}, inb = {};
+    if (!create_dev_buffer(&outb, 1 << 20) || !create_dev_buffer(&inb, 1 << 16))
+        return 1;
+    uint32_t *o = (uint32_t *)outb.b.map;
+    uint32_t *in = (uint32_t *)inb.b.map;
+    for (unsigned i = 0; i < 1024; i++)
+        in[i] = 0x10000u * i + 0x5a5a;
+    in[5] = 0x5555;
+
+    step("cutest k_consts");
+    {
+        uint32_t magic = 0x1234abcd;
+        const void *p[] = {&outb.addr, &inb.addr, &magic};
+        if (cu_launch(fn[K_CONSTS], "k_consts", 3, 2, 4, 2, p, 3, NULL, 0)) {
+            uint32_t want[12] = {4, 2, 1, 3, 2, 1, magic, 22, 77, magic, 0x5555, 32};
+            cu_expect("k_consts out (ntid xyz, nctaid xyz, param, global, constant, global rw, ld.nc, warpsize)",
+                      o, want, 12);
+        }
+    }
+
+    step("cutest k_local");
+    {
+        memset(o, 0, 4096);
+        struct { uint64_t out; uint32_t n, idx; } pk = {outb.addr, 1000, 5};
+        if (cu_launch(fn[K_LOCAL], "k_local", 1, 1, 64, 1, NULL, 0, &pk, sizeof(pk))) {
+            uint32_t want[64];
+            for (unsigned t = 0; t < 64; t++)
+                want[t] = ((t + 5) & 63) * 3 + 1000;
+            uint64_t la, ga;
+            memcpy(&la, (uint8_t *)o + 512, 8);
+            memcpy(&ga, (uint8_t *)o + 520, 8);
+            out("       local array: local address 0x%llx, generic 0x%llx", (unsigned long long)la,
+                (unsigned long long)ga);
+            cu_expect("k_local out (local array on the stack, packed parameters)", o, want, 64);
+            uint32_t want_g = 5 * 3 + 1000;
+            cu_expect("k_local generic load from the local array", o + 132, &want_g, 1);
+        }
+    }
+
+    step("cutest k_shared");
+    {
+        memset(o, 0, 4096);
+        const void *p[] = {&outb.addr};
+        if (cu_launch(fn[K_SHARED], "k_shared", 1, 1, 256, 1, p, 1, NULL, 0)) {
+            uint32_t want[512];
+            for (unsigned t = 0; t < 256; t++) {
+                want[t] = 7 * (255 - t) + 1;
+                want[256 + t] = 7 * (t ^ 1) + 1;
+            }
+            cu_expect("k_shared out (shared address)", o, want, 256);
+            cu_expect("k_shared out (generic address of shared memory)", o + 256, want + 256, 256);
+        }
+    }
+
+    // Images: 64x32 RGBA8 with a pattern, uploaded through a buffer.
+    const unsigned W = 64, H = 32;
+    Img tex = {}, s_src = {}, s_dst = {};
+    VkSampler sampler = VK_NULL_HANDLE;
+    bool imgs = create_image(&tex, "cutest tex", VK_FORMAT_R8G8B8A8_UNORM, W, H,
+                             VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT) &&
+                create_image(&s_src, "cutest surf src", VK_FORMAT_R8G8B8A8_UNORM, W, H,
+                             VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT) &&
+                create_image(&s_dst, "cutest surf dst", VK_FORMAT_R8G8B8A8_UNORM, W, H,
+                             VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                                 VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+    VkSamplerCreateInfo sci = {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+    sci.magFilter = sci.minFilter = VK_FILTER_NEAREST;
+    sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    sci.maxLod = 0.0f;
+    imgs = imgs && vkcheck("vkCreateSampler", pCreateSampler(dev, &sci, NULL, &sampler));
+    // A second sampler (another sampler index in the handle), as NGX uses
+    // one sampler for the application's inputs and another for its own.
+    // It takes unnormalized coordinates, so k_tex's normalized ones all land
+    // in texel (0, 0) when the kernel really samples with it.
+    VkSampler sampler2 = VK_NULL_HANDLE;
+    sci.unnormalizedCoordinates = VK_TRUE;
+    imgs = imgs && vkcheck("vkCreateSampler", pCreateSampler(dev, &sci, NULL, &sampler2));
+    uint32_t pattern[64 * 32];
+    for (unsigned y = 0; y < H; y++)
+        for (unsigned x = 0; x < W; x++)
+            pattern[y * W + x] = (x * 4) | ((y * 8) << 8) | (((x ^ y) * 3 & 0xff) << 16) | (0xc0u << 24);
+    DevBuf stage = {};
+    if (imgs && create_dev_buffer(&stage, sizeof(pattern))) {
+        memcpy(stage.b.map, pattern, sizeof(pattern));
+        begin_cmd();
+        Img *ims[] = {&tex, &s_src, &s_dst};
+        for (Img *im : ims)
+            image_barrier(im->img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                          VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                          VK_ACCESS_TRANSFER_WRITE_BIT);
+        VkBufferImageCopy region = {};
+        region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.imageExtent = {W, H, 1};
+        vkCmdCopyBufferToImage(cmd, stage.b.buf, tex.img, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+        vkCmdCopyBufferToImage(cmd, stage.b.buf, s_src.img, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+        VkClearColorValue cc = {};
+        VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vkCmdClearColorImage(cmd, s_dst.img, VK_IMAGE_LAYOUT_GENERAL, &cc, 1, &range);
+        memory_barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                       VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+        imgs = submit_wait("cutest image upload", NULL);
+    } else {
+        imgs = false;
+    }
+
+    VkImageViewHandleInfoNVX hi = {VK_STRUCTURE_TYPE_IMAGE_VIEW_HANDLE_INFO_NVX};
+    uint32_t want_tex[64 * 32 * 4];
+    for (unsigned i = 0; i < W * H; i++)
+        for (unsigned c = 0; c < 4; c++)
+            want_tex[i * 4 + c] = f2u((float)((pattern[i] >> (8 * c)) & 0xff) / 255.0f);
+    uint32_t want_tex00[64 * 32 * 4];
+    for (unsigned i = 0; i < W * H * 4; i++)
+        want_tex00[i] = want_tex[i & 3];
+    // Handle encodings tried with the second sampler: as the driver returns
+    // it, and image index (bits 0-19) | sampler index << 32.
+    for (int run = 0; run < 6 && imgs; run++) {
+        const int k = run & 1 ? K_TLD : K_TEX;
+        const bool second = run >= 2;
+        const bool split = run >= 4;
+        step(k == K_TEX ? "cutest k_tex" : "cutest k_tld");
+        hi.imageView = tex.view;
+        hi.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        hi.sampler = second ? sampler2 : sampler;
+        uint64_t th = pGetImageViewHandle(dev, &hi);
+        if (split)
+            th = (th & 0xfffff) | ((th >> 20) << 32);
+        out("       %s sampler, handle 0x%llx%s", second ? "second (unnormalized)" : "first",
+            (unsigned long long)th, split ? " (sampler index moved to bit 32)" : "");
+        memset(o, 0, sizeof(want_tex));
+        uint32_t w = W, h = H;
+        const void *p[] = {&th, &outb.addr, &w, &h};
+        if (cu_launch(fn[k], names[k], W / 16, H / 16, 16, 16, p, 4, NULL, 0)) {
+            const uint32_t *want = (k == K_TEX && second) ? want_tex00 : want_tex;
+            char what[128];
+            snprintf(what, sizeof(what), "%s, %s sampler%s",
+                     k == K_TEX ? "k_tex texels (normalized coordinates)" : "k_tld texels (integer coordinates)",
+                     second ? "second" : "first", split ? ", split handle" : "");
+            cu_expect(what, o, want, W * H * 4);
+        }
+    }
+
+    if (imgs) {
+        step("cutest k_surf");
+        hi.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        hi.sampler = VK_NULL_HANDLE;
+        hi.imageView = s_src.view;
+        uint64_t sh = pGetImageViewHandle(dev, &hi);
+        hi.imageView = s_dst.view;
+        uint64_t dh = pGetImageViewHandle(dev, &hi);
+        out("       storage image handles src 0x%08llx dst 0x%08llx", (unsigned long long)sh,
+            (unsigned long long)dh);
+        memset(o, 0, sizeof(pattern));
+        uint32_t w = W, h = H;
+        const void *p[] = {&sh, &dh, &outb.addr, &w, &h};
+        if (cu_launch(fn[K_SURF], "k_surf", W / 16, H / 16, 16, 16, p, 5, NULL, 0)) {
+            cu_expect("k_surf surface loads", o, pattern, W * H);
+            begin_cmd();
+            VkBufferImageCopy region = {};
+            region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            region.imageExtent = {W, H, 1};
+            vkCmdCopyImageToBuffer(cmd, s_dst.img, VK_IMAGE_LAYOUT_GENERAL, stage.b.buf, 1, &region);
+            memory_barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                           VK_ACCESS_HOST_READ_BIT);
+            if (submit_wait("cutest surface readback", NULL)) {
+                uint32_t inv[64 * 32];
+                for (unsigned i = 0; i < W * H; i++)
+                    inv[i] = ~pattern[i];
+                cu_expect("k_surf surface stores", (const uint32_t *)stage.b.map, inv, W * H);
+            }
+        }
+    }
+
+    step("cutest k_async");
+    {
+        memset(o, 0, 4096);
+        const void *p[] = {&inb.addr, &outb.addr};
+        if (cu_launch(fn[K_ASYNC], "k_async", 1, 1, 64, 1, p, 2, NULL, 0)) {
+            uint32_t want[256];
+            for (unsigned t = 0; t < 64; t++)
+                for (unsigned i = 0; i < 4; i++)
+                    want[4 * t + i] = in[(63 - t) * 4 + i];
+            cu_expect("k_async out (cp.async to shared memory)", o, want, 256);
+            cu_expect("k_async ldmatrix", o + 256, in, 32);
+        }
+    }
+
+    step("cutest k_mma");
+    {
+        memset(o, 0, 4096);
+        const void *p[] = {&outb.addr};
+        if (cu_launch(fn[K_MMA], "k_mma", 1, 1, 32, 1, p, 1, NULL, 0)) {
+            uint32_t want[128];
+            for (unsigned l = 0; l < 32; l++)
+                for (unsigned i = 0; i < 4; i++)
+                    want[4 * l + i] = f2u(16.0f + (float)l);
+            cu_expect("k_mma out (mma.sync m16n8k16 f16 -> f32)", o, want, 128);
+        }
+    }
+
+    step("cutest cleanup");
+    destroy_dev_buffer(&stage);
+    if (sampler)
+        pDestroySampler(dev, sampler, NULL);
+    if (sampler2)
+        pDestroySampler(dev, sampler2, NULL);
+    destroy_img(&tex);
+    destroy_img(&s_src);
+    destroy_img(&s_dst);
+    destroy_dev_buffer(&outb);
+    destroy_dev_buffer(&inb);
+    for (int i = 0; i < K_COUNT; i++)
+        if (fn[i])
+            pDestroyCuFunction(dev, fn[i], NULL);
+    pDestroyCuModule(dev, module, NULL);
+    free(data);
+    ok("CUDA test objects destroyed");
+    return failures() ? 1 : 0;
+}
+
 int run_vulkan()
 {
     step("vulkan loader");
@@ -619,6 +1026,11 @@ int run_vulkan()
     if (!vkcheck("vkAllocateCommandBuffers", vkAllocateCommandBuffers(dev, &cai, &cmd)) ||
         !vkcheck("vkCreateFence", vkCreateFence(dev, &fci, NULL, &fence)))
         return finish();
+
+    if (g_opt.cutest) {
+        run_cutest_kernels();
+        return finish();
+    }
 
     step("NGX init");
     double t0 = now_ms();

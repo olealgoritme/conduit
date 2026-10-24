@@ -76,16 +76,16 @@ done
 # 2. Our code.
 cflags="--target=$TARGET -O2 -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers"
 "$CLANG" $cflags -c "$here/msvc_rt_shim.c" -o "$work/msvc_rt_shim.o"
-for s in main vk_mode d3d12_mode; do
+for s in main vk_mode d3d12_mode image_io; do
   "$CLANGXX" $cflags -std=c++17 -fno-exceptions -fno-rtti -I"$work/include" -isystem "$inc" \
     -c "$here/$s.cpp" -o "$work/$s.o"
 done
 
 # 3. Link. Anything left unresolved is a hard error (lld).
 "$CLANGXX" --target=$TARGET -fuse-ld=lld -static -o "$OUT_DIR/ngx-smoketest.exe" \
-  "$work/main.o" "$work/vk_mode.o" "$work/d3d12_mode.o" "$work/msvc_rt_shim.o" \
+  "$work/main.o" "$work/vk_mode.o" "$work/d3d12_mode.o" "$work/image_io.o" "$work/msvc_rt_shim.o" \
   "$work"/ngx/*.obj "$work/libngxucrt.a" \
-  -ld3d12 -ldxgi -lversion -lshell32 -ladvapi32 -luser32 -lkernel32
+  -ld3d12 -ldxgi -lwindowscodecs -lole32 -luuid -lversion -lshell32 -ladvapi32 -luser32 -lkernel32
 
 dlss="$NGX_SDK/lib/Windows_x86_64/rel/nvngx_dlss.dll"
 if [ -f "$dlss" ]; then

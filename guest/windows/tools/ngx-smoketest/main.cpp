@@ -11,6 +11,7 @@
 #include <winver.h>
 
 Options g_opt;
+InputImage g_image;
 
 static CRITICAL_SECTION out_lock;
 static const char *cur_step = "start";
@@ -322,11 +323,17 @@ bool ngx_print_caps(NVSDK_NGX_Parameter *caps)
     return avail == 1;
 }
 
+double quality_ratio(NVSDK_NGX_PerfQuality_Value q)
+{
+    static const double ratio[] = {0.5, 0.58, 2.0 / 3.0, 1.0 / 3.0, 0.77, 1.0}; // by PerfQuality_Value
+    return (unsigned)q < sizeof(ratio) / sizeof(ratio[0]) ? ratio[q] : 2.0 / 3.0;
+}
+
 void ngx_render_size(NVSDK_NGX_Parameter *caps, unsigned *w, unsigned *h)
 {
-    static const double ratio[] = {0.5, 0.58, 0.667, 0.333, 0.77, 1.0}; // by PerfQuality_Value
+    const double ratio = quality_ratio(g_opt.quality);
     unsigned ow = g_opt.out_w, oh = g_opt.out_h;
-    unsigned fw = (unsigned)(ow * ratio[g_opt.quality] + 0.5), fh = (unsigned)(oh * ratio[g_opt.quality] + 0.5);
+    unsigned fw = (unsigned)(ow * ratio + 0.5), fh = (unsigned)(oh * ratio + 0.5);
     unsigned opt_w = 0, opt_h = 0, min_w = 0, min_h = 0, max_w = 0, max_h = 0;
     void *cb = NULL;
     NVSDK_NGX_Parameter_GetVoidPointer(caps, NVSDK_NGX_Parameter_DLSSOptimalSettingsCallback, &cb);
@@ -406,6 +413,14 @@ void jitter(int frame, float *x, float *y)
 
 void make_color(uint8_t *rgba, unsigned w, unsigned h, size_t pitch)
 {
+    if (g_image.rgba) {
+        // --image: render size is the image's (nearest if it was overridden)
+        for (unsigned y = 0; y < h; y++)
+            for (unsigned x = 0; x < w; x++)
+                memcpy(rgba + y * pitch + x * 4,
+                       g_image.rgba + ((size_t)(y * g_image.h / h) * g_image.w + x * g_image.w / w) * 4, 4);
+        return;
+    }
     long cx = w / 2, cy = h / 2, rad = h / 4;
     for (unsigned y = 0; y < h; y++) {
         uint8_t *row = rgba + y * pitch;
@@ -533,6 +548,34 @@ bool check_output(const uint8_t *rgba, unsigned w, unsigned h, size_t pitch,
     log_path(path, L"ngx-input-", L".bmp");
     bool w2 = write_bmp(path, in_rgba, in_w, in_h, in_pitch);
     out("       %s %ls", w2 ? "wrote" : "could not write", path);
+    if (g_image.rgba) {
+        // --image: PNGs of the output and the input, and a plain bilinear
+        // upscale of the input to the output size to compare with.
+        uint8_t *bil = (uint8_t *)malloc((size_t)w * h * 4);
+        if (bil) {
+            bilinear_upscale(in_rgba, in_w, in_h, in_pitch, bil, w, h);
+            double bd[3] = {0, 0, 0};
+            for (unsigned y = 0; y < h; y++)
+                for (unsigned x = 0; x < w; x++)
+                    for (int c = 0; c < 3; c++)
+                        bd[c] += abs((int)rgba[(size_t)y * pitch + x * 4 + c] - (int)bil[((size_t)y * w + x) * 4 + c]);
+            out("       mean |output - bilinear upscale of the input| RGB = %.1f %.1f %.1f", bd[0] / n, bd[1] / n,
+                bd[2] / n);
+            log_path(path, L"ngx-bilinear-", L".bmp");
+            bool w3 = write_bmp(path, bil, w, h, (size_t)w * 4);
+            out("       %s %ls", w3 ? "wrote" : "could not write", path);
+            log_path(path, L"ngx-bilinear-", L".png");
+            w3 = image_write_png(path, bil, w, h, (size_t)w * 4);
+            out("       %s %ls", w3 ? "wrote" : "could not write", path);
+            free(bil);
+        }
+        log_path(path, L"ngx-output-", L".png");
+        bool w4 = image_write_png(path, rgba, w, h, pitch);
+        out("       %s %ls", w4 ? "wrote" : "could not write", path);
+        log_path(path, L"ngx-input-", L".png");
+        w4 = image_write_png(path, in_rgba, in_w, in_h, in_pitch);
+        out("       %s %ls", w4 ? "wrote" : "could not write", path);
+    }
 
     if (nonzero == 0) {
         fail("the output is all zero (black)");
@@ -711,6 +754,8 @@ static void usage()
         "                         [--quality perf|balanced|quality|ultraperf|ultraquality|dlaa]\n"
         "                         [--preset default|J|K|L|M] [--logdir DIR] [--appid N | --project-id GUID]\n"
         "                         [--timeout-ms N] [--watchdog-s N] [--device N] [-v]\n"
+        "                         [--image FILE.png|bmp|jpg]\n"
+        "       ngx-smoketest.exe --cutest cutest.ptx|FILE.cubin [--device N]  (CUDA kernel checks, no DLSS)\n"
         "defaults: --api vk --frames 100 --out 1920x1080 --quality quality (render size from NGX)\n"
         "          --logdir .\\ngxlog --timeout-ms 10000 --watchdog-s 300; -v echoes every NGX log line");
 }
@@ -758,6 +803,7 @@ static bool parse_args(int argc, char **argv)
             if (o.frames < 1 || o.frames > 100000) return false;
         } else if (!strcmp(a, "--out")) {
             if (!parse_wxh(v, &o.out_w, &o.out_h)) return false;
+            o.out_set = true;
         } else if (!strcmp(a, "--in")) {
             if (!parse_wxh(v, &o.in_w, &o.in_h)) return false;
         } else if (!strcmp(a, "--quality")) {
@@ -791,6 +837,10 @@ static bool parse_args(int argc, char **argv)
             if (!o.watchdog_s) return false;
         } else if (!strcmp(a, "--device")) {
             o.device = atoi(v);
+        } else if (!strcmp(a, "--cutest")) {
+            o.cutest = v;
+        } else if (!strcmp(a, "--image")) {
+            MultiByteToWideChar(CP_ACP, 0, v, -1, o.image, MAX_PATH);
         } else {
             out("unknown option %s", a);
             return false;
@@ -823,6 +873,22 @@ int main(int argc, char **argv)
     }
     done_event = CreateEventW(NULL, TRUE, FALSE, NULL);
     CreateThread(NULL, 0, watchdog, NULL, 0, NULL);
+
+    if (g_opt.image[0]) {
+        // The image is the render-size color input; the output is the
+        // mode's upscale of it unless --out says otherwise.
+        step("image");
+        if (!image_load(g_opt.image, &g_image.rgba, &g_image.w, &g_image.h))
+            return 2;
+        g_opt.in_w = g_image.w;
+        g_opt.in_h = g_image.h;
+        if (!g_opt.out_set) {
+            const double r = quality_ratio(g_opt.quality);
+            g_opt.out_w = (unsigned)(g_image.w / r + 0.5);
+            g_opt.out_h = (unsigned)(g_image.h / r + 0.5);
+        }
+        ok("%ls: %ux%u, upscaled to %ux%u", g_opt.image, g_image.w, g_image.h, g_opt.out_w, g_opt.out_h);
+    }
 
     out("ngx-smoketest: api %s, %d frames, output %ux%u, %s, preset %u, logdir %ls", g_opt.api,
         g_opt.frames, g_opt.out_w, g_opt.out_h, g_opt.quality_name, g_opt.preset, g_opt.logdir);

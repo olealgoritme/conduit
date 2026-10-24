@@ -34,7 +34,26 @@ struct Options {
     DWORD watchdog_s;           // the whole run
     int device;                 // physical device / adapter index, -1 = first usable
     bool verbose;               // echo every NGX log line
+    const char *cutest;         // --cutest FILE: CUDA kernel checks instead of DLSS (.ptx or .cubin)
+    bool out_set;               // --out given
+    wchar_t image[MAX_PATH];    // --image FILE: the color input for every frame (empty: the pattern)
 };
+
+// --image: the loaded input, RGBA8, pitch w * 4 (rgba NULL without --image)
+struct InputImage {
+    uint8_t *rgba;
+    unsigned w, h;
+};
+extern InputImage g_image;
+
+// image_io.cpp (Windows Imaging Component)
+bool image_load(const wchar_t *path, uint8_t **rgba, unsigned *w, unsigned *h);
+bool image_write_png(const wchar_t *path, const uint8_t *rgba, unsigned w, unsigned h, size_t pitch);
+// Plain bilinear resize (texel centres aligned, edges clamped) to ow x oh, pitch ow * 4.
+void bilinear_upscale(const uint8_t *in, unsigned iw, unsigned ih, size_t ipitch, uint8_t *out, unsigned ow,
+                      unsigned oh);
+// Render size / output size of a DLSS mode (by NVSDK_NGX_PerfQuality_Value).
+double quality_ratio(NVSDK_NGX_PerfQuality_Value q);
 
 extern Options g_opt;
 
@@ -68,7 +87,8 @@ void ngx_set_create_hints(NVSDK_NGX_Parameter *params);
 int ngx_create_flags();
 void jitter(int frame, float *x, float *y);
 
-// Inputs: RGBA8 color, R32F depth, RG16F motion vectors (all zero).
+// Inputs: RGBA8 color (the --image file, else a pattern), R32F depth, RG16F
+// motion vectors (all zero).
 void make_color(uint8_t *rgba, unsigned w, unsigned h, size_t pitch);
 void make_depth(float *d, unsigned w, unsigned h, size_t pitch_bytes);
 static const uint8_t kClear[4] = {255, 0, 255, 255}; // output before DLSS writes it
@@ -90,4 +110,7 @@ void timings_print(const Timings *t);
 
 void report_loaded_modules();
 int run_vulkan();
+// --cutest: runs the kernels of cutest.ptx through VK_NVX_binary_import on
+// the device run_vulkan created and checks their results (vk_mode.cpp).
+int run_cutest_kernels();
 int run_d3d12();

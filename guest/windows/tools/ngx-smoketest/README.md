@@ -27,6 +27,43 @@ path (signature check, registry lookup) is the one a game takes.
 | readback | output to the CPU: FNV-1a checksum, sample pixels next to the input's, min/max/mean, mean difference to a nearest-neighbour upscale of the input; `ngx-output-<api>.bmp` and `ngx-input-<api>.bmp` in the log folder |
 | shutdown | ReleaseFeature, DestroyParameters, Shutdown1, API objects |
 
+With `--image FILE` (PNG, BMP, JPEG: anything the Windows Imaging Component
+reads) the image is the color input of every frame instead of the pattern,
+with the same jitter sequence. The render size is the image's size; the
+output is the mode's upscale of it (Quality: 1.5x) unless `--out` is given.
+Besides the `.bmp` files the log folder then gets `ngx-output-<api>.png`,
+`ngx-input-<api>.png` and `ngx-bilinear-<api>.png` / `.bmp`, a plain
+bilinear upscale of the input to the output size to compare with, and the
+output check prints the mean difference to it.
+
+## CUDA kernel checks (`--cutest`)
+
+`--cutest cutest.ptx` (Vulkan only) skips NGX and runs the small CUDA
+kernels of [cutest.ptx](cutest.ptx) through `VK_NVX_binary_import` on the
+device, each checked against the values it must produce: the launch
+constants (`blockDim`, `gridDim`), a kernel parameter, module globals and
+`__constant__` data, a local array on the stack (also through its generic
+address), shared memory (shared and generic addresses), texture fetches
+and filtered lookups through `vkGetImageViewHandleNVX` handles with two
+samplers, surface loads and stores, `cp.async`, `ldmatrix` and `mma.sync`.
+Parameters go both ways NGX passes them (`pParams` and the packed
+`CU_LAUNCH_PARAM_BUFFER_POINTER`). A failing check names the values that
+are wrong.
+
+NVK has no PTX compiler: compile the module for the GPU on the host first,
+with the same tool as the DLSS cubin cache, and point NVK at the result:
+
+```sh
+guest/nvk-rm/tools/cubin-cache/nvk-cubin-cache.py build -o cutest-cache guest/windows/tools/ngx-smoketest/cutest.ptx
+```
+
+```bat
+set NVK_CUBIN_CACHE_DIR=C:\ngx-smoketest\cutest-cache
+ngx-smoketest.exe --cutest C:\ngx-smoketest\cutest.ptx
+```
+
+(A `.cubin` file is passed to NVK as is.)
+
 Every NGX call prints its result code and name. The output check fails if
 the output is all black, one constant value, or still the magenta clear
 color (DLSS never wrote it).
@@ -63,6 +100,8 @@ ngx-smoketest.exe [--api vk|d3d12] [--frames N] [--out WxH] [--in WxH]
                   [--quality perf|balanced|quality|ultraperf|ultraquality|dlaa]
                   [--preset default|J|K|L|M] [--logdir DIR] [--appid N | --project-id GUID]
                   [--timeout-ms N] [--watchdog-s N] [--device N] [-v]
+                  [--image FILE]
+ngx-smoketest.exe --cutest cutest.ptx|FILE.cubin [--device N]
 ```
 
 Defaults: Vulkan, 100 frames, output 1920x1080, Quality, render size from
