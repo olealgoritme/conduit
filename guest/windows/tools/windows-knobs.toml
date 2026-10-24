@@ -1379,7 +1379,7 @@ effect = "Unset: in compute shaders, a register copy of an immediate (needed whe
 [env.NAK_TEX_UHANDLE]
 class = "experiment"
 read = "first shader compile (once per process)"
-effect = "1 (SM100+): a bindless texture handle that is the same in every lane goes in the uniform register field of TEX, TLD and TLD4 instead of the second source vector, so the sources often use the scalar form (.SCR) without copies to build contiguous vectors, as in the reference compiler's code. Default 0. Part of the shader cache key."
+effect = "1 (SM100+): a bindless texture handle that is the same in every lane goes in the uniform register field of TEX, TLD and TLD4 with the scalar source form (.SCR, at most four source components), as in the reference compiler's code, which also saves the copies that build contiguous source vectors; instructions with more source components keep the handle in the second source vector. naktest has texture tests for it. Default 0. Part of the shader cache key."
 
 [env.NAK_UADDR_PIN]
 class = "tuning"

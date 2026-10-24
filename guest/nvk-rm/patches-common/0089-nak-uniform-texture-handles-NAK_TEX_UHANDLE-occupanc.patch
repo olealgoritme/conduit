@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Ole Algoritme <olealgoritme@gmail.com>
-Date: Sat, 24 Oct 2026 06:53:25 +0200
+Date: Sat, 24 Oct 2026 07:15:29 +0200
 Subject: [PATCH] nak: uniform texture handles (NAK_TEX_UHANDLE),
  occupancy-target knobs
 
@@ -8,9 +8,10 @@ NAK_TEX_UHANDLE (default off, SM100+): a bindless texture handle that is
 the same in every lane (by NIR's divergence analysis of the texture and
 sampler parts) goes in the uniform register field of TEX, TLD and TLD4
 (opcodes 0xf60, 0xf66, 0xf63) instead of the second source vector, as
-in the reference compiler's code.  The second vector is then often
-empty, and the sources use the scalar form (.SCR) without the copies
-that build contiguous vectors.  Legalization brings the handle back to
+in the reference compiler's code, and only with the scalar source form
+(.SCR: one or two components per source register, four in all), which
+also saves the copies that build contiguous vectors.  An instruction
+with more source components keeps the handle in its second vector.  Legalization brings the handle back to
 a UGPR with R2UR if NAK moved it to a GPR.
 
 NAK_REMAT_LD_COST (1-63, default 4): what a rematerialized load costs in
@@ -25,11 +26,11 @@ All three are in nak_knobs_key2(), so in NVK's pipeline cache keys.
  src/nouveau/compiler/nak/knobs.rs          | 53 ++++++++++++++++++++++
  src/nouveau/compiler/nak/nvdisasm_tests.rs |  3 ++
  src/nouveau/compiler/nak/occ_target.rs     | 17 +++++++
- src/nouveau/compiler/nak/sm70_encode.rs    | 39 +++++++++++++---
+ src/nouveau/compiler/nak/sm70_encode.rs    | 48 +++++++++++++++++---
  src/nouveau/compiler/nak/spill_remat.rs    |  3 +-
- src/nouveau/compiler/nak_nir_lower_tex.c   | 20 ++++++++
+ src/nouveau/compiler/nak_nir_lower_tex.c   | 43 ++++++++++++++++++
  src/nouveau/compiler/nak_private.h         |  1 +
- 9 files changed, 183 insertions(+), 12 deletions(-)
+ 9 files changed, 215 insertions(+), 12 deletions(-)
 
 diff --git a/src/nouveau/compiler/nak/from_nir.rs b/src/nouveau/compiler/nak/from_nir.rs
 index dac9df5..505ce3c 100644
@@ -308,7 +309,7 @@ index 48ca45c..18095ba 100644
          let mut cands = Vec::new();
          let mut a = natural;
 diff --git a/src/nouveau/compiler/nak/sm70_encode.rs b/src/nouveau/compiler/nak/sm70_encode.rs
-index f0af793..da17b46 100644
+index f0af793..bccd904 100644
 --- a/src/nouveau/compiler/nak/sm70_encode.rs
 +++ b/src/nouveau/compiler/nak/sm70_encode.rs
 @@ -2904,12 +2904,30 @@ fn legalize_tex_instr(op: &mut impl SrcsAsSlice, b: &mut LegalizeBuilder) {
@@ -353,19 +354,22 @@ index f0af793..da17b46 100644
                      e.set_bit(91, true);
                  } else {
                      e.set_opcode(0x361);
-@@ -2949,8 +2968,10 @@ impl SM70Op for OpTex {
+@@ -2949,8 +2968,13 @@ impl SM70Op for OpTex {
          e.set_reg_src(24..32, &self.srcs[0]);
          e.set_reg_src(32..40, &self.srcs[1]);
          if e.sm >= 100 {
 -            e.set_ureg_src(40, &Src::ZERO); // handle
 +            e.set_ureg_src(40, &self.handle); // handle
++            // The UR handle only with the scalar source form (as the
++            // reference compiler's code; nak_nir_lower_tex.c)
++            assert!(self.handle.is_zero() || self.scalar);
              e.set_ureg_src(48, &Src::ZERO); // offset
 +        } else {
 +            assert!(self.handle.is_zero());
          }
  
          e.set_bit(60, self.scalar);
-@@ -2998,7 +3019,7 @@ impl SM70Op for OpTld {
+@@ -2998,7 +3022,7 @@ impl SM70Op for OpTld {
              }
              TexRef::Bindless => {
                  if e.sm >= 100 {
@@ -374,19 +378,22 @@ index f0af793..da17b46 100644
                      e.set_bit(91, true);
                  } else {
                      e.set_opcode(0x367);
-@@ -3018,8 +3039,10 @@ impl SM70Op for OpTld {
+@@ -3018,8 +3042,13 @@ impl SM70Op for OpTld {
          e.set_reg_src(24..32, &self.srcs[0]);
          e.set_reg_src(32..40, &self.srcs[1]);
          if e.sm >= 100 {
 -            e.set_ureg_src(40, &Src::ZERO); // handle
 +            e.set_ureg_src(40, &self.handle); // handle
++            // The UR handle only with the scalar source form (as the
++            // reference compiler's code; nak_nir_lower_tex.c)
++            assert!(self.handle.is_zero() || self.scalar);
              e.set_ureg_src(48, &Src::ZERO); // offset
 +        } else {
 +            assert!(self.handle.is_zero());
          }
  
          if e.sm >= 100 {
-@@ -3074,7 +3097,7 @@ impl SM70Op for OpTld4 {
+@@ -3074,7 +3103,7 @@ impl SM70Op for OpTld4 {
              }
              TexRef::Bindless => {
                  if e.sm >= 100 {
@@ -395,12 +402,15 @@ index f0af793..da17b46 100644
                      e.set_bit(91, true);
                  } else {
                      e.set_opcode(0x364);
-@@ -3094,8 +3117,10 @@ impl SM70Op for OpTld4 {
+@@ -3094,8 +3123,13 @@ impl SM70Op for OpTld4 {
          e.set_reg_src(24..32, &self.srcs[0]);
          e.set_reg_src(32..40, &self.srcs[1]);
          if e.sm >= 100 {
 -            e.set_ureg_src(40, &Src::ZERO); // handle
 +            e.set_ureg_src(40, &self.handle); // handle
++            // The UR handle only with the scalar source form (as the
++            // reference compiler's code; nak_nir_lower_tex.c)
++            assert!(self.handle.is_zero() || self.scalar);
              e.set_ureg_src(48, &Src::ZERO); // offset
 +        } else {
 +            assert!(self.handle.is_zero());
@@ -422,7 +432,7 @@ index a808dc4..0c67a5d 100644
          _ => 1,
      }
 diff --git a/src/nouveau/compiler/nak_nir_lower_tex.c b/src/nouveau/compiler/nak_nir_lower_tex.c
-index 8343644..fd050a8 100644
+index 8343644..6af28a4 100644
 --- a/src/nouveau/compiler/nak_nir_lower_tex.c
 +++ b/src/nouveau/compiler/nak_nir_lower_tex.c
 @@ -215,6 +215,12 @@ lower_tex(nir_builder *b, nir_tex_instr *tex, const struct nak_compiler *nak)
@@ -456,7 +466,38 @@ index 8343644..fd050a8 100644
     /* Array index is treated separately, so pull it off if we have one. */
     nir_def *arr_idx = NULL;
     unsigned coord_components = tex->coord_components;
-@@ -443,6 +460,9 @@ lower_tex(nir_builder *b, nir_tex_instr *tex, const struct nak_compiler *nak)
+@@ -375,7 +392,30 @@ lower_tex(nir_builder *b, nir_tex_instr *tex, const struct nak_compiler *nak)
+             PUSH(src1, ms_idx);
+       }
+ 
++      /* NAK_TEX_UHANDLE: the reference compiler's code puts the handle in
++       * the uniform register field only with the scalar source form (one or
++       * two components per source register, at most four in all), so the
++       * same here: the sources are one list split 2 + 2 (as try_scalarize_tex
++       * rebalances), else the handle goes back to the front of the second
++       * vector and the instruction keeps the bindless form
++       */
++      if (uhandle != NULL) {
++         if (src0_comps + src1_comps <= 4) {
++            for (unsigned i = 0; i < src1_comps; i++)
++               src0[src0_comps++] = src1[i];
++            src1_comps = 0;
++         } else {
++            assert(src1_comps < ARRAY_SIZE(src1));
++            for (unsigned i = src1_comps; i > 0; i--)
++               src1[i] = src1[i - 1];
++            src1[0] = uhandle;
++            src1_comps++;
++            uhandle = NULL;
++         }
++      }
++
+       scalar = try_scalarize_tex(tex, nak, src0, &src0_comps, src1, &src1_comps);
++      assert(uhandle == NULL || scalar);
+ 
+       nir_tex_instr_add_src(tex, nir_tex_src_backend1,
+                             nir_vec(b, src0, src0_comps));
+@@ -443,6 +483,9 @@ lower_tex(nir_builder *b, nir_tex_instr *tex, const struct nak_compiler *nak)
        UNREACHABLE("Unsupported shader model");
     }
  
