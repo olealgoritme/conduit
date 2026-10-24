@@ -8,7 +8,9 @@ Two routes:
 - **DLSS on NVK** (NVIDIA hosts, RTX 20 to 50): NVIDIA's NGX runtime runs the
   game's DLSS DLL on our NVK. Needs NVK's CUDA module import (done), SASS for
   the GPU (shipped for RTX 20/30/40, host-compiled for RTX 50: done), the NGX
-  runtime from the host driver (designed), and nvapi64 (designed).
+  runtime from the host driver and nvapi64 (both done, `Install-Dlss.ps1`).
+  Vulkan games first; D3D12 through the D3D12 driver's engine-object
+  meta-commands; D3D11 not yet.
 - **OptiScaler** (any host GPU: NVIDIA, AMD, Intel): a per-game mod that takes
   a game's DLSS, FSR or XeSS calls and runs FSR or XeSS instead. Plain compute
   shaders on our D3D11/D3D12/Vulkan drivers, no NGX.
@@ -26,9 +28,10 @@ default|dlss|fsr|xess` pick between them.
 | Host tool `nvk-cubin-cache.py` (PTX to sm_120 SASS) | done; all 261 PTX-only modules of the 310.9.16 DLLs compile on the host, none with anything NVK refuses |
 | `conduit upscaler`, ctl op `upscaler`, tray, viewer menu row | done, unit tests |
 | `Install-OptiScaler.ps1` (per-game, user-downloaded OptiScaler) | written, not run |
-| NGX runtime install (host's signed `nvngx.dll`, `_nvngx.dll`) | designed below |
-| nvapi64 for NGX (dxvk-nvapi with a Windows adapter seam) | designed below |
-| D3D11/D3D12 DLSS (NGX through the app's D3D device) | blocked: needs the nvapi object mapping |
+| NGX runtime install (host's signed `nvngx.dll`, `_nvngx.dll`): `Install-Dlss.ps1` / `Uninstall-Dlss.ps1` | written, not run |
+| nvapi64 for NGX: dxvk-nvapi + `third_party/patches/dxvk-nvapi` 0001-0004, `tools/build-dxvk-nvapi.sh` | builds (MinGW, 64-bit), not run |
+| D3D12 DLSS: engine-object meta-commands in the D3D12 driver (`umd12/src/forward12/dlss12.rs`) + nvapi 0004 | done, host `cargo check`, not run |
+| D3D11 DLSS | blocked: no channel from the runtime's objects to DXVK's (below) |
 | DLSS frame generation, Multi Frame Generation | blocked: HAGS, Reflex markers, flip metering |
 
 ## How DLSS reaches the GPU
@@ -154,9 +157,10 @@ files Proton copies into its prefixes: `nvidia/wine/nvngx.dll` and
 on Debian-style hosts). Both carry NVIDIA's Authenticode signature, which the
 loader checks.
 
-What the NGX loader in a game does (`NGXLoadCoreLibrary(LUID)` in the DLSS
-SDK's `nvsdk_ngx_s.lib` 310.9.16, read from its code), in order, taking the
-first `_nvngx.dll` that loads and passes the signature check:
+Where the NGX loader in a game (`nvsdk_ngx_s.lib`, linked into the game)
+is expected to look for `_nvngx.dll`, in order, taking the first that loads
+and passes the signature check (the expected order, to be confirmed with
+Process Monitor in the guest: filter on `_nvngx.dll` and on `NGXCore`):
 
 1. next to the game's executable;
 2. `D3DKMTQueryAdapterInfo` on the adapter with the device's LUID: the
@@ -167,57 +171,83 @@ first `_nvngx.dll` that loads and passes the signature check:
 4. `HKLM\SYSTEM\CurrentControlSet\Services\nvlddmkm\NGXCore` `NGXPath`;
 5. `HKLM\SOFTWARE\NVIDIA Corporation\Global\NGXCore` `FullPath`.
 
-The `PCI\VEN_10DE&CC_0300` SetupAPI probe in the same library is not on this
-path (it belongs to driver-store helpers the core load does not call), so our
-PCI identity does not stop NGX from loading. Install plan (not implemented):
+Whether our PCI identity (virtio, not `PCI\VEN_10DE`) matters to the
+loader is also to be confirmed in the guest.
 
-- host: `conduit` copies both DLLs from the loaded driver's `nvidia/wine/`
-  directory into the guest share and records the driver version;
-- guest installer: copies them to `C:\ProgramData\Helios\ngx\` and writes
-  `helios_kmd_render\Parameters\NGXCore` `NGXPath` and `FullPath` (step 2 and
-  5) to that folder; copies again when the recorded host driver version
-  changes.
+`Install-Dlss.ps1` (guest, elevated) covers steps 1, 2 and 5: it copies both
+DLLs to `C:\ProgramData\Helios\ngx\` (and next to the game with `-Game`),
+and writes `NGXPath` under `helios_kmd_render\NGXCore` and
+`helios_kmd_render\Parameters\NGXCore` and `FullPath` under
+`NVIDIA Corporation\Global\NGXCore`. Every change is recorded in
+`C:\ProgramData\Helios\ngx\conduit-dlss.json`; `Uninstall-Dlss.ps1` undoes
+it. The files come from the host (`/usr/lib/x86_64-linux-gnu/nvidia/wine/`
+on Debian-style hosts) through a share; copy them again after a host driver
+update.
 
 NGX's own log: `HKLM\SOFTWARE\NVIDIA Corporation\Global\NGXCore` `LogLevel`
-(DWORD 2), `EnableLogPathOverride` (1), `LogPath` (directory).
+(DWORD 2), `EnableLogPathOverride` (1), `LogPath` (directory);
+`ShowDlssIndicator` (1024) draws the on-screen DLSS indicator.
+`Install-Dlss.ps1 -Log` sets them (logs to `C:\ProgramData\Helios\logs\dlss`).
 
 ## nvapi64
 
 `_nvngx.dll` asks NvAPI for the GPU and its architecture before it offers a
 feature; without nvapi64 NGX reports `NVSDK_NGX_GPU_Arch_Unknown`. The guest
-has no nvapi64. Plan: dxvk-nvapi built for Windows (it builds with MinGW
-already) with Helios patches:
+gets DXVK-NVAPI (MIT), built on the host with
+`guest/windows/tools/build-dxvk-nvapi.sh` (pinned upstream commit, MinGW,
+`--arch 64|32|both`; NGX is 64-bit only) with
+`guest/windows/third_party/patches/dxvk-nvapi`:
 
-- **Vulkan without DXVK's DXGI.** dxvk-nvapi gets its `VkInstance` from
-  `IDXGIVkInteropFactory` and each adapter's `VkPhysicalDevice` from
-  `IDXGIVkInteropAdapter`, which only DXVK's `dxgi.dll` has; our guest runs
-  Microsoft's DXGI. The seam: create its own instance from `vulkan-1.dll`
-  (the `Vk(PFN_vkGetInstanceProcAddr, ...)` constructor exists) and match
-  each DXGI adapter to the physical device whose
-  `VkPhysicalDeviceIDProperties::deviceLUID` equals the adapter's LUID (NVK on
-  RM reports the Helios adapter's LUID, patches-windows 0025).
-- **Architecture.** dxvk-nvapi reports GB20x when the driver has
-  `VK_KHR_compute_shader_derivatives` with `meshAndTaskShaderDerivatives`,
-  else Ada for any device ID >= 0x2600. Until NVK reports that feature,
-  `DXVK_NVAPI_GPU_ARCH=GB200` must be set on RTX 50 hosts, or NGX picks the
-  Ada (sm_89) kernels and NVK refuses them.
-- **Configuration from the registry.** dxvk-nvapi reads only environment
-  variables, which native games do not get from us. `env::getEnvVariable`
-  falls back to `HKLM\SOFTWARE\Helios\Nvapi` (REG_SZ per variable name), and
-  `Upscaler` = `dlss` maps to `DXVK_NVAPI_DRS_NGX_DLSS_SR_OVERRIDE=on` and
-  `DXVK_NVAPI_DRS_NGX_DLSS_SR_OVERRIDE_RENDER_PRESET_SELECTION=render_preset_latest`
-  (DRS 0x10E41DF3 = 0xffffff), the NVIDIA app's "latest model" override.
-- **Install opt-in only.** Many games treat an `nvapi64.dll` in System32 as
-  "this is an NVIDIA GPU" and take NVIDIA-only paths; it goes in with `Dlss`.
+| Patch | What |
+|---|---|
+| 0001 | `DXVK_NVAPI_*` settings also from `HKLM\SOFTWARE\Helios\Nvapi` (REG_SZ or DWORD named like the variable; the environment wins); log lines also to OutputDebugString |
+| 0002 | Microsoft's DXGI has no DXVK interop: DXVK-NVAPI creates its own Vulkan 1.1 instance and matches each DXGI adapter to the physical device with the same `deviceLUID` (NVK on RM reports the Helios adapter's LUID, patches-windows 0025); reports that device's PCI IDs (0x10de:...) instead of the virtio adapter's |
+| 0003 | Architecture: NVK has no `meshAndTaskShaderDerivatives`, so device IDs >= 0x2900 on NVK report GB200 (Blackwell), and NGX picks its sm_120 path |
+| 0004 | D3D12: reaches vkd3d-proton's `ID3D12DeviceExt` / `ID3D12GraphicsCommandListExt` through the D3D12 driver's meta-commands (next section) |
 
-D3D11 and D3D12 DLSS also go through nvapi: NGX calls
-`NvAPI_D3D11/D3D12_CreateCubinComputeShader` and friends on the game's device,
-which dxvk-nvapi forwards to `ID3D11VkExtDevice1` (DXVK) and `ID3D12DeviceExt`
-(vkd3d-proton). In our guest the game's device is Microsoft's runtime object
-and the DXVK / vkd3d-proton objects sit behind the UMD DDI, so that
-`QueryInterface` fails. It needs a private UMD escape from the runtime's
-device to the UMD's Vulkan device (blocked until designed). Vulkan games are
-the first target.
+`nvapi64.dll` goes next to the game (`Install-Dlss.ps1 -Game`) or into
+System32 (`-SystemNvapi`). Many games treat an NvAPI as "this is an NVIDIA
+GPU" and take NVIDIA-only paths, so it is per game by default. Useful values
+under `Helios\Nvapi`: `DXVK_NVAPI_LOG_LEVEL` (`info`), `DXVK_NVAPI_LOG_PATH`
+(folder for `nvapi64.log`), `DXVK_NVAPI_DRIVER_VERSION` (NVK reports 999.99),
+`DXVK_NVAPI_GPU_ARCH`, `DXVK_NVAPI_DRS_SETTINGS` (DLSS preset overrides, e.g.
+`0x10E41DF3=0xffffff` for the latest SR preset).
+
+## D3D12 and D3D11
+
+NGX's D3D paths call `NvAPI_D3D12_CreateCubinComputeShader*`,
+`NvAPI_D3D12_LaunchCubinShader`, `NvAPI_D3D12_GetCudaTextureObject` and the
+D3D11 equivalents on the game's device and command list. Under Proton the
+game's objects are vkd3d-proton's / DXVK's, and DXVK-NVAPI reaches their
+`...Ext` interfaces with `QueryInterface`. In our guest the game holds
+Microsoft's runtime objects; vkd3d-proton and DXVK sit behind the WDDM user
+mode drivers, and the runtime never forwards an unknown `QueryInterface`.
+
+**D3D12.** Meta-commands are the IHV channel the D3D12 runtime does forward.
+With `Dlss` = 1 the D3D12 driver publishes two (`umd12/src/forward12/dlss12.rs`):
+
+| Meta-command | Parameters (UINT64) | Effect |
+|---|---|---|
+| `HeliosEngineDevice` `{f4c98fb7-...}` | creation: `Magic`, `Out` | writes the engine (vkd3d-proton) `ID3D12Device*` to `*Out` |
+| `HeliosEngineCommandList` `{8c8f8982-...}` | creation: `Magic`; execution: `Magic`, `Out` | writes the list's engine `ID3D12GraphicsCommandList*` to `*Out`, records nothing |
+
+DXVK-NVAPI 0004 uses them when the `QueryInterface` fails and caches the
+result on the runtime object (as upstream does). The engine objects live as
+long as the runtime objects, and the driver records every command on the
+engine list on the calling thread, so a cubin launch lands in order.
+Descriptor handles need no mapping: the driver hands the runtime vkd3d's own
+handle values (`forward12/descriptors.rs`). vkd3d-proton enables
+`VK_NVX_binary_import` / `VK_NVX_image_view_handle` when NVK offers them,
+which `Dlss` does. To verify in the guest: that the runtime passes the CPU
+descriptor handles to the app unchanged, and the cubin 64-bit path
+(`SupportsCubin64bit`, NVX spec versions).
+
+**D3D11.** No such channel: the D3D11 runtime has no meta-commands, and
+NGX's D3D11 calls pass runtime SRVs, UAVs, samplers and resources, which
+would each need mapping to DXVK's. A possible route (not designed further):
+bind the object to a slot so the driver sees its DDI handle, read the DXVK
+object back through a device-dependent counter's `GetData`. Until then D3D11
+games use OptiScaler.
 
 ## Vendor identity
 
@@ -336,24 +366,13 @@ Run:
 - The series applies in build-windows.sh order; DXVK patches 0001-0022 + 0025
   apply; `gen-windows-knobs.py --check` passes.
 
+- dxvk-nvapi 0001-0004 apply to the pinned commit and build with MinGW
+  (`build-dxvk-nvapi.sh`); the D3D12 driver with `dlss12.rs` passes
+  `tools/umd12-host-check.sh`.
+
 Not run: anything in a guest; NVK with these patches on a GPU; the tray on
-Windows; `Install-OptiScaler.ps1`.
+Windows; `Install-OptiScaler.ps1`, `Install-Dlss.ps1`; DXVK-NVAPI on Windows.
 
-## Guest test plan (Vulkan first)
+## Guest test plan
 
-1. Install a driver package built from this branch. `Dlss` absent: nothing
-   changes (`vulkaninfo` lists no `VK_NVX_binary_import`).
-2. `conduit upscaler win11 dlss` (sets `Dlss` = 1); a new process:
-   `vulkaninfo --summary` lists `VK_NVX_binary_import` and
-   `VK_NVX_image_view_handle`; `MESA_LOG_FILE` shows `NVK: DLSS on`.
-3. RTX 50 host: build the cubin cache from the game's DLLs and copy it to
-   `C:\ProgramData\Helios\ngx\cubin\`. RTX 20/30/40 hosts skip this.
-4. NGX runtime and nvapi64 installed (plans above), NGX logging on.
-5. The DLSS SDK sample (github.com/NVIDIA/DLSS) in Vulkan mode with the DLSS
-   indicator (`NGXCore` `ShowDlssIndicator` = 1024). Success: the NGX log
-   shows the feature created, the indicator shows "DLSS SR", NVK logs cache
-   hits (RTX 50) and no `Fatbin does not have compatible bytecode`, and DLSS
-   Quality runs faster than native at the same output resolution.
-6. A Vulkan game with DLSS (DOOM: The Dark Ages, No Man's Sky); then the
-   OptiScaler route on a DX12 game: install it, `conduit upscaler win11 fsr`,
-   start the game, its DLSS option should run FSR (OptiScaler overlay: Insert).
+[dlss-test.md](dlss-test.md): Vulkan game first, then D3D12.

@@ -1,0 +1,31 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Sat, 24 Oct 2026 12:45:58 +0200
+Subject: [PATCH 3/4] helios: Blackwell on NVK by PCI device ID
+
+NVK reports no meshAndTaskShaderDerivatives, so an RTX 50 GPU on NVK
+was reported as Ada (device ID >= 0x2600), and NGX picked its sm_89
+kernels, which NVK cannot run on sm_120. On NVK an NVIDIA device ID of
+0x2900 or more (GB100; GB20x from 0x2b00) is now reported as GB200.
+DXVK_NVAPI_GPU_ARCH still overrides it.
+---
+ src/nvapi/nvapi_adapter.cpp | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/src/nvapi/nvapi_adapter.cpp b/src/nvapi/nvapi_adapter.cpp
+index a1030d5..f18efab 100644
+--- a/src/nvapi/nvapi_adapter.cpp
++++ b/src/nvapi/nvapi_adapter.cpp
+@@ -280,6 +280,12 @@ namespace dxvk {
+             && m_vkComputeShaderDerivativesProperties.meshAndTaskShaderDerivatives)
+             return NV_GPU_ARCHITECTURE_GB200;
+ 
++        // NVK does not report meshAndTaskShaderDerivatives (it has no mesh
++        // shaders); Blackwell PCI device IDs start at 0x2900 (GB100, GB20x
++        // from 0x2b00), Ada ends below. NGX picks its sm_120 kernels by this.
++        if (HasNvkDriver() && m_vkProperties.vendorID == NvidiaPciVendorId && m_vkProperties.deviceID >= 0x2900)
++            return NV_GPU_ARCHITECTURE_GB200;
++
+         // In lieu of a more idiomatic Vulkan-based solution, check the PCI
+         // DeviceID to determine if an Ada card is present
+         if (m_vkProperties.deviceID >= 0x2600)

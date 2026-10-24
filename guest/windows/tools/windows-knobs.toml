@@ -591,7 +591,7 @@ see = "[dlss.md](../guest/nvk-rm/docs/dlss.md)"
 [umd.Dlss]
 class = "experiment"
 read = "NVK instance creation; once per process in the bridge"
-effect = "1 turns on NVK's DLSS support: NVK exposes VK_NVX_binary_import (NGX imports its CUDA kernels with it) to native Vulkan apps, and the bridge sets HELIOS_DXVK_NVX=1 so DXVK keeps the NVX extensions. NGX also needs its runtime from the host driver and nvapi64; on RTX 50 the SASS comes from the host-built cubin cache (see dlss.md). The tray sets it with `conduit upscaler VM dlss`. 0 (default) leaves both off."
+effect = "1 turns on NVK's DLSS support: NVK exposes VK_NVX_binary_import (NGX imports its CUDA kernels with it) to native Vulkan apps and to vkd3d-proton, the bridge sets HELIOS_DXVK_NVX=1 so DXVK keeps the NVX extensions, and the D3D12 driver publishes two meta-commands through which Conduit's nvapi64 reaches vkd3d-proton's cubin entry points (NGX's D3D12 path). NGX also needs its runtime from the host driver and nvapi64; on RTX 50 the SASS comes from the host-built cubin cache (see dlss.md). The tray sets it with `conduit upscaler VM dlss`. 0 (default) leaves both off."
 see = "[dlss.md](../guest/nvk-rm/docs/dlss.md)"
 
 [umd.DwmIcd]
