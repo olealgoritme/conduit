@@ -600,6 +600,12 @@ read = "each DWM start with DwmIcd=nvk"
 effect = "How many DWM starts on NVK within DwmNvkGuardSeconds that never got healthy (DwmNvkHealthySeconds) send the next start to Venus (the crash-loop guard; pending starts are kept in %ProgramData%\\Helios\\dwm-nvk-starts.txt; only starts of the installed driver build in other DWM processes count). If Venus then cannot create DWM's device, DWM runs on NVK after all. 0 disables the guard."
 see = "[dwm-on-nvk.md](dwm-on-nvk.md)"
 
+[umd.EnhanceD3D]
+class = "supported"
+read = "once per process (the DXGI hooks) and each D3D swap chain creation"
+effect = "1 (default): with Enhance settings on for the process, D3D11 and D3D12 swap chains of processes whose D3D driver runs on NVK are presented through NVK's composed present with upscaling and frame generation (NVK hooks DXGI's swap chain creation and hands the application a swap chain of its own); 0 leaves D3D swap chains to DXGI. A per-exe profile's D3D wins."
+see = "[enhance.md](../guest/nvk-rm/docs/enhance.md)"
+
 [umd.EnhanceFgQuality]
 class = "supported"
 read = "each swapchain creation and every registry change (composed present)"
@@ -621,7 +627,7 @@ see = "[enhance.md](../guest/nvk-rm/docs/enhance.md)"
 [umd.EnhanceFrameGen]
 class = "supported"
 read = "each swapchain creation and every registry change (composed present)"
-effect = "Frame generation in NVK's composed present: off (default), 2x, 3x, 4x or adaptive (fill to EnhanceFgTarget or the refresh, up to 8 pictures per frame). Generated pictures are interpolated from the last two frames by optical flow and presented between them, paced; native Vulkan and Zink swapchains only, not D3D11/D3D12. A per-exe profile under HKLM\\SOFTWARE\\Helios\\Enhance\\<exe> (value FrameGen) wins; the tray sets it."
+effect = "Frame generation in NVK's composed present: off (default), 2x, 3x, 4x or adaptive (fill to EnhanceFgTarget or the refresh, up to 8 pictures per frame). Generated pictures are interpolated from the last two frames by optical flow and presented between them, paced; Vulkan and Zink swapchains, and D3D11/D3D12 swap chains of processes on NVK (EnhanceD3D). A per-exe profile under HKLM\\SOFTWARE\\Helios\\Enhance\\<exe> (value FrameGen) wins; the tray sets it."
 see = "[enhance.md](../guest/nvk-rm/docs/enhance.md)"
 
 [umd.EnhanceLowLatency]
@@ -633,7 +639,7 @@ see = "[enhance.md](../guest/nvk-rm/docs/enhance.md)"
 [umd.EnhanceScaler]
 class = "supported"
 read = "each swapchain creation and every registry change (composed present)"
-effect = "Upscaling in NVK's composed present: off (default), fsr (FidelityFX FSR 1), bicubic, bilinear, nearest or integer. The surface then reports no current extent, so the application renders at its own size and the picture is scaled to the window. Native Vulkan and Zink swapchains only, not D3D11/D3D12. A per-exe profile under HKLM\\SOFTWARE\\Helios\\Enhance\\<exe> (value Scaler) wins; the tray sets it."
+effect = "Upscaling in NVK's composed present: off (default), fsr (FidelityFX FSR 1), bicubic, bilinear, nearest or integer. A Vulkan surface then reports no current extent and a D3D swap chain keeps its own size, so the application renders at its own size and the picture is scaled to the window. Vulkan and Zink swapchains, and D3D11/D3D12 swap chains of processes on NVK (EnhanceD3D). A per-exe profile under HKLM\\SOFTWARE\\Helios\\Enhance\\<exe> (value Scaler) wins; the tray sets it."
 see = "[enhance.md](../guest/nvk-rm/docs/enhance.md)"
 
 [umd.EnhanceSharpness]
@@ -1384,6 +1390,12 @@ effect = "Index of the DXGI adapter the Win32 WSI's composed present uses for it
 class = "tuning"
 read = "swapchain creation"
 effect = "1 hands composed presents to a WSI thread so the application's present call does not wait for the D3D11 flip; 0 presents on the calling thread."
+
+[env.MESA_WSI_ENHANCE_D3D]
+class = "supported"
+read = "once per process"
+effect = "0: D3D11/D3D12 swap chains are not enhanced (DXGI is not hooked); wins over EnhanceD3D."
+see = "[enhance.md](../guest/nvk-rm/docs/enhance.md)"
 
 [env.MESA_WSI_ENHANCE_FG]
 class = "supported"
