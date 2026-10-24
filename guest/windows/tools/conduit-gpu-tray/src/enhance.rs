@@ -28,10 +28,14 @@ pub const SCALER: Setting = Setting {
     choices: &[
         ("off", "Off"),
         ("fsr", "FSR 1 (edge-adaptive, sharpened)"),
+        ("nis", "NIS (NVIDIA Image Scaling, up to 2x)"),
+        ("sgsr", "SGSR (cheap, for weaker GPUs)"),
+        ("cas", "CAS (sharpen and scale)"),
         ("bicubic", "Bicubic"),
         ("bilinear", "Bilinear"),
         ("nearest", "Nearest"),
         ("integer", "Integer (sharp pixels)"),
+        ("xbr", "xBR (pixel art)"),
     ],
     default: "off",
     per_exe: true,
@@ -151,9 +155,14 @@ impl Setting {
             if let Some(i) = pick(v) {
                 return i;
             }
-            // NVK also takes fsr1 for fsr
-            if self.name == SCALER.name && v.trim().eq_ignore_ascii_case("fsr1") {
-                return 1;
+            // NVK also takes fsr1 for fsr and pixel for xbr
+            if self.name == SCALER.name {
+                if v.trim().eq_ignore_ascii_case("fsr1") {
+                    return 1;
+                }
+                if v.trim().eq_ignore_ascii_case("pixel") {
+                    return 9;
+                }
             }
             // DWORD settings: the nearest choice
             if self.dword {
@@ -253,7 +262,9 @@ mod tests {
         assert_eq!(SCALER.index_of(None), 0);
         assert_eq!(SCALER.index_of(Some("FSR")), 1);
         assert_eq!(SCALER.index_of(Some("fsr1")), 1);
-        assert_eq!(SCALER.index_of(Some("integer")), 5);
+        assert_eq!(SCALER.index_of(Some("integer")), 8);
+        assert_eq!(SCALER.index_of(Some("pixel")), 9);
+        assert_eq!(SCALER.index_of(Some("xbr")), 9);
         assert_eq!(SCALER.index_of(Some("nonsense")), 0);
         assert_eq!(FRAMEGEN.index_of(Some("adaptive")), 4);
         assert_eq!(SHARPNESS.index_of(None), 2);
