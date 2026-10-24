@@ -14,7 +14,9 @@ replays it as that draw.
 
 The common runtime gets vk_device::graphics_spirv_hook, called with the
 SPIR-V of each graphics shader of a new pipeline, and graphics shaders
-get their SPIR-V source hash.  Draws with vertex attributes,
+get their SPIR-V source hash.  While the hook is installed, graphics
+stages are precompiled from their SPIR-V, not taken from the pipeline
+cache (a cached precompiled shader has no SPIR-V).  Draws with vertex attributes,
 tessellation, geometry or mesh shaders, multisampling or multiview are
 logged, not captured.
 
@@ -25,8 +27,8 @@ cannot be mapped is made without the outputs.
  src/nouveau/vulkan/nvk_dispatch_capture.c | 744 ++++++++++++++++++++--
  src/nouveau/vulkan/nvk_dispatch_capture.h |  11 +
  src/vulkan/runtime/vk_device.h            |  14 +
- src/vulkan/runtime/vk_pipeline.c          |  53 ++
- 5 files changed, 807 insertions(+), 46 deletions(-)
+ src/vulkan/runtime/vk_pipeline.c          |  66 +-
+ 5 files changed, 818 insertions(+), 48 deletions(-)
 
 diff --git a/src/nouveau/vulkan/nvk_cmd_draw.c b/src/nouveau/vulkan/nvk_cmd_draw.c
 index 0b3bb8d..422bff0 100644
@@ -1055,7 +1057,7 @@ index c17155e..e54b1f1 100644
     const struct vk_acceleration_structure_build_ops *as_build_ops;
  
 diff --git a/src/vulkan/runtime/vk_pipeline.c b/src/vulkan/runtime/vk_pipeline.c
-index 5538199..6d8c0f9 100644
+index 5538199..5fadb3c 100644
 --- a/src/vulkan/runtime/vk_pipeline.c
 +++ b/src/vulkan/runtime/vk_pipeline.c
 @@ -819,6 +819,13 @@ struct vk_pipeline_precomp_shader {
@@ -1080,10 +1082,26 @@ index 5538199..6d8c0f9 100644
     vk_pipeline_cache_object_finish(&shader->cache_obj);
     vk_free(&device->alloc, shader);
  }
-@@ -1129,6 +1137,25 @@ vk_pipeline_precompile_shader(struct vk_device *device,
+@@ -1068,7 +1076,13 @@ vk_pipeline_precompile_shader(struct vk_device *device,
+    const struct vk_device_shader_ops *ops = device->shader_ops;
+    VkResult result;
+ 
+-   if (cache != NULL) {
++   /* A precompiled shader from a cache has no SPIR-V for
++    * vk_device::graphics_spirv_hook: with the hook, graphics stages are
++    * precompiled from their SPIR-V
++    */
++   const bool want_spirv = device->graphics_spirv_hook != NULL &&
++                           stage->stage != MESA_SHADER_COMPUTE;
++   if (cache != NULL && !want_spirv) {
+       struct vk_pipeline_cache_object *cache_obj =
+          vk_pipeline_cache_lookup_object(cache,
+                                          stage->precomp_key,
+@@ -1129,7 +1143,29 @@ vk_pipeline_precompile_shader(struct vk_device *device,
     if (stage->precomp == NULL)
        return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
  
+-   if (cache != NULL) {
 +   /* The source hash and, for vk_device::graphics_spirv_hook, the SPIR-V
 +    * (vk_graphics_pipeline_spirv_hooks())
 +    */
@@ -1103,10 +1121,14 @@ index 5538199..6d8c0f9 100644
 +      }
 +   }
 +
-    if (cache != NULL) {
++   /* (with the hook, not through the cache: that could hand back an older
++    * object without SPIR-V)
++    */
++   if (cache != NULL && !want_spirv) {
        struct vk_pipeline_cache_object *cache_obj = &stage->precomp->cache_obj;
        cache_obj = vk_pipeline_cache_add_object(cache, cache_obj);
-@@ -2031,6 +2058,30 @@ vk_graphics_pipeline_compile_shaders(struct vk_device *device,
+       stage->precomp = vk_pipeline_precomp_shader_from_cache_obj(cache_obj);
+@@ -2031,6 +2067,30 @@ vk_graphics_pipeline_compile_shaders(struct vk_device *device,
     return VK_SUCCESS;
  }
  
@@ -1137,7 +1159,7 @@ index 5538199..6d8c0f9 100644
  static VkResult
  vk_graphics_pipeline_get_executable_properties(
     struct vk_device *device,
-@@ -2310,6 +2361,8 @@ vk_create_graphics_pipeline(struct vk_device *device,
+@@ -2310,6 +2370,8 @@ vk_create_graphics_pipeline(struct vk_device *device,
           goto fail_stages;
     }
  
