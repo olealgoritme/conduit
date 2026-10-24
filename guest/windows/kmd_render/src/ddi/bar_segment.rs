@@ -18,6 +18,10 @@ pub(super) const VIDMM_MEMORY_BASE: u64 = 1 << 32;
 const VIDMM_VRAM_MIN_MB: u32 = helios_kmd_logic::vidmm_vram::MIN_MB;
 const VIDMM_VRAM_MAX_MB: u32 = helios_kmd_logic::vidmm_vram::MAX_MB;
 
+/// The ignored-backend-limit message is printed once per driver load.
+static LIMIT_IGNORED_LOGGED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 /// Resolve an absent `VidMmVramMB` registry value (`helios_kmd_logic::vidmm_vram`).
 ///
 /// The registry override, host heap, or fallback window supplies the capacity;
@@ -39,6 +43,13 @@ pub(super) fn resolve_vidmm_vram_mb(
         b"VidVLmt",
         backend_limit_mb.min(u64::from(u32::MAX)) as u32,
     );
+    // An unusable limit never fails StartDevice: the size is chosen as if it were absent, and
+    // `VidVLIg` names the reason (`vidmm_vram::LIMIT_IGNORED_*`, 0 = not ignored).
+    let ignored = helios_kmd_logic::vidmm_vram::backend_limit_ignored(backend_limit_mb);
+    crate::diag::record_named_bytes(b"VidVLIg", ignored);
+    if ignored != 0 && !LIMIT_IGNORED_LOGGED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+        crate::kmsg(c"Helios: backend VRAM limit below 256 MiB ignored (VidVLmt, VidVLIg)\n");
+    }
     if let Some(bad_mb) = resolved.bad_mb {
         crate::diag::record_named_bytes(b"VidVBad", bad_mb);
     }

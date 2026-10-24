@@ -523,7 +523,7 @@ see = "[vram-redirection.md](../guest/windows/docs/vram-redirection.md)"
 [kmd.VidMmVramMB]
 class = "experiment"
 read = "AddAdapter, resolved at StartDevice"
-effect = "Device-memory capacity reported to VidMm (the dedicated video memory games and dxdiag see), in MiB. Valid nonzero values are capped by a backend VRAM limit of at least 256 MiB; smaller limits are ignored and recorded in VidVBad. 0 selects the fixed one-GiB aperture+BAR topology."
+effect = "Device-memory capacity reported to VidMm (the dedicated video memory games and dxdiag see), in MiB. Valid nonzero values are capped by a backend VRAM limit of at least 256 MiB; smaller limits are ignored (VidVLIg=1) and the size is chosen as without a limit. 0 selects the fixed one-GiB aperture+BAR topology."
 default_note = "u32::MAX = auto: the host GPU's video memory (largest device-local Vulkan heap, capped at 65536), bounded by a usable backend VRAM limit; if the Venus device cannot tell, the host-visible size the virtio capability reports is the fallback. Without either usable source, the legacy topology is retained"
 
 [kmd.VsCatchUp]

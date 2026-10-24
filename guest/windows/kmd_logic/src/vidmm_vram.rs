@@ -32,6 +32,21 @@ pub const MAX_MB: u32 = 64 * 1024;
 
 const MIB: u64 = 1 << 20;
 
+/// `VidVLIg` reason: the backend limit is smaller than [`MIN_MB`], which the device-memory
+/// segment cannot represent, so it is ignored and the capacity is chosen as if it were absent.
+pub const LIMIT_IGNORED_BELOW_MIN: u32 = 1;
+
+/// Why the backend limit `backend_limit_mb` does not bound the reported capacity, as the
+/// `VidVLIg` code: 0 when it is used (or absent, 0), else a `LIMIT_IGNORED_*` reason.
+/// An unusable limit never fails device start.
+pub fn backend_limit_ignored(backend_limit_mb: u64) -> u32 {
+    if backend_limit_mb != 0 && backend_limit_mb < u64::from(MIN_MB) {
+        LIMIT_IGNORED_BELOW_MIN
+    } else {
+        0
+    }
+}
+
 /// Read the low/high words of the optional backend limit under one config generation.
 /// Missing fields or a continuously changing generation leave the limit unavailable.
 pub fn read_backend_limit(
@@ -116,11 +131,8 @@ pub fn resolve(
     backend_limit_mb: u64,
 ) -> Resolved {
     let mut resolved = resolve_capacity(knob, device_local_heap, host_visible);
-    if backend_limit_mb != 0 && backend_limit_mb < u64::from(MIN_MB) {
-        resolved.bad_mb = Some(backend_limit_mb as u32);
-        return resolved;
-    }
     if backend_limit_mb == 0
+        || backend_limit_ignored(backend_limit_mb) != 0
         || resolved.mb == 0
         || (knob != AUTO && !(MIN_MB..=MAX_MB).contains(&knob))
     {
@@ -427,20 +439,49 @@ mod tests {
     }
 
     #[test]
-    fn unusable_backend_limits_preserve_capacity_and_record_the_limit() {
+    fn unusable_backend_limits_are_ignored() {
         for limit in 1..u64::from(MIN_MB) {
+            assert_eq!(backend_limit_ignored(limit), LIMIT_IGNORED_BELOW_MIN);
             for (knob, heap, window) in [
                 (AUTO, Some(12 * GIB), Some(8 * GIB)),
                 (AUTO, None, Some(8 * GIB)),
+                (AUTO, None, Some(128 * MIB)),
                 (AUTO, None, None),
                 (4096, Some(12 * GIB), None),
                 (0, Some(12 * GIB), None),
             ] {
-                let mut expected = resolve_capacity(knob, heap, window);
-                expected.bad_mb = Some(limit as u32);
-                assert_eq!(resolve(knob, heap, window, limit), expected);
+                // The real size is reported, and a refused window keeps its own VidVBad.
+                assert_eq!(
+                    resolve(knob, heap, window, limit),
+                    resolve_capacity(knob, heap, window),
+                );
             }
         }
+    }
+
+    #[test]
+    fn usable_or_absent_backend_limits_are_not_ignored() {
+        for limit in [0, u64::from(MIN_MB), 6144, u64::from(MAX_MB) + 1, u64::MAX] {
+            assert_eq!(backend_limit_ignored(limit), 0);
+        }
+    }
+
+    #[test]
+    fn backend_limit_lowers_but_never_raises_the_capacity() {
+        let r = resolve(AUTO, Some(12 * GIB), Some(8 * GIB), 6144);
+        assert_eq!((r.mb, r.source), (6144, Source::BackendLimit));
+        let r = resolve(AUTO, Some(4 * GIB), Some(8 * GIB), 6144);
+        assert_eq!((r.mb, r.source), (4096, Source::DeviceLocalHeap));
+        let r = resolve(2048, Some(12 * GIB), None, 6144);
+        assert_eq!((r.mb, r.source), (2048, Source::Registry));
+        let r = resolve(8192, Some(12 * GIB), None, 6144);
+        assert_eq!((r.mb, r.source), (6144, Source::BackendLimit));
+    }
+
+    #[test]
+    fn no_limit_keeps_the_legacy_topology_without_a_heap_or_window() {
+        let r = resolve(AUTO, None, None, 0);
+        assert_eq!((r.mb, r.source, r.bad_mb), (0, Source::None, None));
     }
 
     #[test]
