@@ -1551,6 +1551,12 @@ read = "each vkCreateCuModuleNVX whose module has no SASS for the GPU"
 effect = "Folder of the host-compiled SASS cache (wins over the registry CubinCache); elsewhere than Windows the default is $XDG_CACHE_HOME/nvk/cubin."
 see = "[dlss.md](../guest/nvk-rm/docs/dlss.md)"
 
+[env.NVK_CUBIN_TRACE]
+class = "debug"
+read = "once per process, at the first CUDA module, function, image view handle or launch"
+effect = "N > 0 logs (mesa_logi) each vkCreateCuModuleNVX's texturing mode, each vkCreateCuFunctionNVX (SM, GPRs, parameter layout, stack and shared memory, constant banks), every vkGetImageViewHandleNVX/Handle64NVX/AddressNVX result and the first N vkCmdCuLaunchKernelNVX calls with grid, block and parameters in hex; 1 means 400. 0 or absent: off."
+see = "[dlss.md](../guest/nvk-rm/docs/dlss.md)"
+
 [env.NVK_CUBIN_CACHE_DUMP]
 class = "debug"
 read = "each CUDA module that misses the cubin cache"

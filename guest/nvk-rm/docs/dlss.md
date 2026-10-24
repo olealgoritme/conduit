@@ -1,7 +1,9 @@
 # DLSS and other upscalers in Windows guests
 
-Status: **experimental, off by default, not yet run in a guest.** Nothing
-changes unless `Dlss` is set or `conduit upscaler` is used.
+Status: **experimental, off by default.** DLSS super resolution runs on NVK
+in a Windows guest on an RTX 5090 (Vulkan, `ngx-smoketest`); not yet in a
+game, D3D12 not yet run. Nothing changes unless `Dlss` is set or `conduit
+upscaler` is used.
 
 Two routes:
 
@@ -23,13 +25,15 @@ default|dlss|fsr|xess` pick between them.
 | NVK: CUDA cubins without libelf (patches-windows 0066) | done, tested on 1490 real cubins |
 | NVK: `Dlss` / `NVK_DLSS` switch for VK_NVX_binary_import (patches-windows 0067) | done |
 | DXVK: NVX extensions on Windows (`HELIOS_DXVK_NVX`, DXVK 0025) | done |
-| NVK: a module's whole code, its globals and constant banks 2-4 (patches-common 0084) | done, compiles, not run on a GPU |
-| NVK: SASS from the host-built cubin cache (patches-common 0085) | done, compiles; keys checked against the host tool on 240 real modules |
+| NVK: a module's whole code, its globals and constant banks 2-4 (patches-common 0084) | done, runs on an RTX 5090 |
+| NVK: SASS from the host-built cubin cache (patches-common 0085) | done, runs on an RTX 5090 (all 81 modules DLSS SR loads come from the cache) |
+| NVK: CUDA kernels on Blackwell, launch constants and texture handles (patches-common 0102) | done, `ngx-smoketest --cutest` and DLSS SR pass on an RTX 5090 |
+| NVK: `NVK_CUBIN_TRACE` (patches-common 0103) | done |
 | Host tool `nvk-cubin-cache.py` (PTX to sm_120 SASS) | done; all 261 PTX-only modules of the 310.9.16 DLLs compile on the host, none with anything NVK refuses |
 | `conduit upscaler`, ctl op `upscaler`, tray, viewer menu row | done, unit tests |
 | `Install-OptiScaler.ps1` (per-game, user-downloaded OptiScaler) | written, not run |
-| NGX runtime install (host's signed `nvngx.dll`, `_nvngx.dll`): `Install-Dlss.ps1` / `Uninstall-Dlss.ps1` | written, not run |
-| nvapi64 for NGX: dxvk-nvapi + `third_party/patches/dxvk-nvapi` 0001-0004, `tools/build-dxvk-nvapi.sh` | builds (MinGW, 64-bit), not run |
+| NGX runtime install (host's signed `nvngx.dll`, `_nvngx.dll`): `Install-Dlss.ps1` / `Uninstall-Dlss.ps1` | `Install-Dlss.ps1` run in the guest (`-SystemNvapi -Log`); `Uninstall-Dlss.ps1` not run |
+| nvapi64 for NGX: dxvk-nvapi + `third_party/patches/dxvk-nvapi` 0001-0004, `tools/build-dxvk-nvapi.sh` | builds (MinGW, 64-bit); runs in the guest for Vulkan (NGX finds the GPU, Blackwell) |
 | D3D12 DLSS: engine-object meta-commands in the D3D12 driver (`umd12/src/forward12/dlss12.rs`) + nvapi 0004 | done, host `cargo check`, not run |
 | D3D11 DLSS | blocked: no channel from the runtime's objects to DXVK's (below) |
 | DLSS frame generation, Multi Frame Generation | blocked: HAGS, Reflex markers, flip metering |
@@ -135,6 +139,41 @@ from the cubin cache (<key>, PTX sm_89)`; a miss logs the file it looked for.
 module to `%LOCALAPPDATA%\Helios\cubin-miss\<key>.fatbin`, which `build` takes
 as input like a DLL: so a DLL NGX downloads itself (over-the-air models) can be
 covered too.
+
+### CUDA kernels on Blackwell
+
+SASS for sm_100 and later (Blackwell; RTX 50 is sm_120) follows a different
+launch ABI from Turing to Ada. Checked with the `ngx-smoketest --cutest`
+kernels compiled by NVIDIA's PTX JIT for sm_120 on an RTX 5090, 0102
+provides:
+
+| What | Where |
+|---|---|
+| kernel parameters | bank 0 from 0x380 (the cubin's `EIATTR_PARAM_CBANK`) |
+| `%ntid` (blockDim) | bank 0 0x360, 0x364, 0x368 |
+| `%nctaid` (gridDim) | bank 0 0x370, 0x374, 0x378 |
+| initial stack pointer | bank 0 0x37c: the top of the thread's local memory (NVK gives each thread the kernel's `EIATTR_MIN_STACK_SIZE`, the stack grows down) |
+| generic address of the local memory window (`cvta.local`) | bank 0 0x2f8, 64 bit |
+| texture handle | the whole handle is the texture header index |
+| sampler | from the QMD: CUDA launches use `SAMPLER_INDEX_VIA_HEADER_INDEX`, the sampler at the texture header's index |
+
+Before sm_100 NVK keeps upstream's layout (blockDim at 0x0, gridDim at 0xc;
+not checked here, no such GPU). On Blackwell, `vkGetImageViewHandleNVX` and
+`vkGetImageViewHandle64NVX` return for a combined image sampler an index
+where the image descriptor table holds a copy of the view's sampled
+descriptor and the sampler table a copy of the sampler (one per view and
+sampler state, freed with the view; the sampler table has 4096 entries);
+sampled and storage image handles are the view's own indices. Without
+these, every kernel saw blockDim = gridDim = 0, stack frames lay outside
+the thread's local memory, and textures sampled with any sampler but the
+first read no texture: DLSS ran and wrote a black image.
+
+`NVK_CUBIN_TRACE=N` (0103; 1 means 400) logs what a CUDA user asks of NVK:
+each module's texturing mode (NGX asks for 64-bit texturing and uses
+`vkGetImageViewHandle64NVX`), each kernel (SM, GPRs, parameter offset and
+size, stack and shared memory, barriers, constant banks), every image view
+handle and address query, and the first N launches with grid, block and
+parameters in hex.
 
 ### What NVK loads from a module
 
@@ -363,6 +402,16 @@ Run:
 - The tool's unit tests; viewer `test-ui` and `test-vmpause` (the Upscaler
   row and its runner); `conduit-ctl`, CLI and tray unit tests (the `upscaler`
   op, mode words, OptiScaler.ini rewriting).
+- `ngx-smoketest --cutest` (RTX 5090, sm_120 SASS from the host JIT):
+  launch constants, a parameter, module globals and `__constant__` data, a
+  stack array and its generic address, shared memory, texture fetches and
+  filtered lookups with two samplers, surfaces, `cp.async`, `ldmatrix`,
+  `mma.sync`: all values right.
+- `ngx-smoketest` (Vulkan, RTX 5090, DLSS 310.9.16, preset K, Quality
+  1280x720 to 1920x1080, 100 frames): the output is the input upscaled
+  (mean difference to a nearest upscale 4-5 of 255, the aliased test lines
+  resolved), 0.43 ms GPU per evaluation; `--image` on a 1280x720 picture:
+  mean difference to a bilinear upscale 2-4 of 255, sharper text.
 - The series applies in build-windows.sh order; DXVK patches 0001-0022 + 0025
   apply; `gen-windows-knobs.py --check` passes.
 
@@ -370,8 +419,8 @@ Run:
   (`build-dxvk-nvapi.sh`); the D3D12 driver with `dlss12.rs` passes
   `tools/umd12-host-check.sh`.
 
-Not run: anything in a guest; NVK with these patches on a GPU; the tray on
-Windows; `Install-OptiScaler.ps1`, `Install-Dlss.ps1`; DXVK-NVAPI on Windows.
+Not run: a game; D3D12 DLSS; GPUs before Blackwell; the tray on Windows;
+`Install-OptiScaler.ps1`, `Uninstall-Dlss.ps1`.
 
 ## Guest test plan
 

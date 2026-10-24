@@ -29,8 +29,8 @@ Classes:
 |---|---:|---:|---:|---:|---:|---:|
 | KMD: service key | 7 | 27 | 26 | 28 | 12 | 100 |
 | UMDs and ICD policy: `HKLM\SOFTWARE\Helios` | 20 | 19 | 26 | 13 | 0 | 78 |
-| Environment variables | 8 | 33 | 104 | 34 | 0 | 179 |
-| All | 35 | 79 | 156 | 75 | 12 | 357 |
+| Environment variables | 8 | 33 | 105 | 34 | 0 | 180 |
+| All | 35 | 79 | 157 | 75 | 12 | 358 |
 
 ## What the installation writes
 
@@ -342,7 +342,7 @@ Per-process: they act only on the process whose environment carries them (and it
 | `NVK_UBO_DESC_CBUF` | `false` / `true` (differs by read site); 0 on Windows, 1 elsewhere | physical device creation | 1 promotes uniform buffer descriptors to bound constant buffers as upstream NVK does; 0 keeps them as descriptors. | [0051-nvk-on-Windows-UBO-descriptors-are-not-promoted-to-b.patch:88](../guest/nvk-rm/patches-windows/0051-nvk-on-Windows-UBO-descriptors-are-not-promoted-to-b.patch#L88), [0051-nvk-on-Windows-UBO-descriptors-are-not-promoted-to-b.patch:90](../guest/nvk-rm/patches-windows/0051-nvk-on-Windows-UBO-descriptors-are-not-promoted-to-b.patch#L90) |
 | `NVK_ZERO_PAGE_VRAM` | `true` | device creation | 1 places the zero page that null descriptors and buffers read in VRAM; 0 keeps it in system memory. | [0041-nvk-null-vertex-buffers-and-the-zero-page-in-VRAM.patch:94](../guest/nvk-rm/patches-common/0041-nvk-null-vertex-buffers-and-the-zero-page-in-VRAM.patch#L94) |
 
-### Debug / diagnostic (104)
+### Debug / diagnostic (105)
 
 | Name | Default (code) | Read | Effect | Source |
 |---|---|---|---|---|
@@ -404,6 +404,7 @@ Per-process: they act only on the process whose environment carries them (and it
 | `NVK_CPU_STATE_TRACKING` | `true` | once per process | 1 skips 3D state methods whose value the GPU already has (Conduit's per-draw cost patches); 0 emits them as upstream NVK does, for bisecting. | [0018-nvk-NVK_CPU_STATE_TRACKING-read-race-closed-and-mixe.patch:47](../guest/nvk-rm/patches-common/0018-nvk-NVK_CPU_STATE_TRACKING-read-race-closed-and-mixe.patch#L47) |
 | `NVK_CUBIN_CACHE_DUMP` | `unset` | each CUDA module that misses the cubin cache | 1 writes a module that misses the cubin cache to NVK_CUBIN_DUMP_DIR for nvk-cubin-cache.py; wins over the registry CubinCacheDump. | [0085-nvk-SASS-from-a-host-built-cubin-cache-for-modules-w.patch:183](../guest/nvk-rm/patches-common/0085-nvk-SASS-from-a-host-built-cubin-cache-for-modules-w.patch#L183) |
 | `NVK_CUBIN_DUMP_DIR` | `unset` | when NVK_CUBIN_CACHE_DUMP or CubinCacheDump writes a module | Where missed CUDA modules are written. Default %LOCALAPPDATA%\Helios\cubin-miss on Windows, the cache folder with -miss appended elsewhere. | [0085-nvk-SASS-from-a-host-built-cubin-cache-for-modules-w.patch:201](../guest/nvk-rm/patches-common/0085-nvk-SASS-from-a-host-built-cubin-cache-for-modules-w.patch#L201) |
+| `NVK_CUBIN_TRACE` | `0` | once per process, at the first CUDA module, function, image view handle or launch | N &gt; 0 logs (mesa_logi) each vkCreateCuModuleNVX's texturing mode, each vkCreateCuFunctionNVX (SM, GPRs, parameter layout, stack and shared memory, constant banks), every vkGetImageViewHandleNVX/Handle64NVX/AddressNVX result and the first N vkCmdCuLaunchKernelNVX calls with grid, block and parameters in hex; 1 means 400. 0 or absent: off. See [dlss.md](../guest/nvk-rm/docs/dlss.md). | [0103-nvk-NVK_CUBIN_TRACE-logs-what-a-CUDA-user-NGX-asks-o.patch:46](../guest/nvk-rm/patches-common/0103-nvk-NVK_CUBIN_TRACE-logs-what-a-CUDA-user-NGX-asks-o.patch#L46) |
 | `NVK_DIAG_NO_WFI_BARRIER` | `false` | first pipeline barrier recorded (once per process) | 1 (unsafe, measurement only): pipeline barriers with a source stage emit no WAIT_FOR_IDLE on the 3D or compute subchannel; cache flushes and invalidates stay (a shader data flush still idles implicitly). Gives an upper bound of what draining at barriers costs; rendering may be wrong. | [0064-nvk-NVK_DIAG_NO_WFI_BARRIER-and-NVK_DIAG_WFI_COUNT-d.patch:49](../guest/nvk-rm/patches-common/0064-nvk-NVK_DIAG_NO_WFI_BARRIER-and-NVK_DIAG_WFI_COUNT-d.patch#L49) |
 | `NVK_DIAG_WFI_COUNT` | `false` | first pipeline barrier recorded (once per process) | 1 logs once a second (mesa_logi, MESA_LOG_FILE on Windows) how many idles pipeline barriers recorded per second: explicit WAIT_FOR_IDLE, shader data flushes, and the ones NVK_DIAG_NO_WFI_BARRIER skipped. | [0064-nvk-NVK_DIAG_NO_WFI_BARRIER-and-NVK_DIAG_WFI_COUNT-d.patch:70](../guest/nvk-rm/patches-common/0064-nvk-NVK_DIAG_NO_WFI_BARRIER-and-NVK_DIAG_WFI_COUNT-d.patch#L70) |
 | `NVK_DISPATCH_CAPTURE` | `unset` | device creation | Comma-separated 16-digit source hashes (vkd3d-proton DXIL hashes, as NVK_DISPATCH_PROFILE prints them) of compute shaders to capture: one dispatch each is written with its SPIR-V, push constants, grid and the contents of every image, buffer, sampler and root buffer address it reads, for replaying it outside the game. Each capture is a directory &lt;hash&gt;-p&lt;pid&gt;-&lt;n&gt; with manifest.json, shader.spv, push.bin and one raw file per resource; events go to nvk-dcap.log there. | [0072-nvk-NVK_DISPATCH_CAPTURE-one-dispatch-with-its-input.patch:2305](../guest/nvk-rm/patches-common/0072-nvk-NVK_DISPATCH_CAPTURE-one-dispatch-with-its-input.patch#L2305) |

@@ -1,0 +1,612 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Sat, 24 Oct 2026 14:02:03 +0200
+Subject: [PATCH] nvk: CUDA kernels on Blackwell: launch constants and texture
+ handles
+
+DLSS ran on an RTX 5090 (sm_120, SASS from the host-built cubin cache)
+without errors but wrote a black image.  Small PTX kernels compiled by
+NVIDIA's JIT for sm_120 and run through VK_NVX_binary_import
+(ngx-smoketest --cutest) showed three differences from what NVK did,
+which came from the Turing to Ada ABI:
+
+- Bank 0 layout.  sm_100+ SASS has its parameters at 0x380 and reads
+  %ntid from 0x360, %nctaid from 0x370, the initial stack pointer from
+  0x37c and the generic address of the local memory window (cvta.local)
+  from 0x2f8.  NVK wrote the block and grid sizes at 0x0 and 0xc, so
+  every kernel saw blockDim = gridDim = 0 (pixel = blockIdx * 0 +
+  threadIdx), and kernels with a stack frame put it below local address
+  0, outside the thread's local memory, where loads return zero.  The
+  launch now fills them: the stack starts at the top of the slm_size
+  bytes the QMD gives each thread.  Before sm_100 the layout is as it was.
+
+- Texture handles.  The texture instructions in this SASS take the whole
+  handle as the texture header index; NVK's combined handle has the
+  sampler index in bits 20-31, so a texture with any sampler but the one
+  at index 0 read another (or no) header and returned zeros, fetches
+  included.  The sampler comes from the QMD: CUDA launches on Blackwell
+  now use SAMPLER_INDEX_VIA_HEADER_INDEX (new nak_qmd_info field), and
+  vkGetImageViewHandleNVX / vkGetImageViewHandle64NVX for a combined
+  image sampler return an index where the image table holds a copy of the
+  view's sampled descriptor and the sampler table a copy of the sampler
+  (nvk_descriptor_table_insert_pair; one per view and sampler state,
+  freed with the view).  Sampled and storage image handles are unchanged.
+
+With this, the cutest kernels all give the expected results (launch
+constants, module globals and __constant__ data, the stack and generic
+local addresses, shared memory, textures with two samplers, surfaces,
+cp.async, ldmatrix, mma.sync), and DLSS 310.9.16 super resolution
+(preset K, 1280x720 to 1920x1080) in ngx-smoketest upscales the input:
+mean difference to a nearest upscale of the input 4-5 of 255, the
+aliased lines resolved; 0.43 ms GPU per evaluation.
+---
+ src/nouveau/compiler/nak.h                |  5 ++
+ src/nouveau/compiler/nak/hw_runner.rs     |  1 +
+ src/nouveau/compiler/nak/qmd.rs           | 11 ++++
+ src/nouveau/vulkan/nvk_cmd_buffer.h       | 10 ++-
+ src/nouveau/vulkan/nvk_cmd_dispatch.c     | 13 ++--
+ src/nouveau/vulkan/nvk_cubin.c            | 71 +++++++++++++++++---
+ src/nouveau/vulkan/nvk_cubin.h            |  7 ++
+ src/nouveau/vulkan/nvk_descriptor_table.c | 54 +++++++++++++++
+ src/nouveau/vulkan/nvk_descriptor_table.h | 10 +++
+ src/nouveau/vulkan/nvk_image_view.c       | 80 ++++++++++++++++++++++-
+ src/nouveau/vulkan/nvk_image_view.h       | 12 ++++
+ src/nouveau/vulkan/nvk_sampler.c          |  1 +
+ src/nouveau/vulkan/nvk_sampler.h          |  5 ++
+ 13 files changed, 265 insertions(+), 15 deletions(-)
+
+diff --git a/src/nouveau/compiler/nak.h b/src/nouveau/compiler/nak.h
+index 0409e32..f430a00 100644
+--- a/src/nouveau/compiler/nak.h
++++ b/src/nouveau/compiler/nak.h
+@@ -313,6 +313,11 @@ struct nak_qmd_info {
+    uint16_t dependence_counter;
+    uint16_t hw_dependence_counter;
+    struct nak_qmd_cbuf cbufs[8];
++
++   /* Texture instructions take the sampler at the texture header's index
++    * (CUDA kernels on Blackwell), not from the handle.
++    */
++   bool sampler_index_via_header;
+ };
+ 
+ #define NAK_QMD_ALIGN_B 256
+diff --git a/src/nouveau/compiler/nak/hw_runner.rs b/src/nouveau/compiler/nak/hw_runner.rs
+index 3cc57bd..a0167a6 100644
+--- a/src/nouveau/compiler/nak/hw_runner.rs
++++ b/src/nouveau/compiler/nak/hw_runner.rs
+@@ -625,6 +625,7 @@ impl PushBuilder {
+             cbufs: qmd_cbufs,
+             dependence_counter,
+             hw_dependence_counter,
++            sampler_index_via_header: false,
+         };
+ 
+         let qmd = qmd_heap.alloc_qmd()?;
+diff --git a/src/nouveau/compiler/nak/qmd.rs b/src/nouveau/compiler/nak/qmd.rs
+index 50f9a4c..706a379 100644
+--- a/src/nouveau/compiler/nak/qmd.rs
++++ b/src/nouveau/compiler/nak/qmd.rs
+@@ -21,6 +21,7 @@ trait QMD {
+ 
+     fn new() -> Self;
+     fn set_barrier_count(&mut self, barrier_count: u8);
++    fn set_sampler_index_via_header(&mut self, via_header: bool);
+     fn set_cbuf(&mut self, idx: u8, addr: u64, size: u32);
+     fn cbuf_desc_layout(idx: u8) -> nak_qmd_cbuf_desc_layout;
+     fn set_global_size(&mut self, width: u32, height: u32, depth: u32);
+@@ -92,6 +93,15 @@ macro_rules! qmd_impl_common {
+             set_field!(bv, $c, $s, BARRIER_COUNT, barrier_count);
+         }
+ 
++        fn set_sampler_index_via_header(&mut self, via_header: bool) {
++            let mut bv = QMDBitView::new(&mut self.qmd);
++            if via_header {
++                set_enum!(bv, $c, $s, SAMPLER_INDEX, VIA_HEADER_INDEX);
++            } else {
++                set_enum!(bv, $c, $s, SAMPLER_INDEX, INDEPENDENTLY);
++            }
++        }
++
+         const GLOBAL_SIZE_LAYOUT: nak_qmd_dispatch_size_layout = {
+             assert!(paste! {$c::[<$s _MAX_BIT>]} < size_of::<Self>() * 8);
+             assert!(NAK_MAX_QMD_SIZE_B as usize >= size_of::<Self>());
+@@ -866,6 +876,7 @@ fn fill_qmd<Q: QMD>(
+     qmd.set_register_count(info.num_gprs);
+     qmd.set_crs_size(info.crs_size);
+     qmd.set_slm_size(info.slm_size);
++    qmd.set_sampler_index_via_header(qmd_info.sampler_index_via_header);
+     qmd.set_dependence_counter(qmd_info.dependence_counter);
+     qmd.set_hw_dependence_counter(qmd_info.hw_dependence_counter);
+ 
+diff --git a/src/nouveau/vulkan/nvk_cmd_buffer.h b/src/nouveau/vulkan/nvk_cmd_buffer.h
+index 1578e5a..13d54b9 100644
+--- a/src/nouveau/vulkan/nvk_cmd_buffer.h
++++ b/src/nouveau/vulkan/nvk_cmd_buffer.h
+@@ -21,6 +21,11 @@
+ 
+ #include <stdio.h>
+ 
++/* Generic address of the local memory window on Volta and later (the
++ * compute class's SET_SHADER_LOCAL_MEMORY_WINDOW).
++ */
++#define NVK_SHADER_LOCAL_MEMORY_WINDOW (0xffull << 24)
++
+ struct nvk_buffer;
+ struct nvk_cbuf;
+ struct nvk_cmd_mem;
+@@ -822,13 +827,16 @@ void nvk_cmd_dispatch_with_root(struct nvk_cmd_buffer *cmd,
+                                 uint32_t groupCountZ);
+ 
+ /* As nvk_cmd_dispatch_with_root(); cbufs (NULL or one entry per constant
+- * buffer slot) binds the slots shader->cbuf_map leaves INVALID.
++ * buffer slot) binds the slots shader->cbuf_map leaves INVALID, and
++ * sampler_via_header makes texture instructions take the sampler at the
++ * texture header's index (QMD SAMPLER_INDEX_VIA_HEADER_INDEX).
+  */
+ void nvk_cmd_dispatch_with_root_cbufs(struct nvk_cmd_buffer *cmd,
+                                       struct nvk_shader *shader,
+                                       const void *root,
+                                       size_t root_size,
+                                       const struct nvk_buffer_address *cbufs,
++                                      bool sampler_via_header,
+                                       uint32_t groupCountX,
+                                       uint32_t groupCountY,
+                                       uint32_t groupCountZ);
+diff --git a/src/nouveau/vulkan/nvk_cmd_dispatch.c b/src/nouveau/vulkan/nvk_cmd_dispatch.c
+index 70601b2..664fc7b 100644
+--- a/src/nouveau/vulkan/nvk_cmd_dispatch.c
++++ b/src/nouveau/vulkan/nvk_cmd_dispatch.c
+@@ -74,7 +74,7 @@ nvk_push_dispatch_state_init(struct nvk_queue *queue, struct nv_push *p)
+       P_NVC3C0_SET_SHADER_SHARED_MEMORY_WINDOW_A(p, temp >> 32);
+       P_NVC3C0_SET_SHADER_SHARED_MEMORY_WINDOW_B(p, temp & 0xffffffff);
+ 
+-      temp = 0xffULL << 24;
++      temp = NVK_SHADER_LOCAL_MEMORY_WINDOW;
+       P_MTHD(p, NVC3C0, SET_SHADER_LOCAL_MEMORY_WINDOW_A);
+       P_NVC3C0_SET_SHADER_LOCAL_MEMORY_WINDOW_A(p, temp >> 32);
+       P_NVC3C0_SET_SHADER_LOCAL_MEMORY_WINDOW_B(p, temp & 0xffffffff);
+@@ -158,7 +158,8 @@ nvk_flush_compute_state(struct nvk_cmd_buffer *cmd,
+ 
+ /* extra_cbufs: NULL, or the address of each constant buffer slot whose
+  * cbuf_map entry is NVK_CBUF_TYPE_INVALID (CUDA kernels' banks 2-4); a slot
+- * with size 0 stays unbound.
++ * with size 0 stays unbound.  sampler_via_header: the QMD's
++ * SAMPLER_INDEX_VIA_HEADER_INDEX (CUDA kernels on Blackwell).
+  */
+ static VkResult
+ nvk_cmd_upload_qmd(struct nvk_cmd_buffer *cmd,
+@@ -167,6 +168,7 @@ nvk_cmd_upload_qmd(struct nvk_cmd_buffer *cmd,
+                    const void *root,
+                    size_t root_size,
+                    const struct nvk_buffer_address *extra_cbufs,
++                   bool sampler_via_header,
+                    uint32_t global_size[3],
+                    uint64_t *qmd_addr_out,
+                    uint64_t *root_desc_addr_out)
+@@ -205,6 +207,7 @@ nvk_cmd_upload_qmd(struct nvk_cmd_buffer *cmd,
+          },
+          .dependence_counter = 0,
+          .hw_dependence_counter = 0,
++         .sampler_index_via_header = sampler_via_header,
+       };
+ 
+       assert(shader->cbuf_map.cbuf_count <= ARRAY_SIZE(qmd_info.cbufs));
+@@ -270,7 +273,7 @@ nvk_cmd_flush_cs_qmd(struct nvk_cmd_buffer *cmd,
+    STATIC_ASSERT((sizeof(desc->root) & 0xff) == 0);
+ 
+    return nvk_cmd_upload_qmd(cmd, state->cs.shader, desc,
+-                             desc->root, sizeof(desc->root), NULL,
++                             desc->root, sizeof(desc->root), NULL, false,
+                              global_size,
+                              qmd_addr_out, root_desc_addr_out);
+ }
+@@ -393,7 +396,7 @@ nvk_cmd_dispatch_with_root(struct nvk_cmd_buffer *cmd,
+                            uint32_t groupCountY,
+                            uint32_t groupCountZ)
+ {
+-   nvk_cmd_dispatch_with_root_cbufs(cmd, shader, root, root_size, NULL,
++   nvk_cmd_dispatch_with_root_cbufs(cmd, shader, root, root_size, NULL, false,
+                                     groupCountX, groupCountY, groupCountZ);
+ }
+ 
+@@ -403,6 +406,7 @@ nvk_cmd_dispatch_with_root_cbufs(struct nvk_cmd_buffer *cmd,
+                                  const void *root,
+                                  size_t root_size,
+                                  const struct nvk_buffer_address *cbufs,
++                                 bool sampler_via_header,
+                                  uint32_t groupCountX,
+                                  uint32_t groupCountY,
+                                  uint32_t groupCountZ)
+@@ -414,6 +418,7 @@ nvk_cmd_dispatch_with_root_cbufs(struct nvk_cmd_buffer *cmd,
+    uint64_t qmd_addr;
+    VkResult result = nvk_cmd_upload_qmd(cmd, shader, NULL,
+                                         root, root_size, cbufs,
++                                        sampler_via_header,
+                                         group_count,
+                                         &qmd_addr, NULL);
+    if (result != VK_SUCCESS) {
+diff --git a/src/nouveau/vulkan/nvk_cubin.c b/src/nouveau/vulkan/nvk_cubin.c
+index d665906..6f40006 100644
+--- a/src/nouveau/vulkan/nvk_cubin.c
++++ b/src/nouveau/vulkan/nvk_cubin.c
+@@ -25,6 +25,12 @@
+ #include <windows.h>
+ #endif
+ 
++bool
++nvk_cuda_sampler_via_header(const struct nvk_physical_device *pdev)
++{
++   return pdev->info.sm >= 100;
++}
++
+ static void
+ nvk_cubin_dump(const char *extension, const void *data, size_t size)
+ {
+@@ -987,12 +993,60 @@ nvk_DestroyCuFunctionNVX(VkDevice _device, VkCuFunctionNVX _function,
+ 
+ /* kernel launch */
+ 
++/* Bank 0: launch constants (nvk_cubin_launch_constants) and parameters */
+ struct nvk_cubin_root_descriptor {
+-   uint32_t block_dim[3];
+-   uint32_t grid_dim[3];
+-   uint8_t data[4096 - (6 * sizeof(uint32_t))];
++   uint8_t data[4096];
+ };
+ 
++/* The launch constants CUDA kernels read from bank 0 besides their
++ * parameters.
++ *
++ * Before sm_100, NVK keeps the layout it always had: blockDim (%ntid) at
++ * 0x0, gridDim (%nctaid) at 0xc.  SASS for sm_100 and later (Blackwell:
++ * RTX 50 is sm_120) has its parameters at 0x380 and reads, checked with
++ * ngx-smoketest --cutest on an RTX 5090 (kernels compiled by NVIDIA's PTX
++ * JIT for sm_120):
++ *
++ *    0x2f8  64-bit generic address of the local memory window (cvta.local)
++ *    0x360  %ntid.x, .y, .z
++ *    0x370  %nctaid.x, .y, .z
++ *    0x37c  initial stack pointer: the stack grows down from it in the
++ *           thread's local memory
++ *
++ * With them zero, every kernel computed its pixel from blockIdx * 0 +
++ * threadIdx, and a kernel with a stack frame (local arrays, spills: DLSS's
++ * output kernels have one) addressed it below local address 0, outside
++ * the thread's local memory, where its loads return zero.  NVK gives
++ * the thread slm_size bytes of local memory (QMD low local memory size,
++ * from the kernel's EIATTR_MIN_STACK_SIZE), so the stack starts at its top.
++ */
++static void
++nvk_cubin_launch_constants(void *root, const struct nv_cubin_function *info,
++                           uint32_t sm, const VkCuLaunchInfoNVX *launch)
++{
++   const uint32_t block[3] = {
++      launch->blockDimX, launch->blockDimY, launch->blockDimZ,
++   };
++   const uint32_t grid[3] = {
++      launch->gridDimX, launch->gridDimY, launch->gridDimZ,
++   };
++   uint8_t *cb0 = root;
++
++   if (sm < 100) {
++      memcpy(cb0 + 0x0, block, sizeof(block));
++      memcpy(cb0 + 0xc, grid, sizeof(grid));
++      return;
++   }
++
++   assert(info->params_offset >= 0x380);
++   const uint64_t local_window = NVK_SHADER_LOCAL_MEMORY_WINDOW;
++   const uint32_t stack_top = align(info->slm_size, 16);
++   memcpy(cb0 + 0x2f8, &local_window, sizeof(local_window));
++   memcpy(cb0 + 0x360, block, sizeof(block));
++   memcpy(cb0 + 0x370, grid, sizeof(grid));
++   memcpy(cb0 + 0x37c, &stack_top, sizeof(stack_top));
++}
++
+ /* extra launch parameters taken from vkd3d-proton */
+ #define CU_LAUNCH_PARAM_BUFFER_POINTER ((const void *)0x01)
+ #define CU_LAUNCH_PARAM_BUFFER_SIZE    ((const void *)0x02)
+@@ -1023,12 +1077,8 @@ nvk_CmdCuLaunchKernelNVX(VkCommandBuffer commandBuffer,
+       root = malloc(root_size);
+    }
+    memset(root, 0, root_size);
+-   root->block_dim[0] = pLaunchInfo->blockDimX;
+-   root->block_dim[1] = pLaunchInfo->blockDimY;
+-   root->block_dim[2] = pLaunchInfo->blockDimZ;
+-   root->grid_dim[0] = pLaunchInfo->gridDimX;
+-   root->grid_dim[1] = pLaunchInfo->gridDimY;
+-   root->grid_dim[2] = pLaunchInfo->gridDimZ;
++   nvk_cubin_launch_constants(root, function_info,
++                              function->module->info->sm, pLaunchInfo);
+ 
+    const void *param_buffer = NULL;
+    const uint32_t *param_buffer_size = NULL;
+@@ -1103,8 +1153,11 @@ nvk_CmdCuLaunchKernelNVX(VkCommandBuffer commandBuffer,
+    shader.cbuf_map.cbuf_count = function->cbuf_count;
+    shader.cbuf_map.cbufs[0].type = NVK_CBUF_TYPE_ROOT_DESC;
+ 
++   const struct nvk_physical_device *pdev =
++      nvk_device_physical(nvk_cmd_buffer_device(cmd));
+    nvk_cmd_dispatch_with_root_cbufs(cmd, &shader, root, root_size,
+                                     function->cbufs,
++                                    nvk_cuda_sampler_via_header(pdev),
+                                     pLaunchInfo->gridDimX,
+                                     pLaunchInfo->gridDimY,
+                                     pLaunchInfo->gridDimZ);
+diff --git a/src/nouveau/vulkan/nvk_cubin.h b/src/nouveau/vulkan/nvk_cubin.h
+index 1c6bc5f..e6d1381 100644
+--- a/src/nouveau/vulkan/nvk_cubin.h
++++ b/src/nouveau/vulkan/nvk_cubin.h
+@@ -72,6 +72,13 @@ struct nvk_cubin_function {
+    uint32_t cbuf_count;
+ };
+ 
++struct nvk_physical_device;
++
++/* CUDA kernels for sm_100 and later take the sampler at the texture
++ * header's index (nvk_image_view.c).
++ */
++bool nvk_cuda_sampler_via_header(const struct nvk_physical_device *pdev);
++
+ VK_DEFINE_NONDISP_HANDLE_CASTS(nvk_cubin_module, base, VkCuModuleNVX,
+                                VK_OBJECT_TYPE_CU_MODULE_NVX)
+ 
+diff --git a/src/nouveau/vulkan/nvk_descriptor_table.c b/src/nouveau/vulkan/nvk_descriptor_table.c
+index a201a57..724a0ab 100644
+--- a/src/nouveau/vulkan/nvk_descriptor_table.c
++++ b/src/nouveau/vulkan/nvk_descriptor_table.c
+@@ -302,6 +302,60 @@ nvk_descriptor_table_insert(struct nvk_device *dev,
+    return result;
+ }
+ 
++static void
++nvk_descriptor_table_remove_locked(struct nvk_device *dev,
++                                   struct nvk_descriptor_table *table,
++                                   uint32_t index);
++
++static bool
++nvk_descriptor_table_index_free_locked(const struct nvk_descriptor_table *table,
++                                       uint32_t index)
++{
++   return index >= table->alloc || !BITSET_TEST(table->in_use, index);
++}
++
++VkResult
++nvk_descriptor_table_insert_pair(struct nvk_device *dev,
++                                 struct nvk_descriptor_table *a,
++                                 const void *desc_a, size_t size_a,
++                                 struct nvk_descriptor_table *b,
++                                 const void *desc_b, size_t size_b,
++                                 uint32_t *index_out)
++{
++   assert(a != b);
++   VkResult result = VK_ERROR_OUT_OF_HOST_MEMORY;
++
++   /* Always a before b: no other path holds two table locks. */
++   simple_mtx_lock(&a->arena.mutex);
++   simple_mtx_lock(&b->arena.mutex);
++   const uint32_t limit = MIN2(a->max_alloc, b->max_alloc);
++   uint32_t index;
++   for (index = 1; index < limit; index++) {
++      if (nvk_descriptor_table_index_free_locked(a, index) &&
++          nvk_descriptor_table_index_free_locked(b, index))
++         break;
++   }
++   if (index < limit) {
++      result = nvk_descriptor_table_insert_locked(dev, a, index,
++                                                  desc_a, size_a);
++      if (result == VK_SUCCESS) {
++         result = nvk_descriptor_table_insert_locked(dev, b, index,
++                                                     desc_b, size_b);
++         if (result != VK_SUCCESS)
++            nvk_descriptor_table_remove_locked(dev, a, index);
++      }
++   } else {
++      result = vk_errorf(dev, VK_ERROR_OUT_OF_HOST_MEMORY,
++                         "No index free in both descriptor tables");
++   }
++   simple_mtx_unlock(&b->arena.mutex);
++   simple_mtx_unlock(&a->arena.mutex);
++
++   if (result == VK_SUCCESS)
++      *index_out = index;
++   return result;
++}
++
+ static int
+ compar_u32(const void *_a, const void *_b)
+ {
+diff --git a/src/nouveau/vulkan/nvk_descriptor_table.h b/src/nouveau/vulkan/nvk_descriptor_table.h
+index 8b9371d..a6a43ce 100644
+--- a/src/nouveau/vulkan/nvk_descriptor_table.h
++++ b/src/nouveau/vulkan/nvk_descriptor_table.h
+@@ -57,6 +57,16 @@ VkResult nvk_descriptor_table_insert(struct nvk_device *dev,
+                                      uint32_t index,
+                                      const void *desc_data, size_t desc_size);
+ 
++/* Writes desc_a into table a and desc_b into table b at one index that
++ * is free in both (from 1, below both tables' maximum size).
++ */
++VkResult nvk_descriptor_table_insert_pair(struct nvk_device *dev,
++                                          struct nvk_descriptor_table *a,
++                                          const void *desc_a, size_t size_a,
++                                          struct nvk_descriptor_table *b,
++                                          const void *desc_b, size_t size_b,
++                                          uint32_t *index_out);
++
+ void nvk_descriptor_table_remove(struct nvk_device *dev,
+                                  struct nvk_descriptor_table *table,
+                                  uint32_t index);
+diff --git a/src/nouveau/vulkan/nvk_image_view.c b/src/nouveau/vulkan/nvk_image_view.c
+index 631fd5f..31b18da 100644
+--- a/src/nouveau/vulkan/nvk_image_view.c
++++ b/src/nouveau/vulkan/nvk_image_view.c
+@@ -3,6 +3,7 @@
+  * SPDX-License-Identifier: MIT
+  */
+ #include "nvk_image_view.h"
++#include "nvk_cubin.h"
+ 
+ #include "nvk_device.h"
+ #include "nvk_dispatch_capture.h"
+@@ -14,6 +15,8 @@
+ 
+ #include "vk_format.h"
+ 
++#include "util/simple_mtx.h"
++
+ #include "clb097.h"
+ 
+ static enum nil_view_type
+@@ -322,6 +325,14 @@ nvk_image_view_finish(struct nvk_device *dev,
+       nvk_image_view_descriptor_finish(dev, &view->planes[plane].storage);
+    }
+ 
++   for (uint32_t i = 0; i < view->cuda_tex_count; i++) {
++      nvk_descriptor_table_remove(dev, &dev->images, view->cuda_tex[i].index);
++      nvk_descriptor_table_remove(dev, &dev->samplers, view->cuda_tex[i].index);
++   }
++   free(view->cuda_tex);
++   view->cuda_tex = NULL;
++   view->cuda_tex_count = 0;
++
+    vk_image_view_finish(&view->vk);
+ }
+ 
+@@ -392,16 +403,83 @@ nvk_GetImageViewOpaqueCaptureDescriptorDataEXT(
+ }
+ 
+ 
++/* CUDA texture handles on Blackwell
++ *
++ * CUDA kernels for sm_100 and later (Blackwell; RTX 50 is sm_120) take
++ * the whole handle as the texture header index: a sampler index in its
++ * upper bits, where NVK's combined handles have it, makes the texture
++ * instruction read another (or no) texture header.  The sampler comes from
++ * the QMD instead, which for CUDA launches NVK sets to
++ * SAMPLER_INDEX_VIA_HEADER_INDEX (nvk_CmdCuLaunchKernelNVX): the sampler at
++ * the texture header's index.  So a combined image sampler handle is an
++ * index where the image table holds a copy of the view's sampled
++ * descriptor and the sampler table a copy of the sampler, one per view and
++ * sampler state, kept until the view is destroyed.
++ *
++ * Checked with ngx-smoketest --cutest on an RTX 5090: with the sampler in
++ * the handle's upper bits, texture fetches and filtered lookups return
++ * zeros; through a pair index both return the texels, filtered with the
++ * pair's sampler.
++ */
++static simple_mtx_t nvk_cuda_tex_mutex = SIMPLE_MTX_INITIALIZER;
++
++static uint32_t
++nvk_image_view_cuda_tex_index(struct nvk_device *dev,
++                              struct nvk_image_view *view,
++                              const struct nvk_sampler *sampler)
++{
++   STATIC_ASSERT(sizeof(view->cuda_tex[0].sampler) ==
++                 sizeof(sampler->header));
++   uint32_t index = 0;
++
++   simple_mtx_lock(&nvk_cuda_tex_mutex);
++   for (uint32_t i = 0; i < view->cuda_tex_count; i++) {
++      if (!memcmp(view->cuda_tex[i].sampler, &sampler->header,
++                  sizeof(sampler->header))) {
++         index = view->cuda_tex[i].index;
++         goto out;
++      }
++   }
++
++   struct nvk_image_view_cuda_tex *list =
++      realloc(view->cuda_tex, (view->cuda_tex_count + 1) * sizeof(*list));
++   if (list == NULL)
++      goto out;
++   view->cuda_tex = list;
++
++   const struct nil_descriptor desc = view->planes[0].sampled.desc.desc;
++   if (nvk_descriptor_table_insert_pair(dev, &dev->images, &desc, sizeof(desc),
++                                        &dev->samplers, &sampler->header,
++                                        sizeof(sampler->header),
++                                        &index) != VK_SUCCESS) {
++      index = 0;
++      goto out;
++   }
++   struct nvk_image_view_cuda_tex *t = &view->cuda_tex[view->cuda_tex_count++];
++   memcpy(t->sampler, &sampler->header, sizeof(t->sampler));
++   t->index = index;
++
++out:
++   simple_mtx_unlock(&nvk_cuda_tex_mutex);
++   return index;
++}
++
+ VKAPI_ATTR uint32_t VKAPI_CALL
+ nvk_GetImageViewHandleNVX(VkDevice _device,
+                           const VkImageViewHandleInfoNVX *pInfo)
+ {
++   VK_FROM_HANDLE(nvk_device, dev, _device);
+    VK_FROM_HANDLE(nvk_image_view, view, pInfo->imageView);
+    VK_FROM_HANDLE(nvk_sampler, sampler, pInfo->sampler);
++   const struct nvk_physical_device *pdev = nvk_device_physical(dev);
+    assert(view->plane_count == 1);
+ 
+    uint32_t handle = 0;
+-   if (pInfo->descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE) {
++   if (pInfo->descriptorType == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER &&
++       sampler != NULL && nvk_cuda_sampler_via_header(pdev)) {
++      assert(sampler->plane_count == 1);
++      handle = nvk_image_view_cuda_tex_index(dev, view, sampler);
++   } else if (pInfo->descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE) {
+       struct nvk_storage_image_descriptor desc;
+       STATIC_ASSERT(sizeof(desc) == sizeof(handle));
+ 
+diff --git a/src/nouveau/vulkan/nvk_image_view.h b/src/nouveau/vulkan/nvk_image_view.h
+index 3ed68a1..62e8211 100644
+--- a/src/nouveau/vulkan/nvk_image_view.h
++++ b/src/nouveau/vulkan/nvk_image_view.h
+@@ -35,6 +35,18 @@ struct nvk_image_view {
+       struct nvk_image_view_descriptor sampled;
+       struct nvk_image_view_descriptor storage;
+    } planes[NVK_MAX_IMAGE_PLANES];
++
++   /* Combined image sampler handles for CUDA kernels on Blackwell
++    * (nvk_GetImageViewHandleNVX): a copy of plane 0's sampled descriptor
++    * and of the sampler's header at one index of both descriptor tables.
++    */
++   struct nvk_image_view_cuda_tex *cuda_tex;
++   uint32_t cuda_tex_count;
++};
++
++struct nvk_image_view_cuda_tex {
++   uint32_t sampler[8]; /* struct nvk_sampler_header */
++   uint32_t index;
+ };
+ 
+ VK_DEFINE_NONDISP_HANDLE_CASTS(nvk_image_view, vk.base, VkImageView,
+diff --git a/src/nouveau/vulkan/nvk_sampler.c b/src/nouveau/vulkan/nvk_sampler.c
+index 9a41ebd..aba0896 100644
+--- a/src/nouveau/vulkan/nvk_sampler.c
++++ b/src/nouveau/vulkan/nvk_sampler.c
+@@ -354,6 +354,7 @@ nvk_CreateSampler(VkDevice device,
+          }
+ 
+          sampler->planes[0].desc_index = desc_index;
++         sampler->header = samp;
+          nvk_dcap_note_sampler(dev, desc_index, &state);
+       }
+    }
+diff --git a/src/nouveau/vulkan/nvk_sampler.h b/src/nouveau/vulkan/nvk_sampler.h
+index 7d99e9a..7cb6888 100644
+--- a/src/nouveau/vulkan/nvk_sampler.h
++++ b/src/nouveau/vulkan/nvk_sampler.h
+@@ -25,6 +25,11 @@ struct nvk_sampler {
+    struct {
+       uint32_t desc_index;
+    } planes[NVK_MAX_SAMPLER_PLANES];
++
++   /* Plane 0's sampler header, for CUDA texture handles
++    * (nvk_GetImageViewHandleNVX on Blackwell)
++    */
++   struct nvk_sampler_header header;
+ };
+ 
+ VK_DEFINE_NONDISP_HANDLE_CASTS(nvk_sampler, vk.base, VkSampler,
