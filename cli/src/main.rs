@@ -428,6 +428,10 @@ enum Cmd {
         #[arg(last = true)]
         cmd: Vec<String>,
     },
+    /// Windows guests: what games that offer DLSS, FSR or XeSS get from
+    /// their next start: default (the game's choice), dlss (newest model),
+    /// fsr or xess (through OptiScaler); without MODE, show it
+    Upscaler { vm: String, mode: Option<String> },
     /// List the apps installed in a running VM (Start Menu and Steam on
     /// Windows; desktop entries and Steam on Linux)
     Apps {
@@ -965,6 +969,7 @@ fn main() {
             no_view,
         }),
         Cmd::Apps { vm, json } => ctl::apps(&vm, json),
+        Cmd::Upscaler { vm, mode } => ctl::upscaler(&vm, mode.as_deref()),
         Cmd::Cp { src, dst, force } => ctl::cp(&src, &dst, force),
         Cmd::App { action } => match action {
             AppCmd::Add { vm, name } => ctl::app_add(&vm, &name),
@@ -1159,6 +1164,8 @@ mod tests {
             vec!["conduit", "poweroff", "myvm"],
             vec!["conduit", "pause", "myvm"],
             vec!["conduit", "resume", "myvm"],
+            vec!["conduit", "upscaler", "myvm"],
+            vec!["conduit", "upscaler", "myvm", "dlss"],
             vec!["conduit", "libvirt", "enable", "myvm"],
             vec!["conduit", "libvirt", "disable", "myvm"],
             vec!["conduit", "view", "myvm", "--keep-running"],

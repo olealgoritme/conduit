@@ -32,6 +32,8 @@ struct Guest {
     ran: Vec<RunArgs>,
     /// What `settime` set the clock to.
     clock: Option<u64>,
+    /// What `upscaler` set.
+    upscaler: Option<String>,
 }
 
 fn apps() -> Vec<App> {
@@ -113,6 +115,25 @@ fn handle(g: &mut Guest, r: Request, f: &Faults) -> Response {
         Op::SetTime { unix_ms } => {
             g.clock = Some(unix_ms);
             Response::ok(id, &serde_json::json!({}))
+        }
+        Op::Upscaler { .. } if f.hostile => Response::ok(
+            id,
+            &conduit_ctl::UpscalerState {
+                mode: "fsr\x1b[2J".into(),
+                optiscaler_games: 1,
+            },
+        ),
+        Op::Upscaler { mode } => {
+            if let Some(m) = mode {
+                g.upscaler = Some(m);
+            }
+            Response::ok(
+                id,
+                &conduit_ctl::UpscalerState {
+                    mode: g.upscaler.clone().unwrap_or_else(|| "default".into()),
+                    optiscaler_games: 0,
+                },
+            )
         }
         Op::Apps if f.hostile => Response::ok(
             id,
@@ -289,6 +310,31 @@ fn settime_sets_the_guest_clock_or_says_why_not() {
         c.set_time(1, Duration::from_secs(1)).unwrap_err(),
         CtlError::Guest("unknown op settime".into())
     );
+}
+
+#[test]
+fn upscaler_sets_and_reads_the_guest_mode() {
+    let (mut c, g) = pair(Faults::default());
+    assert_eq!(c.upscaler(None).unwrap().mode, "default");
+    assert_eq!(c.upscaler(Some("dlss")).unwrap().mode, "dlss");
+    assert_eq!(g.lock().unwrap().upscaler.as_deref(), Some("dlss"));
+    assert_eq!(c.upscaler(None).unwrap().mode, "dlss");
+    // what the guest says is cleaned before it is printed
+    let (mut c, _) = pair(Faults {
+        hostile: true,
+        ..Faults::default()
+    });
+    let s = c.upscaler(Some("fsr")).unwrap();
+    assert!(!s.mode.contains('\x1b'), "{:?}", s.mode);
+}
+
+#[test]
+fn upscaler_mode_words() {
+    assert_eq!(upscaler_mode("DLSS").unwrap(), "dlss");
+    assert_eq!(upscaler_mode(" xess ").unwrap(), "xess");
+    assert_eq!(upscaler_mode("default").unwrap(), "default");
+    assert!(upscaler_mode("fsr4").is_err());
+    assert!(upscaler_mode("").is_err());
 }
 
 #[test]

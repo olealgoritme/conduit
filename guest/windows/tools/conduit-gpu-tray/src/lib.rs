@@ -9,6 +9,7 @@ pub mod policy;
 pub mod procs;
 pub mod startmenu;
 pub mod steam;
+pub mod upscaler;
 pub mod vdf;
 
 #[cfg(test)]

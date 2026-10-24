@@ -82,6 +82,9 @@ Patch numbers are file numbers in the directory named in the patch tables.
 | `NVK_RM_ZCULL` | 1 | ZCULL from `GR_GET_ZCULL_INFO` |
 | `NVK_RM_HUGE_PAGES` | 0 | 2 MiB GPU pages for CPU-unmapped VRAM of 2 MiB or more (common 9) |
 | `NVK_RM_DEFER_FREE` | 1 on Windows, 0 on Linux | memory and VA frees wait for the GPU work submitted before them (common 19); `NVK_RM_DEFER_FREE_MB` (2048) caps the pending bytes |
+| `NVK_DLSS` | 0 (Windows: registry `Dlss`) | VK_NVX_binary_import for NGX/DLSS (windows 0067, [docs/dlss.md](docs/dlss.md)) |
+| `NVK_CUBIN_CACHE_DIR` | Windows: registry `CubinCache`, else `%ProgramData%\Helios\ngx\cubin`; elsewhere `$XDG_CACHE_HOME/nvk/cubin` | host-compiled SASS for CUDA modules without SASS for the GPU, `<key>.sm_<SM>.cubin` from `tools/cubin-cache/nvk-cubin-cache.py` (common 79) |
+| `NVK_CUBIN_CACHE_DUMP`, `NVK_CUBIN_DUMP_DIR` | 0 (Windows: registry `CubinCacheDump`), `%LOCALAPPDATA%\Helios\cubin-miss` | write CUDA modules that miss the cache, as input for the host tool (common 79) |
 | `NVK_RM_VIDEO` | 1 | NVDEC channel for H.264 decode (also needs `-Dvideo-codecs=h264dec` and `NVK_EXPERIMENTAL=video`) |
 | **CPU waits and the GPFIFO ring** | | |
 | `NVK_RM_EVENT_GEN` | 1 | CPU waits on librmclient's wake generations (common 42) |
@@ -265,7 +268,7 @@ Each patch builds on its own.
 |---|---|
 | 0014 | the backend calls neither `mmap` nor `poll`: `crm_event_wait`, `crm_alloc_pages`/`crm_free_pages` (librmclient transport ABI 2; an older librmclient on Linux gets the same code from `nvkmd_rm_lib.c`); `LoadLibrary` of `librmclient.dll` next to the ICD |
 | 0015 | `vk_image::drm_format_mod` exists on every OS (`DRM_FORMAT_MOD_INVALID` on Windows) |
-| 0016 | build without libelf (`nv_cubin_nolibelf.c`, CUDA modules rejected) |
+| 0016 | build without libelf (`nv_cubin_nolibelf.c`, CUDA modules rejected; 0066 replaces it with a parser) |
 | 0017 | driver build id from the Mesa version and module timestamp (`disk_cache_get_function_identifier`) |
 | 0018 | NAK leaves nouveau's winsys and DRM out of its bindings |
 | 0019 | build with the RM backend only: `with_nouveau_drm` (false on Windows) drops the nouveau winsys and `nvkmd/nouveau`; chipset limits in `nouveau_device_limits.[ch]`; the DRM side in `nvkmd_rm_drm.c` (Linux only, stubs otherwise); `VK_EXT_physical_device_drm` and syncobj copies Linux only; empty `<sys/ioccom.h>`; `vulkan_nouveau.dll` with `vulkan_api.def` exports |
@@ -312,6 +315,8 @@ Each patch builds on its own.
 | 0060 | the composed present waits for its copy at acquire, not at present |
 | 0061 | Mesa honours `MESA_LOG_FILE` on Windows; composed acquire/present failures go to `helios-wsi-<pid>.log` |
 | 0062 | `helios_icd_interface` v8, `ecl_fence_create_v3`: the RM fence and copy-engine record of a composed D3D11 present, for a value reserved on an ECL timeline that the submission thread signals after the frame's work, so the presenting thread does not wait for DXVK to submit the frame |
+| 0066 | CUDA cubins parsed without libelf: `nv_cubin_elf.c`, an in-tree ELF64 reader under nv_cubin's interface (replaces 0016's stub that refused every module); bounds-checked, keeps its own copy of the image; `tests/nv_cubin_elf_test.c` (meson test `nv_cubin_elf`) compares it with libelf's `nv_cubin.c` on synthetic and real cubins (see [docs/dlss.md](docs/dlss.md)) |
+| 0067 | `NVK_DLSS=1/0`, else `HKLM\SOFTWARE\Helios` `Dlss` (DWORD), adds or removes `dlss` in `NVK_EXPERIMENTAL` (VK_NVX_binary_import); default off |
 
 ## `patches-windows-dxvk/`
 
@@ -408,6 +413,8 @@ backend. Numbers are file numbers (there is no 0016 or 0025).
 | 0077 | NAK: in compute shaders, a trailing loop that never iterates and a trailing divergent if with a small guarded side become an early exit (EXIT for the lanes that leave) followed by the rest of the shader at the top level, where its uniform values use the uniform datapath; the rematerializer, `nak_nir_opt_uniform_address` and divergent top-level loops follow (`NAK_EARLY_EXIT=0` restores the old structure; part of the shader cache key) |
 | 0082 | QMDs from the latency-bound upload stream next to the compute root tables, so on Windows they are in CPU-mapped VRAM and a dependent dispatch no longer waits for a system memory read after a barrier's idle (`NVK_QMD_LAT`, default on on Windows); opt-in `NVK_DISPATCH_INDIRECT_PREFETCH` (prefetchable indirect argument copies after the first one since a barrier) and `NVK_BARRIER_DEDUP` (no second shader data invalidate after a storage-write flush). Measured with `tools/dispcost` |
 | 0083 | NAK: `NAK_SCHED_MLP` (0-3, default 3 on Windows, 0 elsewhere): the prepass enters an instruction in its future-ready set at the cycle its edge latencies give (it used the graph's static cycle, so no latency ever delayed anything), memory/texture latencies of an L2 round trip, level 3 hoists accesses ahead of everything else while registers are free (prepass and post-RA), read-only accesses unordered against other memory operations, shared scoreboards when all six are busy; the occupancy target is chosen on the plain schedule and a unit that does not fit its register target keeps the plain schedule; part of the shader cache key |
+| 0084 | CUDA modules (VK_NVX_binary_import): the module's `.text` sections uploaded once together, its globals (`.nv.global`, `.nv.global.init`) and constant banks 1-7 in one buffer with their `R_CUDA_32/64` relocations applied (to data or code symbols), banks 2-4 bound at `vkCmdCuLaunchKernelNVX` (`nvk_cmd_dispatch_with_root_cbufs`); relocations NVK cannot apply fail the module ([docs/dlss.md](docs/dlss.md)) |
+| 0085 | a fatbin without SASS for the GPU (or a PTX module) takes `<key>.sm_<SM>.cubin` from the host-built cubin cache, key the BLAKE3 of the PTX entry; the shipped SASS always wins (`NVK_CUBIN_CACHE_DIR`, `CubinCache`, `CubinCacheDump`) |
 | 0088 | `NVK_DISPATCH_CAPTURE` captures draws: a listed hash that matches the bound fragment shader (DXIL source hash or code hash) captures a `vkCmdDraw`, `vkCmdDrawIndexed` or their indirect and indirect-count forms with both shaders' SPIR-V, their descriptors and root buffers, the color, depth and stencil attachments, the index and vertex buffers and the pipeline state with the vertex input layout (`"kind": "draw"`, `vs.spv`), for `dispatch-replay`; the common runtime gets `vk_device::graphics_spirv_hook` and graphics shaders their SPIR-V source hash. A capture whose staging with the outputs cannot be mapped is made without them |
 | 0090 | `NVK_PUSH_DUMP_WINDOW="START_S,DURATION_MS"`: the pushbuffers executed in that window after the first submit, with their submit times, to `NVK_PUSH_DUMP_FILE` (`nvk-push-<pid>.txt`): one or two frames of a game instead of `NVK_DEBUG=push_dump` for the whole run |
 | 0101 | `NVK_DISPATCH_CAPTURE_SEQ=N`: a captured dispatch and the next N - 1 dispatches of the command buffer, whatever their shaders, as one sequence (manifest `sequence`: id, index, barrier before); resources an earlier dispatch of the sequence captured are referred to (`same_as`), not copied again; `NVK_DISPATCH_CAPTURE_SEQ_START=<hashes>`: a sequence starts only at a command buffer's first dispatch with one of these shaders and is kept only if it contains a `NVK_DISPATCH_CAPTURE` shader; `tests/perf/dispatch-replay --seq` replays it in one command buffer |

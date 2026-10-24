@@ -784,6 +784,22 @@ area:
     chip(&b, "Fullscreen", NB_UI_ID_FULLSCREEN, 0, env->fullscreen, false);
     flow_break(&b);
 
+    /*
+     * Upscaler: what games that offer DLSS, FSR or XeSS get (the guest's
+     * Upscaler value; games started afterwards).  Lit: the last choice the
+     * viewer made; nothing is lit until then, since only the guest knows.
+     */
+    if (env->upscaler) {
+        section(&b, env->upscaler_busy ? "Upscaler in games (setting...)"
+                                       : "Upscaler in games");
+        for (i = 0; i < NB_UPSCALER_COUNT; i++) {
+            chip(&b, nb_upscaler_label(i), NB_UI_ID_UPSCALER, i,
+                 env->upscaler_mode == i && !env->upscaler_busy,
+                 env->upscaler_busy);
+        }
+        hint(&b, "For games started next; FSR, XeSS: OptiScaler games");
+    }
+
     /* VM */
     if (env->vm_pause || env->vm_actions) {
         section(&b, env->vm_pause && env->vm_paused ? "Virtual machine (paused)"
@@ -837,6 +853,22 @@ area:
 }
 
 /* ── public: lifecycle, layout ──────────────────────────────────────────── */
+
+const char *nb_upscaler_word(int mode)
+{
+    static const char *const w[NB_UPSCALER_COUNT] = {
+        "default", "dlss", "fsr", "xess",
+    };
+    return mode >= 0 && mode < NB_UPSCALER_COUNT ? w[mode] : "default";
+}
+
+const char *nb_upscaler_label(int mode)
+{
+    static const char *const l[NB_UPSCALER_COUNT] = {
+        "Game default", "DLSS (latest model)", "FSR", "XeSS",
+    };
+    return mode >= 0 && mode < NB_UPSCALER_COUNT ? l[mode] : "?";
+}
 
 const char *nb_ui_vm_pause_label(const struct nb_ui_env *env)
 {
@@ -1156,6 +1188,13 @@ static unsigned act(struct nb_ui *ui, const struct nb_ui_env *env,
             return bits | nb_ui_set_open(ui, env, false) | NB_UI_VM_RESUME;
         }
         return bits | NB_UI_REDRAW | NB_UI_VM_PAUSE;
+    case NB_UI_ID_UPSCALER:
+        if (!env->upscaler || env->upscaler_busy || it->arg < 0 ||
+            it->arg >= NB_UPSCALER_COUNT) {
+            return bits;
+        }
+        ui->upscaler = it->arg;
+        return bits | NB_UI_REDRAW | NB_UI_UPSCALER;
     default:
         return bits;
     }
