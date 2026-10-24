@@ -1,0 +1,315 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Sat, 24 Oct 2026 02:57:26 +0200
+Subject: [PATCH] nak: NAK_SCHED_ILP (prepass honors latencies), NAK_FSET_BF,
+ NAK_GCM
+
+The prepass places a producer right above its consumer whenever nothing
+else is ready. Because its future-ready set uses the graph's static ready
+cycle (0), "nothing else" is almost always the case, and the producer is
+on the critical path. In 2a040240, 36% of the instructions read the
+result of the one before them in the original order and 74% do after the
+prepass (reference compiler's code: 2%).
+
+- NAK_SCHED_ILP=1 (default off): an instruction enters the future-ready
+  set at the cycle its edge latencies give, as NAK_SCHED_MLP does, with
+  the plain latency model (no memory-latency modeling, no hoisting). A
+  unit that does not fit its register target keeps the plain schedule.
+  The occupancy target is chosen on the plain schedule. Static stall
+  cycles with NAK_RA_LRU=1, NAK_SCHED_ILP off -> on: 2a040240 44.4k ->
+  39.7k, 88825d04 5.6k -> 5.5k, f125b4a2 770 -> 631, fb2df990
+  1585 -> 1502 (40 instead of 48 GPRs, 48 warps instead of 40).
+- NAK_FSET_BF=1 (default off): b2f32 of a 32-bit float comparison used
+  only there becomes slt/sge/seq/sne (nak_nir_algebraic.py), which
+  from_nir.rs emits as one FSET.BF (1.0 or 0.0) instead of FSETP and
+  SEL, as in the reference compiler's code. 2a040240: 180 fewer
+  instructions.
+- NAK_GCM (0-3, default off, fragment shaders only): nir_opt_gcm with
+  value numbering after NAK's NIR optimization loop (2: and ALU sunk back
+  towards its uses, 3: global loads too). Read-only loads that an
+  unrolled loop repeats in each iteration's if become one load in the
+  common dominator. While it is on, the occupancy target accepts up to 32
+  loop-weighted memory spill operations. Steel Nomad corpus, 136 fragment
+  shaders: instructions 133.6k -> 112.4k (-16%), average warps 44.1 ->
+  43.4. Lighting FS d2c045ea: 4091 -> 3430 instructions and 312 -> 207 LDGs,
+  but 128 GPRs (16 warps) instead of 96 (20 warps), with 16 memory spills.
+  The reference compiler uses 128 GPRs for it too.
+
+All three are packed into nak_knobs_key2() (bits 8-11).
+---
+ src/nouveau/compiler/nak/api.rs               |  6 ++-
+ src/nouveau/compiler/nak/from_nir.rs          | 21 ++++++++
+ src/nouveau/compiler/nak/knobs.rs             | 50 ++++++++++++++++++-
+ src/nouveau/compiler/nak/occ_target.rs        |  5 ++
+ .../compiler/nak/opt_instr_sched_prepass.rs   | 14 +++---
+ src/nouveau/compiler/nak_nir.c                | 22 ++++++++
+ src/nouveau/compiler/nak_nir_algebraic.py     |  7 +++
+ src/nouveau/compiler/nak_private.h            |  2 +
+ 8 files changed, 118 insertions(+), 9 deletions(-)
+
+diff --git a/src/nouveau/compiler/nak/api.rs b/src/nouveau/compiler/nak/api.rs
+index 58ada35..c683f00 100644
+--- a/src/nouveau/compiler/nak/api.rs
++++ b/src/nouveau/compiler/nak/api.rs
+@@ -547,8 +547,10 @@ fn nak_compile_shader_internal(
+     // NAK_SCHED_MLP: the occupancy target is chosen on the plain schedule
+     // (a schedule with loads in flight costs more to bring down), then the
+     // shader is scheduled again for it with loads in flight
+-    let mlp = crate::knobs::sched_mlp();
+-    let mlp_later = mlp > 0 && occ_target && gpr_cap.is_none();
++    // NAK_SCHED_ILP is bit 2 of the level the prepass takes
++    let mlp = crate::knobs::sched_mlp()
++        | (u32::from(crate::knobs::sched_ilp()) << 2);
++    let mlp_later = mlp != 0 && occ_target && gpr_cap.is_none();
+     s.opt_instr_sched_prepass_target_mlp(
+         gpr_cap,
+         if mlp_later { 0 } else { mlp },
+diff --git a/src/nouveau/compiler/nak/from_nir.rs b/src/nouveau/compiler/nak/from_nir.rs
+index b85aa5d..dac9df5 100644
+--- a/src/nouveau/compiler/nak/from_nir.rs
++++ b/src/nouveau/compiler/nak/from_nir.rs
+@@ -786,6 +786,27 @@ impl<'a> ShaderFromNir<'a> {
+             nir_op_b2f32 => {
+                 b.sel(srcs(0).bnot(), 0.0_f32.into(), 1.0_f32.into()).into()
+             }
++            // NAK_FSET_BF (nak_nir_algebraic.py): FSET.BF, 1.0 or 0.0
++            nir_op_slt | nir_op_sge | nir_op_seq | nir_op_sne => {
++                assert!(alu.get_src(0).bit_size() == 32);
++                assert!(alu.def.bit_size() == 32);
++                assert!(alu.def.num_components == 1);
++                let cmp_op = match alu.op {
++                    nir_op_slt => FloatCmpOp::OrdLt,
++                    nir_op_sge => FloatCmpOp::OrdGe,
++                    nir_op_seq => FloatCmpOp::OrdEq,
++                    nir_op_sne => FloatCmpOp::UnordNe,
++                    _ => panic!("Unsupported set-on-comparison"),
++                };
++                let dst = b.alloc_ssa(RegFile::GPR);
++                b.push_op(OpFSet {
++                    dst: dst.into(),
++                    cmp_op,
++                    srcs: [srcs(0), srcs(1)],
++                    ftz: self.float_ctl[FloatType::F32].ftz,
++                });
++                dst.into()
++            }
+             nir_op_b2f64 => {
+                 let lo = b.copy(0.into());
+                 let hi = b.sel(srcs(0).bnot(), 0.into(), 0x3ff00000.into());
+diff --git a/src/nouveau/compiler/nak/knobs.rs b/src/nouveau/compiler/nak/knobs.rs
+index 0a8b369..b5759bb 100644
+--- a/src/nouveau/compiler/nak/knobs.rs
++++ b/src/nouveau/compiler/nak/knobs.rs
+@@ -113,6 +113,50 @@ static RA_LRU: OnceLock<bool> = OnceLock::new();
+ static REUSE: OnceLock<bool> = OnceLock::new();
+ static SM120_YIELD: OnceLock<bool> = OnceLock::new();
+ static SCHED_FREE: OnceLock<i32> = OnceLock::new();
++static FSET_BF: OnceLock<bool> = OnceLock::new();
++static SCHED_ILP: OnceLock<bool> = OnceLock::new();
++static GCM: OnceLock<u32> = OnceLock::new();
++
++/// NAK_GCM (0-3, default 0): nir_opt_gcm with value numbering after NAK's
++/// NIR optimization loop; 2 also sinks ALU instructions back towards their
++/// uses, 3 global loads too
++pub fn gcm() -> u32 {
++    *GCM.get_or_init(|| match env::var("NAK_GCM") {
++        Ok(s) => match s.trim().parse::<u32>() {
++            Ok(v) if v <= 3 => v,
++            _ => 0,
++        },
++        Err(_) => 0,
++    })
++}
++
++#[unsafe(no_mangle)]
++pub extern "C" fn nak_knob_gcm() -> u32 {
++    gcm()
++}
++
++/// NAK_SCHED_ILP (default off): the prepass enters an instruction in its
++/// future-ready set at the cycle its edge latencies give, as NAK_SCHED_MLP
++/// does, but keeps the plain latency model.  Without it a producer is ready
++/// as soon as its consumer is placed and, being on the critical path, is
++/// placed right above it: in 2a040240, 74% of the instructions read the
++/// result of the one before them after the prepass (36% before it)
++pub fn sched_ilp() -> bool {
++    *SCHED_ILP
++        .get_or_init(|| parse("NAK_SCHED_ILP", env::var("NAK_SCHED_ILP"), false))
++}
++
++/// NAK_FSET_BF (default off): b2f32 of a float comparison used only there
++/// is one FSET.BF (1.0 or 0.0) instead of FSETP and SEL, as in the
++/// reference compiler's code (nak_nir_algebraic.py, from_nir.rs)
++pub fn fset_bf() -> bool {
++    *FSET_BF.get_or_init(|| parse("NAK_FSET_BF", env::var("NAK_FSET_BF"), false))
++}
++
++#[unsafe(no_mangle)]
++pub extern "C" fn nak_knob_fset_bf() -> bool {
++    fset_bf()
++}
+ 
+ /// NAK_SCHED_FREE (0-31, default 4, experimental): how many GPRs below its
+ /// register target the prepass scheduler switches from scheduling for
+@@ -131,13 +175,17 @@ pub fn sched_free() -> i32 {
+ }
+ 
+ /// The knobs that do not fit in nak_knobs_key(), for a second word of
+-/// NVK's cache keys: NAK_RA_LRU, NAK_REUSE, NAK_YIELD, NAK_SCHED_FREE
++/// NVK's cache keys: NAK_RA_LRU, NAK_REUSE, NAK_YIELD, NAK_SCHED_FREE,
++/// NAK_FSET_BF, NAK_SCHED_ILP
+ #[unsafe(no_mangle)]
+ pub extern "C" fn nak_knobs_key2() -> u32 {
+     u32::from(ra_lru())
+         | (u32::from(reuse()) << 1)
+         | (u32::from(sm120_yield()) << 2)
+         | ((sched_free() as u32) << 3)
++        | (u32::from(fset_bf()) << 8)
++        | (u32::from(sched_ilp()) << 9)
++        | (gcm() << 10)
+ }
+ 
+ /// NAK_YIELD (default off, experimental, SM120): control bit 109 set on
+diff --git a/src/nouveau/compiler/nak/occ_target.rs b/src/nouveau/compiler/nak/occ_target.rs
+index c4c9b23..48ca45c 100644
+--- a/src/nouveau/compiler/nak/occ_target.rs
++++ b/src/nouveau/compiler/nak/occ_target.rs
+@@ -67,6 +67,11 @@ fn occ_trace() -> bool {
+ 
+ /// True if a dry run's memory spills and fills are few enough
+ fn mem_ok(d: &DryCost) -> bool {
++    // NAK_GCM: the loads it shares between branches raise register pressure;
++    // a few memory spills inside loops are then still worth the warps
++    if crate::knobs::gcm() > 0 {
++        return d.mem_ops <= MAX_MEM_OPS && d.mem_weighted <= 8 * u64::from(MAX_MEM_OPS);
++    }
+     d.mem_ops <= MAX_MEM_OPS && d.mem_weighted == u64::from(d.mem_ops)
+ }
+ 
+diff --git a/src/nouveau/compiler/nak/opt_instr_sched_prepass.rs b/src/nouveau/compiler/nak/opt_instr_sched_prepass.rs
+index 649a022..78c35f0 100644
+--- a/src/nouveau/compiler/nak/opt_instr_sched_prepass.rs
++++ b/src/nouveau/compiler/nak/opt_instr_sched_prepass.rs
+@@ -99,7 +99,9 @@ fn generate_dep_graph(
+                 }
+                 last_barrier_op = Some(ip);
+             }
+-            SideEffect::Memory if mlp > 0 && is_read_only_mem(&instr.op) => {
++            SideEffect::Memory
++                if (mlp & 3) > 0 && is_read_only_mem(&instr.op) =>
++            {
+                 // NAK_SCHED_MLP: nothing to order against; barriers still
+                 // order it (above)
+             }
+@@ -137,7 +139,7 @@ fn generate_dep_graph(
+                                     &instr.op,
+                                     i,
+                                 ),
+-                                estimate_variable_latency_mlp(sm, &def_instr.op, mlp),
++                                estimate_variable_latency_mlp(sm, &def_instr.op, mlp & 3),
+                             )
+                         };
+ 
+@@ -155,7 +157,7 @@ fn generate_dep_graph(
+                 } else {
+                     max(
+                         sm.paw_latency(&def_instr.op, def_idx),
+-                        estimate_variable_latency_mlp(sm, &def_instr.op, mlp),
++                        estimate_variable_latency_mlp(sm, &def_instr.op, mlp & 3),
+                     )
+                 };
+ 
+@@ -536,7 +538,7 @@ impl<'a> GenerateOrder<'a> {
+                 // ready instruction goes below a memory access (we walk
+                 // backwards), so the accesses rise as far as their operands
+                 // allow and are in flight together
+-                let deferred = if self.mlp >= 3 {
++                let deferred = if (self.mlp & 3) >= 3 {
+                     ready_instrs
+                         .iter()
+                         .rev()
+@@ -547,7 +549,7 @@ impl<'a> GenerateOrder<'a> {
+                 };
+                 // With only accesses ready, an instruction that becomes
+                 // ready later still goes first: time moves on to it
+-                let later = if self.mlp >= 3
++                let later = if (self.mlp & 3) >= 3
+                     && deferred.is_none()
+                 {
+                     future_ready_instrs
+@@ -802,7 +804,7 @@ impl ScheduleUnit {
+         // registers; where it does not fit the register target, the plain
+         // schedule for the same target is used, so the knob never costs
+         // occupancy
+-        if new_order.is_none() && mlp > 0 {
++        if new_order.is_none() && mlp != 0 {
+             let plain = self
+                 .plain_graph
+                 .get_or_insert_with(|| ScheduleUnitGraph::new(sm, &self.instrs, 0));
+diff --git a/src/nouveau/compiler/nak_nir.c b/src/nouveau/compiler/nak_nir.c
+index b30e5a8..b577050 100644
+--- a/src/nouveau/compiler/nak_nir.c
++++ b/src/nouveau/compiler/nak_nir.c
+@@ -1730,6 +1730,28 @@ nak_postprocess_nir(nir_shader *nir,
+ 
+    nak_optimize_nir(nir, nak);
+ 
++   /* NAK_GCM: global code motion with value numbering, in fragment
++    * shaders.  A read-only load repeated in sibling branches (the same
++    * matrix rows in each unrolled iteration's if) becomes one load in their
++    * common dominator.  In compute shaders it cost occupancy without saving
++    * much (88825d04: 128 -> 184 GPRs)
++    */
++   if (nak_knob_gcm() > 0 && nir->info.stage == MESA_SHADER_FRAGMENT) {
++      OPT(nir, nir_opt_gcm, true);
++      /* GCM hoists every instruction to the earliest block it can and
++       * values live longer; sink the ALU back towards its uses (2), and
++       * the global loads too (3)
++       */
++      if (nak_knob_gcm() >= 2) {
++         nir_move_options sink = nir_move_const_undef | nir_move_alu |
++                                 nir_move_copies | nir_move_comparisons;
++         if (nak_knob_gcm() >= 3)
++            sink |= nir_move_load_global;
++         OPT(nir, nir_opt_sink, sink);
++      }
++      nak_optimize_nir(nir, nak);
++   }
++
+    OPT(nir, nak_nir_lower_tex, nak);
+    OPT(nir, nir_lower_idiv, NULL);
+ 
+diff --git a/src/nouveau/compiler/nak_nir_algebraic.py b/src/nouveau/compiler/nak_nir_algebraic.py
+index a8af942..ed5e568 100644
+--- a/src/nouveau/compiler/nak_nir_algebraic.py
++++ b/src/nouveau/compiler/nak_nir_algebraic.py
+@@ -57,6 +57,13 @@ algebraic_lowering = [
+         ('lea_nv', a, b, s), 'nak->sm >= 70'),
+ ]
+ 
++# NAK_FSET_BF: a comparison whose only use is b2f32 is one FSET.BF
++for cmp, scmp in [('flt', 'slt'), ('fge', 'sge'), ('feq', 'seq'), ('fneu', 'sne')]:
++    algebraic_lowering += [
++        (('b2f32', (cmp + '(is_used_once)', 'a@32', 'b@32')), (scmp, a, b),
++            'nak->sm >= 70 && nak_knob_fset_bf()'),
++    ]
++
+ for f2f16 in ['f2f16', 'f2f16_rtz', 'f2f16_rtne']:
+     algebraic_lowering += [
+         (('vec2', (f2f16 + '(is_used_once)', 'a@32'), (f2f16 + '(is_used_once)', 'b@32')), (f2f16, ('vec2', a, b)), 'nak->sm >= 86')
+diff --git a/src/nouveau/compiler/nak_private.h b/src/nouveau/compiler/nak_private.h
+index fe60ed9..6207d4c 100644
+--- a/src/nouveau/compiler/nak_private.h
++++ b/src/nouveau/compiler/nak_private.h
+@@ -17,6 +17,8 @@ extern "C" {
+ bool nak_should_print_nir(void);
+ bool nak_debug_no_ugpr(void);
+ bool nak_knob_uaddr_pin(void);
++bool nak_knob_fset_bf(void);
++uint32_t nak_knob_gcm(void);
+ bool nak_knob_nir_flatten(void);
+ bool nak_knob_uniform_atomics(void);
+ bool nak_knob_loop_cont_sync(void);
+-- 
+2.43.0
+

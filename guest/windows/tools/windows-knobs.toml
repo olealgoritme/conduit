@@ -1441,6 +1441,16 @@ class = "tuning"
 read = "first shader compile (once per process)"
 effect = "Most iterations NIR fully unrolls a loop with a known trip count: 0, 1, 2, 4, 8, 16, 32 (default) or 64; other values round down to one of these. Lower values keep loops rolled as NVIDIA's compiler does (smaller code, sometimes fewer registers, a few instructions of loop overhead per iteration). Part of the shader cache key."
 
+[env.NAK_YIELD]
+class = "experiment"
+read = "first shader compile (once per process)"
+effect = "1 (SM120): control bit 109 on instructions followed by a stall of 1-2 cycles, as the reference compiler sets it. Default 0. NAK_REUSE needs it. Part of the shader cache key."
+
+[env.NAK_SCHED_ILP]
+class = "experiment"
+read = "first shader compile (once per process)"
+effect = "1: NAK's pre-RA scheduler enters an instruction in its ready set at the cycle its edge latencies give, with the plain latency model, instead of placing a producer right above its consumer. Default 0. Part of the shader cache key."
+
 [env.NAK_VEC_CSE]
 class = "tuning"
 read = "first shader compile (once per process)"
