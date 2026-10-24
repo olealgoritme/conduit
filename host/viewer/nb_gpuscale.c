@@ -218,6 +218,41 @@ struct nb_gs {
     } s[NB_GS_SRC];
 };
 
+/*
+ * ONE CONTEXT CURRENT PER THREAD, SEVERAL SCALERS PER PROCESS.  The viewer
+ * has two: the cursor copier (opened at start-up) and the frame scaler
+ * (opened by the first frame or QUERY_FORMAT the display does not take).
+ * Each has its own EGL display and context, and every GL call goes to
+ * whichever context was made current LAST -- so without this a cursor copy
+ * made after the frame scaler opened ran in the frame scaler's context:
+ * its FBO names named the frame scaler's XRGB8888 targets, and every
+ * transparent pixel of the cursor read back opaque black (a black square
+ * around the arrow, for as long as the viewer ran).  After a scaler closed
+ * no context was current at all and a copy read back nothing.
+ *
+ * Every entry point that touches GL binds its own context first; the check
+ * is a compare against the instance made current last, so the frame path
+ * pays one MakeCurrent only after a cursor copy came in between.
+ */
+static const struct nb_gs *gs_current;
+
+static bool gs_bind(struct nb_gs *g)
+{
+    if (!g || !g->ctx) {
+        return false;
+    }
+    if (gs_current == g) {
+        return true;
+    }
+    if (!g->f.MakeCurrent(g->dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, g->ctx)) {
+        gs_current = NULL;
+        return false;
+    }
+    gs_current = g;
+    return true;
+}
+
+
 static void say(char *why, size_t n, const char *fmt, ...)
 {
     va_list ap;
@@ -477,6 +512,7 @@ static bool egl_up(struct nb_gs *g, char *why, size_t n)
         say(why, n, "no GLES2 context on %s (0x%x)", g->node, f->GetError());
         return false;
     }
+    gs_current = g;
     /* What the driver granted, which the extension says the query reports
      * (it may be less than asked, silently). */
     if (has_ext(ext, "EGL_IMG_context_priority")) {
@@ -592,7 +628,7 @@ static void gs_down(struct nb_gs *g)
 {
     struct fns *f = &g->f;
 
-    if (g->dpy && g->ctx) {
+    if (g->dpy && g->ctx && gs_bind(g)) {
         for (int i = 0; i < NB_GS_SRC; i++) {
             nb_gs_src_drop(g, g->s[i].valid ? g->s[i].key : -1);
         }
@@ -610,6 +646,9 @@ static void gs_down(struct nb_gs *g)
             f->DeleteProgram(g->prog);
         }
         f->MakeCurrent(g->dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+        gs_current = NULL;
+    }
+    if (g->dpy && g->ctx) {
         f->DestroyContext(g->dpy, g->ctx);
     }
     for (int i = 0; i < NB_GS_TARGETS; i++) {
@@ -822,6 +861,10 @@ int nb_gs_targets_readback(struct nb_gs *g, uint32_t w, uint32_t h,
 {
     struct fns *f = &g->f;
 
+    if (!gs_bind(g)) {
+        say(why, n, "the scaler's context cannot be made current");
+        return 0;
+    }
     targets_free(g);
     for (int i = 0; i < NB_GS_TARGETS; i++) {
         g->t[i].fd = -1;
@@ -852,6 +895,9 @@ int nb_gs_readback(struct nb_gs *g, int target, void *dst)
     if (!g->readback || target < 0 || target >= NB_GS_TARGETS ||
         !g->t[target].valid) {
         return -EINVAL;
+    }
+    if (!gs_bind(g)) {
+        return -EIO;
     }
     g->f.BindFramebuffer(GL_FRAMEBUFFER, g->t[target].fbo);
     /* R and B were swapped by the shader, so GL_RGBA bytes are XRGB8888's
@@ -897,6 +943,10 @@ int nb_gs_targets(struct nb_gs *g, uint32_t w, uint32_t h, nb_gs_fmt_ok ok,
     struct fns *f = &g->f;
     static const uint32_t fmts[2] = { FMT_XRGB8888, FMT_ARGB8888 };
 
+    if (!gs_bind(g)) {
+        say(why, n, "the scaler's context cannot be made current");
+        return 0;
+    }
     targets_free(g);
     g->readback = false;
     for (int i = 0; i < NB_GS_TARGETS; i++) {
@@ -1007,7 +1057,7 @@ int nb_gs_src(struct nb_gs *g, int key, int fd, uint32_t w, uint32_t h,
             free_i = i;
         }
     }
-    if (free_i < 0 || fd < 0) {
+    if (free_i < 0 || fd < 0 || !gs_bind(g)) {
         return -1;
     }
     g->s[free_i].img = import(g, fd, w, h, stride, offset, fourcc, mod);
@@ -1028,7 +1078,7 @@ int nb_gs_src(struct nb_gs *g, int key, int fd, uint32_t w, uint32_t h,
 
 void nb_gs_src_drop(struct nb_gs *g, int key)
 {
-    if (!g || key < 0) {
+    if (!g || key < 0 || !gs_bind(g)) {
         return;
     }
     for (int i = 0; i < NB_GS_SRC; i++) {
@@ -1065,6 +1115,9 @@ int nb_gs_draw(struct nb_gs *g, const struct nb_gs_draw *d,
     if (si < 0 || d->target < 0 || d->target >= NB_GS_TARGETS ||
         !g->t[d->target].valid) {
         return -EINVAL;
+    }
+    if (!gs_bind(g)) {
+        return -EIO;
     }
     f->BindFramebuffer(GL_FRAMEBUFFER, g->t[d->target].fbo);
     /* Bars: only when the picture leaves some of the buffer uncovered. */
@@ -1117,6 +1170,9 @@ int nb_gs_read(struct nb_gs *g, int target, int x, int y, uint32_t *rgb)
 
     if (target < 0 || target >= NB_GS_TARGETS || !g->t[target].valid) {
         return -EINVAL;
+    }
+    if (!gs_bind(g)) {
+        return -EIO;
     }
     g->f.BindFramebuffer(GL_FRAMEBUFFER, g->t[target].fbo);
     g->f.ReadPixels(x, y, 1, 1, 0x1908 /* GL_RGBA */, 0x1401 /* UNSIGNED_BYTE */,
