@@ -1,0 +1,116 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Sat, 24 Oct 2026 07:51:44 +0200
+Subject: [PATCH] nvk: NVK_PUSH_DUMP_WINDOW, the pushbuffers of a time window
+
+NVK_PUSH_DUMP_WINDOW="START_S,DURATION_MS" prints every pushbuffer
+executed from START_S seconds after the first submit for DURATION_MS
+milliseconds to NVK_PUSH_DUMP_FILE (default nvk-push-<pid>.txt), each
+submit headed by its time and context.  Unlike NVK_DEBUG=push_dump for
+a whole run, this gives one or two frames of a game.
+---
+ src/nouveau/vulkan/nvkmd/nvkmd.c | 82 ++++++++++++++++++++++++++++++++
+ 1 file changed, 82 insertions(+)
+
+diff --git a/src/nouveau/vulkan/nvkmd/nvkmd.c b/src/nouveau/vulkan/nvkmd/nvkmd.c
+index 4c41c48..aacc03b 100644
+--- a/src/nouveau/vulkan/nvkmd/nvkmd.c
++++ b/src/nouveau/vulkan/nvkmd/nvkmd.c
+@@ -641,12 +641,94 @@ fail_lookup:
+    nvkmd_mem_unref(mem);
+ }
+ 
++/* NVK_PUSH_DUMP_WINDOW="START_S,DURATION_MS": every pushbuffer executed from
++ * START_S seconds after the first submit for DURATION_MS milliseconds is
++ * printed to NVK_PUSH_DUMP_FILE (default nvk-push-<pid>.txt in the current
++ * directory), each submit headed by its time and context, without
++ * NVK_DEBUG=push_dump for the whole run: one or two frames of a game
++ */
++static simple_mtx_t push_window_mutex = SIMPLE_MTX_INITIALIZER;
++static int push_window_state; /* 0 unread, 1 off, 2 on */
++static int64_t push_window_base_ns, push_window_start_ns, push_window_end_ns;
++static FILE *push_window_fp;
++static uint64_t push_window_submits;
++
++static FILE *
++push_window_file(void)
++{
++   if (likely(p_atomic_read(&push_window_state) == 1))
++      return NULL;
++
++   simple_mtx_lock(&push_window_mutex);
++   const int64_t now = os_time_get_nano();
++   if (push_window_state == 0) {
++      const char *w = os_get_option("NVK_PUSH_DUMP_WINDOW");
++      double start_s = 0, dur_ms = 0;
++      if (w == NULL || sscanf(w, "%lf,%lf", &start_s, &dur_ms) != 2 ||
++          dur_ms <= 0) {
++         p_atomic_set(&push_window_state, 1);
++         simple_mtx_unlock(&push_window_mutex);
++         return NULL;
++      }
++      push_window_base_ns = now;
++      push_window_start_ns = now + (int64_t)(start_s * 1e9);
++      push_window_end_ns = push_window_start_ns + (int64_t)(dur_ms * 1e6);
++      p_atomic_set(&push_window_state, 2);
++   }
++   FILE *fp = NULL;
++   if (now >= push_window_start_ns && now < push_window_end_ns) {
++      if (push_window_fp == NULL) {
++         const char *f = os_get_option("NVK_PUSH_DUMP_FILE");
++         char name[64];
++         if (f == NULL) {
++#ifdef _WIN32
++            snprintf(name, sizeof(name), "nvk-push-%d.txt", (int)_getpid());
++#else
++            snprintf(name, sizeof(name), "nvk-push-%d.txt", (int)getpid());
++#endif
++            f = name;
++         }
++         push_window_fp = fopen(f, "w");
++      }
++      fp = push_window_fp;
++   } else if (now >= push_window_end_ns) {
++      if (push_window_fp != NULL) {
++         fprintf(push_window_fp, "=== end of window: %" PRIu64 " submits\n",
++                 push_window_submits);
++         fclose(push_window_fp);
++         push_window_fp = NULL;
++      }
++      p_atomic_set(&push_window_state, 1);
++   }
++   if (fp == NULL)
++      simple_mtx_unlock(&push_window_mutex);
++   /* else: returned with the mutex held; push_window_done() releases it */
++   return fp;
++}
++
++static void
++push_window_done(void)
++{
++   simple_mtx_unlock(&push_window_mutex);
++}
++
+ VkResult MUST_CHECK
+ nvkmd_ctx_exec(struct nvkmd_ctx *ctx,
+                struct vk_object_base *log_obj,
+                uint32_t exec_count,
+                const struct nvkmd_ctx_exec *execs)
+ {
++   FILE *window_fp = push_window_file();
++   if (unlikely(window_fp != NULL)) {
++      const int64_t now = os_time_get_nano();
++      fprintf(window_fp, "=== submit %" PRIu64 " at %.3f ms, ctx %p, %u "
++              "pushbuffers\n", push_window_submits++,
++              (now - push_window_base_ns) / 1e6, (void *)ctx, exec_count);
++      for (uint32_t i = 0; i < exec_count; i++)
++         nvkmd_ctx_exec_dump(ctx->dev, log_obj, window_fp, &execs[i]);
++      push_window_done();
++   }
++
+    const bool sync = ctx->dev->pdev->debug_flags & NVK_DEBUG_PUSH_SYNC;
+ 
+    VkResult result = ctx->ops->exec(ctx, log_obj, exec_count, execs);
+-- 
+2.43.0
+
