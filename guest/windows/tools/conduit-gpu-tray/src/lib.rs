@@ -5,6 +5,7 @@
 pub mod ctl_logic;
 pub mod display_logic;
 pub mod enhance;
+pub mod optiscaler;
 pub mod png;
 pub mod policy;
 pub mod procs;
