@@ -380,80 +380,21 @@ fn is_block_compressed(format: ddi12::DXGI_FORMAT) -> bool {
         || (DXGI_FORMAT_BC6H_TYPELESS.0..=DXGI_FORMAT_BC7_UNORM_SRGB.0).contains(&format)
 }
 
-/// The factor between a dimension stated in **blocks** and the same dimension in
-/// **texels**, for `format`.
-///
-/// ⛔ `(4, 4, 1)` for the whole BC family and `(1, 1, 1)` for everything else,
-/// and that is exact rather than a convention. vkd3d's own format table gives a
-/// `block_width` / `block_height` of 4 to exactly **21** entries — BC1..BC7, the
-/// same 21 [`is_block_compressed`] classifies — and 1 to all 75 others
-/// (`vkd3d-proton-helios/libs/vkd3d/utils.c`, the `vkd3d_formats[]` rows). No
-/// DXGI format has a block depth above 1, which is why the third element is
-/// always 1 and the `Depth` field needs no scaling at all.
-fn block_extent(format: ddi12::DXGI_FORMAT) -> (u32, u32, u32) {
-    if is_block_compressed(format) {
-        (4, 4, 1)
-    } else {
-        (1, 1, 1)
-    }
-}
-
-/// Whether a pitched layout's `SlicePitch` survives the translation to
-/// `D3D12_SUBRESOURCE_FOOTPRINT`.
-///
-/// ⛔ **Both DDI pitched layouts carry a `SlicePitch` and the API footprint has
-/// nowhere to put it.** `D3D12DDIARG_PHYSICAL_SUBRESOURCE_PITCHED_LAYOUT` ends
-/// `{ Pitch, SlicePitch }` (bindgen offsets 16 and 20) and
-/// `D3D12DDIARG_VIRTUAL_SUBRESOURCE_PITCHED_LAYOUT` likewise (28 and 32), while
-/// `D3D12_SUBRESOURCE_FOOTPRINT` is `{ Format, Width, Height, Depth, RowPitch }`
-/// and nothing else. So the field is **necessarily** dropped by
-/// [`texture_copy_location`], and D3D12 derives the distance between depth
-/// slices instead. This is the test that says whether that derivation can
-/// reproduce what the runtime actually sent.
-///
-/// ⭐ The comparison is `SlicePitch == Pitch * PhysicalHeight`, and it is
-/// **format-independent by construction**: all three are memory quantities —
-/// bytes per block row, block rows in memory, bytes per slice. It is also
-/// exactly the engine's own derivation, which is the reason it is the right
-/// comparison rather than a plausible one: `vk_buffer_image_copy_from_d3d12`
-/// computes `row_count = Footprint.Height / block_height` and strides by
-/// `row_count * RowPitch` (`libs/vkd3d/command.c:9631-9645`), and
-/// [`texture_copy_location`] writes `Footprint.Height = PhysicalHeight *
-/// block_height`, so `row_count` is `PhysicalHeight` for **every** format, BC or
-/// not. Both structs carry `PhysicalHeight` / `PhysicalDepth`, including the
-/// virtual one, which is why one helper serves both arms.
-///
-/// ⚠ `PhysicalDepth <= 1` is representable by definition: with a single slice
-/// there is no second offset for a slice pitch to move, so the field is unused
-/// rather than lost. That is what keeps this from firing on the 2-D traffic that
-/// is nearly all of it.
-///
-/// ⚠ **A `false` now refuses the copy**, where an earlier revision counted it
-/// and forwarded anyway. That revision's stated reason was that *"removing the
-/// device on an unmeasured case would be the guess"* — which described
-/// `pfnSetErrorCb` and is no longer the alternative ([`report_error`]). The
-/// principle that separates this from the block-dimension question next door is
-/// **expressibility**: block dimensions are wrong but *computable*, so
-/// [`texture_copy_location`] corrects them; a divergent slice pitch has no field
-/// in `D3D12_SUBRESOURCE_FOOTPRINT` to carry it at all, so the only honest
-/// answers are refuse or corrupt slices >= 1. ⚠ The condition should be
-/// unreachable — the public `D3D12_PLACED_SUBRESOURCE_FOOTPRINT` the runtime
-/// itself computes has no slice pitch, so its layouts can only ever be
-/// `RowPitch * rows` — which is what makes refusing cheap; see
-/// [`L3cRefusals::copy_slice_pitch_unrepresentable`].
+/// Whether a slice stride can be represented by the API footprint, which has
+/// no separate slice-pitch field. A single slice does not use that stride.
 fn slice_pitch_representable(
+    format: ddi12::DXGI_FORMAT,
     pitch: u32,
-    physical_height: u32,
-    physical_depth: u32,
+    height: u32,
+    depth: u32,
     slice: u32,
 ) -> bool {
-    if physical_depth <= 1 {
+    if depth <= 1 {
         return true;
     }
-    // ⚠ `u64` on both sides: `Pitch * PhysicalHeight` overflows `u32` at a 64 KB
-    // row and a 64 Ki-row surface, and a wrapped product would compare equal to
-    // the wrong thing. No `as`, no panic.
-    u64::from(slice) == u64::from(pitch) * u64::from(physical_height)
+    let block_height = if is_block_compressed(format) { 4 } else { 1 };
+    let rows = height.div_ceil(block_height);
+    u64::from(slice) == u64::from(pitch) * u64::from(rows)
 }
 
 /// Resolve a `D3D12DDI_HRESOURCE` that the DDI requires to be present.
@@ -502,63 +443,19 @@ enum LocationRefusal {
     UnknownLayout(ddi12::D3D12DDI_RESOURCE_LAYOUT),
     /// `RL_SELECT_SUBRESOURCE` carried a subresource index above `UINT_MAX`.
     SubresourceOutOfRange(u64),
-    /// A `Physical*` block dimension times its block extent does not fit in the
-    /// `UINT` texel count `D3D12_SUBRESOURCE_FOOTPRINT` wants. ⚠ Unreachable for
-    /// any real texture — D3D12's maximum dimension is 16384 texels — so this
-    /// exists to keep the conversion total without a wrapping `as`.
-    BlockDimensionsOverflow,
-    /// A pitched layout's `SlicePitch` is not the `Pitch * PhysicalHeight` the
-    /// API footprint can express. Carries every number the log line needs,
-    /// because nothing downstream can recover them.
+    /// A multi-slice layout has a stride the API footprint cannot represent.
     SlicePitchUnrepresentable {
         arm: &'static str,
+        format: ddi12::DXGI_FORMAT,
         pitch: u32,
-        physical_height: u32,
-        physical_depth: u32,
+        height: u32,
+        depth: u32,
         slice: u32,
     },
 }
 
-/// Build one API `D3D12_TEXTURE_COPY_LOCATION` out of the DDI's two arguments.
-///
-/// See the module doc for where the `RL_SELECT_SUBRESOURCE` rule comes from.
-///
-/// # ⛔ `RL_PLACED_PHYSICAL_SUBRESOURCE_PITCHED` converts BLOCKS to TEXELS
-///
-/// An earlier revision forwarded `Physical{Width,Height,Depth}` into
-/// `D3D12_SUBRESOURCE_FOOTPRINT::{Width,Height,Depth}` unchanged and called the
-/// units unsettleable on the Linux host. **The SDK header in this tree settles
-/// them, against that choice.** `D3D12DDIARG_VIRTUAL_SUBRESOURCE_PITCHED_LAYOUT`
-/// carries **both** triples in one struct (`d3d12umddi.h:1556-1568`) with
-/// `// Block dimensions` on the `Physical*` one only — so `Physical*` cannot be
-/// texels without making `Virtual*` a duplicate field — while
-/// `D3D12_SUBRESOURCE_FOOTPRINT` is in texels. The VIRTUAL arm below already
-/// acted on that reading; the two arms could not both be right.
-///
-/// The engine confirms it independently: `vk_buffer_image_copy_from_d3d12`
-/// divides `Footprint.Height` by `src_format->block_height`
-/// (`libs/vkd3d/command.c:9631-9645`) and clamps `imageExtent` against
-/// `Footprint.{Width,Height,Depth}` as texel extents. A 64x64 BC7 subresource
-/// arriving as 16x16 blocks therefore became `row_count = 4` against a 16-texel
-/// extent — a quarter of the rows copied into a sixteenth of the area, success
-/// returned, frame wrong.
-///
-/// ⭐ So the three fields are multiplied by [`block_extent`] — 4x4x1 for every BC
-/// format, 1x1x1 otherwise. ⚠ For a texture whose texel size is not a multiple
-/// of the block size the product **over-states** the extent (a 65-texel-wide BC7
-/// mip is 17 blocks, i.e. 68), and that is harmless rather than tolerated: the
-/// engine takes `min(subresource extent, Footprint.Width)`, so the true 65 wins,
-/// while the row arithmetic that actually needs the number — `row_count =
-/// 68 / 4 = 17` — gets exactly the 17 block rows the memory holds. The
-/// unmultiplied value got neither right.
-///
-/// ⚠ **`SlicePitch` is dropped by both pitched arms**, and that one is forced
-/// rather than chosen: `D3D12_SUBRESOURCE_FOOTPRINT` has no member for it, so
-/// D3D12 derives the distance between depth slices from `RowPitch`. Where the
-/// runtime's value and that derivation disagree the layout is **not
-/// expressible**, and the location is refused rather than forwarded — see
-/// [`slice_pitch_representable`] for why that is the opposite answer from the
-/// block-dimension one and why both are right.
+/// Build an API copy location. The runtime supplies PHYSICAL pitched extents
+/// in texels, including block-compressed formats.
 ///
 /// # Safety
 /// `placement` must be non-null and point at a live `D3D12DDIARG_BUFFER_PLACEMENT`,
@@ -601,35 +498,22 @@ unsafe fn texture_copy_location(
                     .pLayout
                     .cast::<ddi12::D3D12DDIARG_PHYSICAL_SUBRESOURCE_PITCHED_LAYOUT>()
             };
-            // ⛔ Blocks -> texels; see this function's doc for the header
-            // pairing that settles the units and the engine arithmetic that
-            // confirms them. ⚠ `Pitch` is NOT scaled: it is bytes per block row
-            // on both sides, which is what `D3D12_SUBRESOURCE_FOOTPRINT::RowPitch`
-            // means for a BC format.
-            let (bw, bh, bd) = block_extent(l.Format);
-            // ⚠ Counted off the extent rather than off `is_block_compressed`, so
-            // the counter means exactly "a scaling happened here" and cannot
-            // drift from the arithmetic below it.
-            if (bw, bh, bd) != (1, 1, 1) {
+            if is_block_compressed(l.Format) {
                 L3C_REFUSALS.copy_texture_block_physical_layout.bump();
             }
-            // ⚠ `checked_mul`, not `as` and not `saturating_mul`: a saturated
-            // extent would be a silently wrong footprint, which is the class of
-            // bug this whole arm was just repaired for.
-            let (Some(width), Some(height), Some(depth)) = (
-                l.PhysicalWidth.checked_mul(bw),
-                l.PhysicalHeight.checked_mul(bh),
-                l.PhysicalDepth.checked_mul(bd),
-            ) else {
-                return Err(LocationRefusal::BlockDimensionsOverflow);
-            };
-            if !slice_pitch_representable(l.Pitch, l.PhysicalHeight, l.PhysicalDepth, l.SlicePitch)
-            {
+            if !slice_pitch_representable(
+                l.Format,
+                l.Pitch,
+                l.PhysicalHeight,
+                l.PhysicalDepth,
+                l.SlicePitch,
+            ) {
                 return Err(LocationRefusal::SlicePitchUnrepresentable {
                     arm: "PHYSICAL",
                     pitch: l.Pitch,
-                    physical_height: l.PhysicalHeight,
-                    physical_depth: l.PhysicalDepth,
+                    format: l.Format,
+                    height: l.PhysicalHeight,
+                    depth: l.PhysicalDepth,
                     slice: l.SlicePitch,
                 });
             }
@@ -641,9 +525,9 @@ unsafe fn texture_copy_location(
                         Offset: base.Offset,
                         Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
                             Format: DXGI_FORMAT(l.Format),
-                            Width: width,
-                            Height: height,
-                            Depth: depth,
+                            Width: l.PhysicalWidth,
+                            Height: l.PhysicalHeight,
+                            Depth: l.PhysicalDepth,
                             RowPitch: l.Pitch,
                         },
                     },
@@ -661,23 +545,19 @@ unsafe fn texture_copy_location(
                     .pLayout
                     .cast::<ddi12::D3D12DDIARG_VIRTUAL_SUBRESOURCE_PITCHED_LAYOUT>()
             };
-            // ⭐ The virtual dimensions, not the physical ones: the API's
-            // footprint is in texels, and this struct carrying BOTH triples —
-            // `Virtual*` unlabelled, `Physical*` labelled "Block dimensions"
-            // (`d3d12umddi.h:1556-1568`) — is precisely what says which is
-            // which. That same pairing is what the PHYSICAL arm above now
-            // converts on; no scaling is needed here because `Virtual*` is
-            // already the texel triple.
-            // ⚠ The `Physical*` triple is therefore dropped on purpose, and the
-            // only piece of it that can move data is its interaction with
-            // `SlicePitch`, which is what the test below settles.
-            if !slice_pitch_representable(l.Pitch, l.PhysicalHeight, l.PhysicalDepth, l.SlicePitch)
-            {
+            if !slice_pitch_representable(
+                l.Format,
+                l.Pitch,
+                l.VirtualHeight,
+                l.VirtualDepth,
+                l.SlicePitch,
+            ) {
                 return Err(LocationRefusal::SlicePitchUnrepresentable {
                     arm: "VIRTUAL",
                     pitch: l.Pitch,
-                    physical_height: l.PhysicalHeight,
-                    physical_depth: l.PhysicalDepth,
+                    format: l.Format,
+                    height: l.VirtualHeight,
+                    depth: l.VirtualDepth,
                     slice: l.SlicePitch,
                 });
             }
@@ -770,26 +650,18 @@ unsafe fn refuse_location(state: &CommandListState, role: &str, why: &LocationRe
             &L3C_REFUSALS.copy_bad_arg,
             format!("RL_SELECT_SUBRESOURCE carries Offset {o}, which is not a subresource index"),
         ),
-        LocationRefusal::BlockDimensionsOverflow => (
-            &L3C_REFUSALS.copy_bad_arg,
-            "a PHYSICAL pitched layout's block dimensions do not fit in a UINT texel count \
-             once multiplied by the format's block extent"
-                .to_string(),
-        ),
         LocationRefusal::SlicePitchUnrepresentable {
             arm,
+            format,
             pitch,
-            physical_height,
-            physical_depth,
+            height,
+            depth,
             slice,
         } => (
             &L3C_REFUSALS.copy_slice_pitch_unrepresentable,
             format!(
-                "the {arm} pitched layout carries SlicePitch={slice} but Pitch={pitch} * \
-                 PhysicalHeight={physical_height} is {}, and D3D12_SUBRESOURCE_FOOTPRINT has no \
-                 slice-pitch member to carry the difference -- every one of the {physical_depth} \
-                 depth slices after the first would be read at the derived offset",
-                u64::from(*pitch) * u64::from(*physical_height),
+                "the {arm} pitched layout's SlicePitch={slice} cannot be represented by \
+                 its footprint (format={format}, Pitch={pitch}, Height={height}, Depth={depth})",
             ),
         ),
     };
@@ -2531,16 +2403,8 @@ pub(crate) struct L3cRefusals {
     /// this table cannot escalate by either channel. Tracks `cmdlist.rs`'s
     /// counter of the same name in the other lane's set.
     command_list_missing: RefusalCounter,
-    /// A copy slot arrived with a null pointer the DDI declares `_In_ CONST`,
-    /// with an `RL_SELECT_SUBRESOURCE` `Offset` that is not a subresource index,
-    /// or with a `Physical*` triple that does not fit a `UINT` texel count once
-    /// multiplied by the format's block extent. **Expected 0**; reported,
-    /// because a copy that cannot be expressed is a correctness failure rather
-    /// than an unsupported capability.
-    ///
-    /// ⚠ The third condition is defensive only — D3D12's maximum texture
-    /// dimension is 16384 texels, so no legal layout can reach it. It exists so
-    /// [`block_extent`]'s multiplication is total without a wrapping `as`.
+    /// A copy slot received a null required pointer or a subresource index
+    /// above `UINT_MAX`. Expected 0.
     copy_bad_arg: RefusalCounter,
     /// A `D3D12DDI_HRESOURCE` in a copy, resolve or buffer-region slot did not
     /// resolve to an `ID3D12Resource`. **Expected 0.**
@@ -2559,54 +2423,10 @@ pub(crate) struct L3cRefusals {
     /// runtime's own box is unsigned, so a negative here means the `LONG`s were
     /// not written by a `D3D12_BOX`.
     copy_box_negative: RefusalCounter,
-    /// A **traffic** counter, not a refusal:
-    /// `RL_PLACED_PHYSICAL_SUBRESOURCE_PITCHED` arrived carrying a
-    /// block-compressed `DXGI_FORMAT`, and its `Physical*` block dimensions were
-    /// converted to the texels `D3D12_SUBRESOURCE_FOOTPRINT` wants.
-    ///
-    /// ⚠ **Re-graded, and the grading is the whole point.** It read *"Expected
-    /// 0, and a hit is work"* while this arm forwarded block dimensions raw and
-    /// called the units unsettleable. The `PARALLEL.md` §10 review settled them
-    /// out of `d3d12umddi.h:1556-1568`, where
-    /// `D3D12DDIARG_VIRTUAL_SUBRESOURCE_PITCHED_LAYOUT` carries the `Virtual*`
-    /// and `Physical*` triples side by side with `// Block dimensions` on the
-    /// second only. ⇒ **Expected NON-ZERO on any workload that copies BC
-    /// textures**, which is nearly all of them, and it is now the readout that
-    /// says the conversion path ran rather than a defect waiting to be graded.
-    ///
-    /// ⛔ A **zero** on a workload known to stream BC textures is the finding
-    /// now: either those copies take the VIRTUAL arm — legitimate, that arm
-    /// needs no conversion — or they are not reaching this slot at all.
-    /// ⚠ Every non-block format leaves the two readings equal, so a zero says
-    /// nothing about whether the arm itself was taken; read it with
-    /// `L3cCopyBadArg`.
-    ///
-    /// ⚠ Its log line was deleted with the re-grade. It existed to carry the
-    /// dimensions to a VM run that would settle the units; the units are
-    /// settled, and a per-BC-copy line would be pure noise.
+    /// Number of PHYSICAL pitched copy locations with a BC format.
     copy_texture_block_physical_layout: RefusalCounter,
-    /// A pitched copy location arrived with `PhysicalDepth > 1` and a
-    /// `SlicePitch` that is not `Pitch * PhysicalHeight`, and **the copy was
-    /// refused**: `D3D12_SUBRESOURCE_FOOTPRINT` has no member that could carry
-    /// the difference.
-    ///
-    /// **Expected 0**, and unlike its neighbour above this grading survived the
-    /// review unchanged — what changed is the **answer**. It used to forward the
-    /// copy anyway, and its own doc conceded that *"silent forwarding is the one
-    /// answer that is only acceptable while this reads 0"*; the reason given for
-    /// forwarding was that reporting would remove the device, which is no longer
-    /// the channel ([`report_error`]). It now refuses and reports, quarantining
-    /// one list.
-    ///
-    /// ⛔ Refusing is cheap precisely because the condition should be
-    /// unreachable: the public `D3D12_PLACED_SUBRESOURCE_FOOTPRINT` the runtime
-    /// computes for itself has no slice-pitch member, so any layout it derives
-    /// can only be `RowPitch * rows`. A hit is therefore a **finding about the
-    /// runtime**, and the log line at `refuse_location` prints all four numbers.
-    /// ⚠ The reading is exact rather than conservative — the comparison is
-    /// between three memory quantities and needs no format knowledge (see
-    /// [`slice_pitch_representable`]) — so a zero really does mean the runtime
-    /// never diverged on this workload.
+    /// Number of multi-slice layouts with a stride the API footprint cannot
+    /// represent. Expected 0.
     copy_slice_pitch_unrepresentable: RefusalCounter,
     /// `pfnCopyTiles` was called and refused. **Expected 0** while `caps12.rs`
     /// reports `TiledResourcesTier = NOT_SUPPORTED`: a hit means the runtime
