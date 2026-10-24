@@ -282,6 +282,32 @@ void nb_view_cursor_scale(const struct nb_place *p, int bw, int bh,
     *ky = bh > 0 && p->pic.h > 0 ? (double)p->pic.h / bh : 1.0;
 }
 
+bool nb_view_cursor_rect(const struct nb_place *p, int bw, int bh, int gx,
+                         int gy, int hx, int hy, int cw, int ch,
+                         struct nb_rect *r)
+{
+    double kx, ky, wx, wy;
+
+    memset(r, 0, sizeof(*r));
+    if (bw <= 0 || bh <= 0 || p->pic.w <= 0 || p->pic.h <= 0 || cw <= 0 ||
+        ch <= 0 || gx < 0 || gy < 0 || gx >= bw || gy >= bh) {
+        return false;
+    }
+    nb_view_cursor_scale(p, bw, bh, &kx, &ky);
+    /* The hotspot pixel's top-left corner in the window, as the frame is
+     * drawn; the image goes up and left of it by the scaled hotspot. */
+    wx = p->pic.x + gx * kx;
+    wy = p->pic.y + gy * ky;
+    r->x = (int)floor(wx + 0.5) - (int)(hx * kx + 0.5);
+    r->y = (int)floor(wy + 0.5) - (int)(hy * ky + 0.5);
+    r->w = (int)(cw * kx + 0.5);
+    r->h = (int)(ch * ky + 0.5);
+    if (r->w < 1) { r->w = 1; }
+    if (r->h < 1) { r->h = 1; }
+    return wx >= p->vis.x && wx < p->vis.x + p->vis.w &&
+           wy >= p->vis.y && wy < p->vis.y + p->vis.h;
+}
+
 bool nb_view_guest_mode(const struct nb_view *v, int ww, int wh, unsigned s120,
                         unsigned *pw, unsigned *ph)
 {

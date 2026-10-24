@@ -1,0 +1,312 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Sat, 24 Oct 2026 15:30:25 +0200
+Subject: [PATCH] wsi/win32: frame generation: flow propagation, a motion
+ cost per pixel, nine candidates
+
+Measured with a harness that runs the passes on synthetic scenes against
+their truth (Conduit guest/nvk-rm/tools/enhance-eval), the flow was the
+weak part: inside textured objects, which the coarse levels see as flat,
+refinement by one texel could not reach the right vector, and the motion
+cost per texel of each level pulled finer levels towards zero motion.
+
+- fg_flow mode 2: propagation, each texel trying its own and its eight
+  neighbours' vectors at the same level, then refined; one round
+  (two passes) per level, from 1/8 down at `fast`, every level at
+  `quality`
+- the motion cost is per frame pixel (p0.z, 0.0003), the same at every
+  level
+- the coarsest level is 1/32 at both tiers (128 frame pixels of reach)
+- fg_interp chooses among the nine flow texels around a pixel and zero
+  motion (pc.mode bit 0)
+
+Over six scenes (moving boxes on flat and textured backgrounds, a pan
+under a static HUD, crossing objects, several small objects, motion
+beyond the reach), the generated picture's PSNR goes from 33.3 dB to 38.2 dB (fast) and 38.6 dB (quality)
+on average and the error at moving edges falls by about half.  Fine
+scrolling text stays a failure case (periodic at the flow's resolution).
+---
+ src/vulkan/wsi/enhance/fg_flow.comp       | 47 +++++++++++++++++++----
+ src/vulkan/wsi/enhance/fg_interp.comp     | 34 +++++++++++-----
+ src/vulkan/wsi/wsi_common_win32_enhance.c | 40 ++++++++++++++++---
+ 3 files changed, 99 insertions(+), 22 deletions(-)
+
+diff --git a/src/vulkan/wsi/enhance/fg_flow.comp b/src/vulkan/wsi/enhance/fg_flow.comp
+index a6c1d64..94de09a 100644
+--- a/src/vulkan/wsi/enhance/fg_flow.comp
++++ b/src/vulkan/wsi/enhance/fg_flow.comp
+@@ -13,16 +13,22 @@
+  *
+  *   coarsest level   exhaustive search, |v| <= radius texels (p0.y)
+  *   finer levels     the coarser vector here and at its four neighbours,
+- *                    and zero motion; the best refined by one texel
++ *                    and zero motion; the best refined by p0.w texels (1
++ *                    when 0)
++ *   propagation      (mode 2) this level's own vector and those of its
++ *                    eight neighbours (s_aux at this level's size), the
++ *                    best refined by one texel: correct vectors spread from
++ *                    edges into areas the coarser levels saw as flat
+  *
+  * s_src: previous frame's luma at this level, s_src2: newest, s_aux: the
+  * coarser level's flow (aux_size).  p0.x: frame pixels per texel of this
+- * level; mode 1 refines s_aux, 0 searches.  Output RGBA16F: rg the motion
++ * level; mode 1 refines s_aux, 0 searches, 2 propagates.  Output RGBA16F: rg the motion
+  * in frame pixels, b the match cost (mean absolute luma difference).
+  */
+ #include "enh_common.glsl"
+ 
+-const float LAMBDA = 0.002;   /* cost per texel of motion */
++/* cost per frame pixel of motion (p0.z; 0: 0.002 per texel of the level) */
++float lambda_;
+ 
+ float match(vec2 c, vec2 v, vec2 inv)
+ {
+@@ -37,7 +43,7 @@ float match(vec2 c, vec2 v, vec2 inv)
+          s += abs(pa - pb);
+       }
+    }
+-   return s * (1.0 / 9.0) + LAMBDA * (abs(v.x) + abs(v.y));
++   return s * (1.0 / 9.0) + lambda_ * (abs(v.x) + abs(v.y));
+ }
+ 
+ void main()
+@@ -47,6 +53,7 @@ void main()
+       return;
+    vec2 inv = 1.0 / vec2(pc.dst_size);
+    float scale = pc.p0.x;
++   lambda_ = pc.p0.z > 0.0 ? pc.p0.z * scale : 0.002;
+    vec2 c = vec2(p) + 0.5;
+    vec2 best = vec2(0.0);
+    float bc = match(c, best, inv);
+@@ -63,6 +70,31 @@ void main()
+             }
+          }
+       }
++   } else if (pc.mode == 2u) {
++      for (int y = -1; y <= 1; y++) {
++         for (int x = -1; x <= 1; x++) {
++            ivec2 t = clamp(p + ivec2(x, y), ivec2(0), pc.aux_size - 1);
++            vec2 v = texelFetch(s_aux, t, 0).rg / scale;
++            float k = match(c, v, inv);
++            if (k < bc) {
++               bc = k;
++               best = v;
++            }
++         }
++      }
++      vec2 seed = best;
++      for (int y = -1; y <= 1; y++) {
++         for (int x = -1; x <= 1; x++) {
++            if (x == 0 && y == 0)
++               continue;
++            vec2 v = seed + 0.5 * vec2(float(x), float(y));
++            float k = match(c, v, inv);
++            if (k < bc) {
++               bc = k;
++               best = v;
++            }
++         }
++      }
+    } else {
+       ivec2 q = p / 2;
+       const ivec2 off[5] = ivec2[5](ivec2(0, 0), ivec2(-1, 0), ivec2(1, 0),
+@@ -77,8 +109,9 @@ void main()
+          }
+       }
+       vec2 seed = best;
+-      for (int y = -1; y <= 1; y++) {
+-         for (int x = -1; x <= 1; x++) {
++      const int rr = pc.p0.w > 0.0 ? int(pc.p0.w) : 1;
++      for (int y = -rr; y <= rr; y++) {
++         for (int x = -rr; x <= rr; x++) {
+             if (x == 0 && y == 0)
+                continue;
+             vec2 v = seed + vec2(float(x), float(y));
+@@ -90,6 +123,6 @@ void main()
+          }
+       }
+    }
+-   float raw = bc - LAMBDA * (abs(best.x) + abs(best.y));
++   float raw = bc - lambda_ * (abs(best.x) + abs(best.y));
+    imageStore(o_dst, p, vec4(best * scale, raw, 1.0));
+ }
+diff --git a/src/vulkan/wsi/enhance/fg_interp.comp b/src/vulkan/wsi/enhance/fg_interp.comp
+index 0cb40f1..0bdc49f 100644
+--- a/src/vulkan/wsi/enhance/fg_interp.comp
++++ b/src/vulkan/wsi/enhance/fg_interp.comp
+@@ -20,6 +20,9 @@
+  *                the frame nearer in time
+  *   low trust    where the flow match itself was poor (motion beyond the
+  *                search, a scene cut), a plain cross-fade
++ *
++ * pc.mode bit 0: nine candidates (the 3x3 flow texels around the pixel)
++ * instead of four.
+  */
+ #include "enh_common.glsl"
+ 
+@@ -34,18 +37,26 @@ void main()
+    float t = pc.p0.x;
+    vec2 fc = (c / k) / pc.p0.y - 0.5;
+    ivec2 f0 = ivec2(floor(fc));
++   const bool wide = (pc.mode & 1u) != 0u;
+    vec3 a_best = vec3(0.0), b_best = vec3(0.0);
+    float e_best = 1e9, k_best = 0.0;
+-
+-   for (int i = 0; i < 5; i++) {
+-      vec2 v = vec2(0.0);
+-      float cost = 0.0;
+-      if (i < 4) {
+-         ivec2 q = clamp(f0 + ivec2(i & 1, i >> 1), ivec2(0), pc.aux_size - 1);
++   vec2 cand[10];
++   int n = 0;
++   cand[n++] = vec2(0.0);
++   const int lo = wide ? -1 : 0, hi = wide ? 1 : 1;
++   float cost_min = 1e9;
++   for (int y = lo; y <= hi; y++) {
++      for (int x = lo; x <= hi; x++) {
++         if (!wide && (x < 0 || y < 0))
++            continue;
++         ivec2 q = clamp(f0 + ivec2(x, y), ivec2(0), pc.aux_size - 1);
+          vec4 f = texelFetch(s_aux, q, 0);
+-         v = f.rg * k;
+-         cost = f.b;
++         cand[n++] = f.rg * k;
++         cost_min = min(cost_min, f.b);
+       }
++   }
++   for (int i = 0; i < n; i++) {
++      vec2 v = cand[i];
+       vec3 a = textureLod(s_src, (c - t * v) * inv, 0.0).rgb;
+       vec3 b = textureLod(s_src2, (c + (1.0 - t) * v) * inv, 0.0).rgb;
+       float e = dot(abs(a - b), vec3(1.0 / 3.0));
+@@ -53,15 +64,18 @@ void main()
+          e_best = e;
+          a_best = a;
+          b_best = b;
+-         k_best = i < 4 ? cost : e;
+       }
+    }
++   /* the flow's own confidence: its best match nearby (zero motion gets
++    * its pixel error) */
++   k_best = min(cost_min, e_best);
+    vec3 both = mix(a_best, b_best, t);
+    vec3 near = t < 0.5 ? a_best : t > 0.5 ? b_best : 0.5 * (a_best + b_best);
+    float conf_px = 1.0 - smoothstep(0.03, 0.12, e_best);
+    vec3 moved = mix(near, both, conf_px);
++   float conf_flow = 1.0 - smoothstep(0.05, 0.16, k_best);
++
+    vec3 fade = mix(textureLod(s_src, c * inv, 0.0).rgb,
+                    textureLod(s_src2, c * inv, 0.0).rgb, t);
+-   float conf_flow = 1.0 - smoothstep(0.05, 0.16, k_best);
+    imageStore(o_dst, p + pc.dst_off, vec4(mix(fade, moved, conf_flow), 1.0));
+ }
+diff --git a/src/vulkan/wsi/wsi_common_win32_enhance.c b/src/vulkan/wsi/wsi_common_win32_enhance.c
+index b8bd819..0e4ad5c 100644
+--- a/src/vulkan/wsi/wsi_common_win32_enhance.c
++++ b/src/vulkan/wsi/wsi_common_win32_enhance.c
+@@ -424,6 +424,7 @@ struct wsi_enh {
+    struct enh_img hist[2];                /* rect size, after the scaler */
+    struct enh_img pyr[2][ENH_LEVELS];
+    struct enh_img flow[ENH_LEVELS];
++   struct enh_img flow2[ENH_LEVELS];      /* propagation's other half */
+    bool init_layouts;                     /* internal images still UNDEFINED */
+    int cur;
+    bool have_prev;
+@@ -538,9 +539,13 @@ enh_fg_resources(struct wsi_enh *e)
+          r = enh_image(e, &e->pyr[h][l], VK_FORMAT_R16_SFLOAT,
+                        level_dim(e->src.width, l), level_dim(e->src.height, l));
+    }
+-   for (unsigned l = 1; l < ENH_LEVELS && r == VK_SUCCESS; l++)
++   for (unsigned l = 1; l < ENH_LEVELS && r == VK_SUCCESS; l++) {
+       r = enh_image(e, &e->flow[l], VK_FORMAT_R16G16B16A16_SFLOAT,
+                     level_dim(e->src.width, l), level_dim(e->src.height, l));
++      if (r == VK_SUCCESS)
++         r = enh_image(e, &e->flow2[l], VK_FORMAT_R16G16B16A16_SFLOAT,
++                       level_dim(e->src.width, l), level_dim(e->src.height, l));
++   }
+    if (r != VK_SUCCESS) {
+       LOGE("frame-generation images (%ux%u) could not be made: %d",
+            e->rect.extent.width, e->rect.extent.height, (int)r);
+@@ -832,8 +837,10 @@ wsi_enh_destroy(struct wsi_enh *e)
+       for (unsigned l = 0; l < ENH_LEVELS; l++)
+          enh_image_destroy(e, &e->pyr[h][l]);
+    }
+-   for (unsigned l = 0; l < ENH_LEVELS; l++)
++   for (unsigned l = 0; l < ENH_LEVELS; l++) {
+       enh_image_destroy(e, &e->flow[l]);
++      enh_image_destroy(e, &e->flow2[l]);
++   }
+    for (unsigned p = 0; p < P_COUNT; p++) {
+       if (e->pipe[p])
+          wsi->DestroyPipeline(e->dev, e->pipe[p], &e->alloc);
+@@ -1218,7 +1225,7 @@ wsi_enh_record(struct wsi_enh *e, uint32_t qfi, uint32_t src_index,
+                  VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_WRITE_BIT,
+                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+    if (e->init_layouts) {
+-      struct enh_img *imgs[2 + 2 * ENH_LEVELS + ENH_LEVELS];
++      struct enh_img *imgs[2 + 2 * ENH_LEVELS + 2 * ENH_LEVELS];
+       unsigned n = 0;
+       imgs[n++] = &e->tmp;
+       if (e->fg_ready) {
+@@ -1227,8 +1234,10 @@ wsi_enh_record(struct wsi_enh *e, uint32_t qfi, uint32_t src_index,
+             for (unsigned l = 1; l < ENH_LEVELS; l++)
+                imgs[n++] = &e->pyr[h][l];
+          }
+-         for (unsigned l = 1; l < ENH_LEVELS; l++)
++         for (unsigned l = 1; l < ENH_LEVELS; l++) {
+             imgs[n++] = &e->flow[l];
++            imgs[n++] = &e->flow2[l];
++         }
+       }
+       for (unsigned i = 0; i < n; i++) {
+          if (imgs[i]->image)
+@@ -1292,13 +1301,20 @@ wsi_enh_record(struct wsi_enh *e, uint32_t qfi, uint32_t src_index,
+       timestamp(e, cmd, f, src_index, TS_PYR);
+ 
+       if (plan->count > 1 && e->have_prev) {
++         /* Tuned with tools/enhance-eval (guest/nvk-rm): one level more
++          * than the search reach needs (128 frame pixels), a motion cost per
++          * frame pixel, and a propagation round per level, which brings
++          * correct vectors from edges into areas the coarser levels saw as
++          * flat.  `quality` ends at 1/2 of the frame instead of 1/4 and
++          * propagates on every level. */
+          const bool hq = e->cfg.fg_quality == WSI_ENH_FG_QUALITY;
+          const unsigned finest = hq ? 1 : 2;
+-         const unsigned coarsest = hq ? 5 : 4;
++         const unsigned coarsest = 5;
+          for (unsigned l = coarsest; l >= finest; l--) {
+             push_sizes(&p, e->pyr[cur][l].extent, e->flow[l].extent, zero);
+             p.p0[0] = (float)(1u << l);
+             p.p0[1] = 4.0f;               /* search radius, texels */
++            p.p0[2] = 0.0003f;            /* motion cost per frame pixel */
+             p.mode = l == coarsest ? 0 : 1;
+             if (l < coarsest) {
+                p.aux_size[0] = (int32_t)e->flow[l + 1].extent.width;
+@@ -1309,6 +1325,19 @@ wsi_enh_record(struct wsi_enh *e, uint32_t qfi, uint32_t src_index,
+                      l < coarsest ? e->flow[l + 1].view : e->pyr[cur][l].view,
+                      e->flow[l].view, &p);
+             compute_barrier(wsi, cmd);
++            /* propagation: flow -> flow2 -> flow (`fast`: from 1/8 down,
++             * the coarser levels gain little) */
++            if (!hq && l > 3)
++               continue;
++            p.mode = 2;
++            p.aux_size[0] = (int32_t)e->flow[l].extent.width;
++            p.aux_size[1] = (int32_t)e->flow[l].extent.height;
++            dispatch(e, cmd, P_FLOW, e->pyr[prev][l].view, e->linear,
++                     e->pyr[cur][l].view, e->flow[l].view, e->flow2[l].view, &p);
++            compute_barrier(wsi, cmd);
++            dispatch(e, cmd, P_FLOW, e->pyr[prev][l].view, e->linear,
++                     e->pyr[cur][l].view, e->flow2[l].view, e->flow[l].view, &p);
++            compute_barrier(wsi, cmd);
+          }
+          timestamp(e, cmd, f, src_index, TS_FLOW);
+ 
+@@ -1320,6 +1349,7 @@ wsi_enh_record(struct wsi_enh *e, uint32_t qfi, uint32_t src_index,
+             p.p0[1] = (float)(1u << finest);
+             p.p1[0] = (float)e->rect.extent.width / (float)e->src.width;
+             p.p1[1] = (float)e->rect.extent.height / (float)e->src.height;
++            p.mode = 1;                   /* nine candidates */
+             dispatch(e, cmd, P_INTERP, e->hist[prev].view, e->linear,
+                      e->hist[cur].view, e->flow[finest].view,
+                      e->slot_views[plan->slot[k]], &p);

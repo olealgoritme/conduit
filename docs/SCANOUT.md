@@ -190,9 +190,11 @@ guest cursor plane commit ──CursorUpdate{owner,handle,hot}──► backend 
   hotspot or visibility changes — **never for a move**. The host pointer
   positions the cursor itself, so it moves at host rate with zero guest
   latency; guest `crtc_x/y` is carried for information and ignored.
-- Grabbed (CTRL+ALT+G, relative pointer): the host cursor is hidden; the guest
-  cursor plane is not composited anywhere, so there is no visible cursor under
-  grab (games draw their own).
+- Grabbed (CTRL+ALT+G, relative pointer): the host cursor is hidden; a Linux
+  guest's cursor plane is not composited anywhere, so there is no visible
+  cursor under grab (games draw their own). A Windows guest reports its
+  pointer position while a grabbed viewer wants it (`CMD_MOVE_CURSOR`,
+  below), and the viewer draws the cursor there.
 - The backend keeps the last cursor (a dup of its dma-buf) and re-sends it to a
   broker that connects later or whose socket was full; a broker without
   `CAP_CURSOR` never gets `CMD_CURSOR` (it would be a protocol violation).
@@ -249,6 +251,27 @@ struct set_cursor_blob {       /* after the virtio-gpu ctrl header */
 - Sent for a shape or a visibility change, never for a move, as for Linux.
   A hide (resource 0 or `VISIBLE` clear) is `CMD_CURSOR` without a buffer.
   Unref of the cursor's resource and a device reset hide it.
+- **Positions, only while wanted.** Ungrabbed the host pointer is where the
+  guest cursor is. Grabbed (relative input) it is locked and the guest moves
+  its pointer by itself, so a viewer that draws the guest cursor itself needs
+  the guest's position: `CMD_MOVE_CURSOR` (`0x0381`, `MoveCursor`, 40 bytes):
+
+  ```c
+  struct move_cursor {           /* after the virtio-gpu ctrl header */
+      u32 scanout_id;            /* 0 */
+      s32 x, y;                  /* DxgkDdiSetPointerPosition X, Y: the hotspot's position */
+      u32 flags;                 /* 0 */
+  };
+  ```
+
+  Served with `CMD_SET_CURSOR_BLOB` (same queues, same `NVGPU_CFG_VENUS_CURSOR`).
+  The backend passes it to every display client that said `CAP_CURSOR_POS`
+  and is grabbed (`EV_GRAB` x=1), as `CMD_CURSOR_POS`, and answers
+  `RESP_OK_NODATA` while at least one such client exists, else
+  `RESP_ERR_UNSPEC` (also: not served, no display, a scanout other than 0 is
+  `INVALID_SCANOUT_ID`). The answer is the guest's cue: OK keep sending
+  moves, an error stop and probe again later. A move is never logged; the
+  Venus command counts carry `move_cursor`.
 - The KMD side, its knob (`HwCursor`), counters and the test recipe:
   `guest/windows/docs/independent-flip.md` section 12.
 
@@ -285,6 +308,8 @@ types, no version bump; record sizes unchanged:
 | `EV_MODE_HINT` = 17 | broker → backend | x,y = mode in buffer pixels (0,0 = configured), w0 = refresh mHz (0 = configured), w1 = reason 0 restore / 1 fullscreen / 2 window / 3 fixed |
 | `CAP_CURSOR` (HELLO w1 bit 11) | broker → backend | the broker takes `CMD_CURSOR` |
 | `CMD_CURSOR` = 7 | backend → broker | with a dma-buf fd: the cursor image (ATTACH's fields, ≤256², AR24, `seq` = hot_x \| hot_y<<16); without: hide, all fields 0 |
+| `CAP_CURSOR_POS` (HELLO w1 bit 18) | broker → backend | the broker takes `CMD_CURSOR_POS` and, while grabbed, draws the guest cursor at the guest's position itself |
+| `CMD_CURSOR_POS` = 9 | backend → broker | the guest's pointer position: width = x, height = y (int32, scanout pixels, the hotspot's position), `seq` a counter, no fd, every other field 0; only to a `CAP_CURSOR_POS` client between its `EV_GRAB` x=1 and x=0; a full socket keeps only the newest |
 | `CMD_CAPS` width bit `CLIENT_SEQ_USEC` (1<<1) | backend → broker | ATTACH/COMMIT `seq` is the backend's CLOCK_MONOTONIC µs at the flip (lets the viewer measure flip → screen) |
 | `CAP_CLIP_LARGE` (HELLO w1 bit 12) / `CMD_CAPS` width bit `CLIENT_CLIP_LARGE` (1<<2) | both | clipboard transfers up to 1 MiB in chunks (docs/CLIPBOARD.md) |
 | `CAP_GAMEPAD` (HELLO w1 bit 13) | broker → backend | the broker may send `EV_PAD` (a stream host) |

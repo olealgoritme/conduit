@@ -5,9 +5,14 @@
 //! rectangle of it. The blob is exported once, as the scanout's are, and the
 //! image goes to the same display path a Linux guest's cursor plane takes
 //! ([`DisplayLink::cursor`]): `CMD_CURSOR` to every client that takes one,
-//! which shows it as the host pointer's image. The host positions it, so a
-//! move never travels; the guest sends this only when the shape or the
-//! visibility changes. Nothing copies.
+//! which shows it as the host pointer's image. The host positions it; the
+//! guest sends this only when the shape or the visibility changes. Nothing
+//! copies.
+//!
+//! `CMD_MOVE_CURSOR`: the guest's pointer position, for a display client that
+//! draws the guest cursor itself while the host pointer is locked (a grabbed
+//! viewer). Answered OK while such a client exists, else `RESP_ERR_UNSPEC`,
+//! so the guest sends moves only while they are wanted.
 
 use super::*;
 use conduit_venus::ScanoutLayout;
@@ -121,6 +126,27 @@ impl Venus {
         self.cursor = Some(id);
         link.cursor(Some(fd), &u);
         Ok(Reply::NoData)
+    }
+
+    /// `CMD_MOVE_CURSOR`: where the guest's pointer is. Passed to the display
+    /// clients that draw the guest cursor themselves (a grabbed viewer); the
+    /// answer tells the guest whether anyone does, i.e. whether to keep
+    /// sending moves. Runs at mouse rate: no log line, no lock held long.
+    pub(super) fn move_cursor(&mut self, c: &MoveCursor, env: Env<'_>) -> Answer {
+        if !self.cursor_on {
+            return Err(RESP_ERR_UNSPEC);
+        }
+        if c.scanout_id != 0 {
+            return Err(RESP_ERR_INVALID_SCANOUT_ID);
+        }
+        let Some(link) = env.display else {
+            return Err(RESP_ERR_UNSPEC);
+        };
+        if link.cursor_pos(c.x, c.y) {
+            Ok(Reply::NoData)
+        } else {
+            Err(RESP_ERR_UNSPEC)
+        }
     }
 
     /// Hide the guest's cursor (asked for, or its resource went).

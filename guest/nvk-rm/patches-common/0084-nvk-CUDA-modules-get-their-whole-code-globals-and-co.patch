@@ -1,0 +1,814 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Sat, 24 Oct 2026 01:01:52 +0200
+Subject: [PATCH] nvk: CUDA modules get their whole code, globals and constant
+ banks 2-4
+
+nvk_cubin uploaded each kernel's own code section and passed its
+parameters in the root descriptor (bank 0), nothing else.  Real CUDA
+modules need more: of the 169 modules in nvngx_dlss.dll 310.9.16, 66
+read the addresses of module globals (__device__ variables, .nv.global
+and .nv.global.init) from bank 4, which the CUDA loader fills through
+R_CUDA_64 relocations in .rel.nv.constant4, and others read compiler
+constants from bank 2 (.nv.constant2.<kernel>) or __constant__ data
+from bank 3.  Position-independent code from NVIDIA's JIT (the cubins
+the host compiles for GPUs without shipped SASS) also calls the
+module's own subroutines (__cuda_sm20_* math slow paths, each in its
+own .text section) through addresses in bank 4.  NVK bound none of
+this, so those kernels read zeros or jumped nowhere.
+
+At vkCreateCuModuleNVX the module now copies its image (nv_cubin with
+libelf points into it, and it no longer depends on pData afterwards)
+and reads its sections straight from the ELF (bounds-checked, no
+libelf, the same code on every OS):
+
+- every .text.* section goes, 256-byte aligned, into one upload to the
+  shader heap; vkCreateCuFunctionNVX points the kernel at its section
+  in it instead of uploading the section again;
+- .nv.global.init, a zeroed .nv.global and every .nv.constantN[.kernel]
+  (N = 1-7) go into one GPU buffer per module, 256-byte aligned;
+- REL/RELA relocations whose target is one of those data sections
+  (R_CUDA_32, R_CUDA_64, against a data or code symbol of the module)
+  are applied.  A relocation of another type, against another symbol,
+  or in kernel code fails the module creation with a message instead
+  of running code with a wrong address; relocations of debug sections
+  and empty relocation sections (sm_90+ cubins have empty .rela.text.*)
+  are ignored.
+
+vkCreateCuFunctionNVX records the banks the kernel reads (its own
+.nv.constantN.<kernel>, else the module's .nv.constantN), and
+vkCmdCuLaunchKernelNVX binds them next to the root descriptor through
+nvk_cmd_dispatch_with_root_cbufs(): nvk_cmd_upload_qmd() takes the
+addresses of the slots the shader's cbuf map leaves INVALID.  Other
+dispatches pass NULL and are unchanged.
+---
+ src/nouveau/vulkan/nvk_cmd_buffer.h   |  12 +
+ src/nouveau/vulkan/nvk_cmd_dispatch.c |  26 +-
+ src/nouveau/vulkan/nvk_cubin.c        | 525 +++++++++++++++++++++++++-
+ src/nouveau/vulkan/nvk_cubin.h        |  45 ++-
+ 4 files changed, 591 insertions(+), 17 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvk_cmd_buffer.h b/src/nouveau/vulkan/nvk_cmd_buffer.h
+index 295be4a..ef91395 100644
+--- a/src/nouveau/vulkan/nvk_cmd_buffer.h
++++ b/src/nouveau/vulkan/nvk_cmd_buffer.h
+@@ -784,6 +784,18 @@ void nvk_cmd_dispatch_with_root(struct nvk_cmd_buffer *cmd,
+                                 uint32_t groupCountY,
+                                 uint32_t groupCountZ);
+ 
++/* As nvk_cmd_dispatch_with_root(); cbufs (NULL or one entry per constant
++ * buffer slot) binds the slots shader->cbuf_map leaves INVALID.
++ */
++void nvk_cmd_dispatch_with_root_cbufs(struct nvk_cmd_buffer *cmd,
++                                      struct nvk_shader *shader,
++                                      const void *root,
++                                      size_t root_size,
++                                      const struct nvk_buffer_address *cbufs,
++                                      uint32_t groupCountX,
++                                      uint32_t groupCountY,
++                                      uint32_t groupCountZ);
++
+ void nvk_cmd_fill_memory_ce(struct nvk_cmd_buffer *cmd,
+                             uint64_t dst_addr, uint64_t size,
+                             uint32_t data);
+diff --git a/src/nouveau/vulkan/nvk_cmd_dispatch.c b/src/nouveau/vulkan/nvk_cmd_dispatch.c
+index f320b4d..7ad8e66 100644
+--- a/src/nouveau/vulkan/nvk_cmd_dispatch.c
++++ b/src/nouveau/vulkan/nvk_cmd_dispatch.c
+@@ -156,12 +156,17 @@ nvk_flush_compute_state(struct nvk_cmd_buffer *cmd,
+       nvk_cmd_buffer_flush_printf_buffer(cmd, desc);
+ }
+ 
++/* extra_cbufs: NULL, or the address of each constant buffer slot whose
++ * cbuf_map entry is NVK_CBUF_TYPE_INVALID (CUDA kernels' banks 2-4); a slot
++ * with size 0 stays unbound.
++ */
+ static VkResult
+ nvk_cmd_upload_qmd(struct nvk_cmd_buffer *cmd,
+                    const struct nvk_shader *shader,
+                    const struct nvk_descriptor_state *desc,
+                    const void *root,
+                    size_t root_size,
++                   const struct nvk_buffer_address *extra_cbufs,
+                    uint32_t global_size[3],
+                    uint64_t *qmd_addr_out,
+                    uint64_t *root_desc_addr_out)
+@@ -212,6 +217,9 @@ nvk_cmd_upload_qmd(struct nvk_cmd_buffer *cmd,
+                .base_addr = root_desc_addr,
+                .size = root_size,
+             };
++         } else if (cbuf->type == NVK_CBUF_TYPE_INVALID &&
++                    extra_cbufs != NULL) {
++            ba = extra_cbufs[c];
+          } else {
+             ASSERTED bool direct_descriptor =
+                nvk_cmd_buffer_get_cbuf_addr(cmd, desc, shader, cbuf, &ba);
+@@ -262,7 +270,7 @@ nvk_cmd_flush_cs_qmd(struct nvk_cmd_buffer *cmd,
+    STATIC_ASSERT((sizeof(desc->root) & 0xff) == 0);
+ 
+    return nvk_cmd_upload_qmd(cmd, state->cs.shader, desc,
+-                             desc->root, sizeof(desc->root),
++                             desc->root, sizeof(desc->root), NULL,
+                              global_size,
+                              qmd_addr_out, root_desc_addr_out);
+ }
+@@ -384,6 +392,20 @@ nvk_cmd_dispatch_with_root(struct nvk_cmd_buffer *cmd,
+                            uint32_t groupCountX,
+                            uint32_t groupCountY,
+                            uint32_t groupCountZ)
++{
++   nvk_cmd_dispatch_with_root_cbufs(cmd, shader, root, root_size, NULL,
++                                    groupCountX, groupCountY, groupCountZ);
++}
++
++void
++nvk_cmd_dispatch_with_root_cbufs(struct nvk_cmd_buffer *cmd,
++                                 struct nvk_shader *shader,
++                                 const void *root,
++                                 size_t root_size,
++                                 const struct nvk_buffer_address *cbufs,
++                                 uint32_t groupCountX,
++                                 uint32_t groupCountY,
++                                 uint32_t groupCountZ)
+ {
+    struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
+ 
+@@ -391,7 +413,7 @@ nvk_cmd_dispatch_with_root(struct nvk_cmd_buffer *cmd,
+ 
+    uint64_t qmd_addr;
+    VkResult result = nvk_cmd_upload_qmd(cmd, shader, NULL,
+-                                        root, root_size,
++                                        root, root_size, cbufs,
+                                         group_count,
+                                         &qmd_addr, NULL);
+    if (result != VK_SUCCESS) {
+diff --git a/src/nouveau/vulkan/nvk_cubin.c b/src/nouveau/vulkan/nvk_cubin.c
+index d8ed1e3..e05c61a 100644
+--- a/src/nouveau/vulkan/nvk_cubin.c
++++ b/src/nouveau/vulkan/nvk_cubin.c
+@@ -8,10 +8,13 @@
+ #include "nvk_device.h"
+ #include "nvk_entrypoints.h"
+ #include "nvk_instance.h"
++#include "nvkmd/nvkmd.h"
+ 
+ #include "nouveau/cubin/nv_cubin.h"
+ #include "nouveau/cubin/nv_fatbin.h"
+ 
++#include "util/log.h"
++#include "util/u_math.h"
+ #include "util/u_process.h"
+ 
+ static void
+@@ -32,6 +35,455 @@ nvk_cubin_dump(const char *extension, const void *data, size_t size)
+    fclose(dump_file);
+ }
+ 
++/* Module code and data
++ *
++ * nv_cubin gives NVK each kernel's code and its parameter layout, which go
++ * in the root descriptor (bank 0).  Real CUDA modules need more.  The DLSS
++ * DLLs' kernels read compiler constants from bank 2, __constant__ data from
++ * bank 3 and the addresses of module globals (__device__ variables,
++ * .nv.global and .nv.global.init) from bank 4, which the CUDA loader fills
++ * through R_CUDA_64 relocations; without them a kernel reads zeros.  Code
++ * compiled as position-independent code (the host-built cubin cache) also
++ * calls the module's own subroutines (the __cuda_sm20_* math slow paths, in
++ * their own .text sections) through addresses in bank 4, so all of a
++ * module's code is uploaded together, once.
++ *
++ * This reads those sections straight from the ELF image (bounds-checked,
++ * no libelf, so it is the same on every OS), uploads the code, places the
++ * data in one GPU buffer per module, applies the relocations that point
++ * into either and records where each bank of each kernel is.  A relocation
++ * of a kind it does not know, or one in kernel code, fails the module
++ * instead of running code with a wrong address.
++ */
++
++#define NVK_ELF_SHT_NOBITS 8
++#define NVK_ELF_SHT_REL    9
++#define NVK_ELF_SHT_RELA   4
++#define NVK_ELF_SHT_SYMTAB 2
++#define NVK_ELF_SHN_XINDEX 0xffff
++#define NVK_R_CUDA_32      1
++#define NVK_R_CUDA_64      2
++#define NVK_CUBIN_DATA_ALIGN 256
++
++struct nvk_elf {
++   const uint8_t *data;
++   size_t size;
++   uint64_t shoff;
++   uint32_t shnum;
++   uint32_t shstrndx;
++};
++
++struct nvk_elf_shdr {
++   uint32_t name, type;
++   uint64_t flags, addr, offset, size;
++   uint32_t link, info;
++   uint64_t addralign, entsize;
++};
++
++static uint16_t
++nvk_elf_u16(const uint8_t *p)
++{
++   return p[0] | (p[1] << 8);
++}
++
++static uint32_t
++nvk_elf_u32(const uint8_t *p)
++{
++   return p[0] | (p[1] << 8) | (p[2] << 16) | ((uint32_t)p[3] << 24);
++}
++
++static uint64_t
++nvk_elf_u64(const uint8_t *p)
++{
++   return nvk_elf_u32(p) | ((uint64_t)nvk_elf_u32(p + 4) << 32);
++}
++
++static bool
++nvk_elf_range_ok(const struct nvk_elf *elf, uint64_t offset, uint64_t size)
++{
++   return offset <= elf->size && size <= elf->size - offset;
++}
++
++static bool
++nvk_elf_shdr_raw(const struct nvk_elf *elf, uint32_t idx,
++                 struct nvk_elf_shdr *sh)
++{
++   const uint64_t off = elf->shoff + (uint64_t)idx * 64;
++   if (!nvk_elf_range_ok(elf, off, 64))
++      return false;
++   const uint8_t *p = elf->data + off;
++   sh->name = nvk_elf_u32(p + 0);
++   sh->type = nvk_elf_u32(p + 4);
++   sh->flags = nvk_elf_u64(p + 8);
++   sh->addr = nvk_elf_u64(p + 16);
++   sh->offset = nvk_elf_u64(p + 24);
++   sh->size = nvk_elf_u64(p + 32);
++   sh->link = nvk_elf_u32(p + 40);
++   sh->info = nvk_elf_u32(p + 44);
++   sh->addralign = nvk_elf_u64(p + 48);
++   sh->entsize = nvk_elf_u64(p + 56);
++   return true;
++}
++
++static bool
++nvk_elf_init(struct nvk_elf *elf, const void *data, size_t size)
++{
++   const uint8_t *d = data;
++   elf->data = d;
++   elf->size = size;
++   if (size < 64 || memcmp(d, "\x7f" "ELF", 4) != 0 ||
++       d[4] != 2 /* ELFCLASS64 */ || d[5] != 1 /* little-endian */ ||
++       nvk_elf_u16(d + 18) != 190 /* EM_CUDA */)
++      return false;
++   elf->shoff = nvk_elf_u64(d + 40);
++   if (nvk_elf_u16(d + 58) != 64)
++      return false;
++   elf->shnum = nvk_elf_u16(d + 60);
++   elf->shstrndx = nvk_elf_u16(d + 62);
++
++   if (elf->shoff == 0)
++      return elf->shnum == 0;
++   struct nvk_elf_shdr sh0;
++   if (!nvk_elf_shdr_raw(elf, 0, &sh0))
++      return false;
++   if (elf->shnum == 0)
++      elf->shnum = sh0.size > UINT32_MAX ? 0 : (uint32_t)sh0.size;
++   if (elf->shstrndx == NVK_ELF_SHN_XINDEX)
++      elf->shstrndx = sh0.link;
++   return nvk_elf_range_ok(elf, elf->shoff, (uint64_t)elf->shnum * 64) &&
++          elf->shstrndx < elf->shnum;
++}
++
++/* A section header, its contents checked to lie in the image (unless it
++ * occupies none).
++ */
++static bool
++nvk_elf_shdr(const struct nvk_elf *elf, uint32_t idx, struct nvk_elf_shdr *sh)
++{
++   if (idx >= elf->shnum || !nvk_elf_shdr_raw(elf, idx, sh))
++      return false;
++   return sh->type == NVK_ELF_SHT_NOBITS ||
++          nvk_elf_range_ok(elf, sh->offset, sh->size);
++}
++
++/* A NUL-terminated string at off in string table strtab, or NULL. */
++static const char *
++nvk_elf_str(const struct nvk_elf *elf, uint32_t strtab, uint64_t off)
++{
++   struct nvk_elf_shdr sh;
++   if (!nvk_elf_shdr(elf, strtab, &sh) || sh.type == NVK_ELF_SHT_NOBITS ||
++       off >= sh.size)
++      return NULL;
++   const char *s = (const char *)elf->data + sh.offset + off;
++   if (!memchr(s, '\0', sh.size - off))
++      return NULL;
++   return s;
++}
++
++static const char *
++nvk_elf_section_name(const struct nvk_elf *elf, const struct nvk_elf_shdr *sh)
++{
++   return nvk_elf_str(elf, elf->shstrndx, sh->name);
++}
++
++/* Which module data section a name is: bank (1-7) of a .nv.constantN or
++ * .nv.constantN.<kernel> section (kernel_out = the kernel's name or NULL),
++ * NVK_CUBIN_SEC_GLOBAL for .nv.global and .nv.global.init, 0 for anything
++ * else (bank 0 is the parameter bank, which NVK fills itself).
++ */
++#define NVK_CUBIN_SEC_GLOBAL 0x100
++
++static unsigned
++nvk_cubin_data_section_kind(const char *name, const char **kernel_out)
++{
++   *kernel_out = NULL;
++   if (!strcmp(name, ".nv.global") || !strcmp(name, ".nv.global.init"))
++      return NVK_CUBIN_SEC_GLOBAL;
++
++   static const char prefix[] = ".nv.constant";
++   if (strncmp(name, prefix, sizeof(prefix) - 1) != 0)
++      return 0;
++   const char *p = name + sizeof(prefix) - 1;
++   if (*p < '0' || *p > '9')
++      return 0;
++   unsigned bank = 0;
++   while (*p >= '0' && *p <= '9' && bank < 100)
++      bank = bank * 10 + (*p++ - '0');
++   if (*p == '.')
++      *kernel_out = p + 1;
++   else if (*p != '\0')
++      return 0;
++   if (bank == 0 || bank >= NVK_CUBIN_MAX_CBUFS)
++      return 0;
++   return bank;
++}
++
++/* Offset of an address inside a section: data sections of a CUDA ELF have
++ * address 0, so symbol values and relocation offsets are section offsets;
++ * a section with an address is handled too.
++ */
++static uint64_t
++nvk_elf_section_offset(const struct nvk_elf_shdr *sh, uint64_t addr)
++{
++   return addr >= sh->addr ? addr - sh->addr : addr;
++}
++
++static bool
++nvk_cubin_apply_relocs(const struct nvk_elf *elf,
++                       const struct nvk_cubin_section_place *place,
++                       uint8_t *map, uint64_t base_addr, uint64_t code_addr)
++{
++   for (uint32_t s = 0; s < elf->shnum; s++) {
++      struct nvk_elf_shdr rsh;
++      if (!nvk_elf_shdr(elf, s, &rsh))
++         return false;
++      /* sm_90+ cubins carry empty .rela.text.<kernel> sections */
++      if ((rsh.type != NVK_ELF_SHT_REL && rsh.type != NVK_ELF_SHT_RELA) ||
++          rsh.size == 0)
++         continue;
++
++      const uint32_t target = rsh.info;
++      struct nvk_elf_shdr tsh;
++      if (!nvk_elf_shdr(elf, target, &tsh))
++         return false;
++      const char *tname = nvk_elf_section_name(elf, &tsh);
++      if (tname == NULL)
++         return false;
++
++      if (place[target].offset == UINT32_MAX) {
++         /* Debug info is not loaded; a relocation anywhere else (kernel
++          * code, the parameter bank) would need patching what NVK uploads
++          * as is.
++          */
++         if (!strncmp(tname, ".debug", 6) || !strncmp(tname, ".nv.rel", 7))
++            continue;
++         mesa_logw("NVK: CUDA module has relocations in %s, not supported",
++                   tname);
++         return false;
++      }
++
++      const uint64_t entsize = rsh.type == NVK_ELF_SHT_RELA ? 24 : 16;
++      if (rsh.entsize != 0 && rsh.entsize != entsize)
++         return false;
++      struct nvk_elf_shdr symsh;
++      if (!nvk_elf_shdr(elf, rsh.link, &symsh) ||
++          symsh.type != NVK_ELF_SHT_SYMTAB || symsh.entsize != 24)
++         return false;
++
++      for (uint64_t r = 0; r + entsize <= rsh.size; r += entsize) {
++         const uint8_t *rel = elf->data + rsh.offset + r;
++         const uint64_t r_offset = nvk_elf_u64(rel);
++         const uint64_t r_info = nvk_elf_u64(rel + 8);
++         const uint32_t type = r_info & 0xffffffff;
++         const uint64_t sym = r_info >> 32;
++
++         const unsigned width = type == NVK_R_CUDA_64 ? 8 :
++                                type == NVK_R_CUDA_32 ? 4 : 0;
++         if (width == 0) {
++            mesa_logw("NVK: CUDA module relocation type %u in %s not "
++                      "supported", type, tname);
++            return false;
++         }
++
++         const uint64_t where = nvk_elf_section_offset(&tsh, r_offset);
++         if (where > place[target].size || width > place[target].size - where)
++            return false;
++         uint8_t *dst = map + place[target].offset + where;
++
++         if (sym * 24 + 24 > symsh.size)
++            return false;
++         const uint8_t *st = elf->data + symsh.offset + sym * 24;
++         const uint16_t st_shndx = nvk_elf_u16(st + 6);
++         const uint64_t st_value = nvk_elf_u64(st + 8);
++         if (st_shndx >= elf->shnum ||
++             (place[st_shndx].offset == UINT32_MAX &&
++              place[st_shndx].code_offset == UINT32_MAX)) {
++            mesa_logw("NVK: CUDA module relocation in %s against a symbol "
++                      "outside module code and data", tname);
++            return false;
++         }
++         struct nvk_elf_shdr ssh;
++         if (!nvk_elf_shdr(elf, st_shndx, &ssh))
++            return false;
++
++         uint64_t addend;
++         if (rsh.type == NVK_ELF_SHT_RELA) {
++            addend = nvk_elf_u64(rel + 16);
++         } else if (width == 8) {
++            addend = nvk_elf_u64(dst);
++         } else {
++            addend = nvk_elf_u32(dst);
++         }
++
++         /* module data, or code (a subroutine's address) */
++         const uint64_t sec_addr = place[st_shndx].offset != UINT32_MAX ?
++            base_addr + place[st_shndx].offset :
++            code_addr + place[st_shndx].code_offset;
++         const uint64_t value = sec_addr +
++                                nvk_elf_section_offset(&ssh, st_value) +
++                                addend;
++         if (width == 8) {
++            memcpy(dst, &value, 8);
++         } else {
++            const uint32_t v32 = (uint32_t)value;
++            memcpy(dst, &v32, 4);
++         }
++      }
++   }
++   return true;
++}
++
++/* Uploads the module's .text sections, 256-byte aligned, in one piece of
++ * the shader heap, and places its module data sections in one GPU buffer
++ * (none when it has none).
++ */
++static VkResult
++nvk_cubin_module_init_data(struct nvk_device *dev,
++                           struct nvk_cubin_module *module,
++                           const VkAllocationCallbacks *pAllocator)
++{
++   struct nvk_elf elf;
++   if (!nvk_elf_init(&elf, module->image, module->image_size))
++      return vk_errorf(dev, VK_ERROR_INITIALIZATION_FAILED,
++                       "CUDA module: bad ELF image");
++
++   module->section_count = elf.shnum;
++   module->sections =
++      vk_alloc2(&dev->vk.alloc, pAllocator,
++                MAX2(elf.shnum, 1) * sizeof(*module->sections), 8,
++                VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
++   if (module->sections == NULL)
++      return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
++
++   uint64_t total = 0, code_total = 0;
++   for (uint32_t s = 0; s < elf.shnum; s++) {
++      module->sections[s] = (struct nvk_cubin_section_place) {
++         .offset = UINT32_MAX,
++         .code_offset = UINT32_MAX,
++      };
++      struct nvk_elf_shdr sh;
++      if (!nvk_elf_shdr(&elf, s, &sh))
++         return vk_errorf(dev, VK_ERROR_INITIALIZATION_FAILED,
++                          "CUDA module: bad section %u", s);
++      const char *name = nvk_elf_section_name(&elf, &sh);
++      const char *kernel;
++      if (name != NULL && sh.size != 0 && sh.type != NVK_ELF_SHT_NOBITS &&
++          !strncmp(name, ".text.", 6)) {
++         if (sh.size > (64u << 20) || code_total > (256u << 20))
++            return vk_errorf(dev, VK_ERROR_INITIALIZATION_FAILED,
++                             "CUDA module: section %s too large", name);
++         module->sections[s].code_offset = code_total;
++         module->sections[s].size = sh.size;
++         code_total += align64(sh.size, NVK_CUBIN_DATA_ALIGN);
++         continue;
++      }
++      if (name == NULL || sh.size == 0 ||
++          nvk_cubin_data_section_kind(name, &kernel) == 0)
++         continue;
++      if (sh.size > (64u << 20) || total > (256u << 20))
++         return vk_errorf(dev, VK_ERROR_INITIALIZATION_FAILED,
++                          "CUDA module: section %s too large", name);
++      module->sections[s].offset = total;
++      module->sections[s].size = sh.size;
++      total += align64(sh.size, NVK_CUBIN_DATA_ALIGN);
++   }
++
++   if (code_total > 0) {
++      uint8_t *code = calloc(1, code_total);
++      if (code == NULL)
++         return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
++      for (uint32_t s = 0; s < elf.shnum; s++) {
++         if (module->sections[s].code_offset == UINT32_MAX)
++            continue;
++         struct nvk_elf_shdr sh;
++         nvk_elf_shdr(&elf, s, &sh);
++         memcpy(code + module->sections[s].code_offset, elf.data + sh.offset,
++                sh.size);
++      }
++      VkResult result = nvk_heap_upload(dev, &dev->shader_heap, code,
++                                        code_total, NVK_CUBIN_DATA_ALIGN,
++                                        &module->code_addr);
++      free(code);
++      if (result != VK_SUCCESS)
++         return result;
++      module->code_size = code_total;
++   }
++
++   if (total == 0)
++      return VK_SUCCESS;
++
++   VkResult result =
++      nvkmd_dev_alloc_mapped_mem(dev->nvkmd, &dev->vk.base, total,
++                                 NVK_CUBIN_DATA_ALIGN, NVKMD_MEM_LOCAL,
++                                 NVKMD_MEM_MAP_WR, &module->data_mem);
++   if (result != VK_SUCCESS)
++      return result;
++
++   uint8_t *map = module->data_mem->map;
++   memset(map, 0, total);
++   for (uint32_t s = 0; s < elf.shnum; s++) {
++      if (module->sections[s].offset == UINT32_MAX)
++         continue;
++      struct nvk_elf_shdr sh;
++      nvk_elf_shdr(&elf, s, &sh);
++      if (sh.type != NVK_ELF_SHT_NOBITS) {
++         memcpy(map + module->sections[s].offset, elf.data + sh.offset,
++                sh.size);
++      }
++   }
++
++   if (!nvk_cubin_apply_relocs(&elf, module->sections, map,
++                               module->data_mem->va->addr, module->code_addr))
++      return vk_errorf(dev, VK_ERROR_INITIALIZATION_FAILED,
++                       "CUDA module: relocations NVK cannot apply");
++
++   return VK_SUCCESS;
++}
++
++/* The constant banks a kernel reads besides bank 0: its own
++ * .nv.constantN.<kernel>, else the module's .nv.constantN.
++ */
++static void
++nvk_cubin_function_init_cbufs(struct nvk_cubin_module *module,
++                              struct nvk_cubin_function *function,
++                              const char *kernel_name)
++{
++   function->cbuf_count = 1;
++   memset(function->cbufs, 0, sizeof(function->cbufs));
++   if (module->data_mem == NULL)
++      return;
++
++   struct nvk_elf elf;
++   if (!nvk_elf_init(&elf, module->image, module->image_size))
++      return;
++
++   bool own[NVK_CUBIN_MAX_CBUFS] = { false };
++   for (uint32_t s = 0; s < module->section_count; s++) {
++      const struct nvk_cubin_section_place *pl = &module->sections[s];
++      if (pl->offset == UINT32_MAX)
++         continue;
++      struct nvk_elf_shdr sh;
++      if (!nvk_elf_shdr(&elf, s, &sh))
++         continue;
++      const char *name = nvk_elf_section_name(&elf, &sh);
++      const char *kernel;
++      const unsigned bank =
++         name ? nvk_cubin_data_section_kind(name, &kernel) : 0;
++      if (bank == 0 || bank == NVK_CUBIN_SEC_GLOBAL)
++         continue;
++      if (kernel != NULL && strcmp(kernel, kernel_name) != 0)
++         continue;
++      if (kernel == NULL && own[bank])
++         continue;
++      own[bank] = kernel != NULL;
++      function->cbufs[bank] = (struct nvk_buffer_address) {
++         .base_addr = module->data_mem->va->addr + pl->offset,
++         .size = align(pl->size, NVK_CUBIN_DATA_ALIGN),
++      };
++      function->cbuf_count = MAX2(function->cbuf_count, bank + 1);
++   }
++}
++
+ /* nvk_cubin_module */
+ 
+ static VkResult
+@@ -69,11 +521,23 @@ nvk_cubin_module_init(struct nvk_device *dev, struct nvk_cubin_module *module,
+       nvk_cubin_dump("cubin", data, size);
+ #endif
+ 
++   /* The module keeps its own copy: nv_cubin (libelf) points into it, and
++    * the module data is read from it again for each function.
++    */
++   module->image = vk_alloc2(&dev->vk.alloc, pAllocator, MAX2(size, 1), 8,
++                             VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
++   if (module->image == NULL)
++      return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
++   memcpy(module->image, data, size);
++   module->image_size = size;
++
+    module->info =
+       vk_zalloc2(&dev->vk.alloc, pAllocator, sizeof(struct nv_cubin_module), 8,
+                  VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
++   if (module->info == NULL)
++      return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+ 
+-   if (!nv_cubin_module_init(module->info, data, size))
++   if (!nv_cubin_module_init(module->info, module->image, module->image_size))
+       return VK_ERROR_INITIALIZATION_FAILED;
+ 
+    if (!nv_is_sm_compatible(pdev->info.sm, module->info->sm, backwards_compat))
+@@ -81,7 +545,7 @@ nvk_cubin_module_init(struct nvk_device *dev, struct nvk_cubin_module *module,
+                           "Incompatible cubin module: pdev sm_%u vs cubin sm_%u",
+                           pdev->info.sm, module->info->sm);
+ 
+-   return VK_SUCCESS;
++   return nvk_cubin_module_init_data(dev, module, pAllocator);
+ }
+ 
+ static void
+@@ -93,6 +557,14 @@ nvk_cubin_module_destroy(struct nvk_device *dev,
+       nv_cubin_module_fini(module->info);
+       vk_free2(&dev->vk.alloc, pAllocator, module->info);
+    }
++   if (module->data_mem)
++      nvkmd_mem_unref(module->data_mem);
++   if (module->code_size) {
++      nvk_heap_free(dev, &dev->shader_heap, module->code_addr,
++                    module->code_size);
++   }
++   vk_free2(&dev->vk.alloc, pAllocator, module->sections);
++   vk_free2(&dev->vk.alloc, pAllocator, module->image);
+    vk_object_free(&dev->vk, pAllocator, module);
+ }
+ 
+@@ -153,16 +625,35 @@ nvk_cubin_function_init(struct nvk_device *dev,
+    if (!function->info)
+       return VK_ERROR_INITIALIZATION_FAILED;
+ 
+-   const int alignment = 0x80; /* maxwell+ */
+-
+-   VkResult result = nvk_heap_upload(
+-      dev, &dev->shader_heap, function->info->code_ptr,
+-      function->info->code_size, alignment, &function->upload_addr);
+-   if (result != VK_SUCCESS)
+-      return result;
++   /* The kernel's code is in the module's upload: find its section. */
++   struct nvk_elf elf;
++   if (!nvk_elf_init(&elf, module->image, module->image_size))
++      return VK_ERROR_INITIALIZATION_FAILED;
++   bool found = false;
++   for (uint32_t s = 0; s < module->section_count && !found; s++) {
++      struct nvk_elf_shdr sh;
++      const char *name;
++      if (module->sections[s].code_offset == UINT32_MAX ||
++          !nvk_elf_shdr(&elf, s, &sh) ||
++          (name = nvk_elf_section_name(&elf, &sh)) == NULL ||
++          strcmp(name + 6, function->info->name) != 0)
++         continue;
++      if (sh.size != function->info->code_size)
++         return vk_errorf(dev, VK_ERROR_INITIALIZATION_FAILED,
++                          "CUDA module: code of %s does not match",
++                          function->info->name);
++      function->upload_addr = module->code_addr +
++                              module->sections[s].code_offset;
++      function->code_size = sh.size;
++      found = true;
++   }
++   if (!found)
++      return vk_errorf(dev, VK_ERROR_INITIALIZATION_FAILED,
++                       "CUDA module: no .text.%s", function->info->name);
+ 
+-   function->upload_size = function->info->code_size;
++   function->upload_size = 0;
+    function->max_warps_per_sm = nak_max_warps_per_sm(function->info->gpr_count, nak);
++   nvk_cubin_function_init_cbufs(module, function, function->info->name);
+ 
+    return VK_SUCCESS;
+ }
+@@ -315,7 +806,7 @@ nvk_CmdCuLaunchKernelNVX(VkCommandBuffer commandBuffer,
+ 
+    struct nvk_shader shader;
+    memset(&shader, 0, sizeof(shader));
+-   shader.upload_size = function->upload_size;
++   shader.upload_size = function->code_size;
+    shader.upload_addr = function->upload_addr;
+    shader.hdr_addr = function->upload_addr;
+    shader.data_addr = function->upload_addr + function_info->func_offset;
+@@ -331,11 +822,17 @@ nvk_CmdCuLaunchKernelNVX(VkCommandBuffer commandBuffer,
+    shader.info.cs.local_size[2] = pLaunchInfo->blockDimZ;
+    shader.info.cs.smem_size =
+       function_info->static_smem_size + pLaunchInfo->sharedMemBytes;
+-   shader.cbuf_map.cbuf_count = 1;
++   /* Bank 0 is the root descriptor; banks 2-4 (compiler constants,
++    * __constant__ data, global addresses) come from the module's data.
++    */
++   shader.cbuf_map.cbuf_count = function->cbuf_count;
+    shader.cbuf_map.cbufs[0].type = NVK_CBUF_TYPE_ROOT_DESC;
+ 
+-   nvk_cmd_dispatch_with_root(cmd, &shader, root, root_size, pLaunchInfo->gridDimX,
+-                              pLaunchInfo->gridDimY, pLaunchInfo->gridDimZ);
++   nvk_cmd_dispatch_with_root_cbufs(cmd, &shader, root, root_size,
++                                    function->cbufs,
++                                    pLaunchInfo->gridDimX,
++                                    pLaunchInfo->gridDimY,
++                                    pLaunchInfo->gridDimZ);
+ 
+    if (root != &stack_root)
+       free(root);
+diff --git a/src/nouveau/vulkan/nvk_cubin.h b/src/nouveau/vulkan/nvk_cubin.h
+index 5d7e965..1c6bc5f 100644
+--- a/src/nouveau/vulkan/nvk_cubin.h
++++ b/src/nouveau/vulkan/nvk_cubin.h
+@@ -8,13 +8,49 @@
+ 
+ #include "nvk_private.h"
+ 
++#include "nvk_descriptor_types.h"
++
+ struct nv_cubin_module;
+ struct nv_cubin_function;
++struct nvkmd_mem;
++
++/* Constant banks a CUDA kernel can read besides bank 0 (its parameters,
++ * which NVK passes in the root descriptor): 2 holds compiler constants,
++ * 3 __constant__ data, 4 the addresses of module globals.  A QMD binds at
++ * most 8 banks.
++ */
++#define NVK_CUBIN_MAX_CBUFS 8
++
++struct nvk_cubin_section_place {
++   uint32_t offset;     /* in nvk_cubin_module::data_mem, UINT32_MAX = none */
++   uint32_t size;
++   uint32_t code_offset; /* .text.*: in the module's code, UINT32_MAX = none */
++};
+ 
+ struct nvk_cubin_module {
+    struct vk_object_base base;
+ 
+    struct nv_cubin_module *info;
++
++   /* The cubin, owned by the module (nv_cubin may point into it). */
++   void *image;
++   size_t image_size;
++
++   /* Every .text.* section, uploaded once at module creation: kernels call
++    * the module's own subroutines (__cuda_sm20_* math slow paths), whose
++    * addresses come from constant bank 4.
++    */
++   uint64_t code_addr;
++   uint32_t code_size;
++
++   /* Module data: .nv.global.init, .nv.global (zeroed), and the constant
++    * banks other than 0, module-wide (.nv.constantN) and per kernel
++    * (.nv.constantN.<kernel>), with the R_CUDA_32/64 relocations in them
++    * applied.  NULL when the module has none.
++    */
++   struct nvkmd_mem *data_mem;
++   uint32_t section_count;
++   struct nvk_cubin_section_place *sections;
+ };
+ 
+ struct nvk_cubin_function {
+@@ -23,10 +59,17 @@ struct nvk_cubin_function {
+    struct nvk_cubin_module *module;
+    const struct nv_cubin_function *info;
+ 
+-   uint32_t upload_size;
++   uint32_t upload_size; /* 0: the code is the module's */
+    uint64_t upload_addr;
++   uint32_t code_size;
+ 
+    uint32_t max_warps_per_sm;
++
++   /* Constant banks 1..NVK_CUBIN_MAX_CBUFS-1 bound at launch (index =
++    * bank; size 0 = none) and how many slots the QMD needs.
++    */
++   struct nvk_buffer_address cbufs[NVK_CUBIN_MAX_CBUFS];
++   uint32_t cbuf_count;
+ };
+ 
+ VK_DEFINE_NONDISP_HANDLE_CASTS(nvk_cubin_module, base, VkCuModuleNVX,

@@ -1481,6 +1481,12 @@ pub mod knobs {
     /// Venus traffic. 0 keeps them on the control queue (the fallback, and the old path). Read at
     /// StartDevice; mirrored as `CurQ`.
     pub const HW_CURSOR_Q: KnobName = KnobName::new(b"HwCursorQ");
+    /// `HwCursorPos` (default 1, `helios_kmd_logic::hw_cursor::POS_KNOB_DEFAULT`): send the
+    /// pointer's position (`HELIOS_CMD_MOVE_CURSOR`, cursor queue only, fire and forget) while
+    /// the host asks for it -- a viewer under a grab draws the guest cursor there. 0 never sends
+    /// one (the host then has no position to draw at). Read at StartDevice; mirrored as
+    /// `CurPosKnob`.
+    pub const HW_CURSOR_POS: KnobName = KnobName::new(b"HwCursorPos");
     /// `HwCursorCaps` (default 0 = monochrome | color | masked color, 7): the
     /// `DXGK_DRIVERCAPS.PointerCaps` word reported with the pointer, masked to those three bits.
     /// An A/B lever for "dxgkrnl never calls SetPointerShape": 6 is what the virtio-gpu and QXL

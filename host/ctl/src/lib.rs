@@ -114,6 +114,28 @@ pub enum Op {
     /// clock answers an error (an older one, "unknown op").
     #[serde(rename = "settime")]
     SetTime { unix_ms: u64 },
+    /// Windows guests: the upscaler override games get from their next
+    /// start, one of [`UPSCALER_MODES`]; without `mode` only asks which is
+    /// set. Answers [`UpscalerState`]; an agent that has none answers an
+    /// error (an older one, "unknown op").
+    Upscaler {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mode: Option<String>,
+    },
+}
+
+/// What [`Op::Upscaler`] takes: the game's own choice, DLSS with its
+/// newest model, FSR or XeSS through OptiScaler.
+pub const UPSCALER_MODES: [&str; 4] = ["default", "dlss", "fsr", "xess"];
+
+/// `upscaler`: what is set now.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UpscalerState {
+    /// One of [`UPSCALER_MODES`].
+    pub mode: String,
+    /// Games with OptiScaler whose configuration follows the mode.
+    pub optiscaler_games: u32,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -385,6 +407,10 @@ mod tests {
             Op::SetTime {
                 unix_ms: 1_760_000_000_123,
             },
+            Op::Upscaler {
+                mode: Some("dlss".into()),
+            },
+            Op::Upscaler { mode: None },
         ];
         for (i, op) in ops.into_iter().enumerate() {
             let r = Request::new(i as u64, op);
@@ -517,6 +543,33 @@ mod tests {
         r.push(b"half");
         r.reset();
         assert_eq!(r.push(b"x\n"), ["x"]);
+    }
+
+    #[test]
+    fn upscaler_is_spelled_for_the_agents() {
+        let line = Request::new(
+            3,
+            Op::Upscaler {
+                mode: Some("fsr".into()),
+            },
+        )
+        .to_line();
+        assert_eq!(
+            line,
+            "{\"v\":1,\"id\":3,\"op\":\"upscaler\",\"mode\":\"fsr\"}\n"
+        );
+        let line = Request::new(4, Op::Upscaler { mode: None }).to_line();
+        assert_eq!(line, "{\"v\":1,\"id\":4,\"op\":\"upscaler\"}\n");
+        let r = Response::ok(
+            4,
+            &UpscalerState {
+                mode: "xess".into(),
+                optiscaler_games: 2,
+            },
+        );
+        let back: UpscalerState = Response::parse(&r.to_line()).unwrap().into_body().unwrap();
+        assert_eq!(back.mode, "xess");
+        assert_eq!(back.optiscaler_games, 2);
     }
 
     #[test]

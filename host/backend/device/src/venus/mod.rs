@@ -656,6 +656,11 @@ impl Venus {
                 self.count("set_cursor_blob");
                 self.set_cursor_blob(&SetCursorBlob::from_bytes(b).expect("length checked"), env)
             }
+            CMD_MOVE_CURSOR => {
+                exact(MoveCursor::LEN)?;
+                self.count("move_cursor");
+                self.move_cursor(&MoveCursor::from_bytes(b).expect("length checked"), env)
+            }
             CMD_RESOURCE_FLUSH => {
                 exact(ResourceFlush::LEN)?;
                 self.count("resource_flush");
