@@ -1366,6 +1366,11 @@ class = "tuning"
 read = "device creation (once per process)"
 effect = "On by default (unset or 1); 0 turns it off. Rematerialization in NAK's GPR spiller (cheap values such as constants, constant-buffer and constant-memory loads, thread/CTA IDs and short ALU chains are recomputed at reloads instead of going to local memory; constant-memory loads through a constant-buffer address reload with one LDG from a UGPR copy of the address) and a per-shader register target: after scheduling, NAK estimates the cost of spilling down to each lower register count that gives more warps per SM (workgroup and shared memory limits included) and uses the one with the best estimated gain, never one that needs more than a few memory spills or any inside a loop. A NAK_GPR_CAP for a stage overrides the target of that stage and then spills with rematerialization. Part of the shader cache key."
 
+[env.NAK_SCHED_MLP]
+class = "tuning"
+read = "first shader compile (once per process)"
+effect = "0-3, default 3 on Windows and 0 elsewhere. 1-3: NAK's schedulers model global, local and texture latency as an L2 round trip instead of 32 cycles, so independent loads issue early and stay in flight together, and read-only accesses are not ordered against stores; 3 also hoists them as far as their operands allow. A unit that does not fit its register target keeps the plain schedule, so it never costs occupancy. Part of the shader cache key."
+
 [env.NAK_IMM_CSE]
 class = "tuning"
 read = "first shader compile (once per process)"
@@ -1797,6 +1802,21 @@ class = "tuning"
 read = "device creation"
 effect = "Which command buffer upload memory lives in CPU-mapped VRAM written through BAR1 instead of system memory. compute (the default on Windows): the compute root descriptor tables, which every dispatch waits for (tiny dispatches cost 0.48 us each from VRAM against 2.5-3.7 us from system memory on an RTX 5090); 1: all upload memory; 0: none."
 default_note = "compute on Windows, 0 elsewhere"
+
+[env.NVK_QMD_LAT]
+class = "tuning"
+read = "first use (once per process)"
+effect = "QMDs (the compute dispatch descriptors) come from the compute root tables' latency-bound upload stream, which is CPU-mapped VRAM under NVK_RM_UPLOAD_VRAM=compute, so a dispatch after a barrier does not wait for a system memory read. 1 is the default on Windows; 0 (the default elsewhere) keeps them in the general upload stream in system memory."
+
+[env.NVK_DISPATCH_INDIRECT_PREFETCH]
+class = "experiment"
+read = "first use (once per process)"
+effect = "1: only the first indirect dispatch argument copy after a barrier is a no-prefetch pushbuffer entry; by default every copy is one (two per indirect dispatch). A/B knob, default 0."
+
+[env.NVK_BARRIER_DEDUP]
+class = "experiment"
+read = "first use (once per process)"
+effect = "1: a pipeline barrier whose storage-write flush already invalidated the shader data caches emits no second GLOBAL_DATA invalidate. A/B knob, default 0."
 
 [env.NVK_RM_VIDEO]
 class = "debug"
