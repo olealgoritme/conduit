@@ -1,7 +1,7 @@
 # Upscaling and frame generation in the composed present
 
-NVK's Win32 WSI can upscale a swapchain to its window and generate pictures
-between the application's frames, from the presented images only (no motion
+NVK can upscale an application's frames to its window and generate pictures
+between them, from the presented images only (no motion
 vectors from the application), in the spirit of Lossless Scaling, AMD Fluid
 Motion Frames and NVIDIA Smooth Motion. It runs inside the composed present
 (`NVK_HELIOS_WSI_COMPOSE`, the default under a DWM on NVK), on the
@@ -9,19 +9,23 @@ application's own Vulkan queue, so it needs nothing from the host and works
 on every NVIDIA GPU NVK on RM runs on. Off by default; off, nothing of it
 runs and the present behaves as without it.
 
-Patches: `patches-windows-dxvk/0007` (FidelityFX FSR 1, vendored) and
-`0008` (everything else), files `src/vulkan/wsi/wsi_common_win32_enhance.[ch]`
-and `src/vulkan/wsi/enhance/` in the Mesa tree.
+Patches: `patches-windows-dxvk/0007` (FidelityFX FSR 1, vendored), `0008`
+(the passes and the Vulkan swapchain path) and `0009` (D3D11 and D3D12),
+files `src/vulkan/wsi/wsi_common_win32_enhance.[ch]`,
+`wsi_common_win32_dxgi*.{cpp,h}` and `src/vulkan/wsi/enhance/` in the Mesa
+tree.
 
 ## Which applications
 
-Every swapchain that presents through NVK's Win32 WSI with the composed
-present: native Vulkan applications, and OpenGL through Zink, which presents
-the same way (not measured here). D3D11 and
-D3D12 applications in the Windows guest do not: their presents go through
-DXGI, the Helios UMDs (`umd`, `umd12`) and the KMD, and DWM composes the
-flip-model buffers (`guest/windows/docs/zero-copy-present.md`); DXVK and
-vkd3d-proton render for those UMDs but never call `vkQueuePresentKHR`.
+- **Vulkan**: every swapchain that presents through NVK's Win32 WSI with the
+  composed present: native Vulkan applications, and OpenGL through Zink,
+  which presents the same way (not measured here).
+- **D3D11 and D3D12**: their presents go through DXGI, the Helios UMDs and
+  the KMD, never through a Vulkan swapchain (DXVK and vkd3d-proton render
+  for the UMDs). In processes whose D3D driver runs on NVK, with the
+  settings on for the process and `EnhanceD3D` not 0, NVK hooks DXGI's swap
+  chain creation and gives the application a swap chain of its own (see "D3D
+  swap chains"). With the settings off for the process, nothing is hooked.
 
 By default the global settings apply to windows whose client area covers
 their monitor (borderless and fullscreen); per-exe profiles,
@@ -50,6 +54,7 @@ pacing settings take effect at once.
 | `EnhanceFit` (REG_SZ) | `Fit` | `MESA_WSI_ENHANCE_FIT` | `aspect` (black bars), `stretch` | `aspect` |
 | `EnhanceWindows` (REG_SZ) | | `MESA_WSI_ENHANCE_WINDOWS` | `fullscreen`, `all` | `fullscreen` |
 | `EnhanceStats` (DWORD) | | `MESA_WSI_ENHANCE_STATS` | 1: a CSV row per frame | 0 |
+| `EnhanceD3D` (DWORD) | `D3D` | `MESA_WSI_ENHANCE_D3D` | 0: D3D11/D3D12 swap chains are left to DXGI | 1 |
 | | | `MESA_WSI_ENHANCE_SHOW` | `generated`: only generated pictures are shown (to look at them) | all |
 
 The Conduit tray (`conduit-gpu-tray`, elevated) sets the global values from
@@ -60,7 +65,7 @@ the global one.
 
 ## Upscaling
 
-With a scaler on, the surface reports no current extent
+With a scaler on, a Vulkan surface reports no current extent
 (`currentExtent` 0xFFFFFFFF, `minImageExtent` 1x1): DXVK, vkd3d-proton and
 native applications that take the size from the swapchain then render at
 their own resolution, and the window's DXGI flip swap chain is the window's
@@ -128,6 +133,47 @@ beyond the search reach, wrong vectors on repeating patterns, particles and
 transparency, and HUD elements that move with the scene. The cursor DWM
 draws is never interpolated.
 
+## D3D swap chains
+
+`wsi_common_win32_dxgi.cpp` (`_dxgi12.cpp` for D3D12). When NVK starts in a
+process that has a Helios UMD loaded (not DWM) and the settings are on for
+it, a helper thread patches `IDXGIFactory::CreateSwapChain` (slot 10) and
+`IDXGIFactory2::CreateSwapChainForHwnd` (slot 15). The UMD's own FlipUpgrade
+hooks are installed earlier, when the UMD loads, so NVK's sit in front of
+them: a chain NVK does not take goes on through FlipUpgrade as before, and so
+does the composed present's own flip swap chain.
+
+NVK takes a chain when the settings apply to its window, its format is
+8-bit BGRA or RGBA (sRGB included) and it is not multisampled. The
+application then gets an `IDXGISwapChain4` of NVK's:
+
+- **Back buffers** are textures of the application's size on its device: one
+  for D3D11 (`GetBuffer(0)`, the flip model's always-current buffer), the
+  chain's buffer count for D3D12 (`GetCurrentBackBufferIndex` rotates).
+- **Present** copies the back buffer into one of three shared ring textures
+  on the application's own queue and returns: D3D11 `CopyResource`, an event
+  query and a flush (the immediate context is made multithread-protected, so
+  the present thread may ask whether the copy is done); D3D12 a command list
+  of its own and a fence signal. It waits only when all three ring textures
+  are still being read, at most 100 ms (then the frame is dropped).
+- **A thread per swap chain** waits for the copy, runs the passes on an NVK
+  device of its own in the process (the ring textures and output slots
+  imported by their Helios resource ids: KMT handles for D3D11 textures, NT
+  handles for D3D12 resources), and presents the slots paced through the
+  composed present's D3D11 device and DXGI flip swap chain on the window,
+  exactly as for a Vulkan swapchain. A newer frame cuts a cycle short; older
+  queued frames are dropped (only the newest is shown).
+- **ResizeBuffers** waits for the thread, rebuilds the buffers, ring, slots
+  and passes at the new size (and the output at the window's size).
+- **Exclusive fullscreen** is not entered: `SetFullscreenState` is recorded
+  and reported back, the window stays as it is (borderless at the desktop's
+  mode, as for any frame-generation layer). `GetFrameLatencyWaitableObject`
+  is a semaphore released whenever a frame's ring texture has been read.
+
+The copy costs the application's queue one copy of its back buffer per
+frame; `Present` itself took 0.25 ms (D3D11, the copy and a flush) and 0.06
+ms (D3D12) on average in the tests below.
+
 ## Statistics
 
 Every 5 s the composed present's log (`helios-wsi-<pid>.log` in
@@ -146,7 +192,7 @@ ordinary DXGI presents of the process: PresentMon counts them.
 
 ## Cost
 
-RTX 5090, NVK on RM in the guest, a 240 Hz 5120x1440 desktop, the test
+Vulkan swapchains: RTX 5090, NVK on RM in the guest, a 240 Hz 5120x1440 desktop, the test
 pattern at 60 fps (`vk_enhance_pattern.exe`), GPU clocks not locked (light
 load: times vary up to about 2x between runs), microseconds per real frame:
 
@@ -169,6 +215,18 @@ The present thread's work (one D3D11 copy and `Present` per picture) is on
 top. `vkQueuePresentKHR` itself stayed at 0.02 ms on average (0.5 ms worst)
 with every mode: the application's thread never waits for a picture's time.
 
+D3D swap chains (`d3d11_enhance_pattern.exe`, `d3d12_enhance_pattern.exe`;
+PresentMon over 3 s; GPU microseconds per real frame):
+
+| API | Swapchain -> picture | Mode, game fps | Shown per second | PresentMon | GPU total |
+|---|---|---|---|---|---|
+| D3D11 | 1280x720 -> 2560x1440 | FSR + 2x, 60 | 60 + 60 | 359 presents, independent flip, 0 dropped, 8.33 ms apart (7.5-8.9) | 280 |
+| D3D11 | 1920x1080 -> 2560x1440 | FSR + 3x, 60 | 59 + 118 | 539, 5.55 ms apart (4.6-6.3) | 585 |
+| D3D11 | 1920x1080 -> 2560x1440 | FSR, 60 | 60 | 178, 16.66 ms apart | 91 |
+| D3D12 | 1280x720 -> 2560x1440 | FSR + 2x, 60 | 60 + 60 | 360, 8.33 ms apart (8.1-8.6) | 277 |
+| D3D12 | 1920x1080 -> 2560x1440 | FSR + adaptive, 30 | 30 + 208 | 721, 4.17 ms apart (3.0-5.2) | 841 |
+| D3D12 | 5120x1440 -> 5120x1440 | 2x, 60 | 60 + 60 | 359, 8.33 ms apart (7.0-9.6) | 541 |
+
 ## Test tools
 
 - `guest/nvk-rm/windows/vk_enhance_pattern.c` (built by
@@ -177,13 +235,17 @@ with every mode: the application's thread never waits for a picture's time.
   cap, in a borderless window over the primary monitor or a window of a
   given size; prints the frame rate and the time `vkQueuePresentKHR` took.
   `VK_DIRECT_DRIVER` points it at a test NVK.
-- `guest/windows/tools/d3d11_enhance_pattern.cpp`: the same for D3D11
-  (back buffer smaller than its borderless window), to see what DXGI and
-  DWM do with it.
+- `guest/windows/tools/d3d11_enhance_pattern.cpp` and
+  `d3d12_enhance_pattern.cpp`: D3D11 and D3D12 stand-ins for a game, a back
+  buffer smaller than its borderless window, a moving object and a static
+  HUD, a frame-rate cap, and optionally a `ResizeBuffers` half way. Run with
+  `HELIOS_NVK_ICD=<test vulkan_nouveau.dll>` to test an NVK build in one
+  process.
 
 ## Not done yet
 
-- D3D11 and D3D12 presents (see "Which applications").
+- D3D10, swap chains for composition or a CoreWindow, HDR and 10-bit
+  formats, and multisampled chains (they stay with DXGI).
 - NIS, CAS, SGSR and pixel-art scalers, a learned upscaler tier, and a
   learned interpolator tier.
 - Profiles from the tray for applications without an open window (the

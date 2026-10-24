@@ -125,7 +125,7 @@ Patch numbers are file numbers in the directory named in the patch tables.
 | `MESA_WSI_COMPOSE_ADAPTER` | auto | D3D11 adapter index of the composed path |
 | `MESA_WSI_ENHANCE_SCALER` | registry, else off | upscaling in the composed present: `off`, `fsr`, `bicubic`, `bilinear`, `nearest`, `integer` (see [docs/enhance.md](docs/enhance.md); dxvk 0008) |
 | `MESA_WSI_ENHANCE_FG` | registry, else off | frame generation in the composed present: `off`, `2x`, `3x`, `4x`, `adaptive` |
-| `MESA_WSI_ENHANCE_SHARPNESS`, `_FG_TARGET`, `_FG_QUALITY`, `_LOW_LATENCY`, `_FIT`, `_WINDOWS`, `_STATS`, `_SHOW` | registry, else 50, 0, fast, 0, aspect, fullscreen, 0, all | the other enhancement settings ([docs/enhance.md](docs/enhance.md#settings)) |
+| `MESA_WSI_ENHANCE_SHARPNESS`, `_FG_TARGET`, `_FG_QUALITY`, `_LOW_LATENCY`, `_FIT`, `_WINDOWS`, `_STATS`, `_SHOW`, `_D3D` | registry, else 50, 0, fast, 0, aspect, fullscreen, 0, all, 1 | the other enhancement settings ([docs/enhance.md](docs/enhance.md#settings)) |
 | **Helios interface** | | |
 | `NVK_HELIOS_RESID`, `NVK_HELIOS_FORMATS` | 1 | resource ids for shared images; the wider shared-format set |
 | `NVK_HELIOS_MODIFIERS` | 1 | advertise `VK_EXT_image_drm_format_modifier` on Windows |
@@ -314,6 +314,7 @@ Each patch builds on its own.
 | 0006 | CPU waits without a host round trip per wake (the non-stall event is dataless, so the data read never finds anything; `NVK_RM_EVENT_DRAIN=1` reads it); CPU signals and raised pending values kick waiters through `crm_win_event_kick` (`NVK_RM_CPU_KICK=0` off); `NVK_RM_WAIT_SPIN_US` |
 | 0007 | AMD FidelityFX FSR 1 (`ffx_a.h`, `ffx_fsr1.h`, MIT), vendored unmodified under `src/vulkan/wsi/enhance/third_party` for 0008 |
 | 0008 | upscaling and frame generation in the composed present, off by default (`MESA_WSI_ENHANCE_*`, `HKLM\SOFTWARE\Helios` `Enhance*`, per-exe profiles): compute passes on the application's queue before the present's fence (`wsi_swapchain::present_cmd`) into output slots of the window's size, paced by the present thread; FSR 1 / bicubic / bilinear / nearest / integer scaling, 2x / 3x / 4x / adaptive generation from optical flow; with a scaler the surface reports no current extent. See [docs/enhance.md](docs/enhance.md) |
+| 0009 | D3D11 and D3D12 swap chains through the same: where a Helios D3D driver runs on NVK and enhancement is on, NVK hooks DXGI's swap chain creation and hands the application an `IDXGISwapChain4` of its own whose presents are copied into shared ring textures, enhanced on an NVK device of its own and presented through the composed present (`MESA_WSI_ENHANCE_D3D`, `EnhanceD3D`; see [docs/enhance.md](docs/enhance.md#d3d-swap-chains)) |
 
 ## `patches-common/`: generic NVK work
 
