@@ -115,10 +115,10 @@ static uint64_t fnv64(const void *data, uint64_t n, uint64_t h)
 
 /* ------------------------------------------------------------------------------------------- options */
 static struct {
-    int n, warm, reset, compile_only, list, robust, verbose, no_draw;
+    int n, warm, reset, compile_only, list, robust, verbose, no_draw, split, ts_only;
     const char *dev, *dump, *csv, *label, *dump_cache;
     int grid_override; uint32_t grid[3];
-} O = { 15, 5, 1, 0, 0, 1, 0, 0, NULL, NULL, NULL, NULL, NULL, 0, { 0, 0, 0 } };
+} O = { 15, 5, 1, 0, 0, 1, 0, 0, 0, 0, NULL, NULL, NULL, NULL, NULL, 0, { 0, 0, 0 } };
 
 static void usage(void)
 {
@@ -128,6 +128,8 @@ static void usage(void)
         "  -w N            warm-up dispatches before them (default 5)\n"
         "  --no-reset      do not restore writable resources before each dispatch\n"
         "  --no-draw       draws: time the render pass alone (attachment load and store), without the draw\n"
+        "  --split         draws: also timestamps inside the render pass: begin, draw, end reported apart\n"
+        "  --ts-only       draws: two timestamps with nothing between them, after an untimed empty render pass\n"
         "  --dev STR       device whose name contains STR (default: first NVIDIA-vendor device)\n"
         "  --list          list the devices and exit\n"
         "  --dump DIR      write what the shader may write, after the last dispatch, as DIR/r<N>.out.bin\n"
@@ -740,7 +742,7 @@ static void create_graphics_pipeline(VkShaderModule fs)
 }
 
 /* One replay of the draw: render pass (load, store) with the captured area, viewport and scissor */
-static void record_draw(VkCommandBuffer cb)
+static void record_draw(VkCommandBuffer cb, VkQueryPool qs, uint32_t q)
 {
     const struct json *d = g_dj;
     VkRenderingAttachmentInfo ca[8]; uint32_t ncol = 0;
@@ -769,13 +771,18 @@ static void record_draw(VkCommandBuffer cb)
         (uint32_t)jnum(d, "layers", 1) ? (uint32_t)jnum(d, "layers", 1) : 1, 0, ncol, ca,
         have_d ? &da : NULL, have_s ? &sa : NULL };
     vkCmdBeginRendering(cb, &ri);
+    if (qs) vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, qs, q);
     VkViewport v = { (float)jarr(d, "viewport", 0, 0), (float)jarr(d, "viewport", 1, 0), (float)jarr(d, "viewport", 2, 1),
                      (float)jarr(d, "viewport", 3, 1), (float)jarr(d, "viewport", 4, 0), (float)jarr(d, "viewport", 5, 1) };
     VkRect2D sc = { { (int32_t)jarr(d, "scissor", 0, 0), (int32_t)jarr(d, "scissor", 1, 0) },
                     { (uint32_t)jarr(d, "scissor", 2, 1), (uint32_t)jarr(d, "scissor", 3, 1) } };
     vkCmdSetViewport(cb, 0, 1, &v);
     vkCmdSetScissor(cb, 0, 1, &sc);
-    if (O.no_draw) { vkCmdEndRendering(cb); return; } /* the render pass alone: attachment load and store */
+    if (O.no_draw) { /* the render pass alone: attachment load and store */
+        if (qs) vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, qs, q + 1);
+        vkCmdEndRendering(cb);
+        return;
+    }
     for (int i = 0; i < NR; i++) {
         struct res *r = &R[i];
         if (r->role == 5 && r->buf) {
@@ -806,6 +813,7 @@ static void record_draw(VkCommandBuffer cb)
     else
         vkCmdDraw(cb, (uint32_t)jnum(d, "vertex_count", 3), (uint32_t)jnum(d, "instance_count", 1),
                   (uint32_t)jnum(d, "first_vertex", 0), (uint32_t)jnum(d, "first_instance", 0));
+    if (qs) vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, qs, q + 1);
     vkCmdEndRendering(cb);
 }
 
@@ -939,6 +947,8 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--grid") && i + 1 < argc) { O.grid_override = sscanf(argv[++i], "%u,%u,%u", &O.grid[0], &O.grid[1], &O.grid[2]) == 3; }
         else if (!strcmp(a, "--no-robust")) O.robust = 0;
         else if (!strcmp(a, "--no-draw")) O.no_draw = 1;
+        else if (!strcmp(a, "--split")) O.split = 1;
+        else if (!strcmp(a, "--ts-only")) O.ts_only = 1;
         else if (!strcmp(a, "--compile-only")) O.compile_only = 1;
         else if (!strcmp(a, "--dump-cache") && i + 1 < argc) O.dump_cache = argv[++i];
         else if (!strcmp(a, "-v")) O.verbose = 1;
@@ -992,8 +1002,11 @@ int main(int argc, char **argv)
     const uint32_t total = (uint32_t)(O.warm + O.n);
     VkQueryPoolCreateInfo qpi = { VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, NULL, 0, VK_QUERY_TYPE_TIMESTAMP, 2 * total, 0 };
     VkQueryPool qp; VK(vkCreateQueryPool(g_dev, &qpi, NULL, &qp));
+    VkQueryPool qs = VK_NULL_HANDLE; /* --split: after the render pass begins, before it ends */
+    if (O.split && g_draw) VK(vkCreateQueryPool(g_dev, &qpi, NULL, &qs));
     VkCommandBuffer cb = begin_cmd();
     vkCmdResetQueryPool(cb, qp, 0, 2 * total);
+    if (qs) vkCmdResetQueryPool(cb, qs, 0, 2 * total);
     const VkPipelineBindPoint bp = g_draw ? VK_PIPELINE_BIND_POINT_GRAPHICS : VK_PIPELINE_BIND_POINT_COMPUTE;
     vkCmdBindPipeline(cb, bp, g_pipe);
     for (uint32_t s = 0; s < g_nsets; s++) vkCmdBindDescriptorSets(cb, bp, g_pl, s, 1, &g_sets[s], 0, NULL);
@@ -1001,9 +1014,12 @@ int main(int argc, char **argv)
     for (uint32_t it = 0; it < total; it++) {
         if (O.reset) { full_barrier(cb); record_restore(cb, 1); }
         full_barrier(cb);
+        if (g_draw && O.ts_only) { /* an untimed empty pass, then nothing between the timestamps */
+            int nd = O.no_draw; O.no_draw = 1; record_draw(cb, VK_NULL_HANDLE, 0); O.no_draw = nd;
+        }
         vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, qp, 2 * it);
-        if (g_draw) record_draw(cb);
-        else vkCmdDispatchBase(cb, base[0], base[1], base[2], grid[0], grid[1], grid[2]);
+        if (g_draw && !O.ts_only) record_draw(cb, qs, 2 * it);
+        else if (!g_draw) vkCmdDispatchBase(cb, base[0], base[1], base[2], grid[0], grid[1], grid[2]);
         vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, qp, 2 * it + 1);
     }
     full_barrier(cb);
@@ -1035,6 +1051,26 @@ int main(int argc, char **argv)
         sum += us[k];
     }
     double cold = O.warm > 0 ? (double)(ts[1] - ts[0]) * g_pp.limits.timestampPeriod / 1000.0 : us[0];
+    if (qs) { /* --split: begin, inside, end of the render pass */
+        static uint64_t ti[2 * 4096];
+        VK(vkGetQueryPoolResults(g_dev, qs, 0, 2 * total, sizeof(uint64_t) * 2 * total, ti, sizeof(uint64_t),
+                                 VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT));
+        double *seg[3]; const char *nm[3] = { "begin", "inside", "end" };
+        for (int g = 0; g < 3; g++) seg[g] = calloc(O.n, sizeof(double));
+        for (int k = 0; k < O.n; k++) {
+            uint32_t it = (uint32_t)(O.warm + k);
+            const double tp = g_pp.limits.timestampPeriod / 1000.0;
+            seg[0][k] = (double)(ti[2 * it] - ts[2 * it]) * tp;
+            seg[1][k] = (double)(ti[2 * it + 1] - ti[2 * it]) * tp;
+            seg[2][k] = (double)(ts[2 * it + 1] - ti[2 * it + 1]) * tp;
+        }
+        printf("split_us");
+        for (int g = 0; g < 3; g++) {
+            qsort(seg[g], O.n, sizeof(double), cmp_d);
+            printf(" %s %.2f", nm[g], O.n % 2 ? seg[g][O.n / 2] : 0.5 * (seg[g][O.n / 2 - 1] + seg[g][O.n / 2]));
+        }
+        printf(" (medians)\n");
+    }
     qsort(us, O.n, sizeof *us, cmp_d);
     double med = O.n % 2 ? us[O.n / 2] : 0.5 * (us[O.n / 2 - 1] + us[O.n / 2]);
 

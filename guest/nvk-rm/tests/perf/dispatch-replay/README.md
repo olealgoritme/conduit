@@ -66,7 +66,9 @@ capture in `captures\` on the first NVIDIA-vendor device (NVK) and writes `guest
 Options: `-n N` timed dispatches (median reported, default 15), `-w N` warm-up dispatches (5),
 `--no-reset` (do not restore writable resources before each dispatch), `--grid X,Y,Z` (another grid),
 `--no-robust` (without the robustness features), `--no-draw` (a draw capture: the render pass alone, its
-attachment loads and stores, without the draw), `--compile-only` (create the pipeline and stop),
+attachment loads and stores, without the draw), `--split` (draws: timestamps after the pass begins and before
+it ends too; begin, inside and end are reported apart), `--ts-only` (draws: two timestamps with nothing between
+them, after an untimed empty pass: the cost of the timestamps themselves), `--compile-only` (create the pipeline and stop),
 `--csv FILE`, `--label STR`, `--dump DIR`, `--dump-cache FILE` (write the pipeline cache data), `-v`.
 
 Output per capture: `gpu_us median/min/mean/max/first`, the pipeline creation time, `checksum r<N>` per
