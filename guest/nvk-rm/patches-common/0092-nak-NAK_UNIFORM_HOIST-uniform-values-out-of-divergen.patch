@@ -1,0 +1,341 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Sat, 24 Oct 2026 08:43:11 +0200
+Subject: [PATCH] nak: NAK_UNIFORM_HOIST, uniform values out of divergent
+ control flow
+
+NAK gives a value a UGPR only if both the value and its block are
+uniform: in divergent control flow every value goes to a GPR (a warp runs
+both sides of a branch, so a UGPR reused on one side could clobber a
+value the other side still needs).  In the corpus 5.8% of the
+instructions are uniform values in divergent blocks.
+
+NAK_UNIFORM_HOIST (0-2, default 0) moves them to the nearest dominating
+block in uniform control flow, where they get UGPRs: 1, ALU instructions
+and constant buffer loads whose operands are available there (constants
+are copied along; no global memory, no subgroup operations, since they
+then run when no lane takes the branch); 2, only the constant buffer
+loads and the ALU instructions that compute nothing but their addresses.
+
+Hoisting makes live ranges longer and can cross an occupancy cliff, so a
+shader the hoist changed is also compiled without it (from a copy of the
+NIR), and the result with more warps per SM, or as many and fewer static
+cycles, is kept.
+---
+ src/nouveau/compiler/nak/api.rs    |  58 +++++++++++++
+ src/nouveau/compiler/nak/knobs.rs  |  43 ++++++++++
+ src/nouveau/compiler/nak_nir.c     | 132 +++++++++++++++++++++++++++++
+ src/nouveau/compiler/nak_private.h |   3 +
+ 4 files changed, 236 insertions(+)
+
+diff --git a/src/nouveau/compiler/nak/api.rs b/src/nouveau/compiler/nak/api.rs
+index c683f00..5b25ae2 100644
+--- a/src/nouveau/compiler/nak/api.rs
++++ b/src/nouveau/compiler/nak/api.rs
+@@ -504,6 +504,11 @@ macro_rules! pass {
+     };
+ }
+ 
++/// NAK_UNIFORM_HOIST: the shader is compiled with the hoist; if it moved
++/// anything, also without it (from a copy of the NIR made before), and the
++/// result with more warps per SM, or as many and fewer static cycles, is
++/// kept (moving uniform values out of divergent control flow can make live
++/// ranges longer and cross an occupancy cliff)
+ fn nak_compile_shader_internal(
+     nir: *mut nir_shader,
+     dump_asm: bool,
+@@ -511,6 +516,59 @@ fn nak_compile_shader_internal(
+     robust2_modes: nir_variable_mode,
+     fs_key: *const nak_fs_key,
+     has_task_shader: bool,
++) -> *mut nak_shader_bin {
++    if crate::knobs::uniform_hoist() == 0 {
++        crate::knobs::set_uniform_hoist_active(false);
++        return nak_compile_shader_once(
++            nir, dump_asm, nak, robust2_modes, fs_key, has_task_shader,
++        );
++    }
++    // Freed with the shader it copies
++    let plain_nir = unsafe {
++        nir_shader_clone(nir as *mut std::ffi::c_void, nir)
++    };
++    crate::knobs::set_uniform_hoist_active(true);
++    let hoisted = nak_compile_shader_once(
++        nir, dump_asm, nak, robust2_modes, fs_key, has_task_shader,
++    );
++    let moved = crate::knobs::uniform_hoist_progress();
++    crate::knobs::set_uniform_hoist_active(false);
++    if !moved || plain_nir.is_null() {
++        return hoisted;
++    }
++    let plain = nak_compile_shader_once(
++        plain_nir, dump_asm, nak, robust2_modes, fs_key, has_task_shader,
++    );
++    let (hi, pi) = unsafe { (&(*hoisted).info, &(*plain).info) };
++    let keep_hoisted = hi.max_warps_per_sm > pi.max_warps_per_sm
++        || (hi.max_warps_per_sm == pi.max_warps_per_sm
++            && hi.num_static_cycles < pi.num_static_cycles);
++    if DEBUG.print() {
++        eprintln!(
++            "NAK_UNIFORM_HOIST: hoisted {} warps {} cycles, plain {} warps {} cycles: {}",
++            hi.max_warps_per_sm,
++            hi.num_static_cycles,
++            pi.max_warps_per_sm,
++            pi.num_static_cycles,
++            if keep_hoisted { "hoisted" } else { "plain" }
++        );
++    }
++    if keep_hoisted {
++        nak_shader_bin_destroy(plain);
++        hoisted
++    } else {
++        nak_shader_bin_destroy(hoisted);
++        plain
++    }
++}
++
++fn nak_compile_shader_once(
++    nir: *mut nir_shader,
++    dump_asm: bool,
++    nak: *const nak_compiler,
++    robust2_modes: nir_variable_mode,
++    fs_key: *const nak_fs_key,
++    has_task_shader: bool,
+ ) -> *mut nak_shader_bin {
+     unsafe {
+         nak_postprocess_nir(nir, nak, robust2_modes, fs_key, has_task_shader)
+diff --git a/src/nouveau/compiler/nak/knobs.rs b/src/nouveau/compiler/nak/knobs.rs
+index bcbf9d9..54ad20b 100644
+--- a/src/nouveau/compiler/nak/knobs.rs
++++ b/src/nouveau/compiler/nak/knobs.rs
+@@ -109,6 +109,7 @@ static OCC_GPRS: OnceLock<u32> = OnceLock::new();
+ static F16_PAIR: OnceLock<bool> = OnceLock::new();
+ static TEMP_IF_ELSE: OnceLock<u32> = OnceLock::new();
+ static OCC_FS: OnceLock<bool> = OnceLock::new();
++static UNIFORM_HOIST: OnceLock<u32> = OnceLock::new();
+ static WEAK_MEM: OnceLock<bool> = OnceLock::new();
+ static UNIFORM_ATOMICS: OnceLock<bool> = OnceLock::new();
+ static F16_CVT: OnceLock<bool> = OnceLock::new();
+@@ -218,6 +219,47 @@ pub fn occ_fs() -> bool {
+     *OCC_FS.get_or_init(|| parse("NAK_OCC_FS", env::var("NAK_OCC_FS"), dflt))
+ }
+ 
++/// NAK_UNIFORM_HOIST (0-2, default 0): values that are the same in every
++/// lane but computed in divergent control flow, where NAK keeps them in
++/// GPRs, move to the nearest dominating block in uniform control flow, where
++/// they get UGPRs: 1, ALU instructions and constant-buffer loads whose
++/// operands are available there; 2, only constant-buffer loads and the ALU
++/// instructions that compute nothing but their addresses (nak_nir.c)
++pub fn uniform_hoist() -> u32 {
++    *UNIFORM_HOIST.get_or_init(|| parse_u32("NAK_UNIFORM_HOIST", 0, 2))
++}
++
++#[unsafe(no_mangle)]
++pub extern "C" fn nak_knob_uniform_hoist() -> u32 {
++    uniform_hoist()
++}
++
++thread_local! {
++    /// NAK_UNIFORM_HOIST: whether the compile in progress hoists (api.rs
++    /// compiles with and without it) and whether the hoist moved anything
++    static HOIST_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
++    static HOIST_PROGRESS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
++}
++
++pub fn set_uniform_hoist_active(on: bool) {
++    HOIST_ACTIVE.with(|c| c.set(on));
++    HOIST_PROGRESS.with(|c| c.set(false));
++}
++
++pub fn uniform_hoist_progress() -> bool {
++    HOIST_PROGRESS.with(|c| c.get())
++}
++
++#[unsafe(no_mangle)]
++pub extern "C" fn nak_uniform_hoist_active() -> bool {
++    HOIST_ACTIVE.with(|c| c.get())
++}
++
++#[unsafe(no_mangle)]
++pub extern "C" fn nak_uniform_hoist_note_progress() {
++    HOIST_PROGRESS.with(|c| c.set(true));
++}
++
+ /// NAK_REMAT_LD_COST (1-63, default 4): what a rematerialized global or
+ /// constant load costs in the spiller and in the occupancy target's dry run
+ /// (spill_remat::op_cost).  A memory fill costs 8; a reload that is a load
+@@ -295,6 +337,7 @@ pub extern "C" fn nak_knobs_key2() -> u32 {
+         ;
+     // no free bit left: NAK_OCC_FS is mixed in
+     key ^ if occ_fs() { 0x9e37_79b9 } else { 0 }
++        ^ uniform_hoist().wrapping_mul(0x85eb_ca6b)
+ }
+ 
+ /// NAK_YIELD (default off, experimental, SM120): control bit 109 set on
+diff --git a/src/nouveau/compiler/nak_nir.c b/src/nouveau/compiler/nak_nir.c
+index 8d4d464..9d7e5d6 100644
+--- a/src/nouveau/compiler/nak_nir.c
++++ b/src/nouveau/compiler/nak_nir.c
+@@ -203,6 +203,130 @@ nak_nir_pair_f2f16(nir_shader *nir)
+    return progress;
+ }
+ 
++/* NAK_UNIFORM_HOIST: whether instr may run in the nearest uniform dominator
++ * of its divergent block: an ALU instruction or a constant buffer load whose
++ * value is the same in every lane (no subgroup operations, no global memory:
++ * it then runs even when no lane takes the branch)
++ */
++static bool
++uniform_hoist_candidate(nir_instr *instr)
++{
++   switch (instr->type) {
++   case nir_instr_type_alu:
++      return !nir_instr_as_alu(instr)->def.divergent;
++   case nir_instr_type_intrinsic: {
++      nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
++      return (intr->intrinsic == nir_intrinsic_ldc_nv ||
++              intr->intrinsic == nir_intrinsic_ldcx_nv) &&
++             !intr->def.divergent;
++   }
++   default:
++      return false;
++   }
++}
++
++struct uniform_hoist_state {
++   nir_block *target;
++   bool ok;
++};
++
++static bool
++uniform_hoist_src_ok(nir_src *src, void *data)
++{
++   struct uniform_hoist_state *st = data;
++   nir_instr *def_instr = nir_def_instr(src->ssa);
++   /* Constants are rematerialized per block (nak_nir_rematerialize_load_const):
++    * they come along as copies
++    */
++   if (def_instr->type == nir_instr_type_load_const)
++      return true;
++   if (!nir_block_dominates(def_instr->block, st->target))
++      st->ok = false;
++   return st->ok;
++}
++
++static bool
++uniform_hoist_clone_const(nir_src *src, void *data)
++{
++   nir_builder *b = data;
++   nir_instr *def_instr = nir_def_instr(src->ssa);
++   if (def_instr->type != nir_instr_type_load_const)
++      return true;
++   nir_load_const_instr *lc = nir_instr_as_load_const(def_instr);
++   nir_load_const_instr *copy =
++      nir_load_const_instr_create(b->shader, lc->def.num_components,
++                                  lc->def.bit_size);
++   memcpy(copy->value, lc->value,
++          sizeof(lc->value[0]) * lc->def.num_components);
++   nir_builder_instr_insert(b, &copy->instr);
++   nir_src_rewrite(src, &copy->def);
++   return true;
++}
++
++static bool
++nak_nir_hoist_uniform(nir_shader *nir)
++{
++   bool progress = false;
++   nir_divergence_analysis(nir);
++   nir_foreach_function_impl(impl, nir) {
++      nir_metadata_require(impl, nir_metadata_dominance);
++      bool impl_progress = false;
++      nir_builder b = nir_builder_create(impl);
++      nir_foreach_block(block, impl) {
++         if (!block->divergent)
++            continue;
++         /* Level 2: only cbuf loads and the ALU chains that feed nothing
++          * else (pass_flags 1), found walking the block backwards
++          */
++         const bool loads_only = nak_knob_uniform_hoist() >= 2;
++         if (loads_only) {
++            nir_foreach_instr_reverse(instr, block) {
++               instr->pass_flags = 0;
++               if (!uniform_hoist_candidate(instr))
++                  continue;
++               if (instr->type == nir_instr_type_intrinsic) {
++                  instr->pass_flags = 1;
++                  continue;
++               }
++               nir_def *def = &nir_instr_as_alu(instr)->def;
++               bool only = !nir_def_is_unused(def);
++               nir_foreach_use_including_if(use, def) {
++                  if (nir_src_is_if(use) ||
++                      nir_src_use_instr(use)->block != block ||
++                      nir_src_use_instr(use)->pass_flags != 1) {
++                     only = false;
++                     break;
++                  }
++               }
++               instr->pass_flags = only ? 1 : 0;
++            }
++         }
++         nir_block *target = block->imm_dom;
++         while (target != NULL && target->divergent)
++            target = target->imm_dom;
++         if (target == NULL)
++            continue;
++         nir_foreach_instr_safe(instr, block) {
++            if (!uniform_hoist_candidate(instr))
++               continue;
++            if (loads_only && instr->pass_flags != 1)
++               continue;
++            struct uniform_hoist_state st = { .target = target, .ok = true };
++            nir_foreach_src(instr, uniform_hoist_src_ok, &st);
++            if (!st.ok)
++               continue;
++            /* Constant copies first, while instr is still in place */
++            b.cursor = nir_after_block_before_jump(target);
++            nir_foreach_src(instr, uniform_hoist_clone_const, &b);
++            nir_instr_move(nir_after_block_before_jump(target), instr);
++            impl_progress = true;
++         }
++      }
++      progress |= nir_progress(impl_progress, impl, nir_metadata_control_flow);
++   }
++   return progress;
++}
++
+ static uint8_t
+ vectorize_filter_cb(const nir_instr *instr, const void *data)
+ {
+@@ -2049,6 +2173,14 @@ nak_postprocess_nir(nir_shader *nir,
+    if (NAK_CAN_PRINTF)
+       OPT(nir, nak_nir_lower_printf, nak);
+ 
++   /* NAK_UNIFORM_HOIST: uniform values out of divergent control flow, where
++    * NAK would keep them in GPRs, into uniform control flow (UGPRs)
++    */
++   if (nak->sm >= 73 && nak_uniform_hoist_active()) {
++      if (OPT(nir, nak_nir_hoist_uniform))
++         nak_uniform_hoist_note_progress();
++   }
++
+    /* Call divergence analysis regardless of sm version. */
+    nir_divergence_analysis(nir);
+ 
+diff --git a/src/nouveau/compiler/nak_private.h b/src/nouveau/compiler/nak_private.h
+index 4aae8b2..aa99be5 100644
+--- a/src/nouveau/compiler/nak_private.h
++++ b/src/nouveau/compiler/nak_private.h
+@@ -22,6 +22,9 @@ uint32_t nak_knob_gcm(void);
+ uint32_t nak_knob_tex_uhandle(void);
+ bool nak_knob_f16_pair(void);
+ uint32_t nak_knob_temp_if_else(void);
++uint32_t nak_knob_uniform_hoist(void);
++bool nak_uniform_hoist_active(void);
++void nak_uniform_hoist_note_progress(void);
+ bool nak_knob_nir_flatten(void);
+ bool nak_knob_uniform_atomics(void);
+ bool nak_knob_loop_cont_sync(void);
+-- 
+2.43.0
+
