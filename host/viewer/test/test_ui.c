@@ -430,6 +430,45 @@ static void test_vm(void)
     CHECK(!ui.confirm && ui.drag < 0 && ui.hover < 0, "close resets");
 }
 
+/* Upscaler: shown only with a command; a click asks for that mode, lit is
+ * what was last set, nothing acts while a command runs. */
+static void test_upscaler(void)
+{
+    struct nb_vstore st;
+    struct nb_ui ui;
+    struct nb_ui_env e = env_of(2560, 1440, 120);
+    unsigned bits;
+    int i, idx;
+
+    nb_vstore_init(&st);
+    nb_ui_init(&ui, &st);
+    nb_ui_set_open(&ui, &e, true);
+    nb_ui_layout(&ui, &e, NULL, NULL);
+    CHECK(nb_ui_find(&ui, NB_UI_ID_UPSCALER, 0) < 0, "no command: no row");
+
+    e.upscaler = true;
+    e.upscaler_mode = -1;
+    nb_ui_layout(&ui, &e, NULL, NULL);
+    for (i = 0; i < NB_UPSCALER_COUNT; i++) {
+        CHECK(nb_ui_find(&ui, NB_UI_ID_UPSCALER, i) >= 0, "chip %d", i);
+    }
+    CHECK(!strcmp(nb_upscaler_word(NB_UPSCALER_DLSS), "dlss") &&
+          !strcmp(nb_upscaler_word(NB_UPSCALER_XESS), "xess") &&
+          !strcmp(nb_upscaler_word(NB_UPSCALER_DEFAULT), "default") &&
+          !strcmp(nb_upscaler_word(42), "default"), "words");
+
+    bits = click(&ui, &e, NB_UI_ID_UPSCALER, NB_UPSCALER_FSR);
+    CHECK((bits & NB_UI_UPSCALER) && ui.upscaler == NB_UPSCALER_FSR,
+          "click asks for fsr: %#x", bits);
+
+    e.upscaler_busy = true;
+    nb_ui_layout(&ui, &e, NULL, NULL);
+    idx = nb_ui_find(&ui, NB_UI_ID_UPSCALER, NB_UPSCALER_DLSS);
+    CHECK(idx >= 0 && ui.item[idx].disabled, "busy: disabled");
+    bits = click(&ui, &e, NB_UI_ID_UPSCALER, NB_UPSCALER_DLSS);
+    CHECK(!(bits & NB_UI_UPSCALER), "busy: a click does nothing");
+}
+
 /* Pause / Resume: one toggle, no confirming click, idle while it runs. */
 static void test_vm_pause(void)
 {
@@ -806,6 +845,7 @@ int main(void)
     test_text();
     test_vm();
     test_vm_pause();
+    test_upscaler();
     test_drag();
     test_paint();
     test_mode_list();

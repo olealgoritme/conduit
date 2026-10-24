@@ -83,6 +83,12 @@ that fades in when the pointer touches the window's top edge. The menu has:
   VSync, or Latest per refresh. See
   [Presentation](#presentation-immediate-vsync-or-latest-per-refresh).
 - **View**: the stats overlay and fullscreen.
+- **Upscaler in games** (Windows guests with the Conduit tray): Game default,
+  DLSS (latest model), FSR or XeSS, which runs `conduit upscaler NAME MODE`.
+  It applies to games started afterwards: DLSS asks NGX for its newest model,
+  FSR and XeSS reach games that have OptiScaler installed. The chip of the
+  last successful choice is lit; nothing is lit until the viewer has set one.
+  See [guest/nvk-rm/docs/dlss.md](../guest/nvk-rm/docs/dlss.md).
 - **Virtual machine**: Pause / Resume, Restart and Shut down, which run
   `conduit pause`, `conduit resume`, `conduit reboot` and `conduit shutdown`
   for the VM. Restart and Shut down ask for a second click to confirm.

@@ -13,8 +13,8 @@
 
 use conduit_ctl::{
     b64_decode, b64_encode, App, Apps, Chunk, Entry, GetArgs, Icon, Listing, Op, Pong, PutArgs,
-    Request, Response, RunArgs, Sha256, Started, Written, CHUNK, MAX_FILE, MAX_ICON, MAX_LINE,
-    VERSION,
+    Request, Response, RunArgs, Sha256, Started, UpscalerState, Written, CHUNK, MAX_FILE, MAX_ICON,
+    MAX_LINE, VERSION,
 };
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -51,6 +51,11 @@ pub trait Backend: Send + Sync {
     /// resumed from sleep). A backend that cannot says so.
     fn set_time(&self, _t: &UtcTime) -> Result<(), String> {
         Err("this agent cannot set the clock".into())
+    }
+    /// The upscaler override (`upscaler`): set it to `mode` (already one of
+    /// `UPSCALER_MODES`) when given, and say what is set.
+    fn upscaler(&self, _mode: Option<&str>) -> Result<UpscalerState, String> {
+        Err("this agent has no upscaler setting".into())
     }
 }
 
@@ -200,6 +205,15 @@ impl<B: Backend> Agent<B> {
                 .ok_or_else(|| format!("{unix_ms} ms is not a plausible time"))
                 .and_then(|t| self.backend.set_time(&t))
                 .map(|()| Response::ok(id, &())),
+            Op::Upscaler { mode } => match mode.as_deref().map(crate::upscaler::mode) {
+                Some(None) => Err(format!(
+                    "unknown upscaler mode; one of: {}",
+                    conduit_ctl::UPSCALER_MODES.join(", ")
+                )),
+                Some(Some(m)) => self.backend.upscaler(Some(m)),
+                None => self.backend.upscaler(None),
+            }
+            .map(|s| Response::ok(id, &s)),
         };
         r.unwrap_or_else(|e| Response::err(id, e))
     }
@@ -647,12 +661,25 @@ mod tests {
         refuse_user: bool,
         /// What `settime` set.
         clock: Mutex<Option<UtcTime>>,
+        /// What `upscaler` set.
+        upscaler: Mutex<Option<String>>,
     }
 
     impl Backend for Fake {
         fn set_time(&self, t: &UtcTime) -> Result<(), String> {
             *lock(&self.clock) = Some(*t);
             Ok(())
+        }
+        fn upscaler(&self, mode: Option<&str>) -> Result<UpscalerState, String> {
+            if let Some(m) = mode {
+                *lock(&self.upscaler) = Some(m.to_string());
+            }
+            Ok(UpscalerState {
+                mode: lock(&self.upscaler)
+                    .clone()
+                    .unwrap_or_else(|| "default".into()),
+                optiscaler_games: 0,
+            })
         }
         fn user(&self) -> String {
             "tester".into()
@@ -796,6 +823,31 @@ mod tests {
         let r = call(&a, Op::SetTime { unix_ms: 5 });
         assert!(!r.ok);
         assert!(r.error.unwrap().contains("not a plausible time"));
+    }
+
+    #[test]
+    fn upscaler_takes_only_known_modes() {
+        let a = agent(None);
+        let s: UpscalerState = call(&a, Op::Upscaler { mode: None }).into_body().unwrap();
+        assert_eq!(s.mode, "default");
+        let s: UpscalerState = call(
+            &a,
+            Op::Upscaler {
+                mode: Some("XeSS".into()),
+            },
+        )
+        .into_body()
+        .unwrap();
+        assert_eq!(s.mode, "xess", "lower-cased before the backend sees it");
+        let r = call(
+            &a,
+            Op::Upscaler {
+                mode: Some("fsr4; reg delete".into()),
+            },
+        );
+        assert!(!r.ok);
+        assert!(r.error.unwrap().contains("unknown upscaler mode"));
+        assert_eq!(lock(&a.backend.upscaler).as_deref(), Some("xess"));
     }
 
     #[test]

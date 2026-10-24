@@ -72,6 +72,114 @@ fn set(root: HKEY, sub: &str, name: &str, kind: u32, data: &[u8]) -> bool {
     ok
 }
 
+const HELIOS: &str = r"SOFTWARE\Helios";
+const OPTISCALER_GAMES: &str = r"SOFTWARE\Helios\OptiScaler";
+
+fn reg_sz(s: &str) -> Vec<u8> {
+    wide(s).iter().flat_map(|c| c.to_le_bytes()).collect()
+}
+
+fn from_reg_sz(b: &[u8]) -> String {
+    let w: Vec<u16> = b
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .take_while(|&c| c != 0)
+        .collect();
+    String::from_utf16_lossy(&w)
+}
+
+/// The REG_SZ values of a key (name, data).
+fn sz_values(root: HKEY, sub: &str) -> Vec<(String, String)> {
+    use windows_sys::Win32::Foundation::ERROR_NO_MORE_ITEMS;
+    let Some(k) = open(root, sub, false) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for i in 0.. {
+        let mut name = [0u16; 512];
+        let mut nlen = name.len() as u32;
+        let mut kind = 0u32;
+        let mut data = vec![0u8; 2048];
+        let mut dlen = data.len() as u32;
+        let r = unsafe {
+            RegEnumValueW(
+                k,
+                i,
+                name.as_mut_ptr(),
+                &mut nlen,
+                null(),
+                &mut kind,
+                data.as_mut_ptr(),
+                &mut dlen,
+            )
+        };
+        if r == ERROR_NO_MORE_ITEMS {
+            break;
+        }
+        if r != ERROR_SUCCESS || kind != REG_SZ {
+            continue;
+        }
+        data.truncate(dlen as usize);
+        out.push((
+            String::from_utf16_lossy(&name[..nlen as usize]),
+            from_reg_sz(&data),
+        ));
+    }
+    unsafe { RegCloseKey(k) };
+    out
+}
+
+/// `upscaler` (the viewer's Upscaler row): HKLM\SOFTWARE\Helios Upscaler,
+/// `Dlss` = 1 with `dlss`, and the OptiScaler.ini of every game listed
+/// under HKLM\SOFTWARE\Helios\OptiScaler (gpu_tray::upscaler).
+pub fn upscaler(mode: Option<&str>) -> Result<conduit_ctl::UpscalerState, String> {
+    use gpu_tray::upscaler as up;
+    let games: Vec<String> = sz_values(HKEY_LOCAL_MACHINE, OPTISCALER_GAMES)
+        .into_iter()
+        .map(|(_, path)| path)
+        .filter(|p| up::ini_path_ok(p))
+        .collect();
+    let mut updated = 0u32;
+    let current = match mode {
+        Some(m) => {
+            if !set(HKEY_LOCAL_MACHINE, HELIOS, "Upscaler", REG_SZ, &reg_sz(m)) {
+                return Err("cannot write HKLM\\SOFTWARE\\Helios Upscaler".into());
+            }
+            if m == "dlss" {
+                let one = 1u32.to_le_bytes();
+                if !set(HKEY_LOCAL_MACHINE, HELIOS, "Dlss", REG_DWORD, &one) {
+                    return Err("cannot write HKLM\\SOFTWARE\\Helios Dlss".into());
+                }
+            }
+            for g in &games {
+                let Ok(ini) = std::fs::read_to_string(g) else {
+                    continue;
+                };
+                let new = up::optiscaler_ini(&ini, m);
+                if new == ini || std::fs::write(g, new).is_ok() {
+                    updated += 1;
+                }
+            }
+            m.to_string()
+        }
+        None => {
+            updated = games
+                .iter()
+                .filter(|g| std::path::Path::new(g).is_file())
+                .count() as u32;
+            get(HKEY_LOCAL_MACHINE, HELIOS, "Upscaler")
+                .map(|b| from_reg_sz(&b))
+                .and_then(|s| up::mode(&s))
+                .unwrap_or("default")
+                .to_string()
+        }
+    };
+    Ok(conduit_ctl::UpscalerState {
+        mode: current,
+        optiscaler_games: updated,
+    })
+}
+
 /// Is the volume at `root` ("Z:\\") the virtiofs share `tag`? A letter in
 /// the drive map is trusted only when the volume there says so (label and
 /// file system), not just because some drive has that letter.
