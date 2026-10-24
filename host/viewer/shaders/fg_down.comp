@@ -1,0 +1,29 @@
+// SPDX-License-Identifier: GPL-2.0 OR Apache-2.0
+//
+// fg_down.comp -- one level of the frame-generation luma pyramid
+// (docs/VIEWER-ENHANCE.md).  Each output texel is the average of a 2x2
+// block of the level below, read as one bilinear tap at the block's centre.
+// u_luma = 1: the source is the colour frame and luma is taken here (Rec.601
+// weights; the flow only needs a stable brightness).
+//
+// Follows shaders/es_comp.glsl (nb_gpuscale.c).
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+uniform highp sampler2D u_src;
+layout(rgba16f, binding = 0) uniform writeonly highp image2D u_dst;
+uniform ivec2 u_size;           // destination size
+uniform vec2  u_inv_src;        // 1 / source size
+uniform int   u_luma;
+
+void main()
+{
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+
+    if (p.x >= u_size.x || p.y >= u_size.y) {
+        return;
+    }
+    vec4 c = textureLod(u_src, (vec2(p) * 2.0 + 1.0) * u_inv_src, 0.0);
+    float y = u_luma != 0 ? dot(c.rgb, vec3(0.299, 0.587, 0.114)) : c.r;
+    imageStore(u_dst, p, vec4(y, 0.0, 0.0, 1.0));
+}

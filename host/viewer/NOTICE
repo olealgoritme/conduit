@@ -27,5 +27,14 @@ Conduit (2026-10): renamed the binary to conduit-viewer and replaced
 README.md. Upstream's README and docs/internal/broker-design.md are not
 included; docs/broker-protocol.md is kept with an origin note.
 
+Third-party shader sources (third_party/, see third_party/README.md), MIT:
+  AMD FidelityFX Super Resolution 1 (ffx_a.h, ffx_fsr1.h)
+    Copyright (c) 2021 Advanced Micro Devices, Inc.
+  AMD FidelityFX Contrast Adaptive Sharpening (ffx_cas.h)
+    Copyright (c) 2017-2019 Advanced Micro Devices, Inc.
+  NVIDIA Image Scaling SDK v1.0.3 (NIS_Scaler.h, NIS_Config.h; ported in
+  shaders/nis_scaler_gles.glsl, coefficients in shaders/nis_coef.h)
+    Copyright (c) 2022 NVIDIA CORPORATION & AFFILIATES.
+
 "NVIDIA" is a trademark of NVIDIA Corporation. Nothing here is affiliated
 with or endorsed by NVIDIA.

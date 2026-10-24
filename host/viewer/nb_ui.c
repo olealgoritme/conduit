@@ -761,6 +761,50 @@ area:
     }
     field(&b, NB_UI_ID_PROF_FIELD, "Save current as... (name, Enter)");
 
+    /* picture enhancement (docs/VIEWER-ENHANCE.md) */
+    section(&b, "Upscaling");
+    {
+        static const int order[NB_UPSCALE_COUNT] = {
+            NB_UPSCALE_OFF, NB_UPSCALE_FSR, NB_UPSCALE_NIS, NB_UPSCALE_CAS,
+        };
+
+        for (i = 0; i < NB_UPSCALE_COUNT; i++) {
+            chip(&b, nb_upscale_label(order[i]), NB_UI_ID_UPSCALE, order[i],
+                 st->upscale == order[i],
+                 order[i] != NB_UPSCALE_OFF && !env->enhance_ok);
+        }
+    }
+    if (st->upscale != NB_UPSCALE_OFF) {
+        static const int lv[5] = { 0, 25, 50, 75, 100 };
+
+        hint(&b, "Sharpness:");
+        for (i = 0; i < 5; i++) {
+            snprintf(s, sizeof(s), "%d", lv[i]);
+            chip(&b, s, NB_UI_ID_SHARP, lv[i], st->sharp == lv[i], false);
+        }
+    }
+    hint(&b, env->enhance_ok ? "Pair with a lower guest resolution"
+                             : "Needs the viewer's GPU pass (not here)");
+
+    section(&b, "Frame generation");
+    for (i = 0; i < NB_FGEN_COUNT; i++) {
+        if (i == NB_FGEN_NVSM && !env->nvsm_ok && st->fgen != NB_FGEN_NVSM) {
+            continue;           /* not an NVIDIA RTX 40/50 host: hidden */
+        }
+        chip(&b, nb_fgen_label(i), NB_UI_ID_FGEN, i, st->fgen == i,
+             i != NB_FGEN_OFF && i != NB_FGEN_NVSM && !env->enhance_ok);
+    }
+    if (st->fgen == NB_FGEN_NVSM && env->nvsm_restart) {
+        hint(&b, "Smooth Motion: restart the viewer to apply");
+    } else if (st->fgen == NB_FGEN_NVSM) {
+        hint(&b, "The NVIDIA driver generates frames; adds latency");
+    } else {
+        hint(&b, "Adds about one guest frame of latency");
+    }
+    if (env->enhance_why && env->enhance_why[0]) {
+        hint(&b, env->enhance_why);
+    }
+
     /* presentation */
     section(&b, env->immediate ? "Presentation (immediate now)"
                                : "Presentation (vsync now)");
@@ -1131,6 +1175,29 @@ static unsigned act(struct nb_ui *ui, const struct nb_ui_env *env,
         st->sync = it->arg;
         return noticef(ui, bits | NB_UI_SYNC | NB_UI_SAVE | NB_UI_REDRAW,
                        "Presentation: %s", nb_sync_label(it->arg));
+    case NB_UI_ID_UPSCALE:
+        if (st->upscale == it->arg) {
+            return bits | NB_UI_REDRAW;
+        }
+        st->upscale = it->arg;
+        nb_ui_layout(ui, env, NULL, NULL);
+        return noticef(ui, bits | NB_UI_ENHANCE | NB_UI_SAVE | NB_UI_REDRAW,
+                       "Upscaling: %s", nb_upscale_label(it->arg));
+    case NB_UI_ID_SHARP:
+        if (st->sharp == it->arg) {
+            return bits | NB_UI_REDRAW;
+        }
+        st->sharp = it->arg;
+        return noticef(ui, bits | NB_UI_ENHANCE | NB_UI_SAVE | NB_UI_REDRAW,
+                       "Sharpness: %d", it->arg);
+    case NB_UI_ID_FGEN:
+        if (st->fgen == it->arg) {
+            return bits | NB_UI_REDRAW;
+        }
+        st->fgen = it->arg;
+        nb_ui_layout(ui, env, NULL, NULL);
+        return noticef(ui, bits | NB_UI_ENHANCE | NB_UI_SAVE | NB_UI_REDRAW,
+                       "Frame generation: %s", nb_fgen_label(it->arg));
     case NB_UI_ID_STATS:
         return bits | NB_UI_STATS | NB_UI_REDRAW;
     case NB_UI_ID_FULLSCREEN:

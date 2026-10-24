@@ -1,0 +1,115 @@
+// SPDX-License-Identifier: GPL-2.0 OR Apache-2.0
+//
+// fg_flow.comp -- block-matching optical flow for frame generation, one
+// pyramid level per dispatch, coarse to fine (docs/VIEWER-ENHANCE.md).
+//
+// The match is SYMMETRIC about the moment being generated: for a texel p of
+// the in-between picture and a candidate motion v (previous -> newest frame),
+// the previous frame is read at p - v/2 and the newest at p + v/2, and the
+// candidate is scored by how alike the two 3x3 neighbourhoods are.  That
+// gives a vector for every texel of the picture to be made -- no holes, no
+// forward splatting -- and is the usual approach of frame-rate converters.
+//
+//   coarsest level   exhaustive search, |v| <= u_radius level texels
+//   finer levels     the coarser level's vector here and at its four
+//                    neighbours (so a texel on an object's edge can take
+//                    either side's motion), and zero motion; the best of
+//                    those is refined by one texel in each direction
+//
+// A small cost per texel of motion prefers the shorter of two equally good
+// vectors (flat areas, repeating patterns).  Output: rg = motion in SOURCE
+// pixels (the frame's own resolution), b = the match cost (mean absolute
+// luma difference), which the interpolation turns into a confidence.
+//
+// Follows shaders/es_comp.glsl (nb_gpuscale.c).
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+uniform highp sampler2D u_prev;     // luma, this level
+uniform highp sampler2D u_cur;
+uniform highp sampler2D u_coarse;   // flow of the level above (refinement)
+layout(rgba16f, binding = 0) uniform writeonly highp image2D u_dst;
+uniform ivec2 u_size;               // this level
+uniform ivec2 u_csize;              // the coarser level
+uniform vec2  u_inv;                // 1 / this level's size
+uniform float u_scale;              // source pixels per texel of this level
+uniform int   u_radius;             // coarsest: search radius, texels
+uniform int   u_refine;             // 1: refine u_coarse, 0: full search
+
+const float LAMBDA = 0.002;         // cost per texel of motion
+
+float match(vec2 c, vec2 v)
+{
+    vec2 a = c - 0.5 * v;
+    vec2 b = c + 0.5 * v;
+    float s = 0.0;
+
+    for (int dy = -1; dy <= 1; dy++) {
+        for (int dx = -1; dx <= 1; dx++) {
+            vec2 d = vec2(float(dx), float(dy));
+            float pa = textureLod(u_prev, (a + d) * u_inv, 0.0).r;
+            float pb = textureLod(u_cur, (b + d) * u_inv, 0.0).r;
+            s += abs(pa - pb);
+        }
+    }
+    return s * (1.0 / 9.0) + LAMBDA * (abs(v.x) + abs(v.y));
+}
+
+void main()
+{
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+
+    if (p.x >= u_size.x || p.y >= u_size.y) {
+        return;
+    }
+    vec2 c = vec2(p) + 0.5;
+    vec2 best = vec2(0.0);
+    float bc = match(c, best);
+
+    if (u_refine == 0) {
+        for (int y = -u_radius; y <= u_radius; y++) {
+            for (int x = -u_radius; x <= u_radius; x++) {
+                vec2 v = vec2(float(x), float(y));
+                float k = match(c, v);
+
+                if (k < bc) {
+                    bc = k;
+                    best = v;
+                }
+            }
+        }
+    } else {
+        ivec2 q = p / 2;
+        ivec2 off[5] = ivec2[5](ivec2(0, 0), ivec2(-1, 0), ivec2(1, 0),
+                                ivec2(0, -1), ivec2(0, 1));
+
+        for (int i = 0; i < 5; i++) {
+            ivec2 t = clamp(q + off[i], ivec2(0), u_csize - 1);
+            vec2 v = texelFetch(u_coarse, t, 0).rg / u_scale;
+            float k = match(c, v);
+
+            if (k < bc) {
+                bc = k;
+                best = v;
+            }
+        }
+        vec2 seed = best;
+
+        for (int y = -1; y <= 1; y++) {
+            for (int x = -1; x <= 1; x++) {
+                if (x == 0 && y == 0) {
+                    continue;
+                }
+                vec2 v = seed + vec2(float(x), float(y));
+                float k = match(c, v);
+
+                if (k < bc) {
+                    bc = k;
+                    best = v;
+                }
+            }
+        }
+    }
+    float raw = bc - LAMBDA * (abs(best.x) + abs(best.y));
+    imageStore(u_dst, p, vec4(best * u_scale, raw, 1.0));
+}

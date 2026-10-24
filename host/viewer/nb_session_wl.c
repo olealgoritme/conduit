@@ -56,6 +56,8 @@
 #include "nb_gpuscale.h"
 #include "nb_pace.h"
 #include "nb_latch.h"
+#include "nb_fg.h"
+#include "nb_vkpresent.h"
 #include "nb_blit.h"
 #include "nb_scanout.h"
 #include "nb_present.h"
@@ -748,6 +750,40 @@ struct nb_wl {
     void           *gt_shm;
     size_t          gt_shm_sz;
     uint64_t        st_gs_sum, st_gs_max; unsigned st_gs_n, st_gs_drop;
+    /*
+     * PICTURE ENHANCEMENT (docs/VIEWER-ENHANCE.md).  An upscaler or frame
+     * generation routes every dma-buf frame through the GPU pass above, in
+     * any window mode.  Frame generation keeps the last two frames on the
+     * GPU (nb_gs_fg_push) and shows the pictures between them on its own
+     * timer (nb_fg.h), into the same targets.
+     */
+    struct nb_fg    fg;
+    /* The outputs' current refresh (wl_output mode), and the one the window
+     * is on: frame generation's refresh when wp_presentation reports none
+     * (a headless output, a compositor without it). */
+#define NB_WL_OUTPUTS 8
+    struct { struct wl_output *o; unsigned mhz; } out[NB_WL_OUTPUTS];
+    int             n_out, out_on;
+    bool            enh_noviewport_told;
+    int             fg_tfd;         /* -1 until first needed               */
+    int             fg_pfd;         /* index in the pollfds, -1 none       */
+    bool            fg_armed;
+    bool            fg_live;        /* the history holds the shown frame   */
+    bool            fg_dead;        /* failed: off for this session        */
+    struct nb_gs_draw fg_d;         /* the last draw's placement           */
+    int             fg_mult_was;
+    unsigned        st_fg, st_fg_retry;
+    char            enh_note[96];   /* why a choice is not in force (menu) */
+    int             enh_logged;     /* NB_UPSCALE_* last reported           */
+    /* NVIDIA Smooth Motion: a Vulkan swapchain on its own subsurface
+     * (nb_vkpresent.h), made at startup when the host has it. */
+    struct nb_vkp  *vkp;
+    struct wl_surface    *vk_surf;
+    struct wl_subsurface *vk_sub;
+    struct wp_viewport   *vk_vp;
+    bool            vk_on;          /* frames go through the swapchain     */
+    bool            vk_dead;
+    bool            vk_shown;
     unsigned        st_held;        /* commits the gate held back       */
     /* The GPU copy for layouts the compositor does not take (nb_blit.h):
      * what the viewer's GPU said per pair, and frames copied this second. */
@@ -932,6 +968,7 @@ static int  bd_index(const struct nb_wl *w, const struct wl_surface *s);
 /* Forward: the idle placeholder is released by wl_commit once a real frame is
  * on screen; defined with the rest of the placeholder code. */
 static void wl_idle_drop(struct nb_wl *w);
+static int  wl_fg_mult(const struct nb_wl *w);
 /* Forward: presentation feedback is requested by wl_commit, defined below. */
 extern const struct wp_presentation_feedback_listener nb_pres_listener;
 /* Forward: virtio-nvgpu viewer pieces, defined after the registry. */
@@ -1153,20 +1190,44 @@ static void nb_stats_flush(struct nb_wl *w, uint64_t now)
         uint32_t cp50, cp99, pi50, pi99;
         double pi_mean = 0, pi_sd = 0;
         unsigned i;
-        char gs[200] = "";
+        char gs[512] = "";
 
-        if (w->st_gs_n || w->st_gs_drop) {
+        if (w->vk_on) {
+            snprintf(gs, sizeof(gs), " | smooth motion %u frames through the "
+                     "Vulkan swapchain, blit avg %.0fus max %lluus | path: "
+                     "Vulkan swapchain on %s (NVIDIA Smooth Motion)",
+                     w->st_gs_n,
+                     w->st_gs_n ? (double)w->st_gs_sum / w->st_gs_n : 0.0,
+                     (unsigned long long)w->st_gs_max, nb_vkp_device(w->vkp));
+        } else if (w->st_gs_n || w->st_gs_drop) {
             snprintf(gs, sizeof(gs), " | gpu-scale %u frames, pass avg %.0fus "
                      "max %lluus, %u dropped | path: %s on %s%s", w->st_gs_n,
                      w->st_gs_n ? (double)w->st_gs_sum / w->st_gs_n : 0.0,
                      (unsigned long long)w->st_gs_max, w->st_gs_drop,
                      w->st_copy ? "GPU copy (the compositor does not take "
                                   "the guest's format/modifier)"
+                     : w->vst.upscale ? nb_upscale_label(
+                                            nb_gs_enh_status(w->gs, NULL))
+                     : wl_fg_mult(w) > 1 ? "GPU pass (frame generation)"
                                 : "GPU pass (fullscreen scaler)",
                      w->gs ? nb_gs_node(w->gs) : "?",
                      w->gt_rb ? ", read back into shared memory" : "");
         } else if (w->st_commits) {
             snprintf(gs, sizeof(gs), " | path: direct attach");
+        }
+        if (w->fg_live || w->st_fg) {
+            size_t k = strlen(gs);
+
+            /* Committed pictures per second, the guest's and the generated
+             * ones apart (the commit figure above counts guest frames). */
+            snprintf(gs + k, sizeof(gs) - k, " | framegen %ux: shown %.1f/s "
+                     "guest + %.1f/s generated, %u retried, guest interval "
+                     "%.1fms, output %.0f Hz%s", w->fg.eff > 1 ? w->fg.eff : 1,
+                     w->st_gs_n / secs, w->st_fg / secs, w->st_fg_retry,
+                     (double)w->fg.interval / 1e6,
+                     w->fg.refresh ? 1e9 / (double)w->fg.refresh : 0.0,
+                     w->presentation && w->pres_clock != UINT32_MAX
+                         ? "" : " (no presentation feedback)");
         }
 
         for (i = 0; i < w->st_pi_k; i++) {
@@ -1218,6 +1279,7 @@ static void nb_stats_flush(struct nb_wl *w, uint64_t now)
     w->st_nudges = 0;
     w->st_gs_sum = w->st_gs_max = 0;
     w->st_gs_n = w->st_gs_drop = 0;
+    w->st_fg = w->st_fg_retry = 0;
     w->st_copy = 0;
     w->st_cp_k = w->st_pi_k = 0;
     w->st_t0 = now;
@@ -1297,6 +1359,9 @@ static void wl_buf_destroy(struct nb_wl *w, int i)
     }
     if (w->gs) {
         nb_gs_src_drop(w->gs, i);
+    }
+    if (w->vkp) {
+        nb_vkp_forget(w->vkp, i);
     }
     if (w->bufs[i].fd >= 0) {
         close(w->bufs[i].fd);
@@ -2541,6 +2606,25 @@ static void wl_gs_disable(struct nb_wl *w, const char *why)
     }
 }
 
+/* ── picture enhancement (docs/VIEWER-ENHANCE.md) ───────────────────────── */
+
+/* Frames shown per guest frame by the viewer's own frame generation (1 =
+ * off).  Off with --sync=latch, whose one-commit-per-refresh rule it would
+ * break, and once it failed. */
+static int wl_fg_mult(const struct nb_wl *w)
+{
+    if (w->fg_dead || wl_latch_on(w)) {
+        return 1;
+    }
+    return nb_fgen_mult(w->vst.fgen);
+}
+
+/* A choice that needs the GPU pass for every frame. */
+static bool wl_enh_on(const struct nb_wl *w)
+{
+    return w->vst.upscale != NB_UPSCALE_OFF || wl_fg_mult(w) > 1;
+}
+
 /*
  * Whether the scaler COULD take this frame: fullscreen, a dma-buf, a viewport
  * to undo, and a scaler that has not failed.  Whether it does is
@@ -2766,7 +2850,13 @@ static bool wl_gs_ready(struct nb_wl *w, const struct nb_wl_buf *sl, int pw,
  * main surface.  1: shown.  0: dropped this time (no free target yet; the
  * previous picture stays).  -1: not possible, use the compositor's scaling.
  */
-static int wl_gs_present(struct nb_wl *w, int slot, int pw, int ph)
+static void wl_fg_arm(struct nb_wl *w);
+static int  wl_vk_frame(struct nb_wl *w, int slot);
+static void wl_vk_retry(struct nb_wl *w);
+static void wl_vk_changed(struct nb_wl *w);
+
+static int wl_gs_present(struct nb_wl *w, int slot, int pw, int ph,
+                         bool fresh)
 {
     struct nb_wl_buf *sl = &w->bufs[slot];
     const struct nb_place *p = &w->place;
@@ -2803,7 +2893,43 @@ static int wl_gs_present(struct nb_wl *w, int slot, int pw, int ph)
         .sx = p->sw > 0 ? p->sx : 0, .sy = p->sh > 0 ? p->sy : 0,
         .sw = p->sw > 0 ? p->sw : sl->w, .sh = p->sh > 0 ? p->sh : sl->h,
         .nearest = w->vst.cur.filter == NB_FILTER_NEAREST,
+        .upscale = w->vst.upscale, .sharp = w->vst.sharp,
     };
+    /*
+     * FRAME GENERATION.  A new frame goes into the GPU's two-frame history
+     * (and its flow is estimated) before the guest gets its buffer back; what
+     * is drawn now is the first picture of the new cycle (nb_fg.h).  A redraw
+     * of the same frame (a relayout) takes the newest history frame, so it
+     * never reads a buffer that is the guest's again.
+     */
+    if (wl_fg_mult(w) > 1 && nb_gs_enhance_ok(w->gs, NULL)) {
+        if (fresh) {
+            unsigned us = 0;
+            /* Submitted without a wait: the draw below waits for both,
+             * one GPU submission per guest frame. */
+            int pr = nb_gs_fg_push(w->gs, slot, d.sx, d.sy, d.sw, d.sh, 0,
+                                   &us);
+
+            if (pr < 0) {
+                w->fg_dead = true;
+                w->fg_live = false;
+                nb_err("frame generation: off for this session: the GPU "
+                       "passes failed (%d)", pr);
+            } else {
+                gpu_us += us;
+                d.src_key = NB_GS_SRC_FG;
+                d.fg_t = nb_fg_arrival(&w->fg, nb_mono_ns(), pr == 1);
+                w->fg_live = true;
+            }
+        } else if (w->fg_live && nb_gs_fg_ready(w->gs)) {
+            d.src_key = NB_GS_SRC_FG;
+            d.fg_t = 1.0f;
+        }
+    } else if (w->fg_live) {
+        w->fg_live = false;
+        nb_gs_fg_reset(w->gs);
+        nb_fg_reset(&w->fg);
+    }
     r = nb_gs_draw(w->gs, &d, 50000, &gpu_us);
     if (r < 0) {
         wl_gs_disable(w, r == -ETIMEDOUT ? "the GPU pass took over 50 ms"
@@ -2829,17 +2955,38 @@ static int wl_gs_present(struct nb_wl *w, int slot, int pw, int ph)
         w->st_gs_max = gpu_us;
     }
     w->gt_last = t;
-    /* The main surface: one opaque output-size buffer, nothing on top. */
+    w->fg_d = d;
+    if (d.src_key == NB_GS_SRC_FG && fresh) {
+        wl_fg_arm(w);
+    }
+    {
+        const char *why = NULL;
+        int used = nb_gs_enh_status(w->gs, &why);
+
+        if (w->vst.upscale != NB_UPSCALE_OFF &&
+            (used != w->enh_logged || !w->gs_shown)) {
+            w->enh_logged = used;
+            nb_log("upscaling: %s asked, %s runs%s%s",
+                   nb_upscale_label(w->vst.upscale), nb_upscale_label(used),
+                   why ? ": " : "", why ? why : "");
+        }
+        snprintf(w->enh_note, sizeof(w->enh_note), "%s%s",
+                 used != w->vst.upscale && w->vst.upscale ? "Upscaler: " : "",
+                 used != w->vst.upscale && w->vst.upscale && why ? why : "");
+    }
+    /* The main surface: one opaque output-size buffer, nothing on top.
+     * Without wp_viewporter the buffer is the surface's size already
+     * (wl_nvp_frame), so there is nothing to set. */
     wl_leave_sub(w);
-    if (w->vp_src[0]) {
+    if (w->viewport && w->vp_src[0]) {
         wp_viewport_set_source(w->viewport, wl_fixed_from_int(-1),
                                wl_fixed_from_int(-1), wl_fixed_from_int(-1),
                                wl_fixed_from_int(-1));
         w->vp_src[0] = false;
     }
-    if (pw == w->win_w && ph == w->win_h) {
+    if (w->viewport && pw == w->win_w && ph == w->win_h) {
         wp_viewport_set_destination(w->viewport, -1, -1);
-    } else {
+    } else if (w->viewport) {
         wp_viewport_set_destination(w->viewport, w->win_w, w->win_h);
     }
     /* The pass was waited for: the acquire point is signalled at the
@@ -2863,6 +3010,63 @@ static int wl_gs_present(struct nb_wl *w, int slot, int pw, int ph)
                         : w->so.why);
     }
     return 1;
+}
+
+/*
+ * PICTURE ENHANCEMENT WITHOUT wp_viewporter.  Then a surface is the size of
+ * its buffer, and the guest's buffer is shown 1:1 as it is (the plain path,
+ * unchanged).  With an upscaler or frame generation on, the GPU pass instead
+ * draws a buffer of the WINDOW's size -- the configured size, or the guest's
+ * when the compositor leaves the size to us -- with the picture placed as
+ * the scaling settings say (nb_view_place), and that buffer is the surface:
+ * nothing needs a viewport.  Gamescope's headless backend and any compositor
+ * without the protocol take this path.  true: drawn (or dropped: gs_dropped),
+ * *out_w x *out_h is the surface now; false: the plain path shows the frame.
+ */
+static bool wl_nvp_frame(struct nb_wl *w, struct nb_wl_buf *sl, int *out_w,
+                         int *out_h)
+{
+    int pw, ph, r;
+
+    w->gs_frame = false;
+    w->gs_dropped = false;
+    if (!wl_enh_on(w) || w->gs_dead || sl->fd < 0 || sl->shm) {
+        if (w->gs_shown) {
+            w->gs_shown = false;
+            /* The surface is the guest's buffer again: the pointer maps 1:1
+             * (the placement the pass used would map it wrongly). */
+            nb_view_place(&w->vst.cur, (int)sl->w, (int)sl->h, (int)sl->w,
+                          (int)sl->h, 120, &w->place);
+            nb_log("picture: the guest's buffer as it is again (no "
+                   "wp_viewporter)");
+        }
+        return false;
+    }
+    pw = w->win_w > 0 ? w->win_w : (int)sl->w;
+    ph = w->win_h > 0 ? w->win_h : (int)sl->h;
+    /* Placed in window coordinates at scale 1: the buffer is the window. */
+    nb_view_place(&w->vst.cur, (int)sl->w, (int)sl->h, pw, ph, 120,
+                  &w->place);
+    w->fit_w = w->place.pic.w;
+    w->fit_h = w->place.pic.h;
+    w->off_x = w->place.vis.x;
+    w->off_y = w->place.vis.y;
+    if (w->win_w <= 0 || w->win_h <= 0) {
+        w->win_w = pw;
+        w->win_h = ph;
+    }
+    r = wl_gs_present(w, w->pending, pw, ph, true);
+    if (r < 0) {
+        return false;
+    }
+    w->gs_frame = true;
+    w->gs_dropped = r == 0;
+    *out_w = pw;
+    *out_h = ph;
+    if (w->gc_on && gc_layout(w, false)) {
+        cur_apply(w, w->last_serial);
+    }
+    return true;
 }
 
 static struct wl_surface *wl_viewport_apply(struct nb_wl *w, int bw, int bh,
@@ -2926,11 +3130,16 @@ static struct wl_surface *wl_viewport_apply(struct nb_wl *w, int bw, int bh,
         /* --gpu-scale=off turns off the scaler, not the copy: a copy-only
          * frame has no other way to the screen. */
         bool usable = !w->gs_dead && w->viewport;
+        /* An upscaler or frame generation: every dma-buf frame through the
+         * pass, in every window mode (docs/VIEWER-ENHANCE.md). */
+        bool enh = usable && wl_enh_on(w) && slot >= 0 && slot < NB_MAX_BUFS &&
+                   w->bufs[slot].valid && w->bufs[slot].fd >= 0 &&
+                   !w->bufs[slot].shm;
 
         w->gs_frame = false;
         w->gs_dropped = false;
-        if ((copy_only && usable) || (eligible && path == NB_SO_GPU)) {
-            int r = wl_gs_present(w, slot, pw, ph);
+        if ((copy_only && usable) || (eligible && path == NB_SO_GPU) || enh) {
+            int r = wl_gs_present(w, slot, pw, ph, new_frame);
 
             if (r >= 0) {
                 w->gs_frame = true;
@@ -3192,6 +3401,40 @@ static int wl_commit(struct nb_session *s, struct nb_sink *sink)
      * to scan out.  Without wp_viewporter the surface is the buffer, as
      * before, and the window is whatever size the guest picked.
      */
+    /* NVIDIA Smooth Motion: the frame goes through the Vulkan swapchain. */
+    if (w->vk_on && w->viewport && w->win_w > 0 && w->win_h > 0 &&
+        sl->fd >= 0 && !sl->shm) {
+        int r = wl_vk_frame(w, w->pending);
+
+        if (r > 0) {
+            if (w->sink && !wl_hold_release(s, sl->id, sl->seq)) {
+                nb_sink_release(w->sink, sl->id, sl->seq);
+            }
+            if (w->current < 0) {
+                w->current = w->pending;
+                cur_apply(w, w->last_serial);
+            }
+            w->current = w->pending;
+            w->pending = -1;
+            nb_stats_commit(w, sl);     /* the --stats line, as for others */
+            /* No frame callback comes from a surface the swapchain owns:
+             * the guest's frame token goes with the present. */
+            if (w->sink) {
+                nb_sink_frame(w->sink);
+            }
+            if (w->idle_buf) {
+                wl_idle_drop(w);
+            }
+            return 0;
+        }
+        if (r == 0) {
+            /* No free swapchain image: staged, tried again shortly. */
+            w->commit_staged = true;
+            wl_vk_retry(w);
+            return 0;
+        }
+        /* failed: wl_vk_frame left the mode; on with the usual path */
+    }
     if (w->viewport) {
         if (w->win_w <= 0 || w->win_h <= 0) {
             w->win_w = (int)sl->w;
@@ -3238,7 +3481,18 @@ static int wl_commit(struct nb_session *s, struct nb_sink *sink)
         if (w->gc_on && gc_layout(w, false)) {
             cur_apply(w, w->last_serial);
         }
+    } else if (wl_nvp_frame(w, sl, &new_w, &new_h)) {
+        /* No wp_viewporter, an upscaler or frame generation on: the GPU pass
+         * drew a buffer of the window's size, which is the surface's size. */
+        if (w->gs_dropped) {
+            if (w->sink && !wl_hold_release(s, sl->id, sl->seq)) {
+                nb_sink_release(w->sink, sl->id, sl->seq);
+            }
+            w->pending = -1;
+            return 0;
+        }
     } else {
+        w->gs_frame = false;
         wl_attach_sf(w, 0, sl->buf, NB_XA_GUEST, w->pending, !sl->shm, 0);
         new_w = (int)sl->w;
         new_h = (int)sl->h;
@@ -3520,6 +3774,378 @@ static void wl_commit_staged(struct nb_wl *w)
     if (w->nudge_pending) {
         wl_nudge(w);
     }
+}
+
+/* ── NVIDIA Smooth Motion through a Vulkan swapchain (nb_vkpresent.h) ───── */
+
+/* The presentation setting as a Vulkan present mode. */
+static int wl_vk_mode(const struct nb_wl *w)
+{
+    if (wl_async_wanted(w)) {
+        return NB_VKP_IMMEDIATE;
+    }
+    return w->vst.sync == NB_SYNC_LATCH ? NB_VKP_MAILBOX : NB_VKP_FIFO;
+}
+
+/* Try a staged frame again in a millisecond (the frame-generation timer,
+ * which is idle in this mode). */
+static void wl_vk_retry(struct nb_wl *w)
+{
+    struct itimerspec its = { 0 };
+    uint64_t at = nb_mono_ns() + 1000000ull;
+
+    if (w->fg_tfd < 0) {
+        w->fg_tfd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+    }
+    its.it_value.tv_sec = (time_t)(at / 1000000000ull);
+    its.it_value.tv_nsec = (long)(at % 1000000000ull);
+    if (w->fg_tfd >= 0 &&
+        timerfd_settime(w->fg_tfd, TFD_TIMER_ABSTIME, &its, NULL) == 0) {
+        w->fg_armed = true;
+    }
+}
+
+/* The main surface black under the swapchain's subsurface, at the window's
+ * size; the picture's own surface empty. */
+static void wl_vk_backdrop(struct nb_wl *w)
+{
+    if (w->vk_shown && w->main_vw == w->win_w && w->main_vh == w->win_h) {
+        return;
+    }
+    wl_leave_sub(w);
+    if (w->vp_src[0]) {
+        wp_viewport_set_source(w->viewport, wl_fixed_from_int(-1),
+                               wl_fixed_from_int(-1), wl_fixed_from_int(-1),
+                               wl_fixed_from_int(-1));
+        w->vp_src[0] = false;
+    }
+    if (wl_blk_build(w)) {
+        wl_attach_sf(w, 0, w->blk_buf, NB_XA_NONE, -1, false, 0);
+        wl_surface_damage_buffer(w->surf, 0, 0, 1, 1);
+    }
+    wp_viewport_set_destination(w->viewport, w->win_w, w->win_h);
+    wl_opaque(w, w->surf, w->win_w, w->win_h);
+    if (w->vk_vp) {
+        wp_viewport_set_destination(w->vk_vp, w->win_w, w->win_h);
+    }
+    wl_surf_commit(w, w->surf);
+    w->main_vw = w->win_w;
+    w->main_vh = w->win_h;
+    w->tgt_ow = w->tgt_oh = 0;
+    w->gs_shown = false;
+    w->vk_shown = true;
+}
+
+/*
+ * One guest frame through the swapchain: placed as the usual path would
+ * (nb_view_place), blitted at the window's physical size, presented.
+ * 1 shown (the buffer has been read), 0 no free image now, -1 failed (the
+ * mode is left for this session).
+ */
+static int wl_vk_frame(struct nb_wl *w, int slot)
+{
+    struct nb_wl_buf *sl = &w->bufs[slot];
+    unsigned s120 = w->scale_120 ? w->scale_120 : 120;
+    int pw = (int)(((long)w->win_w * s120 + 60) / 120);
+    int ph = (int)(((long)w->win_h * s120 + 60) / 120);
+    double kx, ky;
+    struct nb_vkp_frame fr;
+    unsigned us = 0;
+    int r;
+
+    nb_view_place(&w->vst.cur, (int)sl->w, (int)sl->h, w->win_w, w->win_h,
+                  w->scale_120, &w->place);
+    w->fit_w = w->place.pic.w;
+    w->fit_h = w->place.pic.h;
+    w->off_x = w->place.vis.x;
+    w->off_y = w->place.vis.y;
+    kx = (double)pw / w->win_w;
+    ky = (double)ph / w->win_h;
+    fr = (struct nb_vkp_frame){
+        .key = slot, .fd = sl->fd, .w = sl->w, .h = sl->h,
+        .stride = sl->stride, .offset = sl->offset, .fourcc = sl->fourcc,
+        .modifier = sl->modifier,
+        .sx = w->place.sw > 0 ? w->place.sx : 0,
+        .sy = w->place.sh > 0 ? w->place.sy : 0,
+        .sw = w->place.sw > 0 ? w->place.sw : sl->w,
+        .sh = w->place.sh > 0 ? w->place.sh : sl->h,
+        .dx = (int)(w->place.vis.x * kx + 0.5),
+        .dy = (int)(w->place.vis.y * ky + 0.5),
+        .dw = (int)(w->place.vis.w * kx + 0.5),
+        .dh = (int)(w->place.vis.h * ky + 0.5),
+        .out_w = (uint32_t)pw, .out_h = (uint32_t)ph,
+        .mode = wl_vk_mode(w),
+        .nearest = w->vst.cur.filter == NB_FILTER_NEAREST,
+    };
+    wl_vk_backdrop(w);
+    r = nb_vkp_present(w->vkp, &fr, 50000, &us);
+    if (r < 0) {
+        nb_err("Smooth Motion: presenting failed (%d); back to the usual "
+               "path for this session", r);
+        w->vk_dead = true;
+        wl_vk_changed(w);
+        return -1;
+    }
+    if (r > 0) {
+        w->st_gs_sum += us;
+        w->st_gs_n++;
+        if (us > w->st_gs_max) {
+            w->st_gs_max = us;
+        }
+        w->buf_w = (int)sl->w;
+        w->buf_h = (int)sl->h;
+        if (w->gc_on && gc_layout(w, false)) {
+            cur_apply(w, w->last_serial);
+        }
+        wl_ptr_follow(w);
+    }
+    return r;
+}
+
+/* The frame-generation choice changed: start or stop the swapchain path. */
+static void wl_vk_changed(struct nb_wl *w)
+{
+    bool want = w->vst.fgen == NB_FGEN_NVSM && !w->vk_dead && w->vk_surf &&
+                w->viewport && nb_vkp_available(NULL);
+
+    if (want == w->vk_on) {
+        return;
+    }
+    if (want) {
+        char why[200] = "";
+
+        w->vkp = nb_vkp_open_wayland(w->dpy, w->vk_surf, why, sizeof(why));
+        if (!w->vkp) {
+            w->vk_dead = true;
+            nb_err("Smooth Motion: %s; frame generation stays off",
+                   why[0] ? why : "cannot start");
+            return;
+        }
+        w->vk_on = true;
+        w->vk_shown = false;
+        nb_log("Smooth Motion: guest frames go through a Vulkan swapchain on "
+               "%s (%s=1, the driver's frame generation)",
+               nb_vkp_device(w->vkp), NB_VKP_ENV);
+        return;
+    }
+    if (w->vkp) {
+        nb_vkp_close(w->vkp);
+        w->vkp = NULL;
+    }
+    w->vk_on = false;
+    w->vk_shown = false;
+    if (w->vk_surf) {
+        wl_surface_attach(w->vk_surf, NULL, 0, 0);
+        wl_surface_commit(w->vk_surf);
+    }
+    /* The usual path takes over at the next frame or relayout. */
+    w->main_vw = w->main_vh = 0;
+    w->tgt_ow = w->tgt_oh = 0;
+    w->frame_inflight = false;
+    nb_log("Smooth Motion: off");
+}
+
+/* ── frame generation: the pictures between guest frames (nb_fg.h) ──────── */
+
+/* Arm the timer for the next generated picture, or disarm it. */
+static void wl_fg_arm(struct nb_wl *w)
+{
+    uint64_t due = nb_fg_due(&w->fg);
+    struct itimerspec its = { 0 };
+
+    if (!due || !w->fg_live) {
+        if (w->fg_armed && w->fg_tfd >= 0) {
+            timerfd_settime(w->fg_tfd, TFD_TIMER_ABSTIME, &its, NULL);
+        }
+        w->fg_armed = false;
+        return;
+    }
+    if (w->fg_tfd < 0) {
+        w->fg_tfd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+        if (w->fg_tfd < 0) {
+            nb_err("frame generation: timerfd: %s; off", strerror(errno));
+            w->fg_dead = true;
+            return;
+        }
+    }
+    its.it_value.tv_sec = (time_t)(due / 1000000000ull);
+    its.it_value.tv_nsec = (long)(due % 1000000000ull);
+    if (timerfd_settime(w->fg_tfd, TFD_TIMER_ABSTIME, &its, NULL) == 0) {
+        w->fg_armed = true;
+    }
+}
+
+/*
+ * One generated picture at phase t into a free target, committed like a
+ * scaled frame.  1 shown, 0 not now (no free target, the gate is closed:
+ * asked again shortly), -1 failed.  It goes through the same gate as guest
+ * frames and the presentation mode in force (immediate in fullscreen by
+ * default): nothing here waits for a vblank, and the guest is not involved.
+ */
+static int wl_fg_present(struct nb_wl *w, float t)
+{
+    struct nb_gs_draw d = w->fg_d;
+    bool armed = false;
+    unsigned gpu_us = 0;
+    int ti = -1;
+
+    if (!w->gs || !w->gs_shown || !nb_gs_fg_ready(w->gs) ||
+        !wl_gate_open(w, nb_mono_ns())) {
+        return 0;
+    }
+    for (int k = 1; k <= NB_GS_TARGETS; k++) {
+        int i = (w->gt_last + k) % NB_GS_TARGETS;
+
+        if (w->gt[i].ready && !w->gt[i].busy) {
+            ti = i;
+            break;
+        }
+    }
+    if (ti < 0) {
+        return 0;
+    }
+    d.target = ti;
+    d.src_key = NB_GS_SRC_FG;
+    d.fg_t = t;
+    if (nb_gs_draw(w->gs, &d, 50000, &gpu_us) < 0) {
+        return -1;
+    }
+    if (w->gt_rb && w->gt_shm &&
+        nb_gs_readback(w->gs, ti, (char *)w->gt_shm +
+                       (size_t)ti * (w->gt_shm_sz / NB_GS_TARGETS)) < 0) {
+        return -1;
+    }
+    w->gt_last = ti;
+    wl_attach_sf(w, 0, w->gt[ti].buf, NB_XA_GT, ti, !w->gt_rb, 0);
+    w->gt[ti].busy = true;
+    wl_surface_damage_buffer(w->surf, 0, 0, INT32_MAX, INT32_MAX);
+    if (!w->frame_inflight) {
+        struct wl_callback *cb = wl_surface_frame(w->surf);
+
+        if (cb) {
+            wl_callback_add_listener(cb, &frame_listener, w);
+            w->frame_inflight = true;
+            armed = true;
+        }
+    }
+    wl_surf_commit(w, w->surf);
+    nb_pace_committed(&w->pace, nb_mono_ns(), armed);
+    nb_pace_flushed(&w->pace, wl_display_flush(w->dpy) < 0 && errno == EAGAIN);
+    w->st_fg++;
+    return 1;
+}
+
+/* The timer fired: show what is due. */
+static void wl_fg_fire(struct nb_wl *w)
+{
+    uint64_t now = nb_mono_ns();
+    int step = 0;
+    float t = nb_fg_peek(&w->fg, now, &step);
+
+    if (t > 0.0f && w->fg_live) {
+        int r;
+
+        if (w->commit_staged && w->pending >= 0) {
+            /* A newer guest frame waits for the gate: it starts its own
+             * cycle, this one is over. */
+            nb_fg_abandon(&w->fg);
+            wl_fg_arm(w);
+            return;
+        }
+        r = wl_fg_present(w, t);
+        if (r == 1) {
+            nb_fg_shown(&w->fg, step);
+        } else if (r < 0) {
+            nb_err("frame generation: the GPU pass failed; off for this "
+                   "session");
+            w->fg_dead = true;
+            w->fg_live = false;
+            nb_fg_reset(&w->fg);
+        } else {
+            /* Asked again in half a millisecond, unless the cycle ends. */
+            struct itimerspec its = { 0 };
+            uint64_t at = now + 500000ull;
+
+            w->st_fg_retry++;
+            its.it_value.tv_sec = (time_t)(at / 1000000000ull);
+            its.it_value.tv_nsec = (long)(at % 1000000000ull);
+            if (w->fg_tfd >= 0 &&
+                timerfd_settime(w->fg_tfd, TFD_TIMER_ABSTIME, &its, NULL) == 0) {
+                w->fg_armed = true;
+            }
+            return;
+        }
+    }
+    wl_fg_arm(w);
+}
+
+/*
+ * THE GPU PASS'S PRIORITY FOLLOWS THE MODE.  With an upscaler or frame
+ * generation on, the pass does real work per frame on the GPU the guest
+ * renders on; at LOW context priority it waits for the guest's channels
+ * instead of preempting them.  The plain scaler keeps HIGH (it is a single
+ * cheap pass, and its latency is what that mode is for).  A context's
+ * priority is fixed at creation: on a change the pass is reopened at the
+ * next frame.  CONDUIT_VIEWER_GPU_PRIORITY, when set, wins.
+ */
+static void wl_gs_prio_follow(struct nb_wl *w)
+{
+    nb_gs_set_prio_default(wl_enh_on(w) ? NB_GS_PRIO_LOW : NB_GS_PRIO_HIGH);
+    if (w->gs && nb_gs_prio_requested(w->gs) != nb_gs_prio_wanted()) {
+        nb_log("gpu-scale: reopening the GPU pass at context priority %s "
+               "(%s)", nb_gs_prio_name(nb_gs_prio_wanted()),
+               wl_enh_on(w) ? "upscaling or frame generation on"
+                            : "plain scaling");
+        wl_gs_close(w);
+    }
+}
+
+/* Without wp_viewporter the pass draws window-size buffers (wl_nvp_frame):
+ * said once, since the surface then follows the window, not the guest. */
+static void wl_enh_viewport_note(struct nb_wl *w)
+{
+    if (!w->viewport && wl_enh_on(w) && !w->enh_noviewport_told) {
+        w->enh_noviewport_told = true;
+        nb_log("upscaling/frame generation: no wp_viewporter; the GPU pass "
+               "draws buffers of the window's size (the surface is the "
+               "buffer), the plain mode shows the guest's buffer as it is");
+    }
+}
+
+/* Frame generation's refresh: wp_presentation's, else the output's mode. */
+static void wl_fg_refresh(struct nb_wl *w)
+{
+    unsigned mhz = w->refresh_mhz;
+
+    if (!mhz && w->out_on >= 0 && w->out_on < w->n_out) {
+        mhz = w->out[w->out_on].mhz;
+    }
+    for (int i = 0; !mhz && i < w->n_out; i++) {
+        mhz = w->out[i].mhz > mhz ? w->out[i].mhz : mhz;
+    }
+    nb_fg_set_refresh(&w->fg, mhz ? 1000000000000ull / mhz : 0);
+}
+
+/* The frame-generation setting or the sync mode changed. */
+static void wl_fg_changed(struct nb_wl *w)
+{
+    int m = wl_fg_mult(w);
+
+    if (m == w->fg_mult_was) {
+        return;
+    }
+    w->fg_mult_was = m;
+    nb_fg_init(&w->fg, m);
+    wl_fg_refresh(w);
+    w->fg_live = false;
+    if (w->gs) {
+        nb_gs_fg_reset(w->gs);
+    }
+    wl_fg_arm(w);
+    nb_log("frame generation: %s%s", m > 1 ? (m == 2 ? "2x" : "3x") : "off",
+           m == 1 && nb_fgen_mult(w->vst.fgen) > 1
+               ? (w->fg_dead ? " (failed earlier)" : " (not with --sync=latch)")
+               : "");
 }
 
 /* ── the client-side title bar ───────────────────────────────────────────── */
@@ -6171,8 +6797,13 @@ static void top_apply(struct nb_wl *w)
      * Whether the guest is ASKED to change resolution is wl_mode_hint()'s
      * business above; the frame on screen is fitted here either way, so a
      * guest that has not switched (yet, or ever) is shown whole.
+     *
+     * Smooth Motion's swapchain (wl_vk_frame) is re-placed by the next
+     * frame instead; the guest buffer on screen is no longer ours to show.
      */
-    if (w->viewport && w->current >= 0) {
+    if (w->vk_on) {
+        w->vk_shown = false;
+    } else if (w->viewport && w->current >= 0) {
         int dw, dh;
         struct wl_surface *pic = wl_viewport_apply(w, w->buf_w, w->buf_h,
                                                    NULL, false, &dw, &dh);
@@ -6689,6 +7320,7 @@ static void pres_presented(void *d, struct wp_presentation_feedback *f,
 
         if (nb_hz_mode == NB_HZ_AUTO && mhz / 1000 != w->refresh_mhz / 1000) {
             w->refresh_mhz = mhz;
+            wl_fg_refresh(w);
             nb_log("host output refresh is %u.%03u Hz — telling the guest, so "
                    "it need not stay at its built-in default",
                    mhz / 1000, mhz % 1000);
@@ -6775,6 +7407,62 @@ static const struct wp_presentation_listener pres_clock_listener = {
 
 /* ── registry ────────────────────────────────────────────────────────────── */
 
+static void out_geometry(void *d, struct wl_output *o, int32_t x, int32_t y,
+                         int32_t pw, int32_t ph, int32_t sp, const char *mk,
+                         const char *md, int32_t tr)
+{
+    (void)d; (void)o; (void)x; (void)y; (void)pw; (void)ph; (void)sp;
+    (void)mk; (void)md; (void)tr;
+}
+
+static void out_mode(void *data, struct wl_output *o, uint32_t flags,
+                     int32_t wd, int32_t ht, int32_t refresh)
+{
+    struct nb_wl *w = data;
+
+    (void)wd; (void)ht;
+    if (!(flags & WL_OUTPUT_MODE_CURRENT) || refresh <= 0) {
+        return;
+    }
+    for (int i = 0; i < w->n_out; i++) {
+        if (w->out[i].o == o) {
+            w->out[i].mhz = (unsigned)refresh;
+            wl_fg_refresh(w);
+        }
+    }
+}
+
+static void out_done(void *d, struct wl_output *o) { (void)d; (void)o; }
+static void out_scale(void *d, struct wl_output *o, int32_t f)
+{
+    (void)d; (void)o; (void)f;
+}
+static const struct wl_output_listener out_listener = {
+    .geometry = out_geometry, .mode = out_mode, .done = out_done,
+    .scale = out_scale,
+};
+
+static void surf_enter(void *data, struct wl_surface *sf, struct wl_output *o)
+{
+    struct nb_wl *w = data;
+
+    (void)sf;
+    for (int i = 0; i < w->n_out; i++) {
+        if (w->out[i].o == o) {
+            w->out_on = i;
+            wl_fg_refresh(w);
+        }
+    }
+}
+
+static void surf_leave(void *data, struct wl_surface *sf, struct wl_output *o)
+{
+    (void)data; (void)sf; (void)o;
+}
+static const struct wl_surface_listener surf_listener = {
+    .enter = surf_enter, .leave = surf_leave,
+};
+
 static void reg_global(void *data, struct wl_registry *r, uint32_t name,
                        const char *iface, uint32_t ver)
 {
@@ -6790,6 +7478,13 @@ static void reg_global(void *data, struct wl_registry *r, uint32_t name,
         w->deco_mgr = BIND(zxdg_decoration_manager_v1_interface, 1);
     } else if (!strcmp(iface, wl_subcompositor_interface.name)) {
         w->subcomp = BIND(wl_subcompositor_interface, 1);
+    } else if (!strcmp(iface, wl_output_interface.name) &&
+               w->n_out < NB_WL_OUTPUTS) {
+        w->out[w->n_out].o = BIND(wl_output_interface, 2);
+        if (w->out[w->n_out].o) {
+            wl_output_add_listener(w->out[w->n_out].o, &out_listener, w);
+            w->n_out++;
+        }
     } else if (!strcmp(iface, wp_presentation_interface.name)) {
         w->presentation = BIND(wp_presentation_interface, 1);
         w->pres_clock = UINT32_MAX;
@@ -7642,6 +8337,18 @@ static const struct nb_ui_env *wl_ui_env(struct nb_wl *w)
     e.vm_pause_busy = nb_vmpause_busy(&w->vmp);
     e.translucent = true;
     e.modes = &nb_mode_rx.cur;
+    /* The GPU pass needs a viewport to undo, and a GPU that has not failed;
+     * whether its driver has GLES 3.1 is only known once it ran. */
+    e.enhance_ok = !w->gs_dead && (!w->gs || nb_gs_enhance_ok(w->gs, NULL));
+    e.nvsm_ok = nb_vkp_available(NULL);
+    e.nvsm_restart = w->vst.fgen == NB_FGEN_NVSM && !w->vk_on && !w->vk_dead;
+    e.enhance_why = w->fg_dead && nb_fgen_mult(w->vst.fgen) > 1
+                        ? "Frame generation failed on this GPU (log)"
+                    : w->vst.fgen == NB_FGEN_NVSM && w->vk_dead
+                        ? "Smooth Motion failed to start (log)"
+                    : nb_fgen_mult(w->vst.fgen) > 1 && wl_latch_on(w)
+                        ? "Frame generation is off with Latest per refresh"
+                    : w->enh_note;
     return &e;
 }
 
@@ -8188,7 +8895,9 @@ static void wl_ptr_follow(struct nb_wl *w)
 /* Re-place the picture after a settings change: a viewport and a position. */
 static void wl_relayout(struct nb_wl *w)
 {
-    if (w->viewport && w->current >= 0) {
+    if (w->vk_on) {
+        w->vk_shown = false;    /* the next frame re-places the swapchain */
+    } else if (w->viewport && w->current >= 0) {
         int dw, dh;
         struct wl_surface *pic = wl_viewport_apply(w, w->buf_w, w->buf_h,
                                                    NULL, false, &dw, &dh);
@@ -8294,7 +9003,17 @@ static void wl_ui_do(struct nb_wl *w, unsigned bits)
     }
     if (bits & NB_UI_SYNC) {
         wl_sync_changed(w, "menu");
+        wl_fg_changed(w);       /* off with latch */
         wl_relayout(w);         /* the scaler follows the sync setting */
+    }
+    if (bits & NB_UI_ENHANCE) {
+        w->enh_note[0] = '\0';
+        w->enh_logged = -1;
+        wl_fg_changed(w);
+        wl_vk_changed(w);
+        wl_gs_prio_follow(w);
+        wl_enh_viewport_note(w);
+        wl_relayout(w);         /* the next picture with the new passes */
     }
     if ((bits & NB_UI_FULLSCREEN) && w->sink) {
         nb_sink_toggle_fullscreen(w->sink);
@@ -8768,6 +9487,13 @@ static int wl_pollfds(struct nb_session *s, struct pollfd *out, int max)
         out[n].revents = 0;
         w->latch_pfd = n++;
     }
+    w->fg_pfd = -1;
+    if (w->fg_armed && w->fg_tfd >= 0 && n < max) {
+        out[n].fd = w->fg_tfd;
+        out[n].events = POLLIN;
+        out[n].revents = 0;
+        w->fg_pfd = n++;
+    }
     /* Explicit sync: a release point reached (nb_xsync.h). */
     w->xs_pfd = -1;
     if (nb_xs_eventfd(w->xs) >= 0 && wl_xs_waiting(w) && n < max) {
@@ -8825,6 +9551,19 @@ static int wl_dispatch_session(struct nb_session *s, struct nb_sink *sink)
         }
         w->latch_armed = false;
         wl_commit_staged(w);    /* the latch window opened */
+    }
+    if (w->pfd && w->fg_pfd > 0 && (w->pfd[w->fg_pfd].revents & POLLIN)) {
+        uint64_t n;
+
+        if (read(w->fg_tfd, &n, sizeof(n)) < 0) {
+            /* EAGAIN: already consumed */
+        }
+        w->fg_armed = false;
+        if (w->vk_on) {
+            wl_commit_staged(w);    /* a staged frame, again */
+        } else {
+            wl_fg_fire(w);
+        }
     }
     if (w->pfd && w->xs_pfd >= 0 && (w->pfd[w->xs_pfd].revents & POLLIN)) {
         wl_xs_scan(w);          /* buffers back to the guest, targets free */
@@ -9002,6 +9741,10 @@ static void wl_close_session(struct nb_session *s)
         close(w->latch_tfd);
         w->latch_tfd = -1;
     }
+    if (w->fg_tfd >= 0) {
+        close(w->fg_tfd);
+        w->fg_tfd = -1;
+    }
     if (w->flog) {
         fclose(w->flog);
         w->flog = NULL;
@@ -9033,6 +9776,23 @@ static void wl_close_session(struct nb_session *s)
         wl_buf_destroy(w, i);
     }
     wl_gs_close(w);
+    if (w->vkp) {
+        nb_vkp_close(w->vkp);
+        w->vkp = NULL;
+    }
+    /* After the presenter, which drew on it. */
+    if (w->vk_vp) {
+        wp_viewport_destroy(w->vk_vp);
+        w->vk_vp = NULL;
+    }
+    if (w->vk_sub) {
+        wl_subsurface_destroy(w->vk_sub);
+        w->vk_sub = NULL;
+    }
+    if (w->vk_surf) {
+        wl_surface_destroy(w->vk_surf);
+        w->vk_surf = NULL;
+    }
     wl_xs_close(w);
     if (w->dfb) {
         zwp_linux_dmabuf_feedback_v1_destroy(w->dfb);
@@ -9322,6 +10082,10 @@ static int wl_open(struct nb_session *s, const struct nb_config *cfg)
     w->scale_120 = 120;         /* until the compositor says otherwise */
     w->fetch_fd = -1;
     w->surf = wl_compositor_create_surface(w->comp);
+    if (w->surf) {
+        /* Which output the window is on (frame generation's refresh). */
+        wl_surface_add_listener(w->surf, &surf_listener, w);
+    }
     if (w->surf && w->frac_mgr) {
         w->frac = wp_fractional_scale_manager_v1_get_fractional_scale(
                       w->frac_mgr, w->surf);
@@ -9463,6 +10227,35 @@ static int wl_open(struct nb_session *s, const struct nb_config *cfg)
                 wl_subsurface_set_desync(w->cs_sub);
             }
             w->cs_at_x = w->cs_at_y = INT32_MIN;
+            /*
+             * NVIDIA Smooth Motion's swapchain surface: made now, second, so
+             * it stacks above the picture's surface and below everything
+             * else (SUBSURFACE STACKING).  Only when the VM's setting is
+             * --framegen=nvidia at startup: chosen later in the menu, it
+             * takes a viewer restart (the menu says so), and no other mode
+             * ever has the extra surface.  No input region: the pointer
+             * keeps meeting the main surface.
+             */
+            if (w->vst.fgen == NB_FGEN_NVSM && nb_vkp_available(NULL)) {
+                w->vk_surf = wl_compositor_create_surface(w->comp);
+                if (w->vk_surf) {
+                    struct wl_region *none =
+                        wl_compositor_create_region(w->comp);
+
+                    w->vk_sub = wl_subcompositor_get_subsurface(w->subcomp,
+                                                                w->vk_surf,
+                                                                w->surf);
+                    w->vk_vp = wp_viewporter_get_viewport(w->viewporter,
+                                                          w->vk_surf);
+                    if (none) {
+                        wl_surface_set_input_region(w->vk_surf, none);
+                        wl_region_destroy(none);
+                    }
+                }
+                if (w->vk_sub) {
+                    wl_subsurface_set_desync(w->vk_sub);
+                }
+            }
         }
     } else {
         nb_log("no wp_viewporter: the window is fixed at the guest's own "
@@ -9489,6 +10282,15 @@ static int wl_open(struct nb_session *s, const struct nb_config *cfg)
            w->hypr_sig ? ", Hyprland: sets this window's `immediate`" : "");
     w->win_w = w->surf_w;
     w->win_h = w->surf_h;
+    /* Picture enhancement as saved for this VM (docs/VIEWER-ENHANCE.md). */
+    wl_fg_changed(w);
+    wl_vk_changed(w);
+    wl_gs_prio_follow(w);
+    wl_enh_viewport_note(w);
+    if (w->vst.upscale != NB_UPSCALE_OFF) {
+        nb_log("upscaling: %s, sharpness %d (the GPU pass draws every frame)",
+               nb_upscale_label(w->vst.upscale), w->vst.sharp);
+    }
     w->wnd_w = w->win_w;            /* what unfullscreen returns to, until a
                                      * windowed configure says otherwise */
     w->wnd_h = w->win_h;
@@ -9637,6 +10439,11 @@ struct nb_session *nb_session_wayland(const struct nb_config *cfg)
     w->fetch_pfd = -1;
     w->latch_tfd = -1;
     w->latch_pfd = -1;
+    w->fg_tfd = -1;
+    w->fg_pfd = -1;
+    w->fg_mult_was = -1;
+    w->out_on = -1;
+    w->enh_logged = -1;
     w->xs_pfd = -1;
     nb_latch_init(&w->latch);
     {

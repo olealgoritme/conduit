@@ -67,6 +67,7 @@
 
 #include "nvkvm_broker.h"
 #include "nb_gpusel.h"
+#include "nb_gpuscale.h"
 #include "nb_present.h"
 
 /*
@@ -3301,6 +3302,15 @@ static void usage(void)
 "                       commits when the compositor offers it (default on;\n"
 "                       also CONDUIT_VIEWER_EXPLICIT_SYNC=0)\n"
 "  --linear-only        deprecated alias for --present-mode=linear\n"
+"  --upscale=MODE       the viewer's GPU pass scales the picture with an\n"
+"                       upscaler (saved per VM; the menu changes it):\n"
+"                       off (default), fsr (FSR 1 EASU+RCAS), nis (NVIDIA\n"
+"                       Image Scaling), cas (sharpen, plain scale)\n"
+"  --sharpness=N        0..100 for the upscalers (default 50)\n"
+"  --framegen=MODE      host frame generation: off (default), 2x, 3x (the\n"
+"                       viewer's optical flow; about one guest frame of\n"
+"                       latency), nvidia (Smooth Motion, RTX 40/50 hosts).\n"
+"                       docs/VIEWER-ENHANCE.md\n"
 "Conduit display options (Wayland backend):\n"
 "  --sync=MODE          when a frame reaches the screen (saved per VM with\n"
 "                       --view-state; the menu, CTRL+ALT+M, changes it):\n"
@@ -3334,6 +3344,12 @@ static void usage(void)
 "                       one that made them first), dgpu, igpu (from PCI\n"
 "                       facts, not card numbers) or a render node path\n"
 "  --resolve-gpu        print the render nodes and what --gpu picks, exit\n"
+"  --bench-enhance[=GWxGH:OWxOH]  time every upscaling and frame-generation\n"
+"                       pass on the viewer's GPU (--gpu), a GWxGH guest frame\n"
+"                       (default 1920x1080) in an OWxOH output (3840x2160);\n"
+"                       no window, no VM; --bench-iters=N (200).  GPU time per\n"
+"                       pass and wall time, at the priority enhancement uses\n"
+"                       (low; CONDUIT_VIEWER_GPU_PRIORITY to compare)\n"
 "  --render-node PATH   the same as --gpu PATH\n"
 "  --tearing            alias for --sync=immediate\n"
 "  --no-tearing         alias for --sync=vsync\n"
@@ -3546,6 +3562,8 @@ int main(int argc, char **argv)
     bool socket_is_ours = true;
     const char *gpu_want = NULL;    /* --gpu / --render-node */
     bool resolve_gpu = false;
+    const char *bench = NULL;       /* --bench-enhance */
+    int bench_iters = 200;
     bool had_client = false;
     /* Sticky within one loop iteration; see the single exit check at the
      * bottom of the loop for why the check cannot live where the detach
@@ -3574,6 +3592,9 @@ int main(int argc, char **argv)
      * numbers either way. */
     cfg.overlay_mode = NB_OVERLAY_WINDOWED;
     cfg.sync = -1;
+    cfg.upscale = -1;
+    cfg.sharp = -1;
+    cfg.fgen = -1;
     {
         const char *e = getenv("CONDUIT_VIEWER_EXPLICIT_SYNC");
 
@@ -3695,6 +3716,9 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--gpu")) { NEEDVAL(); gpu_want = v; }
         else if (!strncmp(a, "--gpu=", 6)) { gpu_want = a + 6; }
         else if (!strcmp(a, "--resolve-gpu")) { resolve_gpu = true; }
+        else if (!strcmp(a, "--bench-enhance")) { bench = "1920x1080:3840x2160"; }
+        else if (!strncmp(a, "--bench-enhance=", 16)) { bench = a + 16; }
+        else if (!strncmp(a, "--bench-iters=", 14)) { bench_iters = atoi(a + 14); }
         else if (!strcmp(a, "--tearing"))    { cfg.sync = NB_SYNC_IMMEDIATE; }
         else if (!strcmp(a, "--no-tearing")) { cfg.sync = NB_SYNC_VSYNC; }
         else if (!strncmp(a, "--sync=", 7) || !strcmp(a, "--sync")) {
@@ -3703,6 +3727,25 @@ int main(int argc, char **argv)
             if (!m) { NEEDVAL(); m = v; }
             if (nb_sync_parse(m, &cfg.sync) != 0) {
                 nb_err("--sync must be fullscreen, immediate, vsync or latch");
+                return 2;
+            }
+        }
+        else if (!strncmp(a, "--upscale=", 10)) {
+            if (nb_upscale_parse(a + 10, &cfg.upscale) != 0) {
+                nb_err("--upscale must be off, fsr, nis or cas");
+                return 2;
+            }
+        }
+        else if (!strncmp(a, "--sharpness=", 12)) {
+            cfg.sharp = nb_sharp_parse(a + 12);
+            if (cfg.sharp < 0) {
+                nb_err("--sharpness must be 0..100");
+                return 2;
+            }
+        }
+        else if (!strncmp(a, "--framegen=", 11)) {
+            if (nb_fgen_parse(a + 11, &cfg.fgen) != 0) {
+                nb_err("--framegen must be off, 2x, 3x or nvidia");
                 return 2;
             }
         }
@@ -3880,6 +3923,20 @@ int main(int argc, char **argv)
         }
         cfg.render_node = gpu_path[0] ? gpu_path : NULL;
         nb_log("viewer GPU: %s", cfg.gpu_why);
+    }
+    if (bench) {
+        unsigned iw = 0, ih = 0, ow = 0, oh = 0;
+
+        if (sscanf(bench, "%ux%u:%ux%u", &iw, &ih, &ow, &oh) != 4 || !iw ||
+            !ih || !ow || !oh || iw > 16384 || ih > 16384 || ow > 16384 ||
+            oh > 16384) {
+            nb_err("--bench-enhance=GWxGH:OWxOH, e.g. 1920x1080:3840x2160");
+            return 2;
+        }
+        /* The priority the enhancement passes run at in a session. */
+        nb_gs_set_prio_default(NB_GS_PRIO_LOW);
+        return nb_gs_bench(cfg.render_node, iw, ih, ow, oh, bench_iters,
+                           stdout) == 0 ? 0 : 1;
     }
     /*
      * CONDUIT_VIEWER_PRESENT: the present mode, over --present-mode.  The

@@ -183,6 +183,9 @@ struct nb_config {
     struct nb_view view;
     unsigned    view_set;
     int         sync;           /* --sync: NB_SYNC_*, -1 = the saved one    */
+    int         upscale;        /* --upscale: NB_UPSCALE_*, -1 = the saved  */
+    int         sharp;          /* --sharpness: 0..100, -1 = the saved one  */
+    int         fgen;           /* --framegen: NB_FGEN_*, -1 = the saved one */
     int         gpu_scale;      /* --gpu-scale: NB_GS_*                     */
     const char *render_node;    /* --render-node: the scaler's GPU          */
     bool        explicit_sync;  /* --explicit-sync: wp_linux_drm_syncobj_v1

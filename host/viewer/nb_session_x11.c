@@ -80,6 +80,10 @@ struct nb_session *nb_session_x11(const struct nb_config *cfg)
 #include "nb_gpuscale.h"
 #include "nb_present.h"
 #include "nb_vmpause.h"
+#include "nb_fg.h"
+#include "nb_vkpresent.h"
+#include <sys/timerfd.h>
+#include <time.h>
 
 #define NB_DRM_FORMAT_MOD_INVALID  0x00ffffffffffffffULL
 
@@ -189,6 +193,27 @@ struct nb_x11 {
     bool              copy_owed;        /* a frame was skipped: ask for it
                                          * again when a buffer frees up   */
     xcb_gcontext_t    copy_gc;
+    /*
+     * PICTURE ENHANCEMENT (docs/VIEWER-ENHANCE.md).  An upscaler, frame
+     * generation or Smooth Motion makes every dma-buf frame a copied one
+     * (x11_wants_copy), so the GPU pass above draws it; frame generation
+     * shows its in-between pictures from a timer.  Presents of generated
+     * pictures are not frame tokens for the guest (fg_serial).
+     */
+    struct nb_fg      fg;
+    int               fg_tfd;
+    bool              fg_armed, fg_live, fg_dead;
+    struct nb_gs_draw fg_d;
+    int               fg_mult_was;
+    uint32_t          fg_serial[8];
+    unsigned          fg_sn;
+    unsigned          st_fg;
+    int               enh_logged;
+    char              enh_note[96];
+    /* NVIDIA Smooth Motion: a Vulkan swapchain on the content window. */
+    struct nb_vkp    *vkp;
+    bool              vk_on, vk_dead;
+    struct pollfd    *pfd;              /* the last pollfds() array       */
     /* Read-back: two frames of w*h*4, in a MIT-SHM segment when it works. */
     uint8_t          *rb_mem;
     size_t            rb_one;
@@ -304,6 +329,11 @@ static void x11_clip_incr_step(struct nb_x11 *x);
 /* The display settings and the viewer's own UI, defined near the end. */
 static void x11_ui_do(struct nb_x11 *x, unsigned bits);
 static const struct nb_ui_env *x11_ui_env(struct nb_x11 *x);
+static void x11_fg_fire(struct nb_x11 *x);
+static void x11_fg_changed(struct nb_x11 *x);
+static void x11_gs_prio_follow(struct nb_x11 *x);
+static void x11_vk_changed(struct nb_x11 *x);
+static int  x11_vk_present(struct nb_x11 *x, struct nb_sink *sink);
 static void x11_menu_set(struct nb_x11 *x, bool open);
 static void x11_layer_expose(struct nb_x11 *x, xcb_window_t w);
 static bool x11_ui_pointer(struct nb_x11 *x, xcb_window_t ev, int ex, int ey,
@@ -445,6 +475,9 @@ static void x11_buf_free(struct nb_x11 *x, int i)
     }
     if (x->bufs[i].copy) {
         nb_gs_src_drop(x->gs, i);   /* the GPU's import of it */
+        if (x->vkp) {
+            nb_vkp_forget(x->vkp, i);
+        }
         close(x->bufs[i].fd);
     }
     memset(&x->bufs[i], 0, sizeof(x->bufs[i]));
@@ -525,10 +558,17 @@ static bool x11_copy_ok(struct nb_session *s, uint32_t fourcc, uint64_t mod)
  * for a pair the X server does not take (the ATTACH validator let it in only
  * because the copy can show it).
  */
+static bool x11_enh_on(const struct nb_x11 *x);
+
 static bool x11_wants_copy(struct nb_x11 *x, const struct nb_buf_desc *d)
 {
     if (d->is_shm) {
         return false;
+    }
+    /* An upscaler, frame generation or Smooth Motion: the GPU pass (or the
+     * swapchain) reads every frame, when this GPU imports it. */
+    if (x11_enh_on(x) && x11_copy_ok(x->sess, d->fourcc, d->modifier)) {
+        return true;
     }
     if (nb_pc_forces_copy(&x->pc)) {
         if (x11_copy_ok(x->sess, d->fourcc, d->modifier)) {
@@ -1007,11 +1047,20 @@ static void x11_stats_flush(struct nb_x11 *x)
             x11_scanout_blockers(x, why, sizeof(why));
             snprintf(blk, sizeof(blk), " | composited, blockers: %s", why);
         }
-        char gpu[96] = "";
+        char gpu[256] = "";
 
         if (x->st_gpu_n) {
-            snprintf(gpu, sizeof(gpu), " | GPU pass avg %.0fus max %uus",
+            snprintf(gpu, sizeof(gpu), " | %s avg %.0fus max %uus",
+                     x->vk_on ? "Smooth Motion swapchain blit" : "GPU pass",
                      (double)x->st_gpu_sum / x->st_gpu_n, x->st_gpu_max);
+        }
+        if (x->fg_live || x->st_fg) {
+            size_t k = strlen(gpu);
+
+            snprintf(gpu + k, sizeof(gpu) - k, " | framegen %ux: shown %.1f/s "
+                     "guest + %.1f/s generated, guest interval %.1fms",
+                     x->fg.eff > 1 ? x->fg.eff : 1, x->st_commits / secs,
+                     x->st_fg / secs, (double)x->fg.interval / 1e6);
         }
         nb_log("stats: commit %.1f fps (%u direct scanout, %.0f%%) | Present "
                "FLIP %u, COPY %u, XRender composites %u | path: %s, %s%s%s",
@@ -1026,6 +1075,7 @@ static void x11_stats_flush(struct nb_x11 *x)
     x->st_commits = x->st_flip = x->st_copy = x->st_comp = 0;
     x->st_gpu_n = x->st_gpu_max = 0;
     x->st_gpu_sum = 0;
+    x->st_fg = 0;
 }
 
 /*
@@ -1270,6 +1320,9 @@ static bool x11_gt_ready(struct nb_x11 *x, uint32_t w, uint32_t h)
  * (readback).  The pass is waited for, so the guest's buffer is free again
  * as soon as this returns.
  */
+static void x11_fg_arm(struct nb_x11 *x);
+static int  x11_fg_mult(const struct nb_x11 *x);
+
 static int x11_copy_present(struct nb_x11 *x, struct nb_sink *sink)
 {
     int slot = x->pending;
@@ -1328,7 +1381,31 @@ static int x11_copy_present(struct nb_x11 *x, struct nb_sink *sink)
         .sx = p->sw > 0 ? p->sx : 0, .sy = p->sh > 0 ? p->sy : 0,
         .sw = p->sw > 0 ? p->sw : sl->w, .sh = p->sh > 0 ? p->sh : sl->h,
         .nearest = x->vst.cur.filter == NB_FILTER_NEAREST,
+        .upscale = x->vst.upscale, .sharp = x->vst.sharp,
     };
+    /* Frame generation (nb_fg.h): the frame into the GPU's history first;
+     * this draw is the first picture of the new cycle. */
+    if (x11_fg_mult(x) > 1 && nb_gs_enhance_ok(x->gs, NULL)) {
+        unsigned us = 0;
+        /* No wait of its own: the draw below waits for both. */
+        int pr = nb_gs_fg_push(x->gs, slot, d.sx, d.sy, d.sw, d.sh, 0, &us);
+
+        if (pr < 0) {
+            x->fg_dead = true;
+            x->fg_live = false;
+            nb_err("frame generation: off for this session: the GPU passes "
+                   "failed (%d)", pr);
+        } else {
+            gpu_us += us;
+            d.src_key = NB_GS_SRC_FG;
+            d.fg_t = nb_fg_arrival(&x->fg, nb_mono_ns(), pr == 1);
+            x->fg_live = true;
+        }
+    } else if (x->fg_live) {
+        x->fg_live = false;
+        nb_gs_fg_reset(x->gs);
+        nb_fg_reset(&x->fg);
+    }
     if (nb_gs_draw(x->gs, &d, 50000, &gpu_us) < 0) {
         x11_gs_disable(x, "the GPU pass failed or took over 50 ms");
         nb_sink_release(sink, sl->id, 0);
@@ -1337,6 +1414,24 @@ static int x11_copy_present(struct nb_x11 *x, struct nb_sink *sink)
     }
     nb_sink_release(sink, sl->id, 0);       /* the pass has read it */
     x->gt_last = t;
+    x->fg_d = d;
+    if (d.src_key == NB_GS_SRC_FG) {
+        x11_fg_arm(x);
+    }
+    {
+        const char *why = NULL;
+        int used = nb_gs_enh_status(x->gs, &why);
+
+        if (x->vst.upscale != NB_UPSCALE_OFF && used != x->enh_logged) {
+            x->enh_logged = used;
+            nb_log("upscaling: %s asked, %s runs%s%s",
+                   nb_upscale_label(x->vst.upscale), nb_upscale_label(used),
+                   why ? ": " : "", why ? why : "");
+        }
+        snprintf(x->enh_note, sizeof(x->enh_note), "%s%s",
+                 used != x->vst.upscale && x->vst.upscale ? "Upscaler: " : "",
+                 used != x->vst.upscale && x->vst.upscale && why ? why : "");
+    }
     if (!x->copy_gc) {
         x->copy_gc = xcb_generate_id(x->c);
         xcb_create_gc(x->c, x->copy_gc, x->content, 0, NULL);
@@ -1426,7 +1521,15 @@ static int x11_commit(struct nb_session *s, struct nb_sink *sink)
     }
 
     /* A copied frame (nb_present.h): the GPU pass, then the pixmap or the
-     * read-back. */
+     * read-back; with Smooth Motion, the Vulkan swapchain. */
+    if (sl->copy && x->vk_on) {
+        int r = x11_vk_present(x, sink);
+
+        if (r >= 0) {
+            return 0;
+        }
+        /* failed: the mode is left; the GPU pass shows this frame */
+    }
     if (sl->copy) {
         return x11_copy_present(x, sink);
     }
@@ -1600,6 +1703,13 @@ static int x11_pollfds(struct nb_session *s, struct pollfd *out, int max)
     out[0].fd = xcb_get_file_descriptor(x->c);
     out[0].events = POLLIN;
     out[0].revents = 0;
+    x->pfd = out;
+    if (x->fg_armed && x->fg_tfd >= 0 && max > 1) {
+        out[1].fd = x->fg_tfd;
+        out[1].events = POLLIN;
+        out[1].revents = 0;
+        return 2;
+    }
     return 1;
 }
 
@@ -1641,8 +1751,17 @@ static void x11_present_event(struct nb_x11 *x, struct nb_sink *sink,
                        : "  — the frame is being composited, not scanned out");
         }
         /* Pacing.  This is the X11 equivalent of a wl frame callback: the
-         * frame is on screen, another may be drawn. */
-        nb_sink_frame(sink);
+         * frame is on screen, another may be drawn.  A generated picture
+         * (frame generation) is not: the guest's pacing stays its own. */
+        for (unsigned k = 0; k < 8; k++) {
+            if (x->fg_serial[k] && x->fg_serial[k] == ce->serial) {
+                x->fg_serial[k] = 0;
+                break;
+            }
+            if (k == 7) {
+                nb_sink_frame(sink);
+            }
+        }
         break;
     }
     case XCB_PRESENT_IDLE_NOTIFY: {
@@ -1680,6 +1799,17 @@ static int x11_dispatch(struct nb_session *s, struct nb_sink *sink)
 
     if (xcb_connection_has_error(x->c)) {
         return -EIO;
+    }
+    if (x->pfd && x->fg_armed && x->fg_tfd >= 0 && x->pfd[1].fd == x->fg_tfd &&
+        (x->pfd[1].revents & POLLIN)) {
+        uint64_t n;
+
+        if (read(x->fg_tfd, &n, sizeof(n)) < 0) {
+            /* EAGAIN: already consumed */
+        }
+        x->pfd[1].revents = 0;
+        x->fg_armed = false;
+        x11_fg_fire(x);
     }
     while ((ev = xcb_poll_for_event(x->c)) != NULL) {
 #ifdef NB_HAVE_XCB_SHM
@@ -2570,8 +2700,14 @@ static void x11_close(struct nb_session *s)
         x11_gt_drop(x);
         xcb_flush(x->c);
     }
+    if (x->vkp) {
+        nb_vkp_close(x->vkp);
+    }
     if (x->gs) {
         nb_gs_close(x->gs);
+    }
+    if (x->fg_tfd >= 0) {
+        close(x->fg_tfd);
     }
     if (x->c) {
         xcb_disconnect(x->c);
@@ -2808,6 +2944,9 @@ skip_dmabuf_extensions:
     nb_vstore_setup(&x->vst, cfg);
     nb_ui_init(&x->ui, &x->vst);
     x->ui_cur = -1;
+    x->fg_tfd = -1;
+    x->fg_mult_was = -1;
+    x->enh_logged = -1;
 #ifdef NB_HAVE_XCB_RENDER
     {
         /* One depth-24 format is all the scaler needs; without it we simply
@@ -2998,6 +3137,14 @@ formats_done:
         s->accept_shm = true;
     }
     x11_pc_report(x);
+    /* Picture enhancement as saved for this VM (docs/VIEWER-ENHANCE.md). */
+    x11_fg_changed(x);
+    x11_vk_changed(x);
+    x11_gs_prio_follow(x);
+    if (x->vst.upscale != NB_UPSCALE_OFF) {
+        nb_log("upscaling: %s, sharpness %d (the GPU pass draws every frame)",
+               nb_upscale_label(x->vst.upscale), x->vst.sharp);
+    }
     return 0;
 
 fail:
@@ -3500,6 +3647,271 @@ static void x11_client_detach_clip(struct nb_session *s, uint64_t generation)
  * ARGB visual and no compositor are needed, and with the menu closed none of
  * them is mapped.  X11 has no per-window scale, so they are drawn at 1x.
  */
+/* ── picture enhancement (docs/VIEWER-ENHANCE.md) ────────────────────────── */
+
+static int x11_fg_mult(const struct nb_x11 *x)
+{
+    return x->fg_dead || x->vst.sync == NB_SYNC_LATCH
+               ? 1 : nb_fgen_mult(x->vst.fgen);
+}
+
+static bool x11_enh_on(const struct nb_x11 *x)
+{
+    return !x->gs_dead &&
+           (x->vst.upscale != NB_UPSCALE_OFF || x11_fg_mult(x) > 1 || x->vk_on);
+}
+
+static void x11_fg_arm(struct nb_x11 *x)
+{
+    uint64_t due = nb_fg_due(&x->fg);
+    struct itimerspec its = { 0 };
+
+    if (!due || !x->fg_live) {
+        if (x->fg_armed && x->fg_tfd >= 0) {
+            timerfd_settime(x->fg_tfd, TFD_TIMER_ABSTIME, &its, NULL);
+        }
+        x->fg_armed = false;
+        return;
+    }
+    if (x->fg_tfd < 0) {
+        x->fg_tfd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+        if (x->fg_tfd < 0) {
+            x->fg_dead = true;
+            return;
+        }
+    }
+    its.it_value.tv_sec = (time_t)(due / 1000000000ull);
+    its.it_value.tv_nsec = (long)(due % 1000000000ull);
+    if (timerfd_settime(x->fg_tfd, TFD_TIMER_ABSTIME, &its, NULL) == 0) {
+        x->fg_armed = true;
+    }
+}
+
+/* One generated picture: 1 shown, 0 not now, -1 failed. */
+static int x11_fg_present(struct nb_x11 *x, float t)
+{
+    struct nb_gs_draw d = x->fg_d;
+    unsigned gpu_us = 0;
+    int ti = -1;
+
+    if (!x->gs || !nb_gs_fg_ready(x->gs) || !x->gt_w) {
+        return 0;
+    }
+    if (x->gt_rb) {
+        if (x->rb_busy[0] && x->rb_busy[1]) {
+            return 0;
+        }
+        ti = (x->gt_last + 1) % NB_GS_TARGETS;
+    } else {
+        for (int k = 1; k <= NB_GS_TARGETS; k++) {
+            int i = (x->gt_last + k) % NB_GS_TARGETS;
+
+            if (!x->gt[i].busy) {
+                ti = i;
+                break;
+            }
+        }
+    }
+    if (ti < 0) {
+        return 0;
+    }
+    d.target = ti;
+    d.src_key = NB_GS_SRC_FG;
+    d.fg_t = t;
+    if (nb_gs_draw(x->gs, &d, 50000, &gpu_us) < 0) {
+        return -1;
+    }
+    x->gt_last = ti;
+    if (!x->gt_rb) {
+        uint32_t ser = ++x->serial;
+
+        x->fg_serial[x->fg_sn++ % 8] = ser;
+        xcb_present_pixmap(x->c, x->content, x->gt[ti].pix, ser, XCB_NONE,
+                           XCB_NONE, 0, 0, XCB_NONE, XCB_NONE, XCB_NONE,
+                           x->imm ? XCB_PRESENT_OPTION_ASYNC : 0, 0, 0, 0, 0,
+                           NULL);
+        x->gt[ti].busy = true;
+    } else {
+        int half = x->rb_busy[x->rb_next] ? x->rb_next ^ 1 : x->rb_next;
+        uint8_t *dst = x->rb_mem + (size_t)half * x->rb_one;
+
+        if (nb_gs_readback(x->gs, ti, dst) < 0) {
+            return -1;
+        }
+        if (!x->copy_gc) {
+            x->copy_gc = xcb_generate_id(x->c);
+            xcb_create_gc(x->c, x->copy_gc, x->content, 0, NULL);
+        }
+#ifdef NB_HAVE_XCB_SHM
+        if (x->shm_ok) {
+            xcb_shm_put_image(x->c, x->content, x->copy_gc, (uint16_t)x->gt_w,
+                              (uint16_t)x->gt_h, 0, 0, (uint16_t)x->gt_w,
+                              (uint16_t)x->gt_h, 0, 0, 24,
+                              XCB_IMAGE_FORMAT_Z_PIXMAP, 1, x->rb_seg,
+                              (uint32_t)((size_t)half * x->rb_one));
+            x->rb_busy[half] = true;
+        } else
+#endif
+        {
+            x11_blit(x, x->content, x->copy_gc, (const uint32_t *)dst,
+                     (int)x->gt_w, (int)x->gt_h);
+        }
+        x->rb_next = half ^ 1;
+    }
+    xcb_flush(x->c);
+    x->st_fg++;
+    return 1;
+}
+
+static void x11_fg_fire(struct nb_x11 *x)
+{
+    int step = 0;
+    float t = nb_fg_peek(&x->fg, nb_mono_ns(), &step);
+
+    if (t > 0.0f && x->fg_live) {
+        int r;
+
+        if (x->pending >= 0) {
+            nb_fg_abandon(&x->fg);  /* a newer frame starts its own cycle */
+            x11_fg_arm(x);
+            return;
+        }
+        r = x11_fg_present(x, t);
+        if (r == 1) {
+            nb_fg_shown(&x->fg, step);
+        } else if (r < 0) {
+            nb_err("frame generation: the GPU pass failed; off for this "
+                   "session");
+            x->fg_dead = true;
+            x->fg_live = false;
+            nb_fg_reset(&x->fg);
+        } else {
+            struct itimerspec its = { 0 };
+            uint64_t at = nb_mono_ns() + 500000ull;
+
+            its.it_value.tv_sec = (time_t)(at / 1000000000ull);
+            its.it_value.tv_nsec = (long)(at % 1000000000ull);
+            if (timerfd_settime(x->fg_tfd, TFD_TIMER_ABSTIME, &its, NULL) == 0) {
+                x->fg_armed = true;
+            }
+            return;
+        }
+    }
+    x11_fg_arm(x);
+}
+
+/* The GPU pass's priority follows the mode (see the Wayland backend's
+ * wl_gs_prio_follow): LOW with upscaling or frame generation on. */
+static void x11_gs_prio_follow(struct nb_x11 *x)
+{
+    nb_gs_set_prio_default(x11_enh_on(x) ? NB_GS_PRIO_LOW : NB_GS_PRIO_HIGH);
+    if (x->gs && nb_gs_prio_requested(x->gs) != nb_gs_prio_wanted()) {
+        nb_log("GPU copy: reopening the GPU pass at context priority %s",
+               nb_gs_prio_name(nb_gs_prio_wanted()));
+        x11_gt_drop(x);
+        nb_gs_close(x->gs);
+        x->gs = NULL;
+        x->copy_n = 0;
+    }
+}
+
+static void x11_fg_changed(struct nb_x11 *x)
+{
+    int m = x11_fg_mult(x);
+
+    if (m == x->fg_mult_was) {
+        return;
+    }
+    x->fg_mult_was = m;
+    nb_fg_init(&x->fg, m);
+    x->fg_live = false;
+    if (x->gs) {
+        nb_gs_fg_reset(x->gs);
+    }
+    x11_fg_arm(x);
+    nb_log("frame generation: %s", m == 2 ? "2x" : m == 3 ? "3x" : "off");
+}
+
+/* Smooth Motion on: the content window becomes a Vulkan swapchain. */
+static void x11_vk_changed(struct nb_x11 *x)
+{
+    bool want = x->vst.fgen == NB_FGEN_NVSM && !x->vk_dead &&
+                nb_vkp_available(NULL);
+
+    if (want == x->vk_on) {
+        return;
+    }
+    if (want) {
+        char why[200] = "";
+
+        x->vkp = nb_vkp_open_xcb(x->c, x->content, why, sizeof(why));
+        if (!x->vkp) {
+            x->vk_dead = true;
+            nb_err("Smooth Motion: %s; frame generation stays off",
+                   why[0] ? why : "cannot start");
+            return;
+        }
+        x->vk_on = true;
+        nb_log("Smooth Motion: guest frames go through a Vulkan swapchain on "
+               "%s (%s=1, the driver's frame generation)",
+               nb_vkp_device(x->vkp), NB_VKP_ENV);
+        return;
+    }
+    nb_vkp_close(x->vkp);
+    x->vkp = NULL;
+    x->vk_on = false;
+    nb_log("Smooth Motion: off");
+}
+
+/* A copied frame through the swapchain.  0 handled, -1 failed (left). */
+static int x11_vk_present(struct nb_x11 *x, struct nb_sink *sink)
+{
+    int slot = x->pending;
+    struct nb_x11_buf *sl = &x->bufs[slot];
+    const struct nb_place *p = &x->place;
+    struct nb_vkp_frame fr;
+    unsigned us = 0;
+    int r;
+
+    x11_place(x, (int)sl->w, (int)sl->h);
+    fr = (struct nb_vkp_frame){
+        .key = slot, .fd = sl->fd, .w = sl->w, .h = sl->h,
+        .stride = sl->stride, .offset = sl->offset, .fourcc = sl->fourcc,
+        .modifier = sl->modifier,
+        .sx = p->sw > 0 ? p->sx : 0, .sy = p->sh > 0 ? p->sy : 0,
+        .sw = p->sw > 0 ? p->sw : sl->w, .sh = p->sh > 0 ? p->sh : sl->h,
+        .dx = 0, .dy = 0,
+        .dw = p->vis.w > 0 ? p->vis.w : 1, .dh = p->vis.h > 0 ? p->vis.h : 1,
+        .out_w = (uint32_t)(p->vis.w > 0 ? p->vis.w : 1),
+        .out_h = (uint32_t)(p->vis.h > 0 ? p->vis.h : 1),
+        .mode = x->imm ? NB_VKP_IMMEDIATE
+              : x->vst.sync == NB_SYNC_LATCH ? NB_VKP_MAILBOX : NB_VKP_FIFO,
+        .nearest = x->vst.cur.filter == NB_FILTER_NEAREST,
+    };
+    r = nb_vkp_present(x->vkp, &fr, 50000, &us);
+    if (r < 0) {
+        nb_err("Smooth Motion: presenting failed (%d); back to the GPU pass "
+               "for this session", r);
+        x->vk_dead = true;
+        x11_vk_changed(x);
+        return -1;
+    }
+    /* Shown, or no free image (dropped: the next frame replaces it). */
+    x->pending = -1;
+    nb_sink_release(sink, sl->id, 0);
+    nb_sink_frame(sink);
+    if (r > 0) {
+        x->st_commits++;
+        x->st_gpu_n++;
+        x->st_gpu_sum += us;
+        x->current = slot;
+        x->idle_shown = false;
+        x11_cursor_policy(x);
+    }
+    x11_stats_flush(x);
+    return 0;
+}
+
 static const struct nb_ui_env *x11_ui_env(struct nb_x11 *x)
 {
     static struct nb_ui_env e;
@@ -3523,6 +3935,14 @@ static const struct nb_ui_env *x11_ui_env(struct nb_x11 *x)
     e.vm_paused = x->vmp.paused;
     e.vm_pause_busy = nb_vmpause_busy(&x->vmp);
     e.translucent = false;
+    e.enhance_ok = !x->gs_dead && (!x->gs || nb_gs_enhance_ok(x->gs, NULL));
+    e.nvsm_ok = nb_vkp_available(NULL);
+    e.nvsm_restart = x->vst.fgen == NB_FGEN_NVSM && !x->vk_on && !x->vk_dead;
+    e.enhance_why = x->fg_dead && nb_fgen_mult(x->vst.fgen) > 1
+                        ? "Frame generation failed on this GPU (log)"
+                    : x->vst.fgen == NB_FGEN_NVSM && x->vk_dead
+                        ? "Smooth Motion failed to start (log)"
+                    : x->enh_note;
     return &e;
 }
 
@@ -3897,6 +4317,16 @@ static void x11_ui_do(struct nb_x11 *x, unsigned bits)
     }
     if (bits & NB_UI_SYNC) {
         x11_sync_apply(x, "menu");
+    }
+    if (bits & NB_UI_ENHANCE) {
+        x->enh_logged = -1;
+        x->enh_note[0] = '\0';
+        x11_fg_changed(x);
+        x11_vk_changed(x);
+        x11_gs_prio_follow(x);
+        if (x->sink) {
+            nb_sink_refresh(x->sink);   /* the next frame, re-imported */
+        }
     }
     if ((bits & NB_UI_FULLSCREEN) && x->sink) {
         nb_sink_toggle_fullscreen(x->sink);

@@ -85,14 +85,23 @@ int  nb_gs_src(struct nb_gs *g, int key, int fd, uint32_t w, uint32_t h,
                uint64_t mod);
 void nb_gs_src_drop(struct nb_gs *g, int key);
 
+/* nb_gs_draw.src_key: the frame-generation history (nb_gs_fg_push) instead
+ * of a guest buffer; fg_t says which picture between its two frames. */
+#define NB_GS_SRC_FG (-2)
+
 struct nb_gs_draw {
     int    src_key;
     int    target;              /* 0..NB_GS_TARGETS-1                        */
     int    dx, dy, dw, dh;      /* destination, target pixels, y down        */
-    double sx, sy, sw, sh;      /* source rectangle, buffer pixels           */
+    double sx, sy, sw, sh;      /* source rectangle, buffer pixels (ignored
+                                 * for NB_GS_SRC_FG: the history is cropped) */
     bool   nearest;
     bool   alpha;               /* keep the source's alpha (a cursor image);
                                  * otherwise the target is opaque            */
+    /* Picture enhancement (docs/VIEWER-ENHANCE.md); zero = the plain pass. */
+    int    upscale;             /* NB_UPSCALE_* (nb_view.h)                  */
+    int    sharp;               /* 0..100                                    */
+    float  fg_t;                /* NB_GS_SRC_FG: 0 previous .. 1 newest      */
 };
 
 /*
@@ -107,6 +116,52 @@ int nb_gs_draw(struct nb_gs *g, const struct nb_gs_draw *d,
 int nb_gs_read(struct nb_gs *g, int target, int x, int y, uint32_t *rgb);
 
 /*
+ * PICTURE ENHANCEMENT (docs/VIEWER-ENHANCE.md): the upscalers and frame
+ * generation run in this same context, which is then GLES 3.1 (asked for
+ * first, GLES 2 otherwise).  Programs are compiled when first used.
+ *
+ * With nb_gs_draw.upscale set, a guest frame is first copied into an
+ * internal texture (an external dma-buf texture cannot be gathered from),
+ * then drawn by the chosen pass: FSR 1 (EASU, then RCAS into the target),
+ * NIS (compute, then a 1:1 copy), CAS (sharpened at the guest's size, then
+ * scaled).  A pass that cannot run (no GLES 3.1, a shader the driver
+ * refuses, a scale it does not do: nb_enhance.h nb_enh_pick) falls back to
+ * the plain pass; nb_gs_enh_status says which ran and why.
+ */
+bool nb_gs_enhance_ok(struct nb_gs *g, const char **why);
+/* The pass the last draw used (NB_UPSCALE_*), and why it is not the one
+ * asked for (NULL when it is). */
+int  nb_gs_enh_status(const struct nb_gs *g, const char **why);
+
+/*
+ * FRAME GENERATION (nb_fg.h decides when).  Push a guest frame: it is
+ * copied (source rectangle sx..sh) into a two-frame history, its luma
+ * pyramid is built and the optical flow from the previous frame estimated
+ * (block matching, coarse to fine).  Waits for the GPU (bounded), so the
+ * guest buffer may be released after.  1: a pair is ready to interpolate;
+ * 0: this is the first frame of a new history (size changed, reset);
+ * -errno on failure.  Then nb_gs_draw with src_key NB_GS_SRC_FG.
+ */
+int  nb_gs_fg_push(struct nb_gs *g, int src_key, double sx, double sy,
+                   double sw, double sh, unsigned timeout_us,
+                   unsigned *gpu_us);
+void nb_gs_fg_reset(struct nb_gs *g);
+/* timeout_us 0: submit without waiting; the next nb_gs_draw's wait covers
+ * it (one GPU submission per guest frame instead of two). */
+/* Whether the history holds a frame to draw. */
+bool nb_gs_fg_ready(const struct nb_gs *g);
+
+/*
+ * BENCHMARK (conduit-viewer --bench-enhance): every enhancement pass on the
+ * GPU at node (NULL: the first that works), an iw x ih source drawn at
+ * ow x oh, `iters` times each; the GPU time per pass (timer queries, when
+ * the driver has them) and the wall time to the fence, medians, to `out`.
+ * No display, no VM.  0, or -1 with the reason printed.
+ */
+int nb_gs_bench(const char *node, uint32_t iw, uint32_t ih, uint32_t ow,
+                uint32_t oh, int iters, void *out_file);
+
+/*
  * GPU PRIORITY OF THE PASS.  The pass sits between the guest's frame and the
  * screen on the GPU the guest is loading, so it asks to be scheduled ahead of
  * it: EGL_IMG_context_priority HIGH by default, EGL_NV_context_priority_
@@ -115,8 +170,13 @@ int nb_gs_read(struct nb_gs *g, int target, int x, int y, uint32_t *rgb);
  * MAKE_REALTIME check RS_ACCESS_NICE), and the granted level is read back
  * with eglQueryContext and reported.
  *
- * CONDUIT_VIEWER_GPU_PRIORITY = off | medium | high (default) | realtime.
- * off and medium both create a context without the attribute.
+ * CONDUIT_VIEWER_GPU_PRIORITY = low | off | medium | high (default) |
+ * realtime.  off and medium both create a context without the attribute.
+ *
+ * With picture enhancement on (docs/VIEWER-ENHANCE.md) the sessions ask for
+ * LOW instead (nb_gs_set_prio_default): those passes do more work per frame,
+ * and run on the GPU the guest renders on; at LOW they wait for the guest's
+ * channels rather than preempt them.  The variable, when set, wins.
  */
 enum nb_gs_prio {
     NB_GS_PRIO_UNKNOWN = -1,    /* not reported by the driver               */
@@ -129,6 +189,11 @@ enum nb_gs_prio {
 /* The env value (NULL or empty: the default, HIGH); an unknown word is
  * reported through *bad and gives the default. */
 enum nb_gs_prio nb_gs_prio_parse(const char *s, bool *bad);
+/* The priority asked for when CONDUIT_VIEWER_GPU_PRIORITY is not set, for
+ * the next nb_gs_open (HIGH until changed). */
+void nb_gs_set_prio_default(enum nb_gs_prio p);
+/* What the next nb_gs_open will ask for: the variable, else the default. */
+enum nb_gs_prio nb_gs_prio_wanted(void);
 const char *nb_gs_prio_name(enum nb_gs_prio p);
 /* What was asked for and what the driver says it granted. */
 enum nb_gs_prio nb_gs_prio_requested(const struct nb_gs *g);

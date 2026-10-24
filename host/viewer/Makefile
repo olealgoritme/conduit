@@ -40,7 +40,7 @@ CFLAGS  += -std=gnu11 -Wall -Wextra -Wno-unused-parameter \
 LDFLAGS += -Wl,-z,relro,-z,now
 
 OBJS = nvkvm_broker.o nb_common.o nb_placeholder.o nb_overlay.o nb_view.o nb_ui.o nb_gpuscale.o nb_xsync.o \
-       nb_session_x11.o nb_session_wl.o nb_session_test.o
+       nb_vkpresent.o nb_session_x11.o nb_session_wl.o nb_session_test.o
 
 # ── X11 backend: xcb + DRI3 + Present ─────────────────────────────────────
 # DRI3 is what lets a dma-buf become an X pixmap without a GL context, and
@@ -145,6 +145,14 @@ $(error REQUIRE_UI_FONT=1 but freetype2/fontconfig development files are missing
 endif
 endif
 
+# ── NVIDIA Smooth Motion presenter: Vulkan headers ────────────────────────
+# Only the headers: libvulkan.so.1 is dlopen'ed when the mode is chosen
+# (nb_vkpresent.h).  Optional -- without them --framegen=nvidia is hidden.
+ifeq ($(shell printf '\043include <vulkan/vulkan.h>\n' | $(CC) $(shell $(PKG_CONFIG) --cflags vulkan 2>/dev/null) -E - >/dev/null 2>&1 && echo yes),yes)
+HAVE_VULKAN = 1
+CFLAGS  += -DNB_HAVE_VULKAN $(shell $(PKG_CONFIG) --cflags vulkan 2>/dev/null)
+endif
+
 ifeq ($(HAVE_X11)$(HAVE_WL),)
 $(warning No display backend will be compiled in: only --backend test will work.)
 $(warning   Wayland: apt install libwayland-dev wayland-protocols)
@@ -166,7 +174,7 @@ GBM_LIBS   = $(shell $(PKG_CONFIG) --libs gbm)
 endif
 
 .SECONDARY:
-.PHONY: all install clean report check check-sanitize
+.PHONY: all install clean report check check-sanitize check-shaders
 SCANTEST    = nvgpu-scanout-test
 all: report $(BIN) $(TESTCLIENT) $(RELAY) $(if $(HAVE_GBM),$(DMASRC),) $(if $(HAVE_SCANTEST),$(SCANTEST),)
 
@@ -178,6 +186,7 @@ report:
 	@echo "  x11     : $(if $(HAVE_X11),yes (dri3+present$(if $(HAVE_XRENDER), +xrender scaling, NO SCALING: install libxcb-render0-dev)$(if $(HAVE_XSHM), +mit-shm read-back, - read-back through PutImage: install libxcb-shm0-dev)),NO - install libxcb1-dev libxcb-dri3-dev libxcb-present-dev)$(if $(HAVE_X11),$(if $(HAVE_XI), + xi2 raw motion, - NO relative motion under grab: install libxcb-xinput-dev),)"
 	@echo "  test    : yes (always)"
 	@echo "  ui text : $(if $(HAVE_FT),freetype + fontconfig,bitmap font only - apt install libfreetype-dev libfontconfig-dev)"
+	@echo "  smooth motion : $(if $(HAVE_VULKAN),yes (Vulkan headers; libvulkan loaded at run time),NO - apt install libvulkan-dev)"
 
 $(BIN): $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
@@ -196,6 +205,44 @@ build_id.h: FORCE
 nvkvm_broker.o: build_id.h
 .PHONY: FORCE
 FORCE:
+
+# The enhancement shaders (docs/VIEWER-ENHANCE.md) as C strings: our own
+# (shaders/) and the vendored FidelityFX / NIS sources (third_party/),
+# in the order nb_gpuscale.c's enh_progs[] names them.  shaders/check.sh
+# compiles the same programs offline (`make check-shaders`).
+SHADER_SRC = \
+  nb_sh_es_frag shaders/es_frag.glsl \
+  nb_sh_es_comp shaders/es_comp.glsl \
+  nb_sh_quad_vert shaders/quad.vert \
+  nb_sh_copy shaders/copy.frag \
+  nb_sh_easu_head shaders/easu_head.glsl \
+  nb_sh_easu_main shaders/easu_main.glsl \
+  nb_sh_rcas_head shaders/rcas_head.glsl \
+  nb_sh_rcas_main shaders/rcas_main.glsl \
+  nb_sh_cas_head shaders/cas_head.glsl \
+  nb_sh_cas_noscale shaders/cas_noscale.glsl \
+  nb_sh_cas_scale shaders/cas_scale.glsl \
+  nb_sh_fsr1_head shaders/fsr1_head.glsl \
+  nb_sh_fsr1_main shaders/fsr1_main.glsl \
+  nb_sh_cas_main shaders/cas_main.glsl \
+  nb_sh_nis_head shaders/nis_head.glsl \
+  nb_sh_nis_main shaders/nis_main.glsl \
+  nb_sh_nis_scaler shaders/nis_scaler_gles.glsl \
+  nb_sh_ffx_a third_party/fsr1/ffx_a.h \
+  nb_sh_ffx_fsr1 third_party/fsr1/ffx_fsr1.h \
+  nb_sh_ffx_cas third_party/cas/ffx_cas.h \
+  nb_sh_fg_down shaders/fg_down.comp \
+  nb_sh_fg_flow shaders/fg_flow.comp \
+  nb_sh_fg_interp shaders/fg_interp.comp
+SHADER_FILES = $(filter-out nb_sh_%,$(SHADER_SRC))
+
+nb_shaders.h: shaders/embed.sh $(SHADER_FILES)
+	sh shaders/embed.sh $@ $(SHADER_SRC)
+
+nb_gpuscale.o: nb_shaders.h
+
+check-shaders:
+	sh shaders/check.sh || [ $$? = 77 ]
 
 # Generated Wayland protocol glue.  Every .o depends on the headers because
 # they are generated, and make has no way to know that otherwise.
@@ -263,8 +310,8 @@ test-ui: test/test_ui.c nb_ui.c nb_ui.h nb_view.c nb_view.h nb_placeholder.c
 
 # The fullscreen scaler on a real GPU, headless (no window).  Skips (77)
 # without a render node, so it is safe on CI.
-test-gpuscale: test/test_gpuscale.c nb_gpuscale.c nb_gpuscale.h
-	$(CC) $(CFLAGS) $(GBM_CFLAGS) -I . -o $@ test/test_gpuscale.c nb_gpuscale.c $(GBM_LIBS) -ldl
+test-gpuscale: test/test_gpuscale.c nb_gpuscale.c nb_gpuscale.h nb_shaders.h
+	$(CC) $(CFLAGS) $(GBM_CFLAGS) -I . -o $@ test/test_gpuscale.c nb_gpuscale.c nb_view.c $(GBM_LIBS) -ldl -lm
 
 test-pace: test/test_pace.c nb_pace.h
 	$(CC) $(CFLAGS) -I . -o $@ test/test_pace.c
@@ -290,8 +337,20 @@ test-present: test/test_present.c nb_present.h nb_scanout.h
 test-vmpause: test/test_vmpause.c nb_vmpause.h
 	$(CC) $(CFLAGS) -I . -o $@ test/test_vmpause.c
 
-check: all test-utf8 test-overlay test-relacc test-vmpause test-view test-ui test-pace test-latch test-blit test-gpusel test-scanout test-present $(if $(HAVE_GBM),test-gpuscale,)
+test-fg: test/test_fg.c nb_fg.h
+	$(CC) $(CFLAGS) -I . -o $@ test/test_fg.c -lm
+
+test-enhance: test/test_enhance.c nb_enhance.h nb_view.c nb_view.h
+	$(CC) $(CFLAGS) -I . -o $@ test/test_enhance.c nb_view.c -lm
+
+test-vkpresent: test/test_vkpresent.c nb_vkpresent.h
+	$(CC) $(CFLAGS) -I . -o $@ test/test_vkpresent.c
+
+check: all test-utf8 test-overlay test-relacc test-vmpause test-view test-ui test-pace test-latch test-blit test-gpusel test-scanout test-present test-fg test-enhance test-vkpresent check-shaders $(if $(HAVE_GBM),test-gpuscale,)
 	./test-utf8
+	./test-fg
+	./test-enhance
+	./test-vkpresent
 	./test-present
 	./test-pace
 	./test-latch
@@ -326,4 +385,4 @@ install: $(BIN)
 
 clean:
 	rm -f $(BIN) $(TESTCLIENT) $(RELAY) $(DMASRC) $(SCANTEST) *.o *.d build_id.h \
-	      *-client-protocol.h *-protocol.c test-utf8 test-overlay test-gpuscale test-pace test-latch test-blit test-gpusel test-scanout test-present test-vmpause test/utf8_extracted.inc
+	      *-client-protocol.h *-protocol.c test-utf8 test-overlay test-gpuscale test-pace test-latch test-blit test-gpusel test-scanout test-present test-vmpause test-fg test-enhance test-vkpresent nb_shaders.h test/utf8_extracted.inc

@@ -1,0 +1,83 @@
+// SPDX-License-Identifier: GPL-2.0 OR Apache-2.0
+//
+// fg_interp.comp -- the generated picture at phase u_t between the previous
+// (0) and the newest (1) guest frame, at the frames' own resolution
+// (docs/VIEWER-ENHANCE.md).  The upscaler, if any, runs on the result.
+//
+// Per pixel x, from the finest flow level (half resolution):
+//
+//   candidates   the four flow vectors around x and zero motion.  Choosing
+//                per pixel, by how well the two frames agree along each
+//                candidate, keeps object edges where the colour says they
+//                are rather than where the half-resolution blocks put them,
+//                and lets static overlays (a HUD, text) pick zero motion
+//                under a moving background
+//   motion       prev(x - t v) and cur(x + (1 - t) v), mixed by t
+//   occlusion    when even the best candidate disagrees (something was
+//                covered or uncovered), the sample from the frame nearer in
+//                time; at t = 1/2 their average
+//   low trust    where the flow match itself was poor (fast motion beyond
+//                the search range, a scene cut, noise), a plain cross-fade
+//                of the two frames at x, which never tears geometry apart
+//
+// Follows shaders/es_comp.glsl (nb_gpuscale.c).
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+uniform highp sampler2D u_prev;     // colour, linear filtering
+uniform highp sampler2D u_cur;
+uniform highp sampler2D u_flow;     // finest flow level, texelFetch
+layout(rgba8, binding = 0) uniform writeonly highp image2D u_dst;
+uniform ivec2 u_size;               // the frames
+uniform ivec2 u_fsize;              // the flow field
+uniform vec2  u_inv;                // 1 / frame size
+uniform float u_fscale;             // frame pixels per flow texel
+uniform float u_t;
+
+void main()
+{
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+
+    if (p.x >= u_size.x || p.y >= u_size.y) {
+        return;
+    }
+    vec2 c = vec2(p) + 0.5;
+    float t = u_t;
+    // The four flow texels whose centres surround c.
+    vec2 fc = c / u_fscale - 0.5;
+    ivec2 f0 = ivec2(floor(fc));
+    vec3 a_best = vec3(0.0), b_best = vec3(0.0);
+    float e_best = 1e9, k_best = 0.0;
+
+    for (int i = 0; i < 5; i++) {
+        vec2 v = vec2(0.0);
+        float k = 0.0;
+
+        if (i < 4) {
+            ivec2 q = clamp(f0 + ivec2(i & 1, i >> 1), ivec2(0), u_fsize - 1);
+            vec4 f = texelFetch(u_flow, q, 0);
+
+            v = f.rg;
+            k = f.b;
+        }
+        vec3 a = textureLod(u_prev, (c - t * v) * u_inv, 0.0).rgb;
+        vec3 b = textureLod(u_cur, (c + (1.0 - t) * v) * u_inv, 0.0).rgb;
+        float e = dot(abs(a - b), vec3(1.0 / 3.0));
+
+        if (e < e_best) {
+            e_best = e;
+            a_best = a;
+            b_best = b;
+            k_best = i < 4 ? k : e;
+        }
+    }
+    vec3 both = mix(a_best, b_best, t);
+    vec3 near = t < 0.5 ? a_best : t > 0.5 ? b_best : 0.5 * (a_best + b_best);
+    float conf_px = 1.0 - smoothstep(0.03, 0.12, e_best);
+    vec3 moved = mix(near, both, conf_px);
+    vec3 fade = mix(textureLod(u_prev, c * u_inv, 0.0).rgb,
+                    textureLod(u_cur, c * u_inv, 0.0).rgb, t);
+    float conf_flow = 1.0 - smoothstep(0.05, 0.16, k_best);
+
+    imageStore(u_dst, p, vec4(mix(fade, moved, conf_flow), 1.0));
+}

@@ -297,6 +297,7 @@ int main(int argc, char **argv)
     const char *modstr = "default";
     uint32_t w = 1280, h = 720;
     unsigned frames = 1;
+    unsigned interval_ms = 200;         /* between frames with --present */
     bool do_list = false, advertise_implicit = false, fill_x11 = false;
     int drmfd, i;
     struct gbm_device *dev;
@@ -315,6 +316,7 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--modifier") && v) { modstr = v; i++; }
         else if (!strcmp(a, "--size") && v)     { sscanf(v, "%ux%u", &w, &h); i++; }
         else if (!strcmp(a, "--frames") && v)   { frames = (unsigned)atoi(v); i++; }
+        else if (!strcmp(a, "--interval-ms") && v) { interval_ms = (unsigned)atoi(v); i++; }
         else if (!strcmp(a, "--as-implicit"))   { advertise_implicit = true; }
         else if (!strcmp(a, "--fill-via-x11"))  { fill_x11 = true; }
         else if (!strcmp(a, "--list"))          { do_list = true; }
@@ -323,7 +325,7 @@ int main(int argc, char **argv)
                     "usage: %s [--node /dev/dri/renderDN] "
                     "[--present SOCK | --serve SOCK | --list]\n"
                     "          [--modifier default|linear|implicit|0xHEX] "
-                    "[--size WxH] [--frames N]\n", argv[0]);
+                    "[--size WxH] [--frames N] [--interval-ms N]\n", argv[0]);
             return 2;
         }
     }
@@ -499,7 +501,7 @@ filled:
             }
             printf("sent ATTACH+COMMIT #%u\n", f);
             fflush(stdout);
-            usleep(200000);
+            usleep(interval_ms * 1000u);
         }
         printf("frames sent.  Reading events — a REJECTION is reported on the\n"
                "BROKER's stderr, not here.\n");

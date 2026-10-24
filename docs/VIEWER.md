@@ -79,6 +79,9 @@ that fades in when the pointer touches the window's top edge. The menu has:
 - **Profiles**: save the current setup under a name (for example
   "CS2 4:3 stretched"), click one to load it, `x` to delete it.
   Ctrl+Alt+P cycles through them.
+- **Upscaling**: Off, FSR 1, NIS or Sharpen only (CAS), with a sharpness,
+  and **Frame generation**: Off, 2x, 3x, or NVIDIA Smooth Motion on an RTX
+  40/50 host. See [VIEWER-ENHANCE.md](VIEWER-ENHANCE.md).
 - **Presentation**: Immediate in fullscreen (the default), Always immediate,
   VSync, or Latest per refresh. See
   [Presentation](#presentation-immediate-vsync-or-latest-per-refresh).
@@ -130,7 +133,9 @@ At most 16 modes keep their own settings; the oldest goes first.
 The viewer restores the settings, profiles and recent resolutions from that
 file at start, and rewrites it on every change. `--res`, `--area`, `--scale`,
 `--filter` and `--sync` given to `conduit view` override only the setting they
-name. `sync=` appears in the file only when it is not the default.
+name. `sync=`, `upscale=`, `sharpness=` and `framegen=`
+([VIEWER-ENHANCE.md](VIEWER-ENHANCE.md)) appear in the file only when they
+are not the default.
 The file is plain `key=value` text:
 
 ```
