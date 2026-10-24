@@ -1818,6 +1818,11 @@ class = "experiment"
 read = "first use (once per process)"
 effect = "1: a pipeline barrier whose storage-write flush already invalidated the shader data caches emits no second GLOBAL_DATA invalidate. A/B knob, default 0."
 
+[env.NVK_MME_LAZY_WFI]
+class = "experiment"
+read = "first use (once per process)"
+effect = "1: the host WFI and system memory barrier that a barrier with indirect-command, conditional rendering, transform feedback counter or descriptor buffer reads asks for go before the next command that reads memory through the MME or the pushbuffer DMA instead of at the barrier (vkd3d-proton has such a barrier at every ExecuteCommandLists). Every command buffer starts with one pending. A/B knob, default 0."
+
 [env.NVK_RM_VIDEO]
 class = "debug"
 read = "physical device enumeration"

@@ -29,8 +29,8 @@ Classes:
 |---|---:|---:|---:|---:|---:|---:|
 | KMD: service key | 7 | 27 | 26 | 28 | 12 | 100 |
 | UMDs and ICD policy: `HKLM\SOFTWARE\Helios` | 20 | 19 | 25 | 11 | 0 | 75 |
-| Environment variables | 8 | 35 | 104 | 35 | 0 | 182 |
-| All | 35 | 81 | 155 | 74 | 12 | 357 |
+| Environment variables | 8 | 35 | 104 | 36 | 0 | 183 |
+| All | 35 | 81 | 155 | 75 | 12 | 358 |
 
 ## What the installation writes
 
@@ -450,7 +450,7 @@ Per-process: they act only on the process whose environment carries them (and it
 | `VKD3D_SHADER_CACHE_PATH` | `unset`; unset: the bridge sets it per process | first D3D12 device creation | vkd3d-proton's shader cache folder. When unset, the D3D12 bridge sets it to %LOCALAPPDATA%\Helios\vkd3d, else the temp folder, else 0 (no disk cache); a value already set, 0 included, is kept. | [vkd3d_bridge.cpp:1174](../guest/windows/umd12/bridge/vkd3d_bridge.cpp#L1174) |
 | `ZINK_VULKAN_ICD` | `unset` | once per process | The Vulkan ICD Zink loads on Windows: a DLL path, or loader for the Vulkan loader; unset loads NVK from next to the driver or the Helios install directory. | [0034-zink-load-a-Vulkan-ICD-directly-on-Windows-NVK-on-RM.patch:76](../guest/nvk-rm/patches-windows/0034-zink-load-a-Vulkan-ICD-directly-on-Windows-NVK-on-RM.patch#L76) |
 
-### Experiment, not for users (35)
+### Experiment, not for users (36)
 
 | Name | Default (code) | Read | Effect | Source |
 |---|---|---|---|---|
@@ -479,6 +479,7 @@ Per-process: they act only on the process whose environment carries them (and it
 | `NVK_HELIOS_WSI_LINEAR` | `false` | swapchain creation | 1 makes Win32 scanout swap chains linear (NVK renders through a tiled shadow); 0 keeps block-linear scanout images. | [0024-nvk-rm-wsi-block-linear-Win32-scanout-swapchains-wit.patch:103](../guest/nvk-rm/patches-windows/0024-nvk-rm-wsi-block-linear-Win32-scanout-swapchains-wit.patch#L103) |
 | `NVK_INDIRECT_PUSH` | `false` | device creation | 1 (Turing and later) pushes indirect draw records inline through the pushbuffer MME path; 0 uses the standard indirect path. | [0037-nvk-rm-no-16-ms-stall-on-a-full-GPFIFO-ring-NVK_INDI.patch:55](../guest/nvk-rm/patches-common/0037-nvk-rm-no-16-ms-stall-on-a-full-GPFIFO-ring-NVK_INDI.patch#L55) |
 | `NVK_MDI_BATCH` | `0` | device creation | N &gt; 0 (Turing and later) reads indirect multi-draw records in batches of N through one MME DMA read; 0 is off. | [0024-nvk-NVK_MDI_BATCH-reads-indirect-multi-draw-records-.patch:85](../guest/nvk-rm/patches-common/0024-nvk-NVK_MDI_BATCH-reads-indirect-multi-draw-records-.patch#L85) |
+| `NVK_MME_LAZY_WFI` | `false` | first use (once per process) | 1: the host WFI and system memory barrier that a barrier with indirect-command, conditional rendering, transform feedback counter or descriptor buffer reads asks for go before the next command that reads memory through the MME or the pushbuffer DMA instead of at the barrier (vkd3d-proton has such a barrier at every ExecuteCommandLists). Every command buffer starts with one pending. A/B knob, default 0. | [0091-nvk-NVK_MME_LAZY_WFI-host-WFI-of-an-MME-data-invalid.patch:53](../guest/nvk-rm/patches-common/0091-nvk-NVK_MME_LAZY_WFI-host-WFI-of-an-MME-data-invalid.patch#L53) |
 | `NVK_MME_PACK_INSTR` | `false` | device creation | 1 packs MME macro instructions to save macro RAM (test only); 0 uploads them unpacked. | [0029-nvk-MME-budget-2976-checked-before-upload-mesh-macro.patch:76](../guest/nvk-rm/patches-common/0029-nvk-MME-budget-2976-checked-before-upload-mesh-macro.patch#L76) |
 | `NVK_RM_ASYNC_WAIT_SWITCH` | `false` | first GPU wait | 1 makes every GPU wait that blocks ask for a channel group switch, also a wait for a value another channel of the same group signals; 0 skips the switch for those. | [0069-nvk-nvk-rm-async-compute-queues-next-to-the-graphics.patch:1270](../guest/nvk-rm/patches-common/0069-nvk-nvk-rm-async-compute-queues-next-to-the-graphics.patch#L1270) |
 | `NVK_RM_BAR_MB` | `0` | physical device enumeration | Size in MiB of the device-local host-visible memory type (the BAR heap). 0 hides that heap; a positive value reports a heap of that size. | [0030-nvk-rm-no-host-visible-VRAM-heap-by-default-NVK_RM_B.patch:56](../guest/nvk-rm/patches-common/0030-nvk-rm-no-host-visible-VRAM-heap-by-default-NVK_RM_B.patch#L56) |
