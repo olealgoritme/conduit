@@ -1,0 +1,200 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Sat, 24 Oct 2026 12:52:46 +0200
+Subject: [PATCH 4/4] helios: D3D12 cubin paths through the Helios UMD's engine
+ objects
+
+On a Windows guest the game's ID3D12Device and command lists are
+Microsoft's runtime objects; vkd3d-proton's sit behind the Helios D3D12
+UMD, so QueryInterface for ID3D12DeviceExt and
+ID3D12GraphicsCommandListExt fails and NGX's D3D12 cubin calls
+(CreateCubinComputeShader*, LaunchCubinShader, GetCudaTextureObject,
+...) returned E_NOTIMPL.
+
+With the Dlss knob on, the UMD publishes two meta-commands that hand out
+its engine objects in-process (src/shared/helios_d3d12.h): creating
+ENGINE_DEVICE writes the engine device, executing ENGINE_COMMAND_LIST on
+a recording list writes that list's engine list. NvapiD3d12Device and
+NvapiD3d12GraphicsCommandList fall back to them when the QueryInterface
+fails, and Cubin64bitSupportAvailable does the same. The engine objects
+live as long as the runtime objects, like vkd3d-proton's own under
+Proton. The UMD records every command on the engine list on the calling
+thread, so a launch lands in order with the game's commands.
+---
+ src/nvapi/nvapi_d3d12_device.cpp              | 19 +++-
+ .../nvapi_d3d12_graphics_command_list.cpp     | 10 +-
+ src/shared/helios_d3d12.h                     | 94 +++++++++++++++++++
+ 3 files changed, 117 insertions(+), 6 deletions(-)
+ create mode 100644 src/shared/helios_d3d12.h
+
+diff --git a/src/nvapi/nvapi_d3d12_device.cpp b/src/nvapi/nvapi_d3d12_device.cpp
+index 761590e..bb5b8ed 100644
+--- a/src/nvapi/nvapi_d3d12_device.cpp
++++ b/src/nvapi/nvapi_d3d12_device.cpp
+@@ -1,5 +1,6 @@
+ #include "nvapi_d3d12_device.h"
+ #include "../util/util_log.h"
++#include "../shared/helios_d3d12.h"
+ 
+ namespace dxvk {
+     std::atomic<LONGLONG> NvapiD3d12Device::m_resetTimestamp;
+@@ -35,8 +36,12 @@ namespace dxvk {
+                 continue;
+ 
+             Com<ID3D12DeviceExt2> d3d12DeviceExt2;
+-            if (FAILED(d3d12Device->QueryInterface(IID_PPV_ARGS(&d3d12DeviceExt2))))
+-                continue;
++            if (FAILED(d3d12Device->QueryInterface(IID_PPV_ARGS(&d3d12DeviceExt2)))) {
++                // Helios: Microsoft's runtime device, vkd3d-proton behind the UMD
++                auto engine = helios::EngineDevice(d3d12Device.ptr());
++                if (engine == nullptr || FAILED(engine->QueryInterface(IID_PPV_ARGS(&d3d12DeviceExt2))))
++                    continue;
++            }
+ 
+             if (d3d12DeviceExt2->SupportsCubin64bit())
+                 return m_cubin64bitSupportAvailable.emplace(true);
+@@ -63,8 +68,14 @@ namespace dxvk {
+             return nvapiDevice;
+ 
+         Com<ID3D12DeviceExt> deviceExt;
+-        if (FAILED(device->QueryInterface(IID_PPV_ARGS(&deviceExt))))
+-            return std::nullopt;
++        if (FAILED(device->QueryInterface(IID_PPV_ARGS(&deviceExt)))) {
++            // Helios: Microsoft's runtime device; the UMD's engine device lives
++            // as long as it does, so the raw pointer below stays valid.
++            auto engine = helios::EngineDevice(device);
++            if (engine == nullptr || FAILED(engine->QueryInterface(IID_PPV_ARGS(&deviceExt))))
++                return std::nullopt;
++            log::info("D3D12: vkd3d-proton device reached through the Helios UMD");
++        }
+ 
+         LARGE_INTEGER count;
+         QueryPerformanceCounter(&count);
+diff --git a/src/nvapi/nvapi_d3d12_graphics_command_list.cpp b/src/nvapi/nvapi_d3d12_graphics_command_list.cpp
+index b8ec06a..47f1153 100644
+--- a/src/nvapi/nvapi_d3d12_graphics_command_list.cpp
++++ b/src/nvapi/nvapi_d3d12_graphics_command_list.cpp
+@@ -2,6 +2,7 @@
+ #include "nvapi_d3d12_device.h"
+ #include "../util/com_pointer.h"
+ #include "../util/util_log.h"
++#include "../shared/helios_d3d12.h"
+ 
+ namespace dxvk {
+     thread_local NvapiAsConverter NvapiD3d12GraphicsCommandList::m_asConverter;
+@@ -32,8 +33,13 @@ namespace dxvk {
+             return nvapiGraphicsCommandList;
+ 
+         Com<ID3D12GraphicsCommandListExt> commandListExt;
+-        if (FAILED(commandList->QueryInterface(IID_PPV_ARGS(&commandListExt))))
+-            return std::nullopt;
++        if (FAILED(commandList->QueryInterface(IID_PPV_ARGS(&commandListExt)))) {
++            // Helios: Microsoft's runtime list (recording); the UMD's engine
++            // list lives as long as it does, so the raw pointer stays valid.
++            auto engine = helios::EngineCommandList(commandList);
++            if (engine == nullptr || FAILED(engine->QueryInterface(IID_PPV_ARGS(&commandListExt))))
++                return std::nullopt;
++        }
+ 
+         LARGE_INTEGER count;
+         QueryPerformanceCounter(&count);
+diff --git a/src/shared/helios_d3d12.h b/src/shared/helios_d3d12.h
+new file mode 100644
+index 0000000..d842dcc
+--- /dev/null
++++ b/src/shared/helios_d3d12.h
+@@ -0,0 +1,94 @@
++#pragma once
++
++#include "../nvapi_private.h"
++#include "../util/com_pointer.h"
++
++// Helios (Windows guests): the game's ID3D12Device and command lists are
++// Microsoft's runtime objects; vkd3d-proton's sit behind the Helios D3D12
++// UMD, so QueryInterface for ID3D12DeviceExt / ID3D12GraphicsCommandListExt
++// fails on them. With the Dlss knob on, the UMD publishes two meta-commands
++// that hand out its engine (vkd3d-proton) objects in-process:
++//
++// - ENGINE_DEVICE, creation parameters { Magic, Out }: writes the engine
++//   ID3D12Device* (borrowed) to *Out when created.
++// - ENGINE_COMMAND_LIST, execution parameters { Magic, Out }: writes the
++//   engine ID3D12GraphicsCommandList* (borrowed) of the list it is executed
++//   on to *Out, and records nothing.
++//
++// The engine objects live as long as the runtime objects they belong to.
++// Keep in sync with Conduit guest/windows/umd12/src/forward12/misc.rs.
++namespace dxvk::helios {
++    // {f4c98fb7-a890-49b7-a74d-19896f223e93}
++    inline constexpr GUID EngineDeviceMetaCommand = {0xf4c98fb7, 0xa890, 0x49b7, {0xa7, 0x4d, 0x19, 0x89, 0x6f, 0x22, 0x3e, 0x93}};
++    // {8c8f8982-ba8b-4eb7-a057-f2336c83d415}
++    inline constexpr GUID EngineCommandListMetaCommand = {0x8c8f8982, 0xba8b, 0x4eb7, {0xa0, 0x57, 0xf2, 0x33, 0x6c, 0x83, 0xd4, 0x15}};
++    inline constexpr UINT64 Magic = 0x48454c494f530001ULL; // "HELIOS", version 1
++
++    struct EngineParameters {
++        UINT64 Magic;
++        UINT64 Out; // address of a UINT64 the UMD writes the engine object to
++    };
++
++    inline bool HasMetaCommand(ID3D12Device5* device, const GUID& id) {
++        UINT count = 0;
++        if (FAILED(device->EnumerateMetaCommands(&count, nullptr)) || count == 0)
++            return false;
++
++        std::vector<D3D12_META_COMMAND_DESC> descs(count);
++        if (FAILED(device->EnumerateMetaCommands(&count, descs.data())))
++            return false;
++
++        for (auto i = 0U; i < count; i++)
++            if (IsEqualGUID(descs[i].Id, id))
++                return true;
++
++        return false;
++    }
++
++    // The engine device behind a runtime device, or nullptr.
++    inline Com<ID3D12Device> EngineDevice(ID3D12Device* device) {
++        Com<ID3D12Device5> device5;
++        if (!device || FAILED(device->QueryInterface(IID_PPV_ARGS(&device5))) || !HasMetaCommand(device5.ptr(), EngineDeviceMetaCommand))
++            return nullptr;
++
++        UINT64 out = 0;
++        EngineParameters params{Magic, reinterpret_cast<UINT64>(&out)};
++        Com<ID3D12MetaCommand> metaCommand;
++        if (FAILED(device5->CreateMetaCommand(EngineDeviceMetaCommand, 0, &params, sizeof(params), IID_PPV_ARGS(&metaCommand))) || !out)
++            return nullptr;
++
++        Com<ID3D12Device> engine;
++        if (FAILED(reinterpret_cast<IUnknown*>(out)->QueryInterface(IID_PPV_ARGS(&engine))))
++            return nullptr;
++
++        return engine;
++    }
++
++    // The engine command list behind a runtime command list that is recording, or nullptr.
++    inline Com<ID3D12GraphicsCommandList> EngineCommandList(ID3D12GraphicsCommandList* commandList) {
++        Com<ID3D12GraphicsCommandList4> commandList4;
++        if (!commandList || FAILED(commandList->QueryInterface(IID_PPV_ARGS(&commandList4))))
++            return nullptr;
++
++        Com<ID3D12Device5> device5;
++        if (FAILED(commandList->GetDevice(IID_PPV_ARGS(&device5))) || !HasMetaCommand(device5.ptr(), EngineCommandListMetaCommand))
++            return nullptr;
++
++        UINT64 magic = Magic;
++        Com<ID3D12MetaCommand> metaCommand;
++        if (FAILED(device5->CreateMetaCommand(EngineCommandListMetaCommand, 0, &magic, sizeof(magic), IID_PPV_ARGS(&metaCommand))))
++            return nullptr;
++
++        UINT64 out = 0;
++        EngineParameters params{Magic, reinterpret_cast<UINT64>(&out)};
++        commandList4->ExecuteMetaCommand(metaCommand.ptr(), &params, sizeof(params));
++        if (!out)
++            return nullptr;
++
++        Com<ID3D12GraphicsCommandList> engine;
++        if (FAILED(reinterpret_cast<IUnknown*>(out)->QueryInterface(IID_PPV_ARGS(&engine))))
++            return nullptr;
++
++        return engine;
++    }
++}

@@ -576,6 +576,24 @@ read = "once per process"
 effect = "What the D3D11.1 CheckDirectFlipSupport DDI answers, which DWM uses for independent flip: 0 never; 1 yes when the KMD reports DirectFlip and size and format are equal; 2 whenever size and format match (test lever); 3 as 1, only for formats the KMD scans out as is; 4 the same as 1; 5 as 1, and two different 8-bit scan-out formats (R8G8B8A8 on a B8G8R8A8 desktop) also pair. HELIOS_DIRECT_FLIP_SUPPORT overrides it per process."
 see = "[independent-flip.md](../guest/windows/docs/independent-flip.md)"
 
+[umd.CubinCache]
+class = "experiment"
+read = "each vkCreateCuModuleNVX whose module has no SASS for the GPU"
+effect = "Folder of the host-compiled SASS cache NVK takes CUDA modules from when their fatbin has no SASS for the GPU (DLSS on RTX 50): <key>.sm_<SM>.cubin files made by nvk-cubin-cache.py. Absent: %ProgramData%\\Helios\\ngx\\cubin. NVK_CUBIN_CACHE_DIR wins."
+see = "[dlss.md](../guest/nvk-rm/docs/dlss.md)"
+
+[umd.CubinCacheDump]
+class = "debug"
+read = "each CUDA module that misses the cubin cache"
+effect = "1 writes a CUDA module that has no SASS for the GPU and no cached cubin to %LOCALAPPDATA%\\Helios\\cubin-miss (or NVK_CUBIN_DUMP_DIR), as input for nvk-cubin-cache.py on the host. 0 or absent: only the log line."
+see = "[dlss.md](../guest/nvk-rm/docs/dlss.md)"
+
+[umd.Dlss]
+class = "experiment"
+read = "NVK instance creation; once per process in the bridge"
+effect = "1 turns on NVK's DLSS support: NVK exposes VK_NVX_binary_import (NGX imports its CUDA kernels with it) to native Vulkan apps and to vkd3d-proton, the bridge sets HELIOS_DXVK_NVX=1 so DXVK keeps the NVX extensions, and the D3D12 driver publishes two meta-commands through which Conduit's nvapi64 reaches vkd3d-proton's cubin entry points (NGX's D3D12 path). NGX also needs its runtime from the host driver and nvapi64; on RTX 50 the SASS comes from the host-built cubin cache (see dlss.md). The tray sets it with `conduit upscaler VM dlss`. 0 (default) leaves both off."
+see = "[dlss.md](../guest/nvk-rm/docs/dlss.md)"
+
 [umd.DwmIcd]
 class = "supported"
 read = "each DWM start (dwm.exe); other processes per process for the desktop-follows rule"
@@ -1071,6 +1089,11 @@ effect = "Internal: the D3D11 bridge sets it to nvk for a process that runs on N
 class = "experiment"
 read = "DXVK device creation"
 effect = "Internal: the D3D11 bridge sets it to 1 from HKLM\\SOFTWARE\\Helios ForeignImport (else empty) before the device is created; 1 lets a Venus DXVK device import NVK-made (foreign) resources through explicit DRM-modifier images. A value set by hand is overwritten."
+
+[env.HELIOS_DXVK_NVX]
+class = "experiment"
+read = "DXVK device creation"
+effect = "1 keeps VK_NVX_binary_import and VK_NVX_image_view_handle on DXVK devices of 64-bit processes (upstream DXVK drops them outside Wine). The bridge sets it when the registry Dlss is 1."
 
 [env.HELIOS_DXVK_SPIN_US]
 class = "tuning"
@@ -1660,10 +1683,32 @@ class = "experiment"
 read = "device creation"
 effect = "1 (Turing and later) writes draw parameters into the root table only for the system values the bound shaders read; 0 writes all of them."
 
+[env.NVK_CUBIN_CACHE_DIR]
+class = "experiment"
+read = "each vkCreateCuModuleNVX whose module has no SASS for the GPU"
+effect = "Folder of the host-compiled SASS cache (wins over the registry CubinCache); elsewhere than Windows the default is $XDG_CACHE_HOME/nvk/cubin."
+see = "[dlss.md](../guest/nvk-rm/docs/dlss.md)"
+
+[env.NVK_CUBIN_CACHE_DUMP]
+class = "debug"
+read = "each CUDA module that misses the cubin cache"
+effect = "1 writes a module that misses the cubin cache to NVK_CUBIN_DUMP_DIR for nvk-cubin-cache.py; wins over the registry CubinCacheDump."
+
+[env.NVK_CUBIN_DUMP_DIR]
+class = "debug"
+read = "when NVK_CUBIN_CACHE_DUMP or CubinCacheDump writes a module"
+effect = "Where missed CUDA modules are written. Default %LOCALAPPDATA%\\Helios\\cubin-miss on Windows, the cache folder with -miss appended elsewhere."
+
+[env.NVK_DLSS]
+class = "experiment"
+read = "instance creation"
+effect = "1 adds dlss to NVK_EXPERIMENTAL (VK_NVX_binary_import for NGX/DLSS), 0 removes it; unset defers to the registry Dlss."
+see = "[dlss.md](../guest/nvk-rm/docs/dlss.md)"
+
 [env.NVK_EXPERIMENTAL]
 class = "supported"
 read = "instance creation"
-effect = "Upstream NVK's list of experimental features; video makes NVK expose Vulkan Video decode. The ICD bridge sets it to video for NVK processes unless the registry VideoDdi is 0."
+effect = "Upstream NVK's list of experimental features; video makes NVK expose Vulkan Video decode, dlss VK_NVX_binary_import (see NVK_DLSS). The ICD bridge sets it to video for NVK processes unless the registry VideoDdi is 0."
 
 [env.NVK_FS_STATE_TRACKING]
 class = "debug"

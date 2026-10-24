@@ -210,6 +210,9 @@ jobs:
       - name: unittest
         working-directory: guest/agent
         run: python3 -m unittest -v test_agent test_ctl_agent
+      - name: unittest (nvk-cubin-cache)
+        working-directory: guest/nvk-rm/tools/cubin-cache
+        run: python3 -m unittest -v test_nvk_cubin_cache
 
   windows-guest-host:
     # Windows guest driver logic kept free of Windows headers so it runs here,

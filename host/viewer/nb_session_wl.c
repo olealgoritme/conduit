@@ -866,6 +866,7 @@ struct nb_wl {
     /* The viewer's own UI layers (nb_ui.h): subsurfaces with shm buffers. */
     struct nb_ui     ui;
     struct nb_vmpause vmp;          /* the menu's Pause / Resume       */
+    struct nb_upscaler upscaler;    /* the menu's Upscaler row          */
     struct nb_wl_layer *ly_menu, *ly_note, *ly_btn;
     uint64_t note_until_ms;         /* notice visible until, 0 = hidden    */
     char     note_txt[64];
@@ -7640,6 +7641,9 @@ static const struct nb_ui_env *wl_ui_env(struct nb_wl *w)
     e.vm_pause = w->cfg && w->cfg->vm_pause_cmd && w->cfg->vm_resume_cmd;
     e.vm_paused = w->vmp.paused;
     e.vm_pause_busy = nb_vmpause_busy(&w->vmp);
+    e.upscaler = w->cfg && w->cfg->vm_upscaler_cmd && *w->cfg->vm_upscaler_cmd;
+    e.upscaler_mode = w->upscaler.mode;
+    e.upscaler_busy = w->upscaler.pid > 0;
     e.translucent = true;
     e.modes = &nb_mode_rx.cur;
     return &e;
@@ -8065,6 +8069,20 @@ static int wl_tick_ui(struct nb_wl *w, int next)
         }
     }
 
+    /* The menu's Upscaler command, reaped when it ends. */
+    if (w->upscaler.pid > 0) {
+        if (nb_upscaler_reap(&w->upscaler, w->ui.notice,
+                             sizeof(w->ui.notice))) {
+            if (w->ui.open) {
+                wl_ui_do(w, NB_UI_REDRAW | NB_UI_NOTICE);
+            } else {
+                wl_note_show(w, w->ui.notice);
+            }
+            flush = true;
+        } else {
+            next = wl_tick_min(next, now + NB_VMPAUSE_POLL_MS, now);
+        }
+    }
     /* The menu's Pause / Resume command, reaped when it ends. */
     if (nb_vmpause_busy(&w->vmp)) {
         if (nb_vm_pause_reap(&w->vmp, w->sink, w->ui.notice,
@@ -8304,6 +8322,11 @@ static void wl_ui_do(struct nb_wl *w, unsigned bits)
     }
     if ((bits & NB_UI_VM_REBOOT) && w->cfg) {
         nb_run_detached(w->cfg->vm_reboot_cmd);
+    }
+    if ((bits & NB_UI_UPSCALER) &&
+        !nb_upscaler_ask(&w->upscaler, w->cfg, w->ui.upscaler, w->ui.notice,
+                         sizeof(w->ui.notice))) {
+        bits |= NB_UI_NOTICE;
     }
     if ((bits & (NB_UI_VM_PAUSE | NB_UI_VM_RESUME)) &&
         !nb_vm_pause_ask(&w->vmp, w->sink, w->cfg, (bits & NB_UI_VM_PAUSE) != 0,
@@ -9212,6 +9235,7 @@ static int wl_open(struct nb_session *s, const struct nb_config *cfg)
     w->cfg = cfg;
     nb_vstore_setup(&w->vst, cfg);
     nb_ui_init(&w->ui, &w->vst);
+    nb_upscaler_init(&w->upscaler);
     w->ui_cur = -1;
     /* virtio-nvgpu viewer state */
     w->ov_mode = cfg->overlay_mode;

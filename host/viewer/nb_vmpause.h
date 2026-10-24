@@ -24,6 +24,7 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <stdbool.h>
+#include <stdio.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -46,22 +47,15 @@ enum {
 /* How often the session's tick polls while a command runs, ms. */
 #define NB_VMPAUSE_POLL_MS 100
 
-/*
- * Start `cmd` to pause (pause = true) or resume the VM.  0 when it runs;
- * -1 when there is no command, one is already in flight, or fork failed.
- */
-static inline int nb_vmpause_start(struct nb_vmpause *s, const char *cmd,
-                                   bool pause)
+/* Start `cmd` through /bin/sh without waiting; its pid, or -1. */
+static inline pid_t nb_vm_spawn(const char *cmd)
 {
     pid_t p;
 
-    if (!cmd || !*cmd || s->pid > 0) {
+    if (!cmd || !*cmd) {
         return -1;
     }
     p = fork();
-    if (p < 0) {
-        return -1;
-    }
     if (p == 0) {
         sigset_t none;
         int fd;
@@ -76,6 +70,53 @@ static inline int nb_vmpause_start(struct nb_vmpause *s, const char *cmd,
         execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
         _exit(127);
     }
+    return p;
+}
+
+/*
+ * Reap *pid if it ended (never blocks): NB_VMPAUSE_BUSY while it runs,
+ * else DONE (exit 0) or FAILED with *status, and *pid becomes 0.
+ */
+static inline int nb_vm_reap(pid_t *pid, int *status)
+{
+    int st = 0;
+    pid_t r;
+
+    if (*pid <= 0) {
+        return NB_VMPAUSE_IDLE;
+    }
+    do {
+        r = waitpid(*pid, &st, WNOHANG);
+    } while (r < 0 && errno == EINTR);
+    if (r == 0) {
+        return NB_VMPAUSE_BUSY;
+    }
+    *pid = 0;
+    if (r > 0 && WIFEXITED(st) && WEXITSTATUS(st) == 0) {
+        *status = 0;
+        return NB_VMPAUSE_DONE;
+    }
+    *status = r < 0 ? -1 : WIFEXITED(st) ? WEXITSTATUS(st)
+                                         : 128 + WTERMSIG(st);
+    return NB_VMPAUSE_FAILED;
+}
+
+/*
+ * Start `cmd` to pause (pause = true) or resume the VM.  0 when it runs;
+ * -1 when there is no command, one is already in flight, or fork failed.
+ */
+static inline int nb_vmpause_start(struct nb_vmpause *s, const char *cmd,
+                                   bool pause)
+{
+    pid_t p;
+
+    if (!cmd || !*cmd || s->pid > 0) {
+        return -1;
+    }
+    p = nb_vm_spawn(cmd);
+    if (p < 0) {
+        return -1;
+    }
     s->pid = p;
     s->pausing = pause;
     return 0;
@@ -84,27 +125,67 @@ static inline int nb_vmpause_start(struct nb_vmpause *s, const char *cmd,
 /* Reap the command if it ended (never blocks). */
 static inline int nb_vmpause_poll(struct nb_vmpause *s)
 {
-    int st = 0;
-    pid_t r;
+    int r = nb_vm_reap(&s->pid, &s->status);
 
-    if (s->pid <= 0) {
-        return NB_VMPAUSE_IDLE;
-    }
-    do {
-        r = waitpid(s->pid, &st, WNOHANG);
-    } while (r < 0 && errno == EINTR);
-    if (r == 0) {
-        return NB_VMPAUSE_BUSY;
-    }
-    s->pid = 0;
-    if (r > 0 && WIFEXITED(st) && WEXITSTATUS(st) == 0) {
+    if (r == NB_VMPAUSE_DONE) {
         s->paused = s->pausing;
-        s->status = 0;
-        return NB_VMPAUSE_DONE;
     }
-    s->status = r < 0 ? -1 : WIFEXITED(st) ? WEXITSTATUS(st)
-                                           : 128 + WTERMSIG(st);
-    return NB_VMPAUSE_FAILED;
+    return r;
+}
+
+/*
+ * The menu's Upscaler row: `--vm-upscaler-cmd CMD` run as `CMD WORD`
+ * (WORD one of nb_upscaler_word(), so nothing needs quoting), the same way:
+ * not waited for, reaped from the UI tick, the row lit with the mode once
+ * the command exits 0.
+ */
+struct nb_upscaler {
+    pid_t pid;                  /* command in flight, 0 none                 */
+    int   want;                 /* the mode it sets                          */
+    int   mode;                 /* the last mode set, -1 none yet            */
+    int   status;               /* exit code of the last failed command      */
+};
+
+static inline void nb_upscaler_init(struct nb_upscaler *u)
+{
+    u->pid = 0;
+    u->want = u->mode = -1;
+    u->status = 0;
+}
+
+/* 0 when `cmd word` runs; -1 when there is no command, one is in flight,
+ * or fork failed. */
+static inline int nb_upscaler_start(struct nb_upscaler *u, const char *cmd,
+                                    const char *word, int mode)
+{
+    char line[1024];
+    pid_t p;
+    int n;
+
+    if (!cmd || !*cmd || u->pid > 0) {
+        return -1;
+    }
+    n = snprintf(line, sizeof(line), "%s %s", cmd, word);
+    if (n < 0 || (size_t)n >= sizeof(line)) {
+        return -1;
+    }
+    p = nb_vm_spawn(line);
+    if (p < 0) {
+        return -1;
+    }
+    u->pid = p;
+    u->want = mode;
+    return 0;
+}
+
+static inline int nb_upscaler_poll(struct nb_upscaler *u)
+{
+    int r = nb_vm_reap(&u->pid, &u->status);
+
+    if (r == NB_VMPAUSE_DONE) {
+        u->mode = u->want;
+    }
+    return r;
 }
 
 /* The menu's view of it. */
