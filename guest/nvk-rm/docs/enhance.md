@@ -45,7 +45,7 @@ pacing settings take effect at once.
 
 | Global (`HKLM\SOFTWARE\Helios`) | Profile (`...\Helios\Enhance\<exe>`) | Environment | Values | Default |
 |---|---|---|---|---|
-| `EnhanceScaler` (REG_SZ) | `Scaler` | `MESA_WSI_ENHANCE_SCALER` | `off`, `fsr`, `nis`, `sgsr`, `cas`, `bicubic`, `bilinear`, `nearest`, `integer`, `xbr` (also `pixel`) | `off` |
+| `EnhanceScaler` (REG_SZ) | `Scaler` | `MESA_WSI_ENHANCE_SCALER` | `off`, `fsr`, `nis`, `sgsr`, `cas`, `bicubic`, `bilinear`, `nearest`, `integer`, `xbr` (also `pixel`), `a4k-3d`, `a4k`, `a4k-vl` | `off` |
 | `EnhanceSharpness` (DWORD) | `Sharpness` | `MESA_WSI_ENHANCE_SHARPNESS` | 0..100 (FSR's RCAS, 0: EASU alone; NIS's and CAS's sharpness) | 50 |
 | `EnhanceFrameGen` (REG_SZ) | `FrameGen` | `MESA_WSI_ENHANCE_FG` | `off`, `2x`, `3x`, `4x`, `adaptive` | `off` |
 | `EnhanceFgTarget` (DWORD) | `FgTarget` | `MESA_WSI_ENHANCE_FG_TARGET` | adaptive: pictures per second to fill to; 0 = the display's refresh | 0 |
@@ -84,20 +84,28 @@ copies that into the DXGI back buffer as before.
 | `bilinear`, `nearest` | the plain filters |
 | `integer` | the largest whole factor that fits, nearest: sharp pixels for fixed low-resolution games |
 | `xbr` | Hyllian's xBR-lv2: edge-directed scaling for pixel art at any factor (smooth diagonals, sharp edges, only nearby colours) |
+| `a4k-3d`, `a4k`, `a4k-vl` | the learned tier: Anime4K's convolutional networks (`a4k-3d` its network for 3D graphics, 4 passes; `a4k` CNN x2 M, 9 passes; `a4k-vl` CNN x2 VL, 18 passes, for strong GPUs). The networks double the image (3x3 convolutions at the image's size into RGBA16F intermediates, then depth to space); EASU (up) or bilinear (down) takes the result to the picture's size. Upscaling only |
 
 Against a truth rendered at the output size (`tools/enhance-eval`, the
 same scene box-filtered to the input size and scaled back), PSNR in dB, and
 the GPU time on the host's RTX 5090:
 
-| Input -> 2560x1440 | nearest | bilinear | bicubic | FSR | NIS | SGSR | CAS | xBR |
-|---|---|---|---|---|---|---|---|---|
-| photo-like, 1920x1080 | 29.9 | 31.1 | 32.2 | 32.6 | 32.2 | 32.9 | 32.4 | 30.9 |
-| photo-like, 1280x720 | 28.3 | 28.3 | 29.1 | 29.5 | 28.1 | 29.3 | 29.1 | 29.2 |
-| pixel art, 640x360 | exact | 25.5 | 26.3 | 25.6 | (over 2x) | 27.4 | 25.7 | 32.6 |
-| GPU us | 32 | 31 | 30 | 71 | 56-67 | 32 | 31 | 63-65 |
+| Input -> 2560x1440 | nearest | bilinear | bicubic | FSR | NIS | SGSR | CAS | xBR | a4k-3d | a4k | a4k-vl |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| photo-like, 1920x1080 | 29.9 | 31.1 | 32.2 | 32.6 | 32.2 | 32.9 | 32.4 | 30.9 | 32.8 | 33.6 | 34.0 |
+| photo-like, 1280x720 | 28.3 | 28.3 | 29.1 | 29.5 | 28.1 | 29.3 | 29.1 | 29.2 | 29.5 | 30.6 | 31.0 |
+| pixel art, 640x360 | exact | 25.5 | 26.3 | 25.6 | (over 2x) | 27.4 | 25.7 | 32.6 | 26.1 | 26.7 | 27.3 |
+| host GPU us, 1280x720 | 32 | 31 | 30 | 71 | 56 | 30 | 30 | 65 | 95 | 163 | 599 |
 
-In the guest (D3D12, 1920x1080 to 2560x1440): NIS 85 us, SGSR 40, CAS 40,
-xBR 75, FSR 90-97.
+In the guest (D3D12, microseconds per frame, clocks not locked):
+
+| Swapchain -> picture | FSR | NIS | SGSR | CAS | xBR | a4k-3d | a4k | a4k-vl |
+|---|---|---|---|---|---|---|---|---|
+| 1920x1080 -> 2560x1440 | 91 | 85 | 40 | 40 | 75 | 201 | 892 | 2467 |
+| 2560x720 -> 5120x1440 | 161 | | | | | 214 | 418 | 2012 |
+
+At 1920x1080 to 2560x1440 the networks make 3840x2160 and scale it down;
+they are best at exactly 2x.
 
 `aspect` keeps the image's aspect ratio, centred, with black bars (cleared
 once per output slot); `stretch` fills the window.
@@ -297,6 +305,13 @@ cost):
 
 - D3D10, swap chains for composition or a CoreWindow, HDR and 10-bit
   formats, and multisampled chains (they stay with DXGI).
-- A learned upscaler tier and a learned interpolator tier.
+- A learned interpolator tier. The interpolation is one stage of
+  `wsi_enh_record` (two history frames and a phase in, a picture out), the
+  place another interpolator would plug in. Licences allow RIFE (MIT; its
+  Vulkan port rife-ncnn-vulkan MIT, ncnn BSD-3-Clause), but it needs a
+  convolutional-network runtime of its own and takes milliseconds per
+  picture at 1080p even on fast GPUs; not real-time for the weaker ones.
+- FSRCNNX (GPL-3.0) is not usable here; Anime4K (MIT) is the learned
+  upscaler tier.
 - Profiles from the tray for applications without an open window (the
   registry takes any executable name).

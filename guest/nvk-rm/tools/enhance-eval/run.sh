@@ -25,6 +25,20 @@ for s in enh_scale enh_easu enh_rcas enh_nis enh_cas enh_sgsr enh_xbr; do
   glslangValidator -V --target-env vulkan1.1 -S comp -I"$enh" -I"$gen" -I"$enh/third_party/fsr1" \
     -I"$enh/third_party/cas" -I"$enh/third_party/nis" -o "$tmp/$s.spv" "$enh/$s.comp" >/dev/null
 done
-cc -O2 -Wall -o "$tmp/scale_eval" "$here/scale_eval.c" -lvulkan -lm
+: > "$gen/a4k_all.h"
+for v in 3d:Anime4K_3DGraphics_Upscale_x2_US.glsl m:Anime4K_Upscale_CNN_x2_M.glsl vl:Anime4K_Upscale_CNN_x2_VL.glsl; do
+  n=${v%%:*}; f=${v#*:}
+  python3 "$enh/adapt.py" a4k $n "$enh/third_party/anime4k/$f" "$gen/a4k_$n.glsl" "$gen/a4k_${n}_passes.h"
+  np=$(sed -n "s/#define A4K_.*_PASSES //p" "$gen/a4k_${n}_passes.h")
+  i=0
+  while [ $i -lt $np ]; do
+    glslangValidator -V --target-env vulkan1.1 -S comp -DA4K_PASS=$i --vn a4k_${n}_${i}_spv \
+      -o "$gen/a4k_${n}_${i}_spv.h" "$gen/a4k_$n.glsl" >/dev/null
+    echo "#include \"a4k_${n}_${i}_spv.h\"" >> "$gen/a4k_all.h"
+    i=$((i + 1))
+  done
+  echo "#include \"a4k_${n}_passes.h\"" >> "$gen/a4k_all.h"
+done
+cc -O2 -Wall -DHAVE_A4K -I"$gen" -o "$tmp/scale_eval" "$here/scale_eval.c" -lvulkan -lm
 echo "== scalers"
 if [ -n "$out" ]; then mkdir -p "$out/scale"; "$tmp/scale_eval" "$tmp" "$out/scale"; else "$tmp/scale_eval" "$tmp"; fi

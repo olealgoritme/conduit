@@ -212,6 +212,18 @@ render(int s, int w, int h, int ss, uint8_t *px)
       }
 }
 
+#ifdef HAVE_A4K
+struct a4k_pass {
+   uint32_t nbind;
+   int bind[16];
+   int save;
+   uint32_t scale;
+   const uint32_t *code;
+   size_t size;
+};
+#include "a4k_all.h"
+#endif
+
 struct pnis {
    float f[18];
    uint32_t u[8];
@@ -264,9 +276,40 @@ main(int argc, char **argv)
    VkPipelineLayoutCreateInfo lci = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
       .setLayoutCount = 1, .pSetLayouts = &dsl, .pushConstantRangeCount = 1, .pPushConstantRanges = &pcr };
    CK(vkCreatePipelineLayout(dev, &lci, NULL, &layout));
-   enum { NEAREST, BILINEAR, BICUBIC, FSR_EASU, FSR, NIS, CAS, SGSR, XBR, NMODES };
+   enum { NEAREST, BILINEAR, BICUBIC, FSR_EASU, FSR, NIS, CAS, SGSR, XBR, A4K_3D, A4K_M, A4K_VL, NMODES };
    const char *mname[NMODES] = { "nearest", "bilinear", "bicubic", "fsr (EASU)", "fsr (+RCAS)",
-                                 "nis", "cas", "sgsr", "xbr" };
+                                 "nis", "cas", "sgsr", "xbr", "a4k 3d", "a4k m", "a4k vl" };
+#ifdef HAVE_A4K
+   /* the Anime4K passes: their own layout, 16 sampled images and the output */
+   VkDescriptorSetLayoutBinding ab[17];
+   for (int i = 0; i < 17; i++)
+      ab[i] = (VkDescriptorSetLayoutBinding){ i, i < 16 ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+                                                       : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT };
+   VkDescriptorSetLayoutCreateInfo adl = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+      .flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR, .bindingCount = 17, .pBindings = ab };
+   VkDescriptorSetLayout adsl;
+   CK(vkCreateDescriptorSetLayout(dev, &adl, NULL, &adsl));
+   VkPipelineLayoutCreateInfo alci = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+      .setLayoutCount = 1, .pSetLayouts = &adsl, .pushConstantRangeCount = 1, .pPushConstantRanges = &pcr };
+   VkPipelineLayout alayout;
+   CK(vkCreatePipelineLayout(dev, &alci, NULL, &alayout));
+   const struct a4k_pass *a4k_tab[3] = { a4k_3d_passes, a4k_m_passes, a4k_vl_passes };
+   const int a4k_n[3] = { A4K_3D_PASSES, A4K_M_PASSES, A4K_VL_PASSES };
+   const int a4k_tex[3] = { A4K_3D_TEXTURES, A4K_M_TEXTURES, A4K_VL_TEXTURES };
+   VkPipeline a4k_pipe[3][32];
+   for (int v = 0; v < 3; v++)
+      for (int i = 0; i < a4k_n[v]; i++) {
+         VkShaderModuleCreateInfo smi = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+                                          .codeSize = a4k_tab[v][i].size, .pCode = a4k_tab[v][i].code };
+         VkShaderModule m;
+         CK(vkCreateShaderModule(dev, &smi, NULL, &m));
+         VkComputePipelineCreateInfo cpci = { VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+            .stage = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                       .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = m, .pName = "main" },
+            .layout = alayout };
+         CK(vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &cpci, NULL, &a4k_pipe[v][i]));
+      }
+#endif
    VkPipeline ps = pipeline(spv, "enh_scale"), pe = pipeline(spv, "enh_easu"),
               pr = pipeline(spv, "enh_rcas"), pn = pipeline(spv, "enh_nis"),
               pc_ = pipeline(spv, "enh_cas"), pg = pipeline(spv, "enh_sgsr"), px = pipeline(spv, "enh_xbr");
@@ -294,6 +337,11 @@ main(int argc, char **argv)
    for (unsigned ci = 0; ci < ARRAY_LEN(cases); ci++) {
       const int W_ = cases[ci].w, H_ = cases[ci].h;
       struct img in = mkimg(VK_FORMAT_R8G8B8A8_UNORM, W_, H_);
+#ifdef HAVE_A4K
+      struct img inter[20], out2 = mkimg(VK_FORMAT_R8G8B8A8_UNORM, 2 * W_, 2 * H_);
+      for (int i = 0; i < 20; i++)
+         inter[i] = mkimg(VK_FORMAT_R16G16B16A16_SFLOAT, W_, H_);
+#endif
       render(cases[ci].s, OW, OH, cases[ci].s == 1 ? 1 : 2, truth);
       render(cases[ci].s, W_, H_, cases[ci].s == 1 ? 1 : 4, up.p);
       printf("== %s\n%-12s %8s %8s\n", cases[ci].name, "scaler", "dB", "us");
@@ -349,6 +397,57 @@ main(int argc, char **argv)
             lin = keep;
             break;
          }
+#ifdef HAVE_A4K
+         case A4K_3D: case A4K_M: case A4K_VL: {
+            const int v = m - A4K_3D;
+            VkImageMemoryBarrier ib2[21];
+            for (int i = 0; i < 21; i++)
+               ib2[i] = (VkImageMemoryBarrier){ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                  .dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT, .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+                  .newLayout = VK_IMAGE_LAYOUT_GENERAL, .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                  .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .image = i < 20 ? inter[i].i : out2.i,
+                  .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
+            vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                 0, 0, NULL, 0, NULL, 21, ib2);
+            for (int i = 0; i < a4k_n[v]; i++) {
+               const struct a4k_pass *ap = &a4k_tab[v][i];
+               VkDescriptorImageInfo ii[17];
+               VkWriteDescriptorSet w[17];
+               uint32_t nw = 0;
+               for (uint32_t b2 = 0; b2 < ap->nbind; b2++) {
+                  ii[nw] = (VkDescriptorImageInfo){ lin, ap->bind[b2] == 0 ? in.v : inter[ap->bind[b2] - 1].v,
+                                                    VK_IMAGE_LAYOUT_GENERAL };
+                  w[nw] = (VkWriteDescriptorSet){ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = b2,
+                     .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                     .pImageInfo = &ii[nw] };
+                  nw++;
+               }
+               struct img *dst = ap->save < 0 ? &out2 : &inter[ap->save - 1];
+               ii[nw] = (VkDescriptorImageInfo){ VK_NULL_HANDLE, dst->v, VK_IMAGE_LAYOUT_GENERAL };
+               w[nw] = (VkWriteDescriptorSet){ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 16,
+                  .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .pImageInfo = &ii[nw] };
+               nw++;
+               struct { int32_t ds[2], off[2]; uint32_t flags; } ap_pc = { { (int32_t)(W_ * ap->scale), (int32_t)(H_ * ap->scale) }, { 0, 0 }, 0 };
+               vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, a4k_pipe[v][i]);
+               push_desc(cb, VK_PIPELINE_BIND_POINT_COMPUTE, alayout, 0, nw, w);
+               vkCmdPushConstants(cb, alayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(ap_pc), &ap_pc);
+               vkCmdDispatch(cb, (ap_pc.ds[0] + 7) / 8, (ap_pc.ds[1] + 7) / 8, 1);
+               barrier(cb);
+            }
+            /* the 2x picture to the output: EASU up, bilinear down */
+            p.src[0] = 2 * W_; p.src[1] = 2 * H_;
+            if (2 * W_ < OW) {
+               dispatch(cb, pe, out2.v, NULL, NULL, out.v, &p);
+            } else {
+               p.mode = 2 * W_ == OW ? 0 : 1;
+               dispatch(cb, ps, out2.v, NULL, NULL, out.v, &p);
+            }
+            break;
+         }
+#else
+         case A4K_3D: case A4K_M: case A4K_VL:
+            break;
+#endif
          case NIS: {
             if (OW > 2 * W_) {
                /* outside NIS's 1x..2x: not run (the driver uses FSR) */
