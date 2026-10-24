@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Ole Algoritme <olealgoritme@gmail.com>
-Date: Sat, 24 Oct 2026 07:43:22 +0200
+Date: Sat, 24 Oct 2026 07:49:49 +0200
 Subject: [PATCH] nak: uniform texture handles, f16 pairing, occupancy-target
  knobs
 
@@ -26,19 +26,24 @@ F2FP.PACK_AB from two registers), preferring partners whose first use is
 the same operation, so nir_opt_vectorize can pack the 16-bit math that
 follows into HFMA2/HADD2/HMUL2.
 
+NAK_TEMP_IF_ELSE (0, 2-64, default 0): function-local arrays of at most
+that many elements with a dynamic index become if/else trees of selects
+(nir_lower_indirect_derefs_to_if_else_trees) instead of scratch loads
+and stores.
+
 All of them are in nak_knobs_key2(), so in NVK's pipeline cache keys.
 ---
- src/nouveau/compiler/nak/from_nir.rs       |  48 ++++++++-
+ src/nouveau/compiler/nak/from_nir.rs       |  48 +++++++-
  src/nouveau/compiler/nak/ir.rs             |  31 +++++-
- src/nouveau/compiler/nak/knobs.rs          |  73 ++++++++++++++
+ src/nouveau/compiler/nak/knobs.rs          |  92 ++++++++++++++++
  src/nouveau/compiler/nak/nvdisasm_tests.rs |   3 +
- src/nouveau/compiler/nak/occ_target.rs     |  17 ++++
- src/nouveau/compiler/nak/sm70_encode.rs    |  50 ++++++++--
+ src/nouveau/compiler/nak/occ_target.rs     |  17 +++
+ src/nouveau/compiler/nak/sm70_encode.rs    |  50 +++++++--
  src/nouveau/compiler/nak/spill_remat.rs    |   3 +-
- src/nouveau/compiler/nak_nir.c             | 111 +++++++++++++++++++++
- src/nouveau/compiler/nak_nir_lower_tex.c   |  46 +++++++++
- src/nouveau/compiler/nak_private.h         |   2 +
- 10 files changed, 372 insertions(+), 12 deletions(-)
+ src/nouveau/compiler/nak_nir.c             | 122 +++++++++++++++++++++
+ src/nouveau/compiler/nak_nir_lower_tex.c   |  46 ++++++++
+ src/nouveau/compiler/nak_private.h         |   3 +
+ 10 files changed, 403 insertions(+), 12 deletions(-)
 
 diff --git a/src/nouveau/compiler/nak/from_nir.rs b/src/nouveau/compiler/nak/from_nir.rs
 index dac9df5..ab5c742 100644
@@ -203,10 +208,10 @@ index a66fcde..9bcb3bf 100644
  }
  impl_display_for_op!(OpTld4);
 diff --git a/src/nouveau/compiler/nak/knobs.rs b/src/nouveau/compiler/nak/knobs.rs
-index b5759bb..0580f1b 100644
+index b5759bb..3810a18 100644
 --- a/src/nouveau/compiler/nak/knobs.rs
 +++ b/src/nouveau/compiler/nak/knobs.rs
-@@ -103,6 +103,10 @@ static BAR_SHARE: OnceLock<bool> = OnceLock::new();
+@@ -103,6 +103,11 @@ static BAR_SHARE: OnceLock<bool> = OnceLock::new();
  static LAT_MASK: OnceLock<u32> = OnceLock::new();
  static UNROLL_MAX: OnceLock<u32> = OnceLock::new();
  static VEC_CSE: OnceLock<bool> = OnceLock::new();
@@ -214,10 +219,11 @@ index b5759bb..0580f1b 100644
 +static REMAT_LD_COST: OnceLock<u32> = OnceLock::new();
 +static OCC_GPRS: OnceLock<u32> = OnceLock::new();
 +static F16_PAIR: OnceLock<bool> = OnceLock::new();
++static TEMP_IF_ELSE: OnceLock<u32> = OnceLock::new();
  static WEAK_MEM: OnceLock<bool> = OnceLock::new();
  static UNIFORM_ATOMICS: OnceLock<bool> = OnceLock::new();
  static F16_CVT: OnceLock<bool> = OnceLock::new();
-@@ -135,6 +139,71 @@ pub extern "C" fn nak_knob_gcm() -> u32 {
+@@ -135,6 +140,87 @@ pub extern "C" fn nak_knob_gcm() -> u32 {
      gcm()
  }
  
@@ -269,6 +275,22 @@ index b5759bb..0580f1b 100644
 +    f16_pair()
 +}
 +
++/// NAK_TEMP_IF_ELSE (0, 2, 4, 8, 16, 32 or 64; default 0): function-local
++/// arrays of at most that many elements with a dynamic index become
++/// if/else trees of selects instead of scratch (local memory) loads and
++/// stores (nak_nir.c); other values round down
++pub fn temp_if_else() -> u32 {
++    *TEMP_IF_ELSE.get_or_init(|| {
++        let v = parse_u32("NAK_TEMP_IF_ELSE", 0, 4096);
++        if v < 2 { 0 } else { 1 << (31 - v.min(64).leading_zeros()) }
++    })
++}
++
++#[unsafe(no_mangle)]
++pub extern "C" fn nak_knob_temp_if_else() -> u32 {
++    temp_if_else()
++}
++
 +/// NAK_REMAT_LD_COST (1-63, default 4): what a rematerialized global or
 +/// constant load costs in the spiller and in the occupancy target's dry run
 +/// (spill_remat::op_cost).  A memory fill costs 8; a reload that is a load
@@ -289,7 +311,7 @@ index b5759bb..0580f1b 100644
  /// NAK_SCHED_ILP (default off): the prepass enters an instruction in its
  /// future-ready set at the cycle its edge latencies give, as NAK_SCHED_MLP
  /// does, but keeps the plain latency model.  Without it a producer is ready
-@@ -186,6 +255,10 @@ pub extern "C" fn nak_knobs_key2() -> u32 {
+@@ -186,6 +272,12 @@ pub extern "C" fn nak_knobs_key2() -> u32 {
          | (u32::from(fset_bf()) << 8)
          | (u32::from(sched_ilp()) << 9)
          | (gcm() << 10)
@@ -297,6 +319,8 @@ index b5759bb..0580f1b 100644
 +        | (remat_ld_cost() << 14)
 +        | (occ_gprs() << 20)
 +        | (u32::from(f16_pair()) << 28)
++        // 0, 2..64 as 0, 1..6 in three bits
++        | ((if temp_if_else() == 0 { 0 } else { temp_if_else().trailing_zeros() }) << 29)
  }
  
  /// NAK_YIELD (default off, experimental, SM120): control bit 109 set on
@@ -482,7 +506,7 @@ index a808dc4..0c67a5d 100644
          _ => 1,
      }
 diff --git a/src/nouveau/compiler/nak_nir.c b/src/nouveau/compiler/nak_nir.c
-index b577050..3c9cb52 100644
+index b577050..8d4d464 100644
 --- a/src/nouveau/compiler/nak_nir.c
 +++ b/src/nouveau/compiler/nak_nir.c
 @@ -94,6 +94,115 @@ nak_nir_workgroup_has_one_subgroup(const nir_shader *nir)
@@ -610,6 +634,24 @@ index b577050..3c9cb52 100644
        LOOP_OPT(nir, nir_opt_vectorize, vectorize_filter_cb, (void*)nak);
        LOOP_OPT(nir, nir_lower_phis_to_scalar, phi_vectorize_cb, NULL);
        LOOP_OPT(nir, nir_lower_frexp);
+@@ -1685,6 +1796,17 @@ nak_postprocess_nir(nir_shader *nir,
+       OPT(nir, nak_nir_lower_kepler_shared_atomics);
+    }
+ 
++   /* NAK_TEMP_IF_ELSE: small local arrays with a dynamic index stay in
++    * registers (selects) instead of going to scratch
++    */
++   if (nak_knob_temp_if_else() > 0 && nir_shader_has_local_variables(nir)) {
++      if (OPT(nir, nir_lower_indirect_derefs_to_if_else_trees,
++              nir_var_function_temp, nak_knob_temp_if_else())) {
++         OPT(nir, nir_lower_vars_to_ssa);
++         nak_optimize_nir(nir, nak);
++      }
++   }
++
+    if (nir_shader_has_local_variables(nir)) {
+       OPT(nir, nir_lower_vars_to_explicit_types, nir_var_function_temp,
+           glsl_get_natural_size_align_bytes);
 diff --git a/src/nouveau/compiler/nak_nir_lower_tex.c b/src/nouveau/compiler/nak_nir_lower_tex.c
 index 8343644..c2efc5f 100644
 --- a/src/nouveau/compiler/nak_nir_lower_tex.c
@@ -690,15 +732,16 @@ index 8343644..c2efc5f 100644
  
     struct nak_nir_tex_flags flags = {
 diff --git a/src/nouveau/compiler/nak_private.h b/src/nouveau/compiler/nak_private.h
-index 6207d4c..4983a95 100644
+index 6207d4c..4aae8b2 100644
 --- a/src/nouveau/compiler/nak_private.h
 +++ b/src/nouveau/compiler/nak_private.h
-@@ -19,6 +19,8 @@ bool nak_debug_no_ugpr(void);
+@@ -19,6 +19,9 @@ bool nak_debug_no_ugpr(void);
  bool nak_knob_uaddr_pin(void);
  bool nak_knob_fset_bf(void);
  uint32_t nak_knob_gcm(void);
 +uint32_t nak_knob_tex_uhandle(void);
 +bool nak_knob_f16_pair(void);
++uint32_t nak_knob_temp_if_else(void);
  bool nak_knob_nir_flatten(void);
  bool nak_knob_uniform_atomics(void);
  bool nak_knob_loop_cont_sync(void);
