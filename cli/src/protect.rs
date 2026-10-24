@@ -205,11 +205,11 @@ pub fn bar1_mib(pci: &Path) -> Option<u64> {
     (end >= start && end != 0).then(|| (end - start + 1) >> 20)
 }
 
-/// What a guest may hold on a card that also drives a display: half of it, and
-/// never leaving the host less than 3 GiB; 4 GiB where the size is unknown.
+/// What a guest may hold on a card that also drives a display: all of it but
+/// the 3 GiB kept for the host (at least 1 GiB); 4 GiB where the size is unknown.
 pub fn default_limit_mib(total: Option<u64>) -> u64 {
     match total {
-        Some(t) => (t / 2).min(t.saturating_sub(HOST_RESERVE_MIB)).max(1024),
+        Some(t) => t.saturating_sub(HOST_RESERVE_MIB).max(1024),
         None => UNKNOWN_CARD_MIB,
     }
 }
@@ -408,9 +408,9 @@ mod tests {
 
     #[test]
     fn the_default_leaves_the_desktop_room() {
-        assert_eq!(default_limit_mib(Some(12288)), 6144);
-        assert_eq!(default_limit_mib(Some(24576)), 12288);
-        // Small cards: the 3 GiB reserve wins over half.
+        assert_eq!(default_limit_mib(Some(12288)), 9216);
+        assert_eq!(default_limit_mib(Some(24576)), 21504);
+        assert_eq!(default_limit_mib(Some(32768)), 29696);
         assert_eq!(default_limit_mib(Some(6144)), 3072);
         assert_eq!(default_limit_mib(Some(4096)), 1024);
         assert_eq!(default_limit_mib(None), UNKNOWN_CARD_MIB);
@@ -430,7 +430,7 @@ mod tests {
         assert!(!card.display_active());
         assert_eq!(card.total_vram_mib(), Some(12288));
         assert_eq!(card.bar1_mib(), Some(256));
-        assert_eq!(vram_limit_mib(&t.0, VramSetting::Auto, false), Some(6144));
+        assert_eq!(vram_limit_mib(&t.0, VramSetting::Auto, false), Some(9216));
     }
 
     #[test]
@@ -576,7 +576,7 @@ mod tests {
         let p = plan_for(&proven, VramSetting::Mib(3000), SafeSetting::Auto, None);
         assert_eq!((p.safe_mode, p.vram_limit_mib), (false, Some(3000)));
         let p = plan_for(&proven, VramSetting::Auto, SafeSetting::Auto, None);
-        assert_eq!((p.safe_mode, p.vram_limit_mib), (false, Some(6144)));
+        assert_eq!((p.safe_mode, p.vram_limit_mib), (false, Some(9216)));
         let p = plan_for(&closed, VramSetting::Off, SafeSetting::Auto, None);
         assert_eq!((p.safe_mode, p.vram_limit_mib), (true, Some(2048)));
         let (_, set, _) = command_line(&p);
@@ -594,24 +594,24 @@ mod tests {
     #[test]
     fn the_final_limit_is_the_smallest_of_number_display_default_and_safe_mode() {
         use VramSetting::*;
-        let half = Some(16384); // a monitor on a 32 GiB card
+        let disp = Some(29696); // the display default on a 32 GiB card
         for (setting, safe, display, want) in [
-            // Safe mode with a monitor: 2 GiB, not half the card (the defect).
-            (Default, true, half, Some(2048)),
+            // Safe mode with a monitor: 2 GiB, not the display default.
+            (Default, true, disp, Some(2048)),
             (Default, true, None, Some(2048)),
-            (Auto, true, half, Some(2048)),
+            (Auto, true, disp, Some(2048)),
             // A smaller number wins; a larger one does not raise the cap.
-            (Mib(1024), true, half, Some(1024)),
-            (Mib(8192), true, half, Some(2048)),
-            (Off, true, half, Some(2048)),
+            (Mib(1024), true, disp, Some(1024)),
+            (Mib(8192), true, disp, Some(2048)),
+            (Off, true, disp, Some(2048)),
             // A small card's display default is below 2 GiB.
             (Default, true, Some(1024), Some(1024)),
             // Safe mode off: the owner's number, the default for `auto`, or none.
-            (Default, false, half, None),
-            (Auto, false, half, half),
+            (Default, false, disp, None),
+            (Auto, false, disp, disp),
             (Auto, false, None, None),
-            (Mib(8192), false, half, Some(8192)),
-            (Off, false, half, None),
+            (Mib(8192), false, disp, Some(8192)),
+            (Off, false, disp, None),
         ] {
             assert_eq!(
                 final_limit_mib(setting, safe, display),
