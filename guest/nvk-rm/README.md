@@ -315,6 +315,8 @@ Each patch builds on its own.
 | 0007 | AMD FidelityFX FSR 1 (`ffx_a.h`, `ffx_fsr1.h`, MIT), vendored unmodified under `src/vulkan/wsi/enhance/third_party` for 0008 |
 | 0008 | upscaling and frame generation in the composed present, off by default (`MESA_WSI_ENHANCE_*`, `HKLM\SOFTWARE\Helios` `Enhance*`, per-exe profiles): compute passes on the application's queue before the present's fence (`wsi_swapchain::present_cmd`) into output slots of the window's size, paced by the present thread; FSR 1 / bicubic / bilinear / nearest / integer scaling, 2x / 3x / 4x / adaptive generation from optical flow; with a scaler the surface reports no current extent. See [docs/enhance.md](docs/enhance.md) |
 | 0009 | D3D11 and D3D12 swap chains through the same: where a Helios D3D driver runs on NVK and enhancement is on, NVK hooks DXGI's swap chain creation and hands the application an `IDXGISwapChain4` of its own whose presents are copied into shared ring textures, enhanced on an NVK device of its own and presented through the composed present (`MESA_WSI_ENHANCE_D3D`, `EnhanceD3D`; see [docs/enhance.md](docs/enhance.md#d3d-swap-chains)) |
+| 0010 | the composed present's own DXGI swap chains pass the D3D swap chain hooks (`wsi_win32_dxgi_internal`): in a Vulkan process the composed present's D3D11 device loads the Helios UMD, NVK hooked DXGI there too, and its own flip swap chain was taken by the proxy (every picture enhanced twice) |
+| 0011 | frame generation: flow propagation (`fg_flow` mode 2, one round per level), a motion cost per frame pixel, a 1/32 coarsest level, nine interpolation candidates; tuned with `tools/enhance-eval` (see [docs/enhance.md](docs/enhance.md#measuring-the-interpolation)) |
 
 ## `patches-common/`: generic NVK work
 
