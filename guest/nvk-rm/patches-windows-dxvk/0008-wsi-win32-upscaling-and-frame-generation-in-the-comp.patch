@@ -1307,7 +1307,7 @@ index f5a574c..e0b9796 100644
                              (int)chain->base.present_mode,
 diff --git a/src/vulkan/wsi/wsi_common_win32_enhance.c b/src/vulkan/wsi/wsi_common_win32_enhance.c
 new file mode 100644
-index 0000000..653c33f
+index 0000000..5f4a9a4
 --- /dev/null
 +++ b/src/vulkan/wsi/wsi_common_win32_enhance.c
 @@ -0,0 +1,1372 @@
@@ -2359,14 +2359,14 @@ index 0000000..653c33f
 +      const bool rcas = e->cfg.sharpness > 0;
 +      push_sizes(&p, e->src, out, rcas ? (VkOffset2D){ 0, 0 } : off);
 +      p.flags = srgb;
-+      dispatch(e, cmd, P_EASU, src, e->linear, NULL, NULL,
++      dispatch(e, cmd, P_EASU, src, e->linear, VK_NULL_HANDLE, VK_NULL_HANDLE,
 +               rcas ? e->tmp.view : dst, &p);
 +      if (rcas) {
 +         compute_barrier(e->wsi, cmd);
 +         push_sizes(&p, out, out, off);
 +         /* RCAS: 0 stops is the sharpest; 100 -> 0, 50 -> 1, 1 -> ~2 */
 +         p.p0[0] = 2.0f * (1.0f - (float)e->cfg.sharpness / 100.0f);
-+         dispatch(e, cmd, P_RCAS, e->tmp.view, e->nearest, NULL, NULL, dst, &p);
++         dispatch(e, cmd, P_RCAS, e->tmp.view, e->nearest, VK_NULL_HANDLE, VK_NULL_HANDLE, dst, &p);
 +      }
 +      return;
 +   }
@@ -2384,7 +2384,7 @@ index 0000000..653c33f
 +               (s == WSI_ENH_SCALER_OFF ? 1 : 0);
 +      break;
 +   }
-+   dispatch(e, cmd, P_SCALE, src, e->linear, NULL, NULL, dst, &p);
++   dispatch(e, cmd, P_SCALE, src, e->linear, VK_NULL_HANDLE, VK_NULL_HANDLE, dst, &p);
 +}
 +
 +static void
@@ -2590,7 +2590,7 @@ index 0000000..653c33f
 +         const struct enh_img *from = l == 1 ? NULL : &e->pyr[cur][l - 1];
 +         push_sizes(&p, from ? from->extent : e->src, e->pyr[cur][l].extent, zero);
 +         p.mode = l == 1 ? 1 : 0;
-+         dispatch(e, cmd, P_DOWN, from ? from->view : src, e->linear, NULL, NULL,
++         dispatch(e, cmd, P_DOWN, from ? from->view : src, e->linear, VK_NULL_HANDLE, VK_NULL_HANDLE,
 +                  e->pyr[cur][l].view, &p);
 +         compute_barrier(wsi, cmd);
 +      }
@@ -2635,7 +2635,7 @@ index 0000000..653c33f
 +      /* the real frame from the history image */
 +      push_sizes(&p, e->rect.extent, e->rect.extent, e->rect.offset);
 +      p.mode = 0;
-+      dispatch(e, cmd, P_SCALE, e->hist[cur].view, e->nearest, NULL, NULL,
++      dispatch(e, cmd, P_SCALE, e->hist[cur].view, e->nearest, VK_NULL_HANDLE, VK_NULL_HANDLE,
 +               e->slot_views[real_slot], &p);
 +      timestamp(e, cmd, f, src_index, TS_COPY);
 +      e->cur = prev;
