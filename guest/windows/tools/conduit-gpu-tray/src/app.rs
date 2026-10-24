@@ -4,6 +4,7 @@ use crate::gfx::{self, argb, wide, Gfx};
 use crate::sendto;
 use crate::sys;
 use crate::view::{self, Snapshot, Wait};
+use gpu_tray::enhance;
 use gpu_tray::policy::{on_denied, OnDenied};
 use gpu_tray::{
     copied_text, default_share, icon_face, tooltip, IconMetric, LineReader, Model, Share, CHANNEL,
@@ -51,6 +52,12 @@ const ID_OPEN_DEFAULT: usize = 7;
 const ID_SHARE: usize = 100;
 /// Menu ids of the recent launches submenu: this plus the index.
 const ID_LAUNCH: usize = 300;
+/// Upscaling and frame generation: global settings at ID_ENH plus
+/// setting * 16 plus choice; profiles at ID_ENH_APP plus app * 256 plus
+/// setting * 16 plus choice, the app's "remove profile" at plus 255
+const ID_ENH: usize = 1000;
+const ID_ENH_APP: usize = 2000;
+const ENH_APPS: usize = 8;
 
 // Channel state, written by the reader thread.
 const CH_WAITING: u8 = 0;
@@ -655,6 +662,11 @@ fn context_menu(hwnd: HWND) {
         }
         let t = wide("Recent launches (click to stop)");
         AppendMenuW(m, MF_POPUP, sub as usize, t.as_ptr());
+        // Upscaling and frame generation (NVK's composed present)
+        let enh_apps = enhance::profile_candidates(&sys::windowed_exes(), ENH_APPS);
+        let enh = enhance_menu(&enh_apps);
+        let t = wide("Upscaling and frame generation");
+        AppendMenuW(m, MF_POPUP, enh as usize, t.as_ptr());
         AppendMenuW(m, MF_SEPARATOR, 0, null());
         add(
             ID_KEEP,
@@ -704,6 +716,18 @@ fn context_menu(hwnd: HWND) {
             id if id >= ID_LAUNCH && id - ID_LAUNCH < launches.len() => {
                 let _ = crate::launch::stop(launches[id - ID_LAUNCH].pid);
             }
+            id if (ID_ENH..ID_ENH + enhance::ALL.len() * 16).contains(&id) => {
+                enhance_pick(None, id - ID_ENH);
+            }
+            id if (ID_ENH_APP..ID_ENH_APP + enh_apps.len() * 256).contains(&id) => {
+                let app = &enh_apps[(id - ID_ENH_APP) / 256];
+                let k = (id - ID_ENH_APP) % 256;
+                if k == 255 {
+                    sys::enhance_remove_profile(app);
+                } else {
+                    enhance_pick(Some(app), k);
+                }
+            }
             ID_AUTOSTART => sys::set_autostart(!sys::autostart_enabled(), &exe_path()),
             ID_EXIT => {
                 DestroyWindow(hwnd);
@@ -711,6 +735,84 @@ fn context_menu(hwnd: HWND) {
             _ => {}
         }
     }
+}
+
+/// One setting's choices as a radio submenu; ids base + choice
+unsafe fn enhance_choices(exe: Option<&str>, s: &enhance::Setting, base: usize) -> HMENU {
+    let sub = CreatePopupMenu();
+    let stored = sys::enhance_get(exe, s);
+    // In a profile an absent value means "as the global setting"
+    let cur = if exe.is_some() && stored.is_none() {
+        usize::MAX
+    } else {
+        s.index_of(stored.as_deref())
+    };
+    let writable = sys::elevated();
+    for (i, (_, text)) in s.choices.iter().enumerate() {
+        let t = wide(text);
+        let fl = if i == cur { MF_CHECKED } else { 0 } | if writable { 0 } else { MF_GRAYED };
+        AppendMenuW(sub, MF_STRING | fl, base + i, t.as_ptr());
+    }
+    sub
+}
+
+/// The settings menu: the global settings, then a profile per open app
+unsafe fn enhance_menu(apps: &[String]) -> HMENU {
+    let m = CreatePopupMenu();
+    let scaler = enhance::SCALER.index_of(sys::enhance_get(None, &enhance::SCALER).as_deref());
+    let fg = enhance::FRAMEGEN.index_of(sys::enhance_get(None, &enhance::FRAMEGEN).as_deref());
+    let t = wide(&format!(
+        "Vulkan and OpenGL games: {}",
+        enhance::summary(scaler, fg)
+    ));
+    AppendMenuW(m, MF_STRING | MF_GRAYED, 0, t.as_ptr());
+    for (si, s) in enhance::ALL.iter().enumerate() {
+        let sub = enhance_choices(None, s, ID_ENH + si * 16);
+        let t = wide(s.title);
+        AppendMenuW(m, MF_POPUP, sub as usize, t.as_ptr());
+    }
+    AppendMenuW(m, MF_SEPARATOR, 0, null());
+    if apps.is_empty() {
+        let t = wide("Per-game profiles: no open windows");
+        AppendMenuW(m, MF_STRING | MF_GRAYED, 0, t.as_ptr());
+    }
+    for (ai, app) in apps.iter().enumerate() {
+        let pm = CreatePopupMenu();
+        let has = sys::enhance_has_profile(app);
+        for (si, s) in enhance::ALL.iter().enumerate() {
+            if !s.per_exe {
+                continue;
+            }
+            let sub = enhance_choices(Some(app), s, ID_ENH_APP + ai * 256 + si * 16);
+            let t = wide(s.title);
+            AppendMenuW(pm, MF_POPUP, sub as usize, t.as_ptr());
+        }
+        AppendMenuW(pm, MF_SEPARATOR, 0, null());
+        let t = wide("Remove profile (use the settings for all games)");
+        let fl = if has && sys::elevated() { 0 } else { MF_GRAYED };
+        AppendMenuW(pm, MF_STRING | fl, ID_ENH_APP + ai * 256 + 255, t.as_ptr());
+        let t = wide(&format!(
+            "Profile for {app}{}",
+            if has { " (set)" } else { "" }
+        ));
+        AppendMenuW(m, MF_POPUP, pm as usize, t.as_ptr());
+    }
+    AppendMenuW(m, MF_SEPARATOR, 0, null());
+    let t = wide("Changes apply within a second; D3D11 and D3D12 games are not covered yet");
+    AppendMenuW(m, MF_STRING | MF_GRAYED, 0, t.as_ptr());
+    m
+}
+
+/// A menu pick: setting k / 16, choice k % 16
+fn enhance_pick(exe: Option<&str>, k: usize) {
+    let (si, ci) = (k / 16, k % 16);
+    let Some(s) = enhance::ALL.get(si) else {
+        return;
+    };
+    let Some((value, _)) = s.choices.get(ci) else {
+        return;
+    };
+    sys::enhance_set(exe, s, value);
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
