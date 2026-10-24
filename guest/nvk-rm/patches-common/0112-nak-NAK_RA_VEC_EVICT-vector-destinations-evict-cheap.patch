@@ -1,0 +1,168 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Sat, 24 Oct 2026 10:06:49 +0200
+Subject: [PATCH] nak: NAK_RA_VEC_EVICT, vector destinations evict cheap ranges
+
+When no aligned register range is free for a vector destination,
+register allocation evicted the values in the lowest unpinned range.
+That is often the range the previous vector load (or texture fetch) went
+to, so that load's result is copied out right after it: the copy waits
+for the load and each load waits for the previous one.  With
+NAK_RA_VEC_EVICT the range to evict is the one with the fewest values and
+no memory, texture or MUFU result defined in the last 64 instructions.
+---
+ src/nouveau/compiler/nak/assign_regs.rs | 68 ++++++++++++++++++++++++-
+ src/nouveau/compiler/nak/knobs.rs       | 13 ++++-
+ 2 files changed, 79 insertions(+), 2 deletions(-)
+
+diff --git a/src/nouveau/compiler/nak/assign_regs.rs b/src/nouveau/compiler/nak/assign_regs.rs
+index 195dd88..acb4a17 100644
+--- a/src/nouveau/compiler/nak/assign_regs.rs
++++ b/src/nouveau/compiler/nak/assign_regs.rs
+@@ -268,6 +268,10 @@ struct RegAllocator {
+     /// Registers that the phi copies at the end of the current block want
+     /// for other values: new values without a preference avoid them
+     avoid: BitSet,
++    /// NAK_RA_VEC_EVICT: values defined by variable-latency instructions
++    /// (memory, texture, MUFU) and the instruction counter at their def
++    late_def: FxHashMap<SSAValue, u32>,
++    cur_ip: u32,
+ }
+ 
+ impl RegAllocator {
+@@ -280,6 +284,8 @@ impl RegAllocator {
+             reg_ssa: Vec::new(),
+             ssa_reg: Default::default(),
+             avoid: Default::default(),
++            late_def: Default::default(),
++            cur_ip: 0,
+         }
+     }
+ 
+@@ -707,10 +713,45 @@ impl<'a> VecRegAllocator<'a> {
+             return self.assign_pin_vec_reg(vec, reg);
+         }
+ 
+-        let reg = self
++        let mut reg = self
+             .try_find_unpinned_reg_range(0, comps, align, 0)
+             .expect("Failed to find an unpinned register range");
+ 
++        // NAK_RA_VEC_EVICT: the first unpinned range is often the one the
++        // previous vector load went to, so its result would be copied out
++        // right away: the copy waits for the load and the loads run one at
++        // a time.  Evict the range whose occupants are cheapest to move
++        // instead: few of them, and none a recent memory, texture or MUFU
++        // result
++        if crate::knobs::ra_vec_evict() {
++            let cost = |s: &Self, r: u32| -> u32 {
++                let mut c = 0;
++                for i in 0..u32::from(comps) {
++                    if let Some(ssa) = s.ra.try_get_ssa(r + i) {
++                        c += 1;
++                        if let Some(&at) = s.ra.late_def.get(&ssa) {
++                            if s.ra.cur_ip.saturating_sub(at) < 64 {
++                                c += 16;
++                            }
++                        }
++                    }
++                }
++                c
++            };
++            let mut best = (cost(self, reg), reg);
++            let mut r = reg + u32::from(align);
++            while r + u32::from(comps) <= self.ra.num_regs {
++                if self.reg_range_is_unpinned(r, comps) {
++                    let c = cost(self, r);
++                    if c < best.0 {
++                        best = (c, r);
++                    }
++                }
++                r += u32::from(align);
++            }
++            reg = best.1;
++        }
++
+         for c in 0..comps {
+             self.evict_reg_if_used(reg + u32::from(c));
+         }
+@@ -787,6 +828,31 @@ fn instr_assign_regs_file(
+     pcopy: &mut OpParCopy,
+     ra: &mut RegAllocator,
+ ) {
++    ra.cur_ip = u32::try_from(ip).unwrap();
++    if crate::knobs::ra_vec_evict()
++        && matches!(
++            instr.op,
++            Op::Ld(_)
++                | Op::Tex(_)
++                | Op::Tld(_)
++                | Op::Tld4(_)
++                | Op::Tmml(_)
++                | Op::Txd(_)
++                | Op::SuLd(_)
++                | Op::MuFu(_)
++                | Op::Ldc(_)
++        )
++    {
++        for dst in instr.dsts() {
++            if let Dst::SSA(ssa) = dst {
++                for &v in ssa.iter() {
++                    if v.file() == ra.file() {
++                        ra.late_def.insert(v, ra.cur_ip);
++                    }
++                }
++            }
++        }
++    }
+     struct VecDst {
+         dst_idx: usize,
+         comps: u8,
+diff --git a/src/nouveau/compiler/nak/knobs.rs b/src/nouveau/compiler/nak/knobs.rs
+index 2b6f1ea..9def7bd 100644
+--- a/src/nouveau/compiler/nak/knobs.rs
++++ b/src/nouveau/compiler/nak/knobs.rs
+@@ -118,6 +118,7 @@ static SCHED_MLP: OnceLock<u32> = OnceLock::new();
+ static LAT_NV: OnceLock<bool> = OnceLock::new();
+ static SCHED_SPILL_ROOM: OnceLock<bool> = OnceLock::new();
+ static SCHED_DELAY_WEIGHT: OnceLock<u32> = OnceLock::new();
++static RA_VEC_EVICT: OnceLock<bool> = OnceLock::new();
+ 
+ /// NAK_TEX_UHANDLE (0-2, default 2 on Windows, 0 elsewhere, SM100+): a
+ /// bindless texture handle that
+@@ -196,6 +197,15 @@ fn sched_delay_weight_u32() -> u32 {
+     })
+ }
+ 
++/// NAK_RA_VEC_EVICT (default off): when register allocation has to evict
++/// values to place a vector destination, it evicts the aligned range with
++/// the fewest values and no recent memory, texture or MUFU result, instead
++/// of the lowest one: there it is often the previous vector load's result,
++/// whose copy then waits for that load (assign_regs.rs)
++pub fn ra_vec_evict() -> bool {
++    *RA_VEC_EVICT.get_or_init(|| parse("NAK_RA_VEC_EVICT", env::var("NAK_RA_VEC_EVICT"), false))
++}
++
+ /// NAK_F16_PAIR (default off): independent scalar 32-to-16-bit float
+ /// conversions in a block are paired into one 2-wide conversion (one
+ /// F2FP.PACK_AB), so the 16-bit math that follows reads the lanes of one
+@@ -255,7 +265,7 @@ pub fn occ_gprs() -> u32 {
+ /// The knobs that do not fit in nak_knobs_key(), for a second word of
+ /// NVK's cache keys: NAK_TEX_UHANDLE, NAK_REMAT_LD_COST, NAK_OCC_GPRS,
+ /// NAK_F16_PAIR, NAK_TEMP_IF_ELSE, NAK_OCC_FS, NAK_LAT_NV,
+-/// NAK_SCHED_SPILL_ROOM, NAK_SCHED_DELAY_WEIGHT
++/// NAK_SCHED_SPILL_ROOM, NAK_SCHED_DELAY_WEIGHT, NAK_RA_VEC_EVICT
+ #[unsafe(no_mangle)]
+ pub extern "C" fn nak_knobs_key2() -> u32 {
+     tex_uhandle()
+@@ -269,6 +279,7 @@ pub extern "C" fn nak_knobs_key2() -> u32 {
+         | (u32::from(sched_spill_room()) << 22)
+         // 1..64 as 0..63 in six bits
+         | ((sched_delay_weight() as u32 - 1) << 23)
++        | (u32::from(ra_vec_evict()) << 29)
+ }
+ 
+ 
+-- 
+2.43.0
+

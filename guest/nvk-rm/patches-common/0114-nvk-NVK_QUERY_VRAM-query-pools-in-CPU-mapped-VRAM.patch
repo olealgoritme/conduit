@@ -1,0 +1,48 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Sat, 24 Oct 2026 10:32:21 +0200
+Subject: [PATCH] nvk: NVK_QUERY_VRAM, query pools in CPU-mapped VRAM
+
+For A/B of the cost of timestamps and other reports: with the knob the
+pool is LOCAL | GPU_LATENCY memory, which the RM backend puts in its BAR
+heap, instead of system memory the GPU writes its reports to across PCIe.
+---
+ src/nouveau/vulkan/nvk_query_pool.c | 13 ++++++++++++-
+ 1 file changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/src/nouveau/vulkan/nvk_query_pool.c b/src/nouveau/vulkan/nvk_query_pool.c
+index 67cb487..a312651 100644
+--- a/src/nouveau/vulkan/nvk_query_pool.c
++++ b/src/nouveau/vulkan/nvk_query_pool.c
+@@ -4,6 +4,8 @@
+  */
+ #include "nvk_query_pool.h"
+ 
++#include "util/u_debug.h"
++
+ #include "nvk_buffer.h"
+ #include "nvk_cmd_buffer.h"
+ #include "nvk_device.h"
+@@ -166,9 +168,18 @@ nvk_CreateQueryPool(VkDevice device,
+    }
+ 
+    if (mem_size > 0) {
++      /* NVK_QUERY_VRAM=1: the query pool in CPU-mapped VRAM (on RM the BAR
++       * heap the latency-bound upload memory uses) instead of system memory
++       * the GPU writes its reports to across PCIe.  For A/B of the cost of
++       * timestamps and other reports.
++       */
++      const enum nvkmd_mem_flags qflags =
++         debug_get_bool_option("NVK_QUERY_VRAM", false)
++            ? NVKMD_MEM_LOCAL | NVKMD_MEM_GPU_LATENCY
++            : NVKMD_MEM_GART;
+       result = nvkmd_dev_alloc_mapped_mem(dev->nvkmd, &dev->vk.base,
+                                           mem_size, 0 /* align_B */,
+-                                          NVKMD_MEM_GART,
++                                          qflags,
+                                           NVKMD_MEM_MAP_RDWR,
+                                           &pool->mem);
+       if (result != VK_SUCCESS) {
+-- 
+2.43.0
+
