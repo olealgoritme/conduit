@@ -10,7 +10,7 @@
 // wrongly (NAK_BAR_SHARE) makes a consumer read a stale register, and the
 // output differs.  Run it with the knobs under test set in the environment:
 //
-//   naktest [-r REPEATS] [-n INVOCATIONS] [-t NAME_PREFIX]
+//   naktest [-r REPEATS] [-n INVOCATIONS] [-t NAME_PREFIX] [--time ITERATIONS]
 //
 // Exit status 0: every test passed; 1: a mismatch; 2: no device / setup error.
 #ifdef _WIN32
@@ -33,7 +33,8 @@
   X(vkCmdBindDescriptorSets) X(vkCmdPushConstants) X(vkCmdDispatch) X(vkEndCommandBuffer) X(vkQueueSubmit) \
   X(vkQueueWaitIdle) X(vkDestroyPipeline) X(vkDestroyShaderModule) X(vkResetCommandBuffer) X(vkCmdFillBuffer) \
   X(vkCmdPipelineBarrier) X(vkDestroyDevice) X(vkDestroyInstance) X(vkGetInstanceProcAddr) X(vkCreateImage) \
-  X(vkGetImageMemoryRequirements) X(vkBindImageMemory) X(vkCreateImageView) X(vkCreateSampler) X(vkCmdCopyBufferToImage)
+  X(vkGetImageMemoryRequirements) X(vkBindImageMemory) X(vkCreateImageView) X(vkCreateSampler) X(vkCmdCopyBufferToImage) \
+  X(vkCreateQueryPool) X(vkCmdResetQueryPool) X(vkCmdWriteTimestamp) X(vkGetQueryPoolResults)
 #define DECL(n) static PFN_##n n;
 FNS(DECL)
 static int load_vk(void) {
@@ -125,15 +126,23 @@ static VkImageView make_tex(VkDevice dev, VkPhysicalDeviceMemoryProperties *mp, 
 }
 
 int main(int argc, char **argv) {
-    int repeats = 20; uint32_t n = 65536; const char *only = NULL;
+    int repeats = 20; uint32_t n = 65536; const char *only = NULL; uint32_t iters = 0;
     for (int a = 1; a < argc; a++) {
         if (!strcmp(argv[a], "-r") && a + 1 < argc) repeats = atoi(argv[++a]);
         else if (!strcmp(argv[a], "-n") && a + 1 < argc) n = (uint32_t)atoi(argv[++a]) & ~63u;
         else if (!strcmp(argv[a], "-t") && a + 1 < argc) only = argv[++a];
-        else { fprintf(stderr, "usage: naktest [-r REPEATS] [-n INVOCATIONS] [-t NAME_PREFIX]\n"); return 2; }
+        else if (!strcmp(argv[a], "--time") && a + 1 < argc) iters = (uint32_t)atoi(argv[++a]);
+        else { fprintf(stderr, "usage: naktest [-r REPEATS] [-n INVOCATIONS] [-t NAME_PREFIX] [--time ITERATIONS]\n"); return 2; }
     }
+    /* --time: the lat_* tests' loops run ITERATIONS times and each dispatch is
+     * timed; with one workgroup per SM (-n 64 * SMs) a warp's dependent chain
+     * runs alone on its scheduler, so time per operation is the issue
+     * distance between producer and consumer.  Results are still checked
+     * (every 17th word) */
+    if (iters && !only) only = "lat_";
+    const double mhz = getenv("NAKTEST_MHZ") ? atof(getenv("NAKTEST_MHZ")) : 1900.0;
     if (!load_vk()) { fprintf(stderr, "no Vulkan loader\n"); return 2; }
-    const char *knobs[] = { "NAK_TEX_UHANDLE", "NAK_LAT", "NAK_BAR_SHARE", "NAK_IF_CONVERT", "NAK_UADDR_PIN", "NAK_PLOP_FOLD", "NAK_IMM_CSE",
+    const char *knobs[] = { "NAK_TEX_UHANDLE", "NAK_LAT", "NAK_LAT_NV", "NAK_LDCU_INDEX", "NAK_BAR_SHARE", "NAK_IF_CONVERT", "NAK_UADDR_PIN", "NAK_PLOP_FOLD", "NAK_IMM_CSE",
                             "NAK_PHI_AVOID", "NAK_WEAK_MEM", "NAK_VEC_CSE", "NAK_UNROLL_MAX", "NAK_BSSY_RECONVERGENT", "NAK_NIR_FLATTEN", "NAK_OCC_TARGET", "MESA_SHADER_CACHE_DISABLE" };
     printf("naktest: %u invocations, %d repeats; environment:", n, repeats);
     for (size_t k = 0; k < sizeof(knobs) / sizeof(knobs[0]); k++) { const char *v = getenv(knobs[k]); if (v) printf(" %s=%s", knobs[k], v); }
@@ -151,13 +160,16 @@ int main(int argc, char **argv) {
     if (!pd) { fprintf(stderr, "no NVIDIA/NVK device\n"); return 2; }
     printf("device: %s, driver version 0x%x\n", pp.deviceName, pp.driverVersion);
 
-    VkPhysicalDeviceFeatures2 f2 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
+    VkPhysicalDeviceShaderFloat16Int8Features f16 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES };
+    VkPhysicalDeviceFeatures2 f2 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &f16 };
     vkGetPhysicalDeviceFeatures2(pd, &f2);
     VkPhysicalDeviceFeatures en = { 0 }; en.shaderInt64 = f2.features.shaderInt64;
+    VkPhysicalDeviceShaderFloat16Int8Features f16en = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES };
+    f16en.shaderFloat16 = f16.shaderFloat16;
     uint32_t nq = 16; VkQueueFamilyProperties qf[16]; vkGetPhysicalDeviceQueueFamilyProperties(pd, &nq, qf);
     uint32_t qfi = 0; while (qfi < nq && !(qf[qfi].queueFlags & VK_QUEUE_COMPUTE_BIT)) qfi++;
     float prio = 1; VkDeviceQueueCreateInfo qci = { VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, NULL, 0, qfi, 1, &prio };
-    VkDeviceCreateInfo dci = { VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, NULL, 0, 1, &qci, 0, NULL, 0, NULL, &en };
+    VkDeviceCreateInfo dci = { VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &f16en, 0, 1, &qci, 0, NULL, 0, NULL, &en };
     VkDevice dev; CHK(vkCreateDevice(pd, &dci, NULL, &dev));
     VkQueue q; vkGetDeviceQueue(dev, qfi, 0, &q);
 
@@ -212,11 +224,15 @@ int main(int argc, char **argv) {
     vkUpdateDescriptorSets(dev, 4, w, 0, NULL);
 
     uint32_t *expect = malloc((size_t)n * 4);
+    VkQueryPoolCreateInfo qpi = { VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, NULL, 0, VK_QUERY_TYPE_TIMESTAMP, 2, 0 };
+    VkQueryPool qp; CHK(vkCreateQueryPool(dev, &qpi, NULL, &qp));
+    double *gpu_us = calloc((size_t)repeats, sizeof *gpu_us);
     int failed = 0, ran = 0;
     for (size_t t = 0; t < sizeof(tests) / sizeof(tests[0]); t++) {
         const struct test *T = &tests[t];
         if (only && strncmp(T->name, only, strlen(only))) continue;
         if (!strcmp(T->kind, "carry") && !en.shaderInt64) { printf("%-10s skipped (no shaderInt64)\n", T->name); continue; }
+        if (!strcmp(T->kind, "lat16") && !f16en.shaderFloat16) { printf("%-10s skipped (no shaderFloat16)\n", T->name); continue; }
         VkShaderModuleCreateInfo smci = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, T->spv_size, T->spv };
         VkShaderModule sm; CHK(vkCreateShaderModule(dev, &smci, NULL, &sm));
         VkComputePipelineCreateInfo cpi = { VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, NULL, 0,
@@ -230,25 +246,42 @@ int main(int argc, char **argv) {
             for (int k = 0; k < 8; k++) { s ^= s << 13; s ^= s >> 17; s ^= s << 5; pc[k] = s; }
             pc[1] = n - 1;            /* index mask of the load tests (n is a power of two) */
             if (n & (n - 1)) pc[1] = 4095;
+            pc[2] = T->lat_ops ? (iters ? iters : 4) : pc[2];   /* loop count of the lat_* tests */
             VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
             CHK(vkBeginCommandBuffer(cb, &bi));
             vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
             vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pl, 0, 1, &ds, 0, NULL);
             vkCmdPushConstants(cb, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, 32, pc);
+            vkCmdResetQueryPool(cb, qp, 0, 2);
+            vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, qp, 0);
             vkCmdDispatch(cb, n / 64, 1, 1);
+            vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, qp, 1);
             CHK(vkEndCommandBuffer(cb));
             VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, 0, NULL, NULL, 1, &cb };
             CHK(vkQueueSubmit(q, 1, &si, VK_NULL_HANDLE)); CHK(vkQueueWaitIdle(q));
-            for (uint32_t i = 0; i < n; i++) expect[i] = T->ref(ptr[0], i, pc);
-            for (uint32_t i = 0; i < n; i++) if (ptr[1][i] != expect[i]) {
+            uint64_t ts[2] = { 0, 0 };
+            CHK(vkGetQueryPoolResults(dev, qp, 0, 2, sizeof ts, ts, 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT));
+            gpu_us[r] = (double)(ts[1] - ts[0]) * pp.limits.timestampPeriod / 1000.0;
+            const uint32_t step = iters ? 17 : 1;
+            for (uint32_t i = 0; i < n; i += step) expect[i] = T->ref(ptr[0], i, pc);
+            for (uint32_t i = 0; i < n; i += step) if (ptr[1][i] != expect[i]) {
                 if (!bad) { first_i = i; first_got = ptr[1][i]; first_want = expect[i]; }
                 bad++;
             }
             CHK(vkResetCommandBuffer(cb, 0));
         }
         ran++;
-        if (bad) { failed++; printf("%-10s %-8s FAIL: %ld wrong words, first at %u: got 0x%08x want 0x%08x\n", T->name, T->kind, bad, first_i, first_got, first_want); }
-        else printf("%-10s %-8s ok\n", T->name, T->kind);
+        char tm[160] = "";
+        if (iters && T->lat_ops) {
+            /* minimum over the repeats: the run least disturbed */
+            double m = gpu_us[0];
+            for (int r = 1; r < repeats; r++) if (gpu_us[r] < m) m = gpu_us[r];
+            double ops = (double)iters * T->lat_ops;
+            snprintf(tm, sizeof tm, "  %9.1f us  %6.3f ns/op  %5.2f cycles/op at %.0f MHz", m, m * 1000.0 / ops,
+                     m * mhz / ops, mhz);
+        }
+        if (bad) { failed++; printf("%-10s %-8s FAIL: %ld wrong words, first at %u: got 0x%08x want 0x%08x%s\n", T->name, T->kind, bad, first_i, first_got, first_want, tm); }
+        else printf("%-10s %-8s ok%s\n", T->name, T->kind, tm);
         fflush(stdout);
         vkDestroyPipeline(dev, pipe, NULL); vkDestroyShaderModule(dev, sm, NULL);
     }

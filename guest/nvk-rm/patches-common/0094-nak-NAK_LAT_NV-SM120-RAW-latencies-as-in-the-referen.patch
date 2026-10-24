@@ -1,0 +1,131 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Sat, 24 Oct 2026 09:36:54 +0200
+Subject: [PATCH] nak: NAK_LAT_NV, SM120 RAW latencies as in the reference
+ compiler's code
+
+The SM120 latency table adds one cycle to every SM100 RAW latency.  The
+reference compiler's SM120 code (stall counts in the control bits of what
+NVIDIA's driver makes of the same shaders) waits the SM100 latency for
+almost every pair: 4 cycles FMA -> FMA, ALU -> ALU, IMAD, HFMA2 and the
+uniform datapath, 5 for FMA <-> ALU, 13 for an execution guard.  It keeps
+one more only between two ALU-pipe instructions when either is a
+dual-issue op (MOV, SEL, ISETP, FSETP, FMNMX: 5), for predicate readers
+other than guards, and for memory instructions reading a uniform register.
+
+NAK_LAT_NV does the same.  Over 93 compute shaders no producer/reader
+pair is then closer than in the reference compiler's code.  On by default
+on Windows; it overrides NAK_LAT.
+---
+ src/nouveau/compiler/nak/knobs.rs             | 16 ++++++++++
+ .../compiler/nak/sm120_instr_latencies.rs     | 32 +++++++++++++++++--
+ 2 files changed, 45 insertions(+), 3 deletions(-)
+
+diff --git a/src/nouveau/compiler/nak/knobs.rs b/src/nouveau/compiler/nak/knobs.rs
+index 3016bb5..cb51438 100644
+--- a/src/nouveau/compiler/nak/knobs.rs
++++ b/src/nouveau/compiler/nak/knobs.rs
+@@ -124,6 +124,7 @@ static FSET_BF: OnceLock<bool> = OnceLock::new();
+ static SCHED_ILP: OnceLock<bool> = OnceLock::new();
+ static GCM: OnceLock<u32> = OnceLock::new();
+ static LDCU_INDEX: OnceLock<bool> = OnceLock::new();
++static LAT_NV: OnceLock<bool> = OnceLock::new();
+ 
+ /// NAK_GCM (0-3, default 0): nir_opt_gcm with value numbering after NAK's
+ /// NIR optimization loop; 2 also sinks ALU instructions back towards their
+@@ -184,6 +185,20 @@ fn parse_u32(name: &str, default: u32, max: u32) -> u32 {
+     }
+ }
+ 
++/// NAK_LAT_NV (default on on Windows, off elsewhere): SM120 RAW latencies as the reference
++/// compiler's SM120 code has them, instead of the SM100 latency plus one
++/// everywhere: plus one only between two ALU-pipe instructions when either
++/// is a dual-issue ALU op, for predicate readers other than execution
++/// guards and for memory instructions reading a uniform register
++/// (sm120_instr_latencies.rs).  Overrides NAK_LAT
++pub fn lat_nv() -> bool {
++    // 405.143: NAK_LAT=95 (the same distances but the fp16 and ALU-ALU
++    // pairs) passed naktest and every replay, -1% to -1.7% on the hot
++    // Steel Nomad shaders; NAK_LAT=128 (no padding at all) faults
++    let dflt = cfg!(target_os = "windows");
++    *LAT_NV.get_or_init(|| parse("NAK_LAT_NV", env::var("NAK_LAT_NV"), dflt))
++}
++
+ /// NAK_LDCU_INDEX (default off): on SM100+, a constant buffer load whose
+ /// offset is a uniform register value is a uniform LDCU c[N][URx] (the
+ /// form the reference compiler uses for descriptor loads) instead of a
+@@ -352,6 +367,7 @@ pub extern "C" fn nak_knobs_key2() -> u32 {
+     key ^ if occ_fs() { 0x9e37_79b9 } else { 0 }
+         ^ uniform_hoist().wrapping_mul(0x85eb_ca6b)
+         ^ if ldcu_index() { 0xc2b2_ae35 } else { 0 }
++        ^ if lat_nv() { 0x27d4_eb2f } else { 0 }
+ }
+ 
+ /// NAK_YIELD (default off, experimental, SM120): control bit 109 set on
+diff --git a/src/nouveau/compiler/nak/sm120_instr_latencies.rs b/src/nouveau/compiler/nak/sm120_instr_latencies.rs
+index 0a17f57..fbf5857 100644
+--- a/src/nouveau/compiler/nak/sm120_instr_latencies.rs
++++ b/src/nouveau/compiler/nak/sm120_instr_latencies.rs
+@@ -473,6 +473,19 @@ impl SM120Latency {
+                     || read_latency == RegLatencySM100::Imma
+                 {
+                     RegLatencySM100::raw(write_latency, read_latency, false) + 5
++                } else if crate::knobs::lat_nv() {
++                    // NAK_LAT_NV: the distances in the reference compiler's
++                    // SM120 code: the SM100 latency, plus one only between
++                    // two ALU-pipe instructions when either is a dual-issue
++                    // ALU op (MOV, SEL, ISETP, FSETP, FMNMX, ...)
++                    let pad = u32::from(
++                        is_alu(&write_latency)
++                            && is_alu(&read_latency)
++                            && (write_latency == RegLatencySM100::Dualalu
++                                || read_latency == RegLatencySM100::Dualalu),
++                    );
++                    RegLatencySM100::raw(write_latency, read_latency, false)
++                        + pad
+                 } else {
+                     let m = lat_mode();
+                     let mut pad = 1;
+@@ -506,7 +519,15 @@ impl SM120Latency {
+                     None => UregLatencySM100::Uldc,
+                 };
+                 let m = lat_mode();
+-                let pad = if m & 128 != 0
++                let pad = if crate::knobs::lat_nv() {
++                    // plus one only for memory instructions reading the
++                    // uniform register (UMOV -> LDG: 3)
++                    u32::from(matches!(
++                        read_latency,
++                        UregLatencySM100::Decoupled
++                            | UregLatencySM100::DecoupledBindless
++                    ))
++                } else if m & 128 != 0
+                     || (m & 16 != 0
+                         && write_latency == UregLatencySM100::Udp
+                         && matches!(
+@@ -527,7 +548,11 @@ impl SM120Latency {
+                     None => PredLatencySM100::RedirectedFp64,
+                 };
+                 let m = lat_mode();
+-                let pad = if m & 128 != 0
++                let pad = if crate::knobs::lat_nv() {
++                    // execution guards take the SM100 latency, other
++                    // predicate readers one more
++                    u32::from(!guard)
++                } else if m & 128 != 0
+                     || (m & 4 != 0 && guard)
+                     || (m & 8 != 0
+                         && write_latency == PredLatencySM100::Coupled
+@@ -545,7 +570,8 @@ impl SM120Latency {
+                     Some(op) => op_upred_latency(op),
+                     None => UpredLatencySM100::UGuard,
+                 };
+-                UpredLatencySM100::raw(write_latency, read_latency, false) + 1
++                UpredLatencySM100::raw(write_latency, read_latency, false)
++                    + u32::from(!crate::knobs::lat_nv())
+             }
+             RegFile::Bar => 0, // Barriers have a HW scoreboard
+             _ => panic!("Not a register"),
+-- 
+2.43.0
+
