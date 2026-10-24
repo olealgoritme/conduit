@@ -7,7 +7,9 @@
 # vk_offscreen_test.exe, vk_scanout_present.exe, vk_bar_test.exe,
 # vk_coherence_test.exe, vk_bl_readback.exe, vk_video_probe.exe,
 # helios_icd_test.exe, vk_rmfence_test.exe and helios_share_test.exe plus their
-# SPIR-V (glslangValidator), the self-checking correctness tests
+# SPIR-V (glslangValidator), vk_depth_bind_test.exe and
+# vk_depth_guard_test.exe (image bindings, depth/stencil readback and memory
+# guards), and the self-checking correctness tests
 # vk_zero_page_test.exe, vk_draw_fetch_test.exe, vk_submit_order_test.exe,
 # vk_texture_roundtrip.exe, vk_vertex_formats.exe and vk_mixed_samples_test.exe
 # (SPIR-V built in), vk_gpu_bound.exe (tests/perf: GPU-bound throughput per
@@ -73,9 +75,10 @@ done
 
 for t in vk_summary vk_compute_test vk_offscreen_test vk_scanout_present vk_bar_test vk_coherence_test vk_bl_readback vk_video_probe \
          vk_zero_page_test vk_draw_fetch_test vk_submit_order_test vk_texture_roundtrip vk_vertex_formats \
-         vk_mixed_samples_test; do
+         vk_mixed_samples_test vk_depth_guard_test; do
   "$CC" -O1 -Wall -I"$OUT_DIR/include" "$tests/$t.c" -L"$OUT_DIR" -lvulkan-1 -lm -o "$OUT_DIR/$t.exe"
 done
+"$CC" -O1 -Wall -I"$OUT_DIR/include" "$tests/vk_depth_bind_test.c" -o "$OUT_DIR/vk_depth_bind_test.exe"
 python3 "$tests/perf/gen_gpu_bound_shaders.py" >/dev/null
 "$CC" -O2 -Wall -I"$OUT_DIR/include" "$tests/perf/vk_gpu_bound.c" -L"$OUT_DIR" -lvulkan-1 -lm -static \
   -o "$OUT_DIR/vk_gpu_bound.exe"
