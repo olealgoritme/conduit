@@ -1,0 +1,27 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: SR_team <me@sr.team>
+Date: Sat, 24 Oct 2026 03:00:00 +0500
+Subject: [PATCH] nvk: align the stencil copy plane to the binding granularity
+
+The D32_SFLOAT_S8_UINT stencil copy plane has its own VA mapping, like
+ordinary tiled image planes. Its offset must satisfy the kernel backend's
+binding alignment as well as NIL's image alignment. ZCULL storage or small
+image planes can otherwise leave it at an offset RM cannot map.
+
+---
+ src/nouveau/vulkan/nvk_image.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/nouveau/vulkan/nvk_image.c b/src/nouveau/vulkan/nvk_image.c
+index f473e5b33a1..7c81cbc194c 100644
+--- a/src/nouveau/vulkan/nvk_image.c
++++ b/src/nouveau/vulkan/nvk_image.c
+@@ -1213,7 +1213,7 @@ nvk_image_init(struct nvk_device *dev,
+                           "Invalid image creation parameters");
+
+       image->stencil_copy_temp.plane_align_B =
+-         image->stencil_copy_temp.nil.align_B;
++         MAX2(image->stencil_copy_temp.nil.align_B, pdev->nvkmd->bind_align_B);
+    }
+
+    uint64_t plane_offset_B = 0;

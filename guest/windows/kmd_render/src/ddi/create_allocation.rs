@@ -4534,10 +4534,15 @@ pub unsafe extern "C" fn dxgkddi_describe_allocation(
     //
     // SAFETY: `h_adapter` is our AdapterContext, as in every adapter-level DDI.
     let adapter = unsafe { &*(h_adapter as *const crate::adapter::AdapterContext) };
-    let (rate_n, rate_d) =
-        helios_kmd_logic::reduce_ratio(u64::from(adapter.effective_refresh_mhz()), 1000);
-    args.RefreshRate.Numerator = rate_n as u32;
-    args.RefreshRate.Denominator = rate_d as u32;
+    let native = crate::ddi::mode_list::native_timing();
+    let (rate_n, rate_d) = helios_kmd_logic::edid::allocation_refresh_rate(
+        ctx.width,
+        ctx.height,
+        adapter.effective_refresh_mhz(),
+        native.as_ref(),
+    );
+    args.RefreshRate.Numerator = rate_n;
+    args.RefreshRate.Denominator = rate_d;
     args.PrivateDriverFormatAttribute = 0;
     STATUS_SUCCESS
 }
