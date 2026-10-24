@@ -1,0 +1,255 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Sat, 24 Oct 2026 08:25:18 +0200
+Subject: [PATCH] nvk: NVK_MME_LAZY_WFI, host WFI of an MME-data invalidate
+ where it is needed
+
+A barrier whose destination includes indirect command, conditional
+rendering, transform feedback counter or descriptor buffer reads makes
+NVK emit a host WFI and a system memory barrier, so that the MME and the
+pushbuffer DMA see the work before it.  vkd3d-proton has such a barrier
+(dst MEMORY_READ) in a small command buffer at every ExecuteCommandLists;
+in a Steel Nomad frame that is about 23 host WFIs, each draining both
+engines of the channel.
+
+With NVK_MME_LAZY_WFI=1 (default off) the barrier only marks the command
+buffer, and the host WFI and barrier go before the next command that
+reads memory through the MME or the pushbuffer DMA: indirect draws and
+dispatches, indirect counts, mesh indirect, transform feedback counters,
+conditional rendering, constant buffer descriptors read by the MME,
+device-generated commands, and every pushbuffer segment fetched from
+memory.  Every command buffer starts with one pending, for the work
+submitted before it.
+---
+ src/nouveau/vulkan/nvk_cmd_buffer.c   | 56 +++++++++++++++++++++++++++
+ src/nouveau/vulkan/nvk_cmd_buffer.h   |  8 ++++
+ src/nouveau/vulkan/nvk_cmd_dispatch.c |  1 +
+ src/nouveau/vulkan/nvk_cmd_draw.c     | 10 +++++
+ src/nouveau/vulkan/nvk_cmd_indirect.c |  1 +
+ 5 files changed, 76 insertions(+)
+
+diff --git a/src/nouveau/vulkan/nvk_cmd_buffer.c b/src/nouveau/vulkan/nvk_cmd_buffer.c
+index 5b4b31b..eb28075 100644
+--- a/src/nouveau/vulkan/nvk_cmd_buffer.c
++++ b/src/nouveau/vulkan/nvk_cmd_buffer.c
+@@ -253,6 +253,54 @@ nvk_cmd_buffer_new_push(struct nvk_cmd_buffer *cmd)
+    }
+ }
+ 
++/* NVK_MME_LAZY_WFI (default off): the host WFI and system memory barrier of
++ * an MME-data invalidate (a barrier whose destination includes indirect
++ * command, conditional rendering, transform feedback counter or descriptor
++ * buffer reads; vkd3d-proton's full barriers at every ExecuteCommandLists
++ * have it) go before the next command that reads memory through the MME or
++ * the pushbuffer DMA instead of at the barrier.  Every command buffer starts
++ * with one pending, for work submitted before it.
++ */
++bool
++nvk_mme_lazy_wfi(void)
++{
++   static int state;
++   int v = p_atomic_read(&state);
++   if (unlikely(v == 0)) {
++      v = debug_get_bool_option("NVK_MME_LAZY_WFI", false) ? 2 : 1;
++      p_atomic_set(&state, v);
++   }
++   return v == 2;
++}
++
++static bool nvk_mme_membar(void);
++
++void
++nvk_cmd_mme_data_sync(struct nvk_cmd_buffer *cmd)
++{
++   if (likely(!cmd->mme_data_stale))
++      return;
++   cmd->mme_data_stale = false;
++
++   struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
++   const struct nvk_physical_device *pdev = nvk_device_physical(dev);
++   struct nv_push *p = nvk_cmd_buffer_push(cmd, 8);
++   if (pdev->info.cls_eng3d >= HOPPER_A) {
++      P_IMMD(p, NVC86F, WFI, 0);
++      if (nvk_mme_membar()) {
++         P_MTHD(p, NVC86F, MEM_OP_A);
++         P_NVC86F_MEM_OP_A(p, {});
++         P_NVC86F_MEM_OP_B(p, 0);
++         P_NVC86F_MEM_OP_C(p, { .membar_type = 0 });
++         P_NVC86F_MEM_OP_D(p, { .operation = OPERATION_MEMBAR });
++      }
++   } else {
++      __push_immd(p, SUBC_NV9097, NV906F_SET_REFERENCE, 0);
++      if (pdev->info.cls_eng3d >= TURING_A)
++         P_IMMD(p, NVC597, MME_DMA_SYSMEMBAR, 0);
++   }
++}
++
+ void
+ nvk_cmd_buffer_push_indirect_ext(struct nvk_cmd_buffer *cmd,
+                                  uint64_t addr, uint32_t range,
+@@ -273,6 +321,7 @@ void
+ nvk_cmd_buffer_push_indirect(struct nvk_cmd_buffer *cmd,
+                              uint64_t addr, uint32_t range)
+ {
++   nvk_cmd_mme_data_sync(cmd);
+    nvk_cmd_buffer_push_indirect_ext(cmd, addr, range, true);
+ }
+ 
+@@ -459,6 +508,7 @@ nvk_BeginCommandBuffer(VkCommandBuffer commandBuffer,
+    nvk_reset_cmd_buffer(&cmd->vk, 0);
+    nvk_pass_profile_reset_cmd(cmd);
+    cmd->indirect_push_synced = false;
++   cmd->mme_data_stale = nvk_mme_lazy_wfi();
+ 
+    if (cmd->vk.level == VK_COMMAND_BUFFER_LEVEL_SECONDARY)
+       cmd->state.inherited_pipeline_statistics =
+@@ -1014,6 +1064,12 @@ nvk_cmd_invalidate_deps(struct nvk_cmd_buffer *cmd,
+    if (cmd->barrier_data_invalidated)
+       barriers &= ~NVK_BARRIER_INVALIDATE_SHADER_DATA;
+ 
++   /* NVK_MME_LAZY_WFI: before the next MME or pushbuffer-DMA memory read */
++   if ((barriers & NVK_BARRIER_INVALIDATE_MME_DATA) && nvk_mme_lazy_wfi()) {
++      barriers &= ~NVK_BARRIER_INVALIDATE_MME_DATA;
++      cmd->mme_data_stale = true;
++   }
++
+    if (!barriers)
+       return;
+ 
+diff --git a/src/nouveau/vulkan/nvk_cmd_buffer.h b/src/nouveau/vulkan/nvk_cmd_buffer.h
+index 1033a5c..ecb2ef3 100644
+--- a/src/nouveau/vulkan/nvk_cmd_buffer.h
++++ b/src/nouveau/vulkan/nvk_cmd_buffer.h
+@@ -419,6 +419,11 @@ struct nvk_cmd_buffer {
+     */
+    bool indirect_push_synced;
+ 
++   /* NVK_MME_LAZY_WFI: a barrier asked for an MME-data invalidate that is
++    * not emitted yet (nvk_cmd_mme_data_sync())
++    */
++   bool mme_data_stale;
++
+    /* NVK_BARRIER_DEDUP: set while one vkCmdPipelineBarrier2 is recorded,
+     * after its flush already invalidated the shader data (L1) caches
+     */
+@@ -509,6 +514,9 @@ nvk_cmd_buffer_push(struct nvk_cmd_buffer *cmd, uint32_t dw_count)
+    return &cmd->push;
+ }
+ 
++bool nvk_mme_lazy_wfi(void);
++void nvk_cmd_mme_data_sync(struct nvk_cmd_buffer *cmd);
++
+ void
+ nvk_cmd_buffer_push_indirect(struct nvk_cmd_buffer *cmd,
+                              uint64_t addr, uint32_t dw_count);
+diff --git a/src/nouveau/vulkan/nvk_cmd_dispatch.c b/src/nouveau/vulkan/nvk_cmd_dispatch.c
+index 3277987..a3bdd30 100644
+--- a/src/nouveau/vulkan/nvk_cmd_dispatch.c
++++ b/src/nouveau/vulkan/nvk_cmd_dispatch.c
+@@ -521,6 +521,7 @@ nvk_CmdDispatchIndirect2KHR(VkCommandBuffer commandBuffer,
+                             const VkDispatchIndirect2InfoKHR* pInfo)
+ {
+    VK_FROM_HANDLE(nvk_cmd_buffer, cmd, commandBuffer);
++   nvk_cmd_mme_data_sync(cmd);
+    struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
+    const struct nvk_physical_device *pdev = nvk_device_physical(dev);
+ 
+diff --git a/src/nouveau/vulkan/nvk_cmd_draw.c b/src/nouveau/vulkan/nvk_cmd_draw.c
+index ec1f521..455a633 100644
+--- a/src/nouveau/vulkan/nvk_cmd_draw.c
++++ b/src/nouveau/vulkan/nvk_cmd_draw.c
+@@ -4899,6 +4899,7 @@ nvk_cmd_flush_gfx_cbufs(struct nvk_cmd_buffer *cmd)
+                nvk_cmd_buffer_get_cbuf_descriptor_addr(cmd, desc, cbuf);
+ 
+             if (nvk_cmd_buffer_3d_cls(cmd) >= TURING_A) {
++               nvk_cmd_mme_data_sync(cmd);
+                struct nv_push *p = nvk_cmd_buffer_push(cmd, 4);
+ 
+                P_1INC(p, NV9097, CALL_MME_MACRO(NVK_MME_BIND_CBUF_DESC));
+@@ -6463,6 +6464,7 @@ nvk_CmdDrawIndirect2KHR_impl(VkCommandBuffer commandBuffer,
+                              const VkDrawIndirect2InfoKHR* pInfo)
+ {
+    VK_FROM_HANDLE(nvk_cmd_buffer, cmd, commandBuffer);
++   nvk_cmd_mme_data_sync(cmd);
+    uint64_t stride = pInfo->addressRange.stride;
+ 
+    if (unlikely(!pInfo->drawCount))
+@@ -6621,6 +6623,7 @@ nvk_CmdDrawIndexedIndirect2KHR_impl(VkCommandBuffer commandBuffer,
+                                     const VkDrawIndirect2InfoKHR* pInfo)
+ {
+    VK_FROM_HANDLE(nvk_cmd_buffer, cmd, commandBuffer);
++   nvk_cmd_mme_data_sync(cmd);
+    uint64_t stride = pInfo->addressRange.stride;
+ 
+    /* From the Vulkan 1.3.238 spec:
+@@ -6764,6 +6767,7 @@ nvk_CmdDrawIndirectCount2KHR_impl(VkCommandBuffer commandBuffer,
+                                   const VkDrawIndirectCount2InfoKHR* pInfo)
+ {
+    VK_FROM_HANDLE(nvk_cmd_buffer, cmd, commandBuffer);
++   nvk_cmd_mme_data_sync(cmd);
+ 
+    /* TODO: Indirect count draw pre-Turing */
+    assert(nvk_cmd_buffer_3d_cls(cmd) >= TURING_A);
+@@ -6850,6 +6854,7 @@ nvk_CmdDrawIndexedIndirectCount2KHR_impl(VkCommandBuffer commandBuffer,
+                                          const VkDrawIndirectCount2InfoKHR* pInfo)
+ {
+    VK_FROM_HANDLE(nvk_cmd_buffer, cmd, commandBuffer);
++   nvk_cmd_mme_data_sync(cmd);
+ 
+    /* TODO: Indexed indirect count draw pre-Turing */
+    assert(nvk_cmd_buffer_3d_cls(cmd) >= TURING_A);
+@@ -6964,6 +6969,7 @@ nvk_CmdDrawIndirectByteCount2EXT(VkCommandBuffer commandBuffer,
+                                  uint32_t vertexStride)
+ {
+    VK_FROM_HANDLE(nvk_cmd_buffer, cmd, commandBuffer);
++   nvk_cmd_mme_data_sync(cmd);
+ 
+    if (unlikely(!instanceCount))
+       return;
+@@ -7163,6 +7169,7 @@ nvk_CmdDrawMeshTasksIndirect2EXT(VkCommandBuffer commandBuffer,
+                                  const VkDrawIndirect2InfoKHR* pInfo)
+ {
+    VK_FROM_HANDLE(nvk_cmd_buffer, cmd, commandBuffer);
++   nvk_cmd_mme_data_sync(cmd);
+    uint64_t stride = pInfo->addressRange.stride;
+ 
+    assert(nvk_cmd_buffer_3d_cls(cmd) >= TURING_A);
+@@ -7238,6 +7245,7 @@ nvk_CmdDrawMeshTasksIndirectCount2EXT(VkCommandBuffer commandBuffer,
+                                       const VkDrawIndirectCount2InfoKHR* pInfo)
+ {
+    VK_FROM_HANDLE(nvk_cmd_buffer, cmd, commandBuffer);
++   nvk_cmd_mme_data_sync(cmd);
+ 
+    assert(nvk_cmd_buffer_3d_cls(cmd) >= TURING_A);
+ 
+@@ -7315,6 +7323,7 @@ nvk_CmdBeginTransformFeedback2EXT(VkCommandBuffer commandBuffer,
+                                   const VkBindTransformFeedbackBuffer2InfoEXT* pCounterInfos)
+ {
+    VK_FROM_HANDLE(nvk_cmd_buffer, cmd, commandBuffer);
++   nvk_cmd_mme_data_sync(cmd);
+    const uint32_t max_buffers = 4;
+ 
+    struct nv_push *p = nvk_cmd_buffer_push(cmd, 2 + 2 * max_buffers);
+@@ -7489,6 +7498,7 @@ static void
+ nvk_cmd_begin_cond_render_mme(struct nvk_cmd_buffer *cmd,
+                               const VkConditionalRenderingBeginInfo2EXT *pConditionalRenderingBegin)
+ {
++   nvk_cmd_mme_data_sync(cmd);
+    struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
+    const struct nvk_physical_device *pdev = nvk_device_physical(dev);
+ 
+diff --git a/src/nouveau/vulkan/nvk_cmd_indirect.c b/src/nouveau/vulkan/nvk_cmd_indirect.c
+index 126b3a8..df3638b 100644
+--- a/src/nouveau/vulkan/nvk_cmd_indirect.c
++++ b/src/nouveau/vulkan/nvk_cmd_indirect.c
+@@ -1128,6 +1128,7 @@ nvk_CmdExecuteGeneratedCommandsEXT(VkCommandBuffer commandBuffer,
+                                    const VkGeneratedCommandsInfoEXT *info)
+ {
+    VK_FROM_HANDLE(nvk_cmd_buffer, cmd, commandBuffer);
++   nvk_cmd_mme_data_sync(cmd);
+    VK_FROM_HANDLE(nvk_indirect_commands_layout, layout,
+                   info->indirectCommandsLayout);
+    struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
+-- 
+2.43.0
+
