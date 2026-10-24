@@ -36,6 +36,9 @@ pub const SCALER: Setting = Setting {
         ("nearest", "Nearest"),
         ("integer", "Integer (sharp pixels)"),
         ("xbr", "xBR (pixel art)"),
+        ("a4k-3d", "Anime4K 3D (learned, light)"),
+        ("a4k", "Anime4K M (learned)"),
+        ("a4k-vl", "Anime4K VL (learned, strong GPUs)"),
     ],
     default: "off",
     per_exe: true,
@@ -265,6 +268,7 @@ mod tests {
         assert_eq!(SCALER.index_of(Some("integer")), 8);
         assert_eq!(SCALER.index_of(Some("pixel")), 9);
         assert_eq!(SCALER.index_of(Some("xbr")), 9);
+        assert_eq!(SCALER.index_of(Some("a4k-vl")), 12);
         assert_eq!(SCALER.index_of(Some("nonsense")), 0);
         assert_eq!(FRAMEGEN.index_of(Some("adaptive")), 4);
         assert_eq!(SHARPNESS.index_of(None), 2);
