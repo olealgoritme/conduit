@@ -1,0 +1,35 @@
+#version 450
+// dispcost's compute shader.  Every invocation reads its word of `d`, runs
+// STEPS dependent integer steps (IMAD, SHF, LOP3: about 3 instructions each)
+// with a load from `s` every LD_EVERY steps (addresses independent of the
+// chain, so the loads can issue early), and writes the word back, so the next
+// dispatch depends on this one.  Built three times by build.sh:
+//   tiny  STEPS=0               about 10 instructions
+//   mid   STEPS=24  LD_EVERY=4  about 100
+//   big   STEPS=110 LD_EVERY=4  about 450
+#extension GL_EXT_control_flow_attributes : require
+#ifndef STEPS
+#define STEPS 0
+#endif
+#ifndef LD_EVERY
+#define LD_EVERY 4
+#endif
+layout(local_size_x = 64) in;
+layout(std430, set = 0, binding = 0) buffer Data { uint d[]; };
+layout(std430, set = 0, binding = 1) readonly buffer Src { uint s[]; };
+layout(push_constant) uniform PC { uint mask; uint salt; } pc;
+
+void main()
+{
+    uint i = gl_GlobalInvocationID.x;
+    uint v = d[i];
+#if STEPS > 0
+    [[unroll]] for (int k = 0; k < STEPS; k++) {
+        v = v * 1664525u + 1013904223u;
+        v ^= v >> 13;
+        if ((k % LD_EVERY) == LD_EVERY - 1)
+            v += s[(i * 17u + uint(k) * 4099u) & pc.mask];
+    }
+#endif
+    d[i] = v ^ pc.salt;
+}

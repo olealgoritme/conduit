@@ -66,10 +66,13 @@ Patch numbers are file numbers in the directory named in the patch tables.
 | `NVK_MDI_BATCH` | 0 | read indirect multi-draw records in batches of n (max 204; 64 suggested) (common 24) |
 | `NVK_DRAW_SYSVAL_SKIP` | 0 | write draw parameters to the root table only for shaders that read them (common 35) |
 | `NVK_MME_PACK_INSTR`, `NVK_SKIP_DRAWID`, `NVK_BLACKWELL_MME_MEMBAR` | 0, 0, 1 | MME/indirect-draw A/B levers (common 26, 29) |
+| `NVK_DISPATCH_INDIRECT_PREFETCH` | 0 | only the first indirect dispatch argument copy after a barrier is a no-prefetch GPFIFO entry; the default makes every copy one (2 per indirect dispatch) (common 82) |
+| `NVK_BARRIER_DEDUP` | 0 | a barrier whose storage-write flush already invalidated the shader data caches emits no second GLOBAL_DATA invalidate (common 82) |
 | **Memory** | | |
 | `NVK_RM_BAR_MB` | 0 | the DEVICE_LOCAL \| HOST_VISIBLE heap through BAR1: 0 off, -1 all of BAR1, N MiB caps it (common 30) |
 | `NVK_RM_DESC_TABLE_VRAM` | 0 | descriptor tables/pools in CPU-mapped VRAM (common 26, 52) |
 | `NVK_RM_UPLOAD_VRAM` | `compute` on Windows, 0 elsewhere | command buffer upload memory in CPU-mapped VRAM: `compute` the compute root descriptor tables (a tiny dispatch costs 0.48 us from VRAM, 2.5-3.7 us from system memory), `1` all of it, `0` none (common 26, 52, 73) |
+| `NVK_QMD_LAT` | 1 on Windows, 0 elsewhere | QMDs come from the compute root tables' latency-bound upload stream (VRAM under `NVK_RM_UPLOAD_VRAM=compute`); `0` keeps them in the general upload stream, which is system memory (common 82) |
 | `NVK_CMD_MEM_CACHE` | 64 | command buffer memory blocks of each kind a device keeps from destroyed and trimmed command pools for new ones; 0 frees them (common 54) |
 | `NVK_RM_SYSMEM_CACHED` | 1 | host-visible system memory GPU-cacheable in L2 (`=0` off, `=desc`/`=app` one kind only) |
 | `NVK_RM_COMPRESSION` | 1 | compressible VRAM for images in dedicated allocations on GB20x |
@@ -104,12 +107,13 @@ Patch numbers are file numbers in the directory named in the patch tables.
 | `NAK_PHI_AVOID` | 1 | new values stay out of the registers the block's phi copies want (common 62) |
 | `NAK_F16_CVT` | 1 | scalar f16 conversions on SM86+ run on the ALU (F2FP) and FMA (HADD2.F32) pipes instead of F2F on the quarter-rate conversion pipe (common 74) |
 | `NAK_EARLY_EXIT` | 1 | in compute shaders, the lanes that leave early exit and the rest runs in convergent control flow with uniform registers; 0 keeps the divergent if or loop around the body (common 77) |
+| `NAK_SCHED_MLP` | 3 on Windows, 0 elsewhere | 0 off; 1-3: the schedulers model global, local and texture latency as an L2 round trip (320/640 cycles) instead of 32, so independent loads issue early and stay in flight together; 3 also hoists them as far as their operands allow; read-only accesses are not ordered against stores; scoreboards are shared when all six are busy; never costs occupancy (common 83) |
 | `NAK_LOOP_CONT_SYNC` | 0 | 1 syncs lanes at the end of every divergent loop iteration; off, loops without a continue skip that sync (common 75) |
 | `NAK_UNROLL_MAX` | 32 | most iterations NIR fully unrolls a loop with a known trip count (common 65) |
 | `NAK_VEC_CSE` | 1 | the copies that make a splat a register vector serve its later uses in the block (common 66) |
 | `NAK_WEAK_MEM` | 0 | weak (L1-cacheable) order for non-coherent global, SSBO and image accesses (common 67) |
 | `NAK_BAR_SHARE`, `NAK_LAT` | 0, 0 | scoreboard sharing and SM120 latency padding, for hardware validation with `tools/naktest` (common 63) |
-| `NVK_DIAG_NO_WFI_BARRIER`, `NVK_DIAG_WFI_COUNT` | 0, 0 | measurement only: pipeline barriers without WAIT_FOR_IDLE (unsafe); count barrier idles per second (common 64) |
+| `NVK_DIAG_NO_WFI_BARRIER`, `NVK_DIAG_WFI_COUNT` | 0, 0 | measurement only: pipeline barriers without WAIT_FOR_IDLE (unsafe; it does not affect barriers with a shader storage write in the source scope, whose cache flush idles itself); count barrier idles per second (common 64) |
 | **Queues** | | |
 | `NVK_RM_ASYNC_COMPUTE` | 1 on GB20x, 0 elsewhere | a compute queue family whose queues run next to the graphics queue (see "Async compute"); 0 = one queue family (common 69) |
 | `NVK_RM_ASYNC_WAIT_SWITCH` | 0 | 1: every GPU wait asks for a TSG switch when it blocks, also waits between channels of one TSG (common 69) |
@@ -145,7 +149,8 @@ file per process.
 | `NVK_PASS_PROFILE=4` | adds the 24 most written 3D methods per pass and bind counts |
 | `NVK_PASS_PROFILE=5` | dumps the draws of one render pass matching `NVK_PASS_DUMP`, after `NVK_PASS_DUMP_DELAY_S` (20) s (`nvk-prepass-dump-<pid>.txt`) |
 | `NVK_DISPATCH_PROFILE=1` | GPU time of every dispatch per compute shader (vkd3d-proton DXIL hash, code hash, workgroup size), with grids (indirect arguments read back), GPRs and warps, every two seconds, in the `NVK_PASS_PROFILE` file; alone or with `NVK_PASS_PROFILE`; each dispatch waits for idle before and after it |
-| `NVK_DISPATCH_CAPTURE=<hash>[,...]` | captures one dispatch of each listed compute shader (DXIL hash as `NVK_DISPATCH_PROFILE` prints it) with its SPIR-V, push constants, grid and the contents of every image, buffer, sampler and root buffer address it reads, for replaying it outside the game; after `NVK_DISPATCH_CAPTURE_DELAY_S` (20) s and, if set, once the file `NVK_DISPATCH_CAPTURE_TRIGGER` exists; `_SKIP`, `_COUNT`, `_POST=1` (outputs too), `_MAX_MB`; written to `NVK_DISPATCH_CAPTURE_DIR` (`%ProgramData%\Helios\dcap`), one directory per capture, log `nvk-dcap.log` |
+| `NVK_DISPATCH_CAPTURE=<hash>[,...]` | captures one dispatch of each listed compute shader, or one draw with each listed fragment shader (DXIL hash as `NVK_DISPATCH_PROFILE` prints it, or the 8-digit code hash), with its SPIR-V, push constants, grid and the contents of every image, buffer, sampler and root buffer address it reads, for replaying it outside the game; after `NVK_DISPATCH_CAPTURE_DELAY_S` (20) s and, if set, once the file `NVK_DISPATCH_CAPTURE_TRIGGER` exists; `_SKIP`, `_COUNT`, `_POST=1` (outputs too), `_MAX_MB`; written to `NVK_DISPATCH_CAPTURE_DIR` (`%ProgramData%\Helios\dcap`), one directory per capture, log `nvk-dcap.log` |
+| `NVK_PUSH_DUMP_WINDOW=S,MS` | the pushbuffers of MS milliseconds from S seconds after the first submit, to `NVK_PUSH_DUMP_FILE` (`nvk-push-<pid>.txt`) |
 | `NVK_SHADER_STATS=1` | NAK statistics of every uploaded shader (`nvk-shaders-<pid>.txt`) |
 | `NVK_WAIT_STATS=1` | CPU wait counts and times per site, woken and timed-out waits, once a second (`nvk-waits-<pid>.txt`) |
 | `NVK_DEBUG=vm` | VA and memory alloc/free/bind lines with times, threads and freeing call stacks (`NVK_VM_LOG`, else `nvk-vm-<pid>.log` in `%TEMP%`) |
@@ -214,15 +219,24 @@ busiest window and a whole-run table per shader (ms per frame and calls per
 frame with `--fps`, the frame rate of the profiled run). `--skip` leaves out
 the first windows (loading and shader compiles).
 
+`tools/dispcost` gives a profile-free number per dispatch. It runs N
+dependent dispatches in one command buffer, timestamps only the start and
+the end, and reports the cost per dispatch for each barrier variant,
+shader size and grid, and for direct and indirect dispatch. It runs on NVK
+and on NVIDIA's driver.
+
 ### Dispatch capture (common 0072)
 
 `NVK_DISPATCH_CAPTURE=<hash>[,...]` writes one dispatch of each listed
 compute shader (the `src` hash the profile prints) with its SPIR-V, push
 constants, grid and the contents of every image, buffer, sampler and root
-buffer address it reads. `tests/perf/dispatch-replay/` replays such a capture
-on any Vulkan driver (NVK in the guest, NVIDIA's driver on a Linux host),
-times the dispatch alone and compares what two drivers wrote; its README has
-the knobs, the capture format and the limits.
+buffer address it reads. A listed fragment shader (DXIL hash or 8-digit code
+hash) captures a direct draw with it instead (common 0088): both shaders, their
+resources, the attachments and the pipeline state.
+`tests/perf/dispatch-replay/` replays such a capture on any Vulkan driver (NVK
+in the guest, NVIDIA's driver on a Linux host), times the dispatch or draw
+alone and compares what two drivers wrote; its README has the knobs, the
+capture format and the limits.
 
 ## `patches/`: the RM backend
 
@@ -397,8 +411,13 @@ backend. Numbers are file numbers (there is no 0016 or 0025).
 | 0075 | NAK: a divergent loop with no continue skips the per-iteration lane sync (BSSY/BSYNC around the body) and its breaks go to the loop's exit sync directly (`NAK_LOOP_CONT_SYNC=1` restores the sync; part of the shader cache key) |
 | 0076 | NAK: the GPR copy of a uniform value that the legalizer makes serves the block's non-ALU uses too (`NAK_DEBUG=noucse` makes a copy per use) |
 | 0077 | NAK: in compute shaders, a trailing loop that never iterates and a trailing divergent if with a small guarded side become an early exit (EXIT for the lanes that leave) followed by the rest of the shader at the top level, where its uniform values use the uniform datapath; the rematerializer, `nak_nir_opt_uniform_address` and divergent top-level loops follow (`NAK_EARLY_EXIT=0` restores the old structure; part of the shader cache key) |
+| 0082 | QMDs from the latency-bound upload stream next to the compute root tables, so on Windows they are in CPU-mapped VRAM and a dependent dispatch no longer waits for a system memory read after a barrier's idle (`NVK_QMD_LAT`, default on on Windows); opt-in `NVK_DISPATCH_INDIRECT_PREFETCH` (prefetchable indirect argument copies after the first one since a barrier) and `NVK_BARRIER_DEDUP` (no second shader data invalidate after a storage-write flush). Measured with `tools/dispcost` |
+| 0083 | NAK: `NAK_SCHED_MLP` (0-3, default 3 on Windows, 0 elsewhere): the prepass enters an instruction in its future-ready set at the cycle its edge latencies give (it used the graph's static cycle, so no latency ever delayed anything), memory/texture latencies of an L2 round trip, level 3 hoists accesses ahead of everything else while registers are free (prepass and post-RA), read-only accesses unordered against other memory operations, shared scoreboards when all six are busy; the occupancy target is chosen on the plain schedule and a unit that does not fit its register target keeps the plain schedule; part of the shader cache key |
 | 0084 | CUDA modules (VK_NVX_binary_import): the module's `.text` sections uploaded once together, its globals (`.nv.global`, `.nv.global.init`) and constant banks 1-7 in one buffer with their `R_CUDA_32/64` relocations applied (to data or code symbols), banks 2-4 bound at `vkCmdCuLaunchKernelNVX` (`nvk_cmd_dispatch_with_root_cbufs`); relocations NVK cannot apply fail the module ([docs/dlss.md](docs/dlss.md)) |
 | 0085 | a fatbin without SASS for the GPU (or a PTX module) takes `<key>.sm_<SM>.cubin` from the host-built cubin cache, key the BLAKE3 of the PTX entry; the shipped SASS always wins (`NVK_CUBIN_CACHE_DIR`, `CubinCache`, `CubinCacheDump`) |
+| 0088 | `NVK_DISPATCH_CAPTURE` captures draws: a listed hash that matches the bound fragment shader (DXIL source hash or code hash) captures a `vkCmdDraw`, `vkCmdDrawIndexed` or their indirect and indirect-count forms with both shaders' SPIR-V, their descriptors and root buffers, the color, depth and stencil attachments, the index and vertex buffers and the pipeline state with the vertex input layout (`"kind": "draw"`, `vs.spv`), for `dispatch-replay`; the common runtime gets `vk_device::graphics_spirv_hook` and graphics shaders their SPIR-V source hash. A capture whose staging with the outputs cannot be mapped is made without them |
+| 0090 | `NVK_PUSH_DUMP_WINDOW="START_S,DURATION_MS"`: the pushbuffers executed in that window after the first submit, with their submit times, to `NVK_PUSH_DUMP_FILE` (`nvk-push-<pid>.txt`): one or two frames of a game instead of `NVK_DEBUG=push_dump` for the whole run |
+| 0101 | `NVK_DISPATCH_CAPTURE_SEQ=N`: a captured dispatch and the next N - 1 dispatches of the command buffer, whatever their shaders, as one sequence (manifest `sequence`: id, index, barrier before); resources an earlier dispatch of the sequence captured are referred to (`same_as`), not copied again; `NVK_DISPATCH_CAPTURE_SEQ_START=<hashes>`: a sequence starts only at a command buffer's first dispatch with one of these shaders and is kept only if it contains a `NVK_DISPATCH_CAPTURE` shader; `tests/perf/dispatch-replay --seq` replays it in one command buffer |
 
 ## Per-draw cost (common 0001-0007)
 
