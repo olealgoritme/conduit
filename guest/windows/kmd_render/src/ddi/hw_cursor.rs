@@ -16,7 +16,10 @@
 //! KMD-owned linear Venus image (256 x 512, host-visible, exported to the host like a primary),
 //! the slot not on screen, and names it to the host with `HELIOS_CMD_SET_CURSOR_BLOB`.
 //! `DxgkDdiSetPointerPosition` costs one spinlock unless the visibility changes; then it shows or
-//! hides the image. A position never travels: the host pointer is where the cursor is.
+//! hides the image. The host pointer is where the cursor is, so a position travels only while the
+//! host asks for it (`hc::Moves`): under a grab the host pointer is locked and the viewer draws the
+//! guest cursor at the guest's position, and a moved pointer sends `HELIOS_CMD_MOVE_CURSOR` on the
+//! cursor queue, fire and forget ([`send_move`]; knob `HwCursorPos`).
 //!
 //! FAILURE. Any shape the host cannot take, a blob that cannot be made, or a host that refuses
 //! the command answers `STATUS_UNSUCCESSFUL`, and dxgkrnl draws that shape in software, as
@@ -40,17 +43,18 @@
 
 use core::sync::atomic::{fence, AtomicBool, AtomicU32, AtomicU64, Ordering};
 
-use bytemuck::Zeroable;
+use bytemuck::{bytes_of, Zeroable};
 
 use crate::adapter::AdapterContext;
 use crate::dxgk::*;
 use crate::irql::PassiveLevel;
 use crate::sync::SpinLock;
-use crate::virtio::gpu::OwnerFilter;
+use crate::virtio::gpu::{CursorPoll, OwnerFilter};
 use crate::virtio::VirtioError;
 use helios_kmd_logic::hw_cursor::{self as hc, AfterFailure, HostFailure, Refuse, Shape, Slots};
 use helios_protocol::{
-    HeliosSetCursorBlob, HELIOS_CURSOR_BLOB_F_VISIBLE, VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM,
+    HeliosMoveCursor, HeliosSetCursorBlob, HELIOS_CMD_MOVE_CURSOR, HELIOS_CURSOR_BLOB_F_VISIBLE,
+    VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM,
 };
 use wdk_sys::ntddk::{MmMapIoSpace, MmUnmapIoSpace};
 use wdk_sys::PHYSICAL_ADDRESS;
@@ -99,6 +103,11 @@ static QUEUE_ON: AtomicU32 = AtomicU32::new(0);
 static Q_BUSY: AtomicU32 = AtomicU32::new(0);
 /// Commands sent on the cursor queue (virtqueue 2).
 static Q_SENT: AtomicU32 = AtomicU32::new(0);
+/// `HwCursorPos`, and the moves sent / refused by the host / not sent (`CurMove*`).
+static POS_KNOB: AtomicU32 = AtomicU32::new(0);
+static MOVE_N: AtomicU32 = AtomicU32::new(0);
+static MOVE_REF: AtomicU32 = AtomicU32::new(0);
+static MOVE_SKIP: AtomicU32 = AtomicU32::new(0);
 /// When the current software-cursor episode began (0: none).
 static SW_SINCE: AtomicU64 = AtomicU64::new(0);
 /// When an owed command last failed to reach the queue (0: nothing to retry).
@@ -206,6 +215,10 @@ fn write_block() {
     crate::diag::record_named_bytes(b"CurPosSrc", r(&POS_SRC));
     crate::diag::record_named_bytes(b"CurCapQn", r(&CAPQ_N));
     crate::diag::record_named_bytes(b"CurCapRep", r(&CAPQ_LAST));
+    crate::diag::record_named_bytes(b"CurPosKnob", r(&POS_KNOB));
+    crate::diag::record_named_bytes(b"CurMoveN", r(&MOVE_N));
+    crate::diag::record_named_bytes(b"CurMoveRef", r(&MOVE_REF));
+    crate::diag::record_named_bytes(b"CurMoveSkip", r(&MOVE_SKIP));
 }
 
 /// The block, when a count moved: from the mirror thread's pass (asked for by [`mark_dirty`]) and
@@ -240,6 +253,8 @@ struct State {
     host_refused: bool,
     x: i32,
     y: i32,
+    /// The position moves of this generation (`HELIOS_CMD_MOVE_CURSOR`).
+    moves: hc::Moves,
 }
 
 impl State {
@@ -252,6 +267,7 @@ impl State {
         host_refused: false,
         x: 0,
         y: 0,
+        moves: hc::Moves::NEW,
     };
 
     /// Whether the host should show the cursor now.
@@ -291,12 +307,16 @@ static BUSY: AtomicBool = AtomicBool::new(false);
 pub(crate) fn reset_for_start(adapter: &AdapterContext, knobs: &crate::adapter::AdapterKnobs) {
     *STATE.lock() = State::NEW;
     KNOB.store(knobs.hw_cursor, Ordering::Relaxed);
+    POS_KNOB.store(
+        crate::diag::read_config_dword(crate::diag::knobs::HW_CURSOR_POS, hc::POS_KNOB_DEFAULT),
+        Ordering::Relaxed,
+    );
     let caps = hc::advertise(knobs.hw_cursor, knobs.display_half, host_features(adapter));
     CAPS.store(u32::from(caps), Ordering::Relaxed);
     for c in [
         &SHAPE_N, &POS_N, &SHOW, &HIDE, &FMT, &SIZE, &REFUSE, &WHY, &HOST_ERR, &XOR, &RTT_US,
         &RTT_MAX, &TMO, &GATE_MS, &SW_N, &SW_MS, &SW_MAX, &RETRY, &Q_BUSY, &Q_SENT, &DDI_SHAPE,
-        &DDI_POS, &POS_VIS, &POS_HID, &POS_SRC,
+        &DDI_POS, &POS_VIS, &POS_HID, &POS_SRC, &MOVE_N, &MOVE_REF, &MOVE_SKIP,
     ] {
         c.store(0, Ordering::Relaxed);
     }
@@ -528,6 +548,9 @@ pub(crate) unsafe fn set_pointer_position(
                 drop(gate);
             }
         }
+        if visible {
+            send_move(adapter, args.X, args.Y);
+        }
         return STATUS_SUCCESS;
     }
     DIRTY.store(1, Ordering::Relaxed);
@@ -633,6 +656,8 @@ fn settle(passive: PassiveLevel, adapter: &AdapterContext) -> bool {
         let t0 = now_100ns();
         // The cursor queue when the transport has one (never behind Venus traffic), else the
         // control queue (`HwCursorQ` = 0, or a host or VMM without the queue).
+        // A move still on the cursor queue is answered first (it is never waited for itself).
+        reap_move(adapter);
         let result = match crate::virtio::ctrl::set_cursor_blob_cursorq(
             passive,
             adapter,
@@ -644,6 +669,8 @@ fn settle(passive: PassiveLevel, adapter: &AdapterContext) -> bool {
                     bump(&Q_BUSY);
                 } else {
                     bump(&Q_SENT);
+                    // The send took the queue: whatever was out (a move) was reaped by it.
+                    STATE.lock().moves.lost();
                 }
                 r
             }
@@ -707,6 +734,115 @@ fn settle(passive: PassiveLevel, adapter: &AdapterContext) -> bool {
         }
     }
     true
+}
+
+/// Send the pointer's position (`HELIOS_CMD_MOVE_CURSOR`) when the host wants it
+/// (`hc::Moves::due`): on the cursor queue only, fire and forget. Never waits: with the gate
+/// taken by another pointer operation, or a move still out, this one is skipped and the next
+/// call sends the newest position. PASSIVE (a position DDI).
+fn send_move(adapter: &AdapterContext, x: i32, y: i32) {
+    let gate = hc::MoveGate {
+        knob_on: POS_KNOB.load(Ordering::Relaxed) != 0,
+        queue_on: QUEUE_ON.load(Ordering::Relaxed) != 0,
+        shown: false,
+    };
+    if !gate.knob_on || !gate.queue_on {
+        return;
+    }
+    let now = now_100ns();
+    {
+        let st = STATE.lock();
+        let gate = hc::MoveGate {
+            shown: st.visible && st.host_shown,
+            ..gate
+        };
+        if !st.moves.due(gate, (x, y), now) {
+            return;
+        }
+    }
+    let Some(_gate) = Gate::try_take() else {
+        bump(&MOVE_SKIP);
+        return;
+    };
+    // With the gate held nobody else sends on the cursor queue, so this stays true until the
+    // poll below.
+    let move_out = STATE.lock().moves.inflight;
+    let mut cmd = HeliosMoveCursor::zeroed();
+    cmd.hdr.type_ = HELIOS_CMD_MOVE_CURSOR;
+    cmd.scanout_id = 0;
+    cmd.x = x;
+    cmd.y = y;
+    // Take the answer of what is out first; send only onto a free queue, and not right after the
+    // host refused the move that was out (the next probe waits `hc::PROBE_100NS`).
+    let Ok((polled, sent)) = adapter.with_virtio(|v| match v.cursor_poll() {
+        CursorPoll::Pending => (CursorPoll::Pending, None),
+        CursorPoll::Done(false) if move_out => (CursorPoll::Done(false), None),
+        p => (p, Some(v.cursor_send(bytes_of(&cmd)))),
+    }) else {
+        STATE.lock().moves.lost();
+        return;
+    };
+    let ok = matches!(sent, Some(Ok(())));
+    let refused = {
+        let mut st = STATE.lock();
+        let refused = match polled {
+            CursorPoll::Done(answer) if st.moves.inflight => {
+                st.moves.answered(answer, now);
+                !answer
+            }
+            // Not a move (a shape command answered late), or nothing out.
+            CursorPoll::Done(_) | CursorPoll::Idle => {
+                st.moves.lost();
+                false
+            }
+            CursorPoll::Pending => false,
+        };
+        if ok {
+            st.moves.sent((x, y));
+        }
+        refused
+    };
+    // Counted with no lock held (a count may write the diagnostics block).
+    if refused {
+        bump(&MOVE_REF);
+    }
+    if ok {
+        bump(&MOVE_N);
+        bump(&Q_SENT);
+    } else if !refused {
+        bump(&MOVE_SKIP);
+    }
+}
+
+/// Take the answer of a move still on the cursor queue, spinning at most
+/// `hc::MOVE_REAP_100NS`, so the shape or visibility command that follows finds the queue free.
+/// With the gate held. A move still out after that stays out (the send then reports
+/// `QueueFull`, handled as before).
+fn reap_move(adapter: &AdapterContext) {
+    if !STATE.lock().moves.inflight {
+        return;
+    }
+    let start = now_100ns();
+    loop {
+        match adapter.with_virtio(|v| v.cursor_poll()) {
+            Ok(CursorPoll::Pending) => {}
+            Ok(CursorPoll::Done(ok)) => {
+                STATE.lock().moves.answered(ok, now_100ns());
+                if !ok {
+                    bump(&MOVE_REF);
+                }
+                return;
+            }
+            Ok(CursorPoll::Idle) | Err(_) => {
+                STATE.lock().moves.lost();
+                return;
+            }
+        }
+        if now_100ns().saturating_sub(start) >= hc::MOVE_REAP_100NS {
+            return;
+        }
+        core::hint::spin_loop();
+    }
 }
 
 /// The cursor image of this generation, made on first use.

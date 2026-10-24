@@ -49,6 +49,13 @@ pub const CMD_RESOURCE_UNMAP_BLOB: u32 = 0x0209;
 /// and the guest falls back to its software cursor. Served only when the
 /// config has [`crate::messages::NVGPU_CFG_VENUS_CURSOR`].
 pub const CMD_SET_CURSOR_BLOB: u32 = 0x0380;
+/// Conduit extension, not virtio-gpu: where the guest's pointer is
+/// ([`MoveCursor`], docs/SCANOUT.md "Hardware cursor, Windows guests"). The
+/// answer says whether the host wants more: `RESP_OK_NODATA` while a display
+/// client draws the guest cursor at the guest's position (a grabbed viewer),
+/// `RESP_ERR_UNSPEC` when none does (the guest stops and probes again later).
+/// Served with [`CMD_SET_CURSOR_BLOB`].
+pub const CMD_MOVE_CURSOR: u32 = 0x0381;
 
 /// Success responses.
 pub const RESP_OK_NODATA: u32 = 0x1100;
@@ -674,6 +681,47 @@ impl SetScanoutBlob {
     }
 }
 
+/// [`CMD_MOVE_CURSOR`]: the guest's pointer is at (`x`, `y`) in scanout
+/// pixels, as a Windows guest's `DxgkDdiSetPointerPosition` reports it (the
+/// hotspot's position). Sent only while the pointer is shown. 40 bytes.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MoveCursor {
+    pub hdr: CtrlHdr,
+    pub scanout_id: u32,
+    pub x: i32,
+    pub y: i32,
+    /// Reserved, 0.
+    pub flags: u32,
+}
+
+impl MoveCursor {
+    pub const LEN: usize = 40;
+
+    pub fn from_bytes(b: &[u8]) -> Option<Self> {
+        if b.len() < Self::LEN {
+            return None;
+        }
+        Some(Self {
+            hdr: CtrlHdr::from_bytes(b)?,
+            scanout_id: w(b, 24),
+            x: w(b, 28) as i32,
+            y: w(b, 32) as i32,
+            flags: w(b, 36),
+        })
+    }
+
+    pub fn to_bytes(&self) -> [u8; Self::LEN] {
+        let mut o = [0u8; Self::LEN];
+        o[..CTRL_HDR_LEN].copy_from_slice(&self.hdr.to_bytes());
+        put_w(&mut o, 24, self.scanout_id);
+        put_w(&mut o, 28, self.x as u32);
+        put_w(&mut o, 32, self.y as u32);
+        put_w(&mut o, 36, self.flags);
+        o
+    }
+}
+
 /// [`SetCursorBlob::flags`]: the cursor is shown. Clear (or resource 0):
 /// hidden, every other field ignored.
 pub const CURSOR_BLOB_F_VISIBLE: u32 = 1 << 0;
@@ -1037,6 +1085,33 @@ mod tests {
         assert_eq!((FLAG_FENCE, FLAG_INFO_RING_IDX), (1, 2));
         assert_eq!(BLOB_MEM_HOST3D, 2);
         assert_eq!(CAPSET_VENUS, 4);
+    }
+
+    /// The Conduit cursor move: its value next to the cursor command and its
+    /// 40-byte layout, as the Windows KMD encodes it
+    /// (`guest/windows/protocol/src/virtio_gpu.rs` `HeliosMoveCursor`).
+    #[test]
+    fn move_cursor_layout() {
+        assert_eq!(CMD_MOVE_CURSOR, 0x0381);
+        let c = MoveCursor {
+            hdr: CtrlHdr {
+                ty: CMD_MOVE_CURSOR,
+                ..Default::default()
+            },
+            scanout_id: 0,
+            x: -7,
+            y: 1439,
+            flags: 0,
+        };
+        let b = c.to_bytes();
+        assert_eq!(b.len(), MoveCursor::LEN);
+        assert_eq!(&b[0..4], &0x0381u32.to_le_bytes());
+        assert_eq!(&b[24..28], &0u32.to_le_bytes());
+        assert_eq!(&b[28..32], &(-7i32).to_le_bytes());
+        assert_eq!(&b[32..36], &1439i32.to_le_bytes());
+        assert_eq!(&b[36..40], &0u32.to_le_bytes());
+        assert_eq!(MoveCursor::from_bytes(&b), Some(c));
+        assert!(MoveCursor::from_bytes(&b[..39]).is_none());
     }
 
     /// The Conduit cursor command: its value, outside the spec's ranges,

@@ -393,9 +393,94 @@ pub const fn retry_due(now: u64, last_try: u64) -> bool {
     last_try == 0 || now.saturating_sub(last_try) >= RETRY_AFTER_100NS
 }
 
+// ---- the pointer's position ----------------------------------------------------------------
+//
+// The host pointer is the cursor while the input is not grabbed, so a move never needs to
+// travel. Under a grab the host pointer is locked and the viewer draws the guest cursor itself,
+// at the guest's position: then `DxgkDdiSetPointerPosition` sends it (`HELIOS_CMD_MOVE_CURSOR`),
+// fire and forget, on the cursor queue only. The host's answer says whether it wants more: OK
+// while a display client draws at the guest's position, an error when none does (or the host
+// does not know the command). After an error the next move probes no sooner than
+// [`PROBE_100NS`] later, so an ungrabbed desktop costs at most ten commands a second while the
+// pointer moves.
+
+/// `HwCursorPos` when the value is absent: send the pointer's position (1). 0 never does.
+pub const POS_KNOB_DEFAULT: u32 = 1;
+
+/// After a refused move, the next one is sent no sooner than this (100 ms, in 100 ns units).
+pub const PROBE_100NS: u64 = 1_000_000;
+
+/// How long a shape or visibility command waits for a move still on the cursor queue before it
+/// is sent anyway (2 ms, in 100 ns units; the answer normally comes in well under one).
+pub const MOVE_REAP_100NS: u64 = 20_000;
+
+/// What gates a move besides the move state itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MoveGate {
+    /// `HwCursorPos` is not 0.
+    pub knob_on: bool,
+    /// The cursor commands go on the cursor queue (never a move on the control queue).
+    pub queue_on: bool,
+    /// dxgkrnl shows the pointer and the host shows our image.
+    pub shown: bool,
+}
+
+/// The moves of one transport generation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Moves {
+    /// A move is on the cursor queue, its answer not yet taken.
+    pub inflight: bool,
+    /// The host's last answer was OK (assumed at the start, so the first move probes).
+    pub wanted: bool,
+    /// When the host last refused a move (100 ns; 0: never).
+    pub refused_at: u64,
+    /// The last position sent.
+    pub last_sent: Option<(i32, i32)>,
+}
+
+impl Moves {
+    pub const NEW: Moves = Moves {
+        inflight: false,
+        wanted: true,
+        refused_at: 0,
+        last_sent: None,
+    };
+
+    /// Whether position `pos` should go to the host at `now` (100 ns). A move already in flight
+    /// is the caller's to check on the ring: it coalesces (the next call sends the newest).
+    pub fn due(&self, gate: MoveGate, pos: (i32, i32), now: u64) -> bool {
+        gate.knob_on
+            && gate.queue_on
+            && gate.shown
+            && self.last_sent != Some(pos)
+            && (self.wanted || now.saturating_sub(self.refused_at) >= PROBE_100NS)
+    }
+
+    /// A move went on the queue.
+    pub fn sent(&mut self, pos: (i32, i32)) {
+        self.inflight = true;
+        self.last_sent = Some(pos);
+    }
+
+    /// The move in flight was answered (`ok`: the host wants more) at `now`.
+    pub fn answered(&mut self, ok: bool, now: u64) {
+        self.inflight = false;
+        self.wanted = ok;
+        if !ok {
+            self.refused_at = now.max(1);
+        }
+    }
+
+    /// The move in flight is gone without its answer being seen (another send reaped it, or the
+    /// transport went away): what the host wants is unchanged.
+    pub fn lost(&mut self) {
+        self.inflight = false;
+    }
+}
+
 /// Counter names (`kmd_render/src/ddi/hw_cursor.rs`), at most 14 characters, in the order the
 /// driver writes them.
-pub const COUNTERS: [&str; 30] = [
+pub const COUNTERS: [&str; 34] = [
     "CurKnob",
     "CurCaps",
     "CurShapeN",
@@ -408,24 +493,28 @@ pub const COUNTERS: [&str; 30] = [
     "CurWhy",
     "CurHostErr",
     "CurXor",
-    "CurRttUs",  // the last cursor command's round trip, microseconds
-    "CurRttMax", // its maximum
-    "CurTmo",    // commands that timed out (assumed taken: the host runs them late)
-    "CurGateMs", // the longest a shape waited for another pointer operation's I/O, ms
-    "CurSwN",    // software-cursor episodes (a refused shape until the host shows one again)
-    "CurSwMs",   // the last episode's length, ms
-    "CurSwMax",  // the longest, ms
-    "CurRetry",  // commands sent again after one that never reached the queue
-    "CurQ",      // 1: the commands go on the cursor queue (virtqueue 2), 0: the control queue
-    "CurQBusy",  // cursor-queue sends deferred: the previous command was still out
-    "CurQSent",  // commands sent on the cursor queue
-    "CurDdiS",   // DxgkDdiSetPointerShape calls that reached the display half (before the caps)
-    "CurDdiP",   // DxgkDdiSetPointerPosition calls likewise
-    "CurPosVis", // ... of them with Flags.Visible set
-    "CurPosHid", // ... with it clear
-    "CurPosSrc", // the last one's VidPnSourceId
-    "CurCapQn",  // DXGK_DRIVERCAPS queries (never reset)
+    "CurRttUs",    // the last cursor command's round trip, microseconds
+    "CurRttMax",   // its maximum
+    "CurTmo",      // commands that timed out (assumed taken: the host runs them late)
+    "CurGateMs",   // the longest a shape waited for another pointer operation's I/O, ms
+    "CurSwN",      // software-cursor episodes (a refused shape until the host shows one again)
+    "CurSwMs",     // the last episode's length, ms
+    "CurSwMax",    // the longest, ms
+    "CurRetry",    // commands sent again after one that never reached the queue
+    "CurQ",        // 1: the commands go on the cursor queue (virtqueue 2), 0: the control queue
+    "CurQBusy",    // cursor-queue sends deferred: the previous command was still out
+    "CurQSent",    // commands sent on the cursor queue
+    "CurDdiS",     // DxgkDdiSetPointerShape calls that reached the display half (before the caps)
+    "CurDdiP",     // DxgkDdiSetPointerPosition calls likewise
+    "CurPosVis",   // ... of them with Flags.Visible set
+    "CurPosHid",   // ... with it clear
+    "CurPosSrc",   // the last one's VidPnSourceId
+    "CurCapQn",    // DXGK_DRIVERCAPS queries (never reset)
     "CurCapRep", // what the last one reported (bit 0 pointer, 1 host known, 4..7 knob, 8 display, 16.. caps)
+    "CurPosKnob", // `HwCursorPos` (1: moves are sent under a host grab)
+    "CurMoveN",  // moves sent (HELIOS_CMD_MOVE_CURSOR)
+    "CurMoveRef", // moves the host refused (no display client wanted positions)
+    "CurMoveSkip", // moves not sent: one still out, or another pointer operation held the queue
 ];
 
 #[cfg(test)]
@@ -650,6 +739,82 @@ mod tests {
         for n in COUNTERS {
             assert!(n.len() <= 14, "{n}");
         }
+    }
+
+    fn gate() -> MoveGate {
+        MoveGate {
+            knob_on: true,
+            queue_on: true,
+            shown: true,
+        }
+    }
+
+    #[test]
+    fn a_move_goes_only_when_every_condition_holds() {
+        let m = Moves::NEW;
+        assert!(
+            m.due(gate(), (10, 20), 5),
+            "a new generation probes with its first move"
+        );
+        for g in [
+            MoveGate {
+                knob_on: false,
+                ..gate()
+            },
+            MoveGate {
+                queue_on: false,
+                ..gate()
+            },
+            MoveGate {
+                shown: false,
+                ..gate()
+            },
+        ] {
+            assert!(!m.due(g, (10, 20), 5), "{g:?}");
+        }
+        let mut m = Moves::NEW;
+        m.sent((10, 20));
+        assert!(m.inflight);
+        assert!(!m.due(gate(), (10, 20), 5), "the same position twice");
+        assert!(
+            m.due(gate(), (11, 20), 5),
+            "a new one (the ring decides about the one out)"
+        );
+    }
+
+    #[test]
+    fn a_refusal_stops_the_moves_until_the_probe_is_due() {
+        let mut m = Moves::NEW;
+        m.sent((1, 1));
+        m.answered(false, 50_000_000);
+        assert!(!m.inflight && !m.wanted);
+        assert_eq!(m.refused_at, 50_000_000);
+        assert!(!m.due(gate(), (2, 2), 50_000_000 + PROBE_100NS - 1));
+        assert!(m.due(gate(), (2, 2), 50_000_000 + PROBE_100NS));
+        m.sent((2, 2));
+        m.answered(true, 50_000_000 + PROBE_100NS + 10);
+        assert!(m.wanted);
+        assert!(
+            m.due(gate(), (3, 3), 50_000_000 + PROBE_100NS + 11),
+            "wanted again: at once"
+        );
+        // A refusal at time 0 still counts as one.
+        let mut z = Moves::NEW;
+        z.answered(false, 0);
+        assert!(!z.due(gate(), (1, 1), PROBE_100NS - 1));
+    }
+
+    #[test]
+    fn a_lost_answer_leaves_what_the_host_wants() {
+        let mut m = Moves::NEW;
+        m.answered(false, 7);
+        m.sent((4, 4));
+        m.lost();
+        assert!(!m.inflight && !m.wanted && m.refused_at == 7);
+        let mut w = Moves::NEW;
+        w.sent((4, 4));
+        w.lost();
+        assert!(!w.inflight && w.wanted);
     }
 
     /// The counters `kmd_render/src/ddi/hw_cursor.rs` writes are exactly [`COUNTERS`] (skipped

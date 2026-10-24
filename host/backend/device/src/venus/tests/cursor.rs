@@ -221,3 +221,62 @@ fn bad_cursors_are_refused() {
     long.push(0);
     assert_eq!(t.ty(&long), RESP_ERR_UNSPEC);
 }
+
+fn move_cmd(scanout_id: u32, x: i32, y: i32) -> [u8; MoveCursor::LEN] {
+    MoveCursor {
+        hdr: hdr(CMD_MOVE_CURSOR, 0),
+        scanout_id,
+        x,
+        y,
+        flags: 0,
+    }
+    .to_bytes()
+}
+
+/// `CMD_MOVE_CURSOR`: answered OK only while a display client draws the
+/// guest cursor at the guest's position (grabbed, `CAP_CURSOR_POS`), which
+/// is what tells the guest to keep sending; otherwise refused, which tells it
+/// to stop.
+#[test]
+fn a_move_is_wanted_only_while_a_grabbed_viewer_draws_the_cursor() {
+    use crate::display::wire;
+    let mut t = Rig::new();
+    let (link, _broker) = display();
+    // Not served before the cursor is.
+    assert_eq!(
+        t.send_on(&move_cmd(0, 1, 2), Some(&link)).0.ty,
+        RESP_ERR_UNSPEC
+    );
+    assert!(t.venus.enable_cursor());
+    // No display client takes positions: not wanted.
+    assert_eq!(
+        t.send_on(&move_cmd(0, 1, 2), Some(&link)).0.ty,
+        RESP_ERR_UNSPEC
+    );
+    link.hello_for_test(wire::CAP_CURSOR | wire::CAP_CURSOR_POS);
+    assert_eq!(
+        t.send_on(&move_cmd(0, 1, 2), Some(&link)).0.ty,
+        RESP_ERR_UNSPEC,
+        "not grabbed"
+    );
+    link.grab_for_test(true);
+    assert_eq!(
+        t.send_on(&move_cmd(0, -3, 1439), Some(&link)).0.ty,
+        RESP_OK_NODATA
+    );
+    // Another scanout, no display link, a wrong length.
+    assert_eq!(
+        t.send_on(&move_cmd(1, 1, 2), Some(&link)).0.ty,
+        RESP_ERR_INVALID_SCANOUT_ID
+    );
+    assert_eq!(t.send_on(&move_cmd(0, 1, 2), None).0.ty, RESP_ERR_UNSPEC);
+    let mut long = move_cmd(0, 1, 2).to_vec();
+    long.push(0);
+    assert_eq!(t.send_on(&long, Some(&link)).0.ty, RESP_ERR_UNSPEC);
+    // Released: not wanted any more.
+    link.grab_for_test(false);
+    assert_eq!(
+        t.send_on(&move_cmd(0, 1, 2), Some(&link)).0.ty,
+        RESP_ERR_UNSPEC
+    );
+}

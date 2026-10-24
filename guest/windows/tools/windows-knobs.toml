@@ -261,6 +261,11 @@ class = "debug"
 read = "StartDevice"
 effect = "1 sends hardware cursor commands on the dedicated cursor virtqueue when the host and VMM provide it; 0 keeps them on the control queue."
 
+[kmd.HwCursorPos]
+class = "debug"
+read = "StartDevice"
+effect = "1 sends the pointer position on the cursor virtqueue while the host asks for it (a viewer under grab draws the guest cursor there); 0 never sends it."
+
 [kmd.HwQueuePktCap]
 class = "experiment"
 read = "AddAdapter"
