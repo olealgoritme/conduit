@@ -7,8 +7,10 @@
 //! - `dlss` also sets `Dlss` = 1 (NVK's VK_NVX_binary_import, which NGX
 //!   needs) and asks NGX for the newest model (DRS override, read by the
 //!   guest's nvapi; see guest/nvk-rm/docs/dlss.md).
-//! - Games with OptiScaler (a per-game install the user makes; GPL-3.0, not
-//!   shipped by Conduit) are listed under `HKLM\SOFTWARE\Helios\OptiScaler`,
+//! - Games with OptiScaler (GPL-3.0, not shipped by Conduit; installed per
+//!   game by Install-OptiScaler.ps1, which downloads a pinned release, or
+//!   from the tray's profile menu, see [`crate::optiscaler`]) are listed under
+//!   `HKLM\SOFTWARE\Helios\OptiScaler`,
 //!   one REG_SZ per game holding the path of its `OptiScaler.ini`; each of
 //!   those files gets the mode's outputs ([`optiscaler_ini`]).
 
@@ -70,12 +72,12 @@ pub fn optiscaler_ini(ini: &str, mode: &str) -> String {
     out
 }
 
-fn section_of(line: &str) -> Option<&str> {
+pub(crate) fn section_of(line: &str) -> Option<&str> {
     let t = line.trim();
     t.strip_prefix('[')?.strip_suffix(']').map(str::trim)
 }
 
-fn key_of(line: &str) -> Option<&str> {
+pub(crate) fn key_of(line: &str) -> Option<&str> {
     let t = line.trim_start();
     if t.starts_with(';') || t.starts_with('#') {
         return None;
