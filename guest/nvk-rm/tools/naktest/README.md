@@ -18,7 +18,7 @@ predicated code) on the GPU before any of them is turned on by default.
 | `carry0-2` | 64-bit adds and shifts (carry predicates) |
 | `uniform0-2` | a chain on push constants only (uniform datapath) |
 | `loads8..32` | 8 to 32 independent loads in flight, consumed in shuffled order (scoreboards) |
-| `lat_ffma`, `lat_imad`, `lat_alu`, `lat_fmnmx`, `lat_fmaalu`, `lat_guard`, `lat_uniform`, `lat_hfma2` | a loop (4 iterations, or `--time N`) around 64 dependent operations of one class: FFMA, IMAD, IADD3/LOP3, FMNMX, FFMA/FMNMX cross pairs, small ifs, uniform datapath, HFMA2 (needs shaderFloat16) |
+| `lat_ffma`, `lat_imad`, `lat_alu`, `lat_fmnmx`, `lat_fmaalu`, `lat_guard`, `lat_uniform`, `lat_hfma2` | a loop (4 iterations, or `--time N`) around 512 dependent operations of one class: FFMA, IMAD, IADD3/LOP3, FMNMX, FFMA/FMNMX cross pairs, small ifs, uniform datapath, HFMA2 (needs shaderFloat16) |
 | `wgsync` | invocations of a workgroup exchange values through the storage buffer around barriers (`NAK_WEAK_MEM`) |
 | `tld_arr_lod`, `tex_arr_lod`, `tex_arr_off`, `tld4_arr`, `tld4_arr_off`, `tex_dc_arr`, `tex_dc_arr_off` | texel fetches, explicit-level samples, gathers and depth compares from a 2D array texture and a depth texture whose handles come from the descriptor set: the source layouts (2+1, 2+2 and 5 components) that `NAK_TEX_UHANDLE` turns into the scalar form with the handle in a uniform register |
 
@@ -54,7 +54,7 @@ the results (every 17th word):
 
 ```bat
 set MESA_SHADER_CACHE_DISABLE=true
-naktest.exe --time 1024 -n 10880 -r 5
+naktest.exe --time 128 -n 10880 -r 5
 ```
 
 On the host's NVIDIA driver at 1900 MHz: about 4.2 cycles per operation for

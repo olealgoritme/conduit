@@ -223,7 +223,8 @@ def emit_lat(name, init_g, init_c, body_g, body_c, out_g, out_c, kind="lat"):
     lat_ops[name] = len(body_g)
 
 
-LAT_REP = 4
+LAT_REP = 32     # 512 dependent operations per iteration (128 small ifs): a lone warp pays
+                 # some 80 cycles per taken loop branch, 0.16 per operation here
 
 
 lat_ops = {}
