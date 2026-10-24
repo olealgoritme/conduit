@@ -1,7 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Ole Algoritme <olealgoritme@gmail.com>
 Date: Sat, 24 Oct 2026 01:42:59 +0200
-Subject: [PATCH] nak: schedule for memory-level parallelism (NAK_SCHED_MLP)
+Subject: [PATCH] nak: schedule for memory-level parallelism (NAK_SCHED_MLP, on
+ on Windows)
 
 NAK's prepass scheduler puts a load about ten instructions above its
 use, even when the load does not depend on the computation in between.
@@ -39,8 +40,16 @@ Causes, and what NAK_SCHED_MLP changes:
   target falls back to the plain schedule for the same target, so the
   knob does not cross an occupancy cliff.
 
-The knob (0-3, default 0) is part of nak_knobs_key() (bits 18-19) and so
-of NVK's shader cache key.
+The knob (0-3; default 3 on Windows, 0 elsewhere) is part of
+nak_knobs_key() (bits 18-19) and so of NVK's shader cache key.
+
+Steel Nomad (D3D12, RTX 5090 in a Windows guest, 400 W, with 0082):
+77.8 fps at 0, 80.9 at 1, 81.0 at 3. SM issue goes from 38.7% to 41.9%
+and warps per SM from 43.6 to 45.5. In tools/dispcost, a 5-workgroup
+dispatch after a UAV barrier costs 1.46 us ("mid") and 2.41 us ("big")
+at 3, against 2.35 and 6.15 us at 0 (NVIDIA: 1.41 and 2.39). Level 3
+spills less than level 1 in the corpus's compute shaders (2 against 18),
+so it is the Windows default.
 
 Offline (drm-shim, GB202), the test shader at level 3 has 28 of 28 loads
 in flight at 40 GPRs and 48 warps, against 1 of 28 at level 0. On the
@@ -52,11 +61,11 @@ spills 8 -> 2 (compute) and 14 -> 30 (fragment); average warps per SM
 ---
  src/nouveau/compiler/nak/api.rs               |  20 ++-
  src/nouveau/compiler/nak/calc_instr_deps.rs   |   8 +-
- src/nouveau/compiler/nak/knobs.rs             |  30 ++++
+ src/nouveau/compiler/nak/knobs.rs             |  36 +++++
  .../compiler/nak/opt_instr_sched_common.rs    |  77 +++++++++-
  .../compiler/nak/opt_instr_sched_postpass.rs  |  20 +++
  .../compiler/nak/opt_instr_sched_prepass.rs   | 131 +++++++++++++++---
- 6 files changed, 264 insertions(+), 22 deletions(-)
+ 6 files changed, 270 insertions(+), 22 deletions(-)
 
 diff --git a/src/nouveau/compiler/nak/api.rs b/src/nouveau/compiler/nak/api.rs
 index 2b1e57e..58ada35 100644
@@ -130,53 +139,59 @@ index 46c1634..c0c48f1 100644
                      }
                      None => {
 diff --git a/src/nouveau/compiler/nak/knobs.rs b/src/nouveau/compiler/nak/knobs.rs
-index 7ac2fbc..e9c83d4 100644
+index 7ac2fbc..05b39cb 100644
 --- a/src/nouveau/compiler/nak/knobs.rs
 +++ b/src/nouveau/compiler/nak/knobs.rs
-@@ -64,6 +64,10 @@
+@@ -64,6 +64,11 @@
  //!   in convergent control flow, where its uniform values can use the
  //!   uniform datapath (nak_nir_lower_early_exit.c).  0 keeps the divergent
  //!   if or the loop around the whole body
-+//! - NAK_SCHED_MLP (0-3, default 0): global, local and texture accesses are
-+//!   modeled with their real latencies in the instruction schedulers, so
-+//!   independent loads issue early and stay in flight together; scoreboards
-+//!   are shared when all six are busy (sched_mlp())
++//! - NAK_SCHED_MLP (0-3; default 3 on Windows, 0 elsewhere): global, local
++//!   and texture accesses are modeled with their real latencies in the
++//!   instruction schedulers, so independent loads issue early and stay in
++//!   flight together; scoreboards are shared when all six are busy
++//!   (sched_mlp())
  
  use std::env;
  use std::sync::OnceLock;
-@@ -103,6 +107,31 @@ static UNIFORM_ATOMICS: OnceLock<bool> = OnceLock::new();
+@@ -103,6 +108,36 @@ static UNIFORM_ATOMICS: OnceLock<bool> = OnceLock::new();
  static F16_CVT: OnceLock<bool> = OnceLock::new();
  static LOOP_CONT_SYNC: OnceLock<bool> = OnceLock::new();
  static EARLY_EXIT: OnceLock<bool> = OnceLock::new();
 +static SCHED_MLP: OnceLock<u32> = OnceLock::new();
 +
-+/// NAK_SCHED_MLP (0-3, default 0): memory-level parallelism in the
-+/// instruction schedulers.  The schedulers model a global, local or
-+/// texture access as 32 cycles, so a load is placed about ten instructions
-+/// before its use, and a warp whose loads do not depend on each other still
-+/// waits for them one at a time.  With 1, 2 or 3 they are modeled as
-+/// 160/120, 320/240 or 640/480 cycles (global and local memory/texture and
-+/// surface), so independent loads are issued as early as their operands and
-+/// the register target allow, and a variable-latency instruction that finds
-+/// all six scoreboards busy shares one (as NAK_BAR_SHARE) instead of waiting
-+/// for the oldest
++/// NAK_SCHED_MLP (0-3; default 3 on Windows, 0 elsewhere): memory-level
++/// parallelism in the instruction schedulers.  Without it the prepass never
++/// delays an instruction by an edge latency and global, local and texture
++/// accesses count as 32 cycles, so a load sits about ten instructions above
++/// its use and a warp whose loads do not depend on each other still waits
++/// for them one at a time.  1: the prepass honors edge latencies, accesses
++/// count as 320 (memory) / 240 (texture, surface) cycles, read-only
++/// accesses are not ordered against other memory operations, and a
++/// variable-latency instruction that finds all six scoreboards busy shares
++/// one (as NAK_BAR_SHARE); 2: 640 / 480 cycles; 3: also hoists accesses as
++/// far as their operands allow while registers are free.  Steel Nomad
++/// (D3D12, RTX 5090 in a Windows guest): 77.8 fps with 0, 80.9 with 1, 81.0
++/// with 3 (fewer compute spills than 1 in the corpus)
 +pub fn sched_mlp() -> u32 {
++    let dflt = if cfg!(target_os = "windows") { 3 } else { 0 };
 +    let v = SCHED_MLP.get_or_init(|| match env::var("NAK_SCHED_MLP") {
 +        Ok(s) => match s.trim().parse::<u32>() {
 +            Ok(v) if v <= 3 => v,
++            _ if s.trim().is_empty() => dflt,
 +            _ => {
 +                eprintln!("NAK: ignoring NAK_SCHED_MLP=\"{}\" (not 0-3)", s);
-+                0
++                dflt
 +            }
 +        },
-+        Err(_) => 0,
++        Err(_) => dflt,
 +    });
 +    *v
 +}
  
  /// NAK_IMM_CSE for a shader: compute shaders unless set
  pub fn imm_cse(compute: bool) -> bool {
-@@ -303,4 +332,5 @@ pub extern "C" fn nak_knobs_key() -> u32 {
+@@ -303,4 +338,5 @@ pub extern "C" fn nak_knobs_key() -> u32 {
          | (u32::from(f16_cvt()) << 15)
          | (u32::from(!loop_cont_sync()) << 16)
          | (u32::from(early_exit()) << 17)
