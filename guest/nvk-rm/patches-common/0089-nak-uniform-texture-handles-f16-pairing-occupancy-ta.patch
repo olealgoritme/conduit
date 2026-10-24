@@ -1,14 +1,15 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Ole Algoritme <olealgoritme@gmail.com>
-Date: Sat, 24 Oct 2026 07:15:29 +0200
-Subject: [PATCH] nak: uniform texture handles (NAK_TEX_UHANDLE),
- occupancy-target knobs
+Date: Sat, 24 Oct 2026 07:43:22 +0200
+Subject: [PATCH] nak: uniform texture handles, f16 pairing, occupancy-target
+ knobs
 
-NAK_TEX_UHANDLE (default off, SM100+): a bindless texture handle that is
-the same in every lane (by NIR's divergence analysis of the texture and
-sampler parts) goes in the uniform register field of TEX, TLD and TLD4
-(opcodes 0xf60, 0xf66, 0xf63) instead of the second source vector, as
-in the reference compiler's code, and only with the scalar source form
+NAK_TEX_UHANDLE (0-2, default 0, SM100+): a bindless texture handle that
+is the same in every lane (by NIR's divergence analysis of the texture
+and sampler parts) goes in the uniform register field of TLD (1) or of
+TEX, TLD and TLD4 (2), opcodes 0xf66, 0xf60, 0xf63, instead of the
+second source vector, as in the reference compiler's code: a UGPR pair
+(texture index, sampler index) unpacked from NVK's handle, and only with the scalar source form
 (.SCR: one or two components per source register, four in all), which
 also saves the copies that build contiguous vectors.  An instruction
 with more source components keeps the handle in its second vector.  Legalization brings the handle back to
@@ -19,24 +20,31 @@ the spiller and in the occupancy target's dry run.  NAK_OCC_GPRS (0-255,
 default off): a fixed register target for every shader whose natural
 count is higher, for sweeps of one shader with dispatch-replay.
 
-All three are in nak_knobs_key2(), so in NVK's pipeline cache keys.
+NAK_F16_PAIR (default off, SM86+): independent scalar 32-to-16-bit
+float conversions in a block are paired into one 2-wide conversion (one
+F2FP.PACK_AB from two registers), preferring partners whose first use is
+the same operation, so nir_opt_vectorize can pack the 16-bit math that
+follows into HFMA2/HADD2/HMUL2.
+
+All of them are in nak_knobs_key2(), so in NVK's pipeline cache keys.
 ---
- src/nouveau/compiler/nak/from_nir.rs       | 28 +++++++++++-
- src/nouveau/compiler/nak/ir.rs             | 31 +++++++++++--
- src/nouveau/compiler/nak/knobs.rs          | 53 ++++++++++++++++++++++
- src/nouveau/compiler/nak/nvdisasm_tests.rs |  3 ++
- src/nouveau/compiler/nak/occ_target.rs     | 17 +++++++
- src/nouveau/compiler/nak/sm70_encode.rs    | 48 +++++++++++++++++---
- src/nouveau/compiler/nak/spill_remat.rs    |  3 +-
- src/nouveau/compiler/nak_nir_lower_tex.c   | 43 ++++++++++++++++++
- src/nouveau/compiler/nak_private.h         |  1 +
- 9 files changed, 215 insertions(+), 12 deletions(-)
+ src/nouveau/compiler/nak/from_nir.rs       |  48 ++++++++-
+ src/nouveau/compiler/nak/ir.rs             |  31 +++++-
+ src/nouveau/compiler/nak/knobs.rs          |  73 ++++++++++++++
+ src/nouveau/compiler/nak/nvdisasm_tests.rs |   3 +
+ src/nouveau/compiler/nak/occ_target.rs     |  17 ++++
+ src/nouveau/compiler/nak/sm70_encode.rs    |  50 ++++++++--
+ src/nouveau/compiler/nak/spill_remat.rs    |   3 +-
+ src/nouveau/compiler/nak_nir.c             | 111 +++++++++++++++++++++
+ src/nouveau/compiler/nak_nir_lower_tex.c   |  46 +++++++++
+ src/nouveau/compiler/nak_private.h         |   2 +
+ 10 files changed, 372 insertions(+), 12 deletions(-)
 
 diff --git a/src/nouveau/compiler/nak/from_nir.rs b/src/nouveau/compiler/nak/from_nir.rs
-index dac9df5..505ce3c 100644
+index dac9df5..ab5c742 100644
 --- a/src/nouveau/compiler/nak/from_nir.rs
 +++ b/src/nouveau/compiler/nak/from_nir.rs
-@@ -1994,12 +1994,35 @@ impl<'a> ShaderFromNir<'a> {
+@@ -1994,12 +1994,55 @@ impl<'a> ShaderFromNir<'a> {
              _ => panic!("Unsupported texture dimension: {}", tex.sampler_dim),
          };
  
@@ -53,12 +61,15 @@ index dac9df5..505ce3c 100644
              assert!(srcs.len() == 2);
              assert!(srcs[1].src_type == nir_tex_src_backend2);
          }
++        // The instruction's uniform register field names a UGPR pair:
++        // texture index (bits 0-19 of the handle), sampler index (bits
++        // 20-31), as the reference compiler's code unpacks it
 +        let handle: Src = match uhandle_src {
 +            None => Src::ZERO,
 +            Some(s) => {
 +                let h = self.get_ssa(s.src.as_def())[0];
-+                if h.file().is_uniform() {
-+                    h.into()
++                let h = if h.file().is_uniform() {
++                    h
 +                } else {
 +                    // Uniform by NIR's divergence analysis: any lane's value
 +                    let u = b.alloc_ssa(RegFile::UGPR);
@@ -66,14 +77,31 @@ index dac9df5..505ce3c 100644
 +                        src: h.into(),
 +                        dst: u.into(),
 +                    });
-+                    u.into()
-+                }
++                    u
++                };
++                let pair = b.alloc_ssa_vec(RegFile::UGPR, 2);
++                b.push_op(OpLop3 {
++                    dst: pair[0].into(),
++                    srcs: [h.into(), 0xfffff_u32.into(), 0.into()],
++                    op: LogicOp3::new_lut(&|x, y, _| x & y),
++                });
++                b.push_op(OpShf {
++                    dst: pair[1].into(),
++                    low: h.into(),
++                    high: 0.into(),
++                    shift: 20_u32.into(),
++                    right: true,
++                    wrap: true,
++                    data_type: IntType::U32,
++                    dst_high: false,
++                });
++                pair.into()
 +            }
 +        };
  
          let flags: nak_nir_tex_flags =
              unsafe { std::mem::transmute_copy(&tex.backend_flags) };
-@@ -2162,6 +2185,7 @@ impl<'a> ShaderFromNir<'a> {
+@@ -2162,6 +2205,7 @@ impl<'a> ShaderFromNir<'a> {
                      nodep: flags.nodep(),
                      channel_mask,
                      scalar: flags.scalar(),
@@ -81,7 +109,7 @@ index dac9df5..505ce3c 100644
                  });
              } else if tex.op == nir_texop_tg4 {
                  b.push_op(OpTld4 {
-@@ -2177,6 +2201,7 @@ impl<'a> ShaderFromNir<'a> {
+@@ -2177,6 +2221,7 @@ impl<'a> ShaderFromNir<'a> {
                      nodep: flags.nodep(),
                      channel_mask,
                      scalar: flags.scalar(),
@@ -89,7 +117,7 @@ index dac9df5..505ce3c 100644
                  });
              } else {
                  assert!(offset_mode != TexOffsetMode::PerPx);
-@@ -2194,6 +2219,7 @@ impl<'a> ShaderFromNir<'a> {
+@@ -2194,6 +2239,7 @@ impl<'a> ShaderFromNir<'a> {
                      nodep: flags.nodep(),
                      channel_mask,
                      scalar: flags.scalar(),
@@ -175,37 +203,43 @@ index a66fcde..9bcb3bf 100644
  }
  impl_display_for_op!(OpTld4);
 diff --git a/src/nouveau/compiler/nak/knobs.rs b/src/nouveau/compiler/nak/knobs.rs
-index b5759bb..4b4593c 100644
+index b5759bb..0580f1b 100644
 --- a/src/nouveau/compiler/nak/knobs.rs
 +++ b/src/nouveau/compiler/nak/knobs.rs
-@@ -103,6 +103,9 @@ static BAR_SHARE: OnceLock<bool> = OnceLock::new();
+@@ -103,6 +103,10 @@ static BAR_SHARE: OnceLock<bool> = OnceLock::new();
  static LAT_MASK: OnceLock<u32> = OnceLock::new();
  static UNROLL_MAX: OnceLock<u32> = OnceLock::new();
  static VEC_CSE: OnceLock<bool> = OnceLock::new();
-+static TEX_UHANDLE: OnceLock<bool> = OnceLock::new();
++static TEX_UHANDLE: OnceLock<u32> = OnceLock::new();
 +static REMAT_LD_COST: OnceLock<u32> = OnceLock::new();
 +static OCC_GPRS: OnceLock<u32> = OnceLock::new();
++static F16_PAIR: OnceLock<bool> = OnceLock::new();
  static WEAK_MEM: OnceLock<bool> = OnceLock::new();
  static UNIFORM_ATOMICS: OnceLock<bool> = OnceLock::new();
  static F16_CVT: OnceLock<bool> = OnceLock::new();
-@@ -135,6 +138,53 @@ pub extern "C" fn nak_knob_gcm() -> u32 {
+@@ -135,6 +139,71 @@ pub extern "C" fn nak_knob_gcm() -> u32 {
      gcm()
  }
  
-+/// NAK_TEX_UHANDLE (default off, SM100+): a bindless texture handle that is
-+/// the same in every lane goes in the instruction's uniform register field
-+/// (TEX/TLD/TLD4 with a UR handle, as in the reference compiler's code)
-+/// instead of the second source vector, which then often is empty and lets
-+/// the sources use the scalar form (.SCR): fewer copies to build contiguous
-+/// source vectors (nak_nir_lower_tex.c, from_nir.rs, sm70_encode.rs)
-+pub fn tex_uhandle() -> bool {
-+    *TEX_UHANDLE.get_or_init(|| {
-+        parse("NAK_TEX_UHANDLE", env::var("NAK_TEX_UHANDLE"), false)
++/// NAK_TEX_UHANDLE (0-2, default 0, SM100+): a bindless texture handle that
++/// is the same in every lane goes in the instruction's uniform register
++/// field, a UGPR pair (texture index, sampler index), with the scalar source
++/// form (.SCR), as in the reference compiler's code, instead of the second
++/// source vector: fewer copies to build contiguous source vectors.  1: texel
++/// fetches (TLD) only; 2: TEX, TLD and TLD4 (nak_nir_lower_tex.c,
++/// from_nir.rs, sm70_encode.rs)
++pub fn tex_uhandle() -> u32 {
++    *TEX_UHANDLE.get_or_init(|| match env::var("NAK_TEX_UHANDLE") {
++        Ok(s) => match s.trim().parse::<u32>() {
++            Ok(v) if v <= 2 => v,
++            _ => 0,
++        },
++        Err(_) => 0,
 +    })
 +}
 +
 +#[unsafe(no_mangle)]
-+pub extern "C" fn nak_knob_tex_uhandle() -> bool {
++pub extern "C" fn nak_knob_tex_uhandle() -> u32 {
 +    tex_uhandle()
 +}
 +
@@ -220,6 +254,19 @@ index b5759bb..4b4593c 100644
 +        },
 +        Err(_) => default,
 +    }
++}
++
++/// NAK_F16_PAIR (default off): independent scalar 32-to-16-bit float
++/// conversions in a block are paired into one 2-wide conversion (one
++/// F2FP.PACK_AB), so the 16-bit math that follows reads the lanes of one
++/// vector and nir_opt_vectorize pairs it into HFMA2/HADD2/HMUL2 (nak_nir.c)
++pub fn f16_pair() -> bool {
++    *F16_PAIR.get_or_init(|| parse("NAK_F16_PAIR", env::var("NAK_F16_PAIR"), false))
++}
++
++#[unsafe(no_mangle)]
++pub extern "C" fn nak_knob_f16_pair() -> bool {
++    f16_pair()
 +}
 +
 +/// NAK_REMAT_LD_COST (1-63, default 4): what a rematerialized global or
@@ -242,13 +289,14 @@ index b5759bb..4b4593c 100644
  /// NAK_SCHED_ILP (default off): the prepass enters an instruction in its
  /// future-ready set at the cycle its edge latencies give, as NAK_SCHED_MLP
  /// does, but keeps the plain latency model.  Without it a producer is ready
-@@ -186,6 +236,9 @@ pub extern "C" fn nak_knobs_key2() -> u32 {
+@@ -186,6 +255,10 @@ pub extern "C" fn nak_knobs_key2() -> u32 {
          | (u32::from(fset_bf()) << 8)
          | (u32::from(sched_ilp()) << 9)
          | (gcm() << 10)
-+        | (u32::from(tex_uhandle()) << 12)
-+        | (remat_ld_cost() << 13)
-+        | (occ_gprs() << 19)
++        | (tex_uhandle() << 12)
++        | (remat_ld_cost() << 14)
++        | (occ_gprs() << 20)
++        | (u32::from(f16_pair()) << 28)
  }
  
  /// NAK_YIELD (default off, experimental, SM120): control bit 109 set on
@@ -309,10 +357,10 @@ index 48ca45c..18095ba 100644
          let mut cands = Vec::new();
          let mut a = natural;
 diff --git a/src/nouveau/compiler/nak/sm70_encode.rs b/src/nouveau/compiler/nak/sm70_encode.rs
-index f0af793..bccd904 100644
+index f0af793..7ad9a55 100644
 --- a/src/nouveau/compiler/nak/sm70_encode.rs
 +++ b/src/nouveau/compiler/nak/sm70_encode.rs
-@@ -2904,12 +2904,30 @@ fn legalize_tex_instr(op: &mut impl SrcsAsSlice, b: &mut LegalizeBuilder) {
+@@ -2904,12 +2904,32 @@ fn legalize_tex_instr(op: &mut impl SrcsAsSlice, b: &mut LegalizeBuilder) {
          b.copy_ssa_ref_if_uniform(ssa);
      }
      if srcs.len() > 1 {
@@ -328,15 +376,17 @@ index f0af793..bccd904 100644
 +    if srcs.len() > 2 {
 +        debug_assert!(srcs.len() == 3);
 +        let gpr_ssa = match &srcs[2].src_ref {
-+            SrcRef::SSA(ssa) if !ssa.file().is_uniform() => Some(ssa[0]),
++            SrcRef::SSA(ssa) if !ssa.file().is_uniform() => Some(ssa.clone()),
 +            _ => None,
 +        };
 +        if let Some(gpr) = gpr_ssa {
-+            let u = b.alloc_ssa(RegFile::UGPR);
-+            b.push_op(OpR2UR {
-+                src: gpr.into(),
-+                dst: u.into(),
-+            });
++            let u = b.alloc_ssa_vec(RegFile::UGPR, gpr.comps());
++            for c in 0..usize::from(gpr.comps()) {
++                b.push_op(OpR2UR {
++                    src: gpr[c].into(),
++                    dst: u[c].into(),
++                });
++            }
 +            srcs[2] = u.into();
 +        }
 +        assert!(srcs[2].is_zero() || srcs[2].is_uniform());
@@ -344,7 +394,7 @@ index f0af793..bccd904 100644
  }
  
  impl SM70Op for OpTex {
-@@ -2929,7 +2947,8 @@ impl SM70Op for OpTex {
+@@ -2929,7 +2949,8 @@ impl SM70Op for OpTex {
              }
              TexRef::Bindless => {
                  if e.sm >= 100 {
@@ -354,7 +404,7 @@ index f0af793..bccd904 100644
                      e.set_bit(91, true);
                  } else {
                      e.set_opcode(0x361);
-@@ -2949,8 +2968,13 @@ impl SM70Op for OpTex {
+@@ -2949,8 +2970,13 @@ impl SM70Op for OpTex {
          e.set_reg_src(24..32, &self.srcs[0]);
          e.set_reg_src(32..40, &self.srcs[1]);
          if e.sm >= 100 {
@@ -369,7 +419,7 @@ index f0af793..bccd904 100644
          }
  
          e.set_bit(60, self.scalar);
-@@ -2998,7 +3022,7 @@ impl SM70Op for OpTld {
+@@ -2998,7 +3024,7 @@ impl SM70Op for OpTld {
              }
              TexRef::Bindless => {
                  if e.sm >= 100 {
@@ -378,7 +428,7 @@ index f0af793..bccd904 100644
                      e.set_bit(91, true);
                  } else {
                      e.set_opcode(0x367);
-@@ -3018,8 +3042,13 @@ impl SM70Op for OpTld {
+@@ -3018,8 +3044,13 @@ impl SM70Op for OpTld {
          e.set_reg_src(24..32, &self.srcs[0]);
          e.set_reg_src(32..40, &self.srcs[1]);
          if e.sm >= 100 {
@@ -393,7 +443,7 @@ index f0af793..bccd904 100644
          }
  
          if e.sm >= 100 {
-@@ -3074,7 +3103,7 @@ impl SM70Op for OpTld4 {
+@@ -3074,7 +3105,7 @@ impl SM70Op for OpTld4 {
              }
              TexRef::Bindless => {
                  if e.sm >= 100 {
@@ -402,7 +452,7 @@ index f0af793..bccd904 100644
                      e.set_bit(91, true);
                  } else {
                      e.set_opcode(0x364);
-@@ -3094,8 +3123,13 @@ impl SM70Op for OpTld4 {
+@@ -3094,8 +3125,13 @@ impl SM70Op for OpTld4 {
          e.set_reg_src(24..32, &self.srcs[0]);
          e.set_reg_src(32..40, &self.srcs[1]);
          if e.sm >= 100 {
@@ -431,8 +481,137 @@ index a808dc4..0c67a5d 100644
          Op::Ldc(_) | Op::S2R(_) => 2,
          _ => 1,
      }
+diff --git a/src/nouveau/compiler/nak_nir.c b/src/nouveau/compiler/nak_nir.c
+index b577050..3c9cb52 100644
+--- a/src/nouveau/compiler/nak_nir.c
++++ b/src/nouveau/compiler/nak_nir.c
+@@ -94,6 +94,115 @@ nak_nir_workgroup_has_one_subgroup(const nir_shader *nir)
+    }
+ }
+ 
++static bool
++is_f2f16_seed(const nir_instr *instr)
++{
++   if (instr->type != nir_instr_type_alu)
++      return false;
++   const nir_alu_instr *alu = nir_instr_as_alu(instr);
++   if (alu->op != nir_op_f2f16 && alu->op != nir_op_f2f16_rtne &&
++       alu->op != nir_op_f2f16_rtz)
++      return false;
++   return alu->def.num_components == 1 && alu->def.bit_size == 16 &&
++          alu->src[0].src.ssa->bit_size == 32;
++}
++
++/* The first ALU use of def, for the partner preference: (op, source) */
++static bool
++first_alu_use(nir_def *def, nir_op *op, unsigned *src_idx)
++{
++   nir_foreach_use(src, def) {
++      nir_instr *u = nir_src_use_instr(src);
++      if (u->type != nir_instr_type_alu)
++         continue;
++      nir_alu_instr *ua = nir_instr_as_alu(u);
++      *op = ua->op;
++      *src_idx = container_of(src, nir_alu_src, src) - ua->src;
++      return true;
++   }
++   return false;
++}
++
++/* True if no use of a's result comes before instruction index limit in
++ * a's block (the pair is placed at the later conversion)
++ */
++static bool
++uses_after(nir_alu_instr *a, unsigned limit)
++{
++   nir_foreach_use_including_if(src, &a->def) {
++      if (nir_src_is_if(src))
++         return false;
++      nir_instr *u = nir_src_use_instr(src);
++      if (u->block == a->instr.block && u->index < limit)
++         return false;
++   }
++   return true;
++}
++
++/* NAK_F16_PAIR: independent scalar f2f16 (32 -> 16 bit) conversions in a
++ * block become one 2-wide conversion (F2FP.PACK_AB takes the two 32-bit
++ * values from separate registers, so the source vector costs nothing).
++ * The 16-bit math that follows then reads the two lanes of one vector,
++ * which nir_opt_vectorize pairs into HFMA2/HADD2/HMUL2 along the chain.
++ * Partners are picked within a window, preferring one whose first use is
++ * the same operation at the same source.
++ */
++static bool
++nak_nir_pair_f2f16(nir_shader *nir)
++{
++   bool progress = false;
++   nir_foreach_function_impl(impl, nir) {
++      nir_index_instrs(impl);
++      bool impl_progress = false;
++      nir_builder b = nir_builder_create(impl);
++      nir_foreach_block(block, impl) {
++         nir_alu_instr *cand[512];
++         unsigned n = 0;
++         nir_foreach_instr(instr, block) {
++            if (is_f2f16_seed(instr) && n < ARRAY_SIZE(cand))
++               cand[n++] = nir_instr_as_alu(instr);
++         }
++         bool used[ARRAY_SIZE(cand)] = { false };
++         for (unsigned i = 0; i < n; i++) {
++            if (used[i])
++               continue;
++            nir_op op_i;
++            unsigned si_i;
++            const bool has_use_i = first_alu_use(&cand[i]->def, &op_i, &si_i);
++            int best = -1;
++            for (unsigned j = i + 1; j < n && j <= i + 16; j++) {
++               if (used[j] || cand[j]->op != cand[i]->op)
++                  continue;
++               if (!uses_after(cand[i], cand[j]->instr.index))
++                  continue;
++               nir_op op_j;
++               unsigned si_j;
++               if (has_use_i && first_alu_use(&cand[j]->def, &op_j, &si_j) &&
++                   op_j == op_i && si_j == si_i) {
++                  best = j;
++                  break;
++               }
++            }
++            if (best < 0)
++               continue;
++            nir_alu_instr *a = cand[i], *c = cand[best];
++            b.cursor = nir_before_instr(&c->instr);
++            nir_def *src = nir_vec2(&b, nir_ssa_for_alu_src(&b, a, 0),
++                                    nir_ssa_for_alu_src(&b, c, 0));
++            nir_def *pair = nir_build_alu1(&b, a->op, src);
++            nir_def_rewrite_uses(&a->def, nir_channel(&b, pair, 0));
++            nir_def_rewrite_uses(&c->def, nir_channel(&b, pair, 1));
++            nir_instr_remove(&a->instr);
++            nir_instr_remove(&c->instr);
++            used[i] = used[best] = true;
++            impl_progress = true;
++         }
++      }
++      progress |= nir_progress(impl_progress, impl, nir_metadata_control_flow);
++   }
++   return progress;
++}
++
+ static uint8_t
+ vectorize_filter_cb(const nir_instr *instr, const void *data)
+ {
+@@ -196,6 +305,8 @@ nak_optimize_nir(nir_shader *nir, const struct nak_compiler *nak)
+       LOOP_OPT(nir, nir_opt_combine_stores, nir_var_all);
+ 
+       LOOP_OPT(nir, nir_lower_alu_width, vectorize_filter_cb, nak);
++      if (nak_knob_f16_pair() && nak->sm >= 86)
++         LOOP_OPT(nir, nak_nir_pair_f2f16);
+       LOOP_OPT(nir, nir_opt_vectorize, vectorize_filter_cb, (void*)nak);
+       LOOP_OPT(nir, nir_lower_phis_to_scalar, phi_vectorize_cb, NULL);
+       LOOP_OPT(nir, nir_lower_frexp);
 diff --git a/src/nouveau/compiler/nak_nir_lower_tex.c b/src/nouveau/compiler/nak_nir_lower_tex.c
-index 8343644..6af28a4 100644
+index 8343644..c2efc5f 100644
 --- a/src/nouveau/compiler/nak_nir_lower_tex.c
 +++ b/src/nouveau/compiler/nak_nir_lower_tex.c
 @@ -215,6 +215,12 @@ lower_tex(nir_builder *b, nir_tex_instr *tex, const struct nak_compiler *nak)
@@ -448,7 +627,7 @@ index 8343644..6af28a4 100644
     /* Combine sampler and texture into one if needed */
     if (samp_h != NULL && samp_h != tex_h) {
        tex_h = nir_ior(b, nir_iand_imm(b, tex_h,  0x000fffff),
-@@ -227,6 +233,17 @@ lower_tex(nir_builder *b, nir_tex_instr *tex, const struct nak_compiler *nak)
+@@ -227,6 +233,20 @@ lower_tex(nir_builder *b, nir_tex_instr *tex, const struct nak_compiler *nak)
        tex_h = NULL;
     }
  
@@ -457,8 +636,11 @@ index 8343644..6af28a4 100644
 +    * for from_nir), not in the source vectors
 +    */
 +   nir_def *uhandle = NULL;
-+   if (tex_h != NULL && uniform_h && nak->sm >= 100 &&
-+       nak_knob_tex_uhandle() && texop_supports_scalar(tex, nak)) {
++   const uint32_t uh_knob = nak_knob_tex_uhandle();
++   const bool uh_op = uh_knob >= 2 ? texop_supports_scalar(tex, nak) :
++                      uh_knob == 1 && (tex->op == nir_texop_txf ||
++                                       tex->op == nir_texop_txf_ms);
++   if (tex_h != NULL && uniform_h && nak->sm >= 100 && uh_op) {
 +      uhandle = tex_h;
 +      tex_h = NULL;
 +   }
@@ -466,7 +648,7 @@ index 8343644..6af28a4 100644
     /* Array index is treated separately, so pull it off if we have one. */
     nir_def *arr_idx = NULL;
     unsigned coord_components = tex->coord_components;
-@@ -375,7 +392,30 @@ lower_tex(nir_builder *b, nir_tex_instr *tex, const struct nak_compiler *nak)
+@@ -375,7 +395,30 @@ lower_tex(nir_builder *b, nir_tex_instr *tex, const struct nak_compiler *nak)
              PUSH(src1, ms_idx);
        }
  
@@ -497,7 +679,7 @@ index 8343644..6af28a4 100644
  
        nir_tex_instr_add_src(tex, nir_tex_src_backend1,
                              nir_vec(b, src0, src0_comps));
-@@ -443,6 +483,9 @@ lower_tex(nir_builder *b, nir_tex_instr *tex, const struct nak_compiler *nak)
+@@ -443,6 +486,9 @@ lower_tex(nir_builder *b, nir_tex_instr *tex, const struct nak_compiler *nak)
        UNREACHABLE("Unsupported shader model");
     }
  
@@ -508,14 +690,15 @@ index 8343644..6af28a4 100644
  
     struct nak_nir_tex_flags flags = {
 diff --git a/src/nouveau/compiler/nak_private.h b/src/nouveau/compiler/nak_private.h
-index 6207d4c..b74cd44 100644
+index 6207d4c..4983a95 100644
 --- a/src/nouveau/compiler/nak_private.h
 +++ b/src/nouveau/compiler/nak_private.h
-@@ -19,6 +19,7 @@ bool nak_debug_no_ugpr(void);
+@@ -19,6 +19,8 @@ bool nak_debug_no_ugpr(void);
  bool nak_knob_uaddr_pin(void);
  bool nak_knob_fset_bf(void);
  uint32_t nak_knob_gcm(void);
-+bool nak_knob_tex_uhandle(void);
++uint32_t nak_knob_tex_uhandle(void);
++bool nak_knob_f16_pair(void);
  bool nak_knob_nir_flatten(void);
  bool nak_knob_uniform_atomics(void);
  bool nak_knob_loop_cont_sync(void);

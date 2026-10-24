@@ -29,8 +29,8 @@ Classes:
 |---|---:|---:|---:|---:|---:|---:|
 | KMD: service key | 7 | 27 | 26 | 28 | 12 | 100 |
 | UMDs and ICD policy: `HKLM\SOFTWARE\Helios` | 20 | 19 | 25 | 11 | 0 | 75 |
-| Environment variables | 8 | 35 | 102 | 36 | 0 | 181 |
-| All | 35 | 81 | 153 | 75 | 12 | 356 |
+| Environment variables | 8 | 35 | 102 | 35 | 0 | 180 |
+| All | 35 | 81 | 153 | 74 | 12 | 355 |
 
 ## What the installation writes
 
@@ -448,7 +448,7 @@ Per-process: they act only on the process whose environment carries them (and it
 | `VKD3D_SHADER_CACHE_PATH` | `unset`; unset: the bridge sets it per process | first D3D12 device creation | vkd3d-proton's shader cache folder. When unset, the D3D12 bridge sets it to %LOCALAPPDATA%\Helios\vkd3d, else the temp folder, else 0 (no disk cache); a value already set, 0 included, is kept. | [vkd3d_bridge.cpp:1174](../guest/windows/umd12/bridge/vkd3d_bridge.cpp#L1174) |
 | `ZINK_VULKAN_ICD` | `unset` | once per process | The Vulkan ICD Zink loads on Windows: a DLL path, or loader for the Vulkan loader; unset loads NVK from next to the driver or the Helios install directory. | [0034-zink-load-a-Vulkan-ICD-directly-on-Windows-NVK-on-RM.patch:76](../guest/nvk-rm/patches-windows/0034-zink-load-a-Vulkan-ICD-directly-on-Windows-NVK-on-RM.patch#L76) |
 
-### Experiment, not for users (36)
+### Experiment, not for users (35)
 
 | Name | Default (code) | Read | Effect | Source |
 |---|---|---|---|---|
@@ -469,7 +469,6 @@ Per-process: they act only on the process whose environment carries them (and it
 | `NAK_LAT` | `unset` | first shader compile (once per process) | Bitmask, default 0: SM120 register dependency pairs that wait the SM100 latency instead of one cycle more: 1 FMA-class chains, 2 FMA/ALU cross pairs, 4 predicate guards, 8 coupled carry predicates, 16 uniform datapath, 64 LOP3/PRMT/SHF chains, 128 every pair (unsafe upper bound). For hardware validation with naktest only. Part of the shader cache key. | [0063-nak-scoreboard-sharing-and-SM120-latency-padding-kno.patch:199](../guest/nvk-rm/patches-common/0063-nak-scoreboard-sharing-and-SM120-latency-padding-kno.patch#L199) |
 | `NAK_NIR_FLATTEN` | `unset` | first shader compile (once per process) | 1 lets NIR flatten small ifs into selects (nir_opt_peephole_select limit 8). Fewer instructions, but the values of both sides are live at once, which costs occupancy on some shaders. Off by default. Part of the shader cache key. | [0060-nak-if-conversion-after-register-allocation-NAK_IF_C.patch:92](../guest/nvk-rm/patches-common/0060-nak-if-conversion-after-register-allocation-NAK_IF_C.patch#L92) |
 | `NAK_SCHED_ILP` | `unset` | first shader compile (once per process) | 1: NAK's pre-RA scheduler enters an instruction in its ready set at the cycle its edge latencies give, with the plain latency model, instead of placing a producer right above its consumer. Default 0. Part of the shader cache key. | [0087-nak-NAK_SCHED_ILP-prepass-honors-latencies-NAK_FSET_.patch:137](../guest/nvk-rm/patches-common/0087-nak-NAK_SCHED_ILP-prepass-honors-latencies-NAK_FSET_.patch#L137) |
-| `NAK_TEX_UHANDLE` | `unset` | first shader compile (once per process) | 1 (SM100+): a bindless texture handle that is the same in every lane goes in the uniform register field of TEX, TLD and TLD4 with the scalar source form (.SCR, at most four source components), as in the reference compiler's code, which also saves the copies that build contiguous source vectors; instructions with more source components keep the handle in the second source vector. naktest has texture tests for it. Default 0. Part of the shader cache key. | [0089-nak-uniform-texture-handles-NAK_TEX_UHANDLE-occupanc.patch:203](../guest/nvk-rm/patches-common/0089-nak-uniform-texture-handles-NAK_TEX_UHANDLE-occupanc.patch#L203) |
 | `NAK_WEAK_MEM` | `unset` | first shader compile (once per process) | 1: global, SSBO and image loads and stores that are not coherent, volatile or atomic use the weak memory order (L1-cacheable plain LDG/STG/SULD/SUST, as NVIDIA's own code does) instead of .STRONG.GPU, which sends every load to L2. Barriers keep the needed cache write-backs and invalidations. Off by default: no measurable change in Steel Nomad, per shader or in frame rate. Part of the shader cache key. | [0067-nak-NAK_WEAK_MEM-weak-memory-order-for-non-coherent-.patch:145](../guest/nvk-rm/patches-common/0067-nak-NAK_WEAK_MEM-weak-memory-order-for-non-coherent-.patch#L145) |
 | `NAK_YIELD` | `unset` | first shader compile (once per process) | 1 (SM120): control bit 109 on instructions followed by a stall of 1-2 cycles, as the reference compiler sets it. Default 0. NAK_REUSE needs it. Part of the shader cache key. | [0086-nak-issue-efficiency-knobs-from-the-SM120-SASS-compa.patch:218](../guest/nvk-rm/patches-common/0086-nak-issue-efficiency-knobs-from-the-SM120-SASS-compa.patch#L218) |
 | `NVK_BARRIER_DEDUP` | `false` | first use (once per process) | 1: a pipeline barrier whose storage-write flush already invalidated the shader data caches emits no second GLOBAL_DATA invalidate. A/B knob, default 0. | [0082-nvk-QMDs-next-to-the-compute-root-tables-NVK_QMD_LAT.patch:128](../guest/nvk-rm/patches-common/0082-nvk-QMDs-next-to-the-compute-root-tables-NVK_QMD_LAT.patch#L128) |
