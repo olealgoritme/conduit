@@ -38,7 +38,7 @@ The registry values are read when a swapchain is made and again whenever
 `HKLM\SOFTWARE\Helios` changes (a registry change notification; no polling
 of the registry itself). The environment wins over a profile, a profile over
 the global values. A change of the scaler on or off, frame generation on or
-off, the fit, or a multiplier needing more output slots makes the next
+off, the whole path on or off (the overlay alone), the fit, or a multiplier needing more output slots makes the next
 present return `VK_SUBOPTIMAL_KHR`, and the application makes a new
 swapchain; the scaler filter, sharpness, multiplier within the slots and
 pacing settings take effect at once.
@@ -55,6 +55,7 @@ pacing settings take effect at once.
 | `EnhanceWindows` (REG_SZ) | | `MESA_WSI_ENHANCE_WINDOWS` | `fullscreen`, `all` | `fullscreen` |
 | `EnhanceStats` (DWORD) | | `MESA_WSI_ENHANCE_STATS` | 1: a CSV row per frame | 0 |
 | `EnhanceD3D` (DWORD) | `D3D` | `MESA_WSI_ENHANCE_D3D` | 0: D3D11/D3D12 swap chains are left to DXGI | 1 |
+| `EnhanceOverlay` (DWORD) | `Overlay` | `MESA_WSI_ENHANCE_OVERLAY` | 1: the [on-screen counter](#on-screen-counter); on its own it turns the path on (a 1:1 copy with the counter) | 0 |
 | | | `MESA_WSI_ENHANCE_SHOW` | `generated`: only generated pictures are shown (to look at them) | all |
 
 The Conduit tray (`conduit-gpu-tray`, elevated) sets the global values from
@@ -245,6 +246,26 @@ GPU times come from timestamps around each stage of the submission. With
 `EnhanceStats=1` there is also `enhance-<pid>-<id>.csv` with a row per
 frame (frame, pictures, interval, the stage times). Generated pictures are
 ordinary DXGI presents of the process: PresentMon counts them.
+
+### On-screen counter
+
+`EnhanceOverlay=1` (or `Overlay` in a profile, `MESA_WSI_ENHANCE_OVERLAY=1`)
+draws a line at the top left of every presented picture, generated ones
+included:
+
+```
+80 / 160  FG 2x  FSR
+```
+
+the application's frames per second, the pictures shown per second (real
+and generated, what reaches DXGI), the frame generation mode (`FG 2x`..`4x`,
+`FG AUTO`) and the scaler. The numbers are counted over the last half
+second, the line is rebuilt twice a second. `enh_text.comp` draws it with a
+5x7 font of its own in a dark box, one dispatch per picture over the box
+only; a font pixel is the picture's height / 360 pixels (at least 2): 9 rows
+of 3 pixels at 1080p, of 4 at 1440p.
+
+![counter, D3D12 at 5120x1440, FSR and 2x](enhance-overlay.png)
 
 ## Cost
 

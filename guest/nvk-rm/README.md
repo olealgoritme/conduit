@@ -125,7 +125,7 @@ Patch numbers are file numbers in the directory named in the patch tables.
 | `MESA_WSI_COMPOSE_ADAPTER` | auto | D3D11 adapter index of the composed path |
 | `MESA_WSI_ENHANCE_SCALER` | registry, else off | upscaling in the composed present: `off`, `fsr`, `nis`, `sgsr`, `cas`, `bicubic`, `bilinear`, `nearest`, `integer`, `xbr`, `a4k-3d`, `a4k`, `a4k-vl` (see [docs/enhance.md](docs/enhance.md); dxvk 0008, 0013, 0015) |
 | `MESA_WSI_ENHANCE_FG` | registry, else off | frame generation in the composed present: `off`, `2x`, `3x`, `4x`, `adaptive` |
-| `MESA_WSI_ENHANCE_SHARPNESS`, `_FG_TARGET`, `_FG_QUALITY`, `_LOW_LATENCY`, `_FIT`, `_WINDOWS`, `_STATS`, `_SHOW`, `_D3D` | registry, else 50, 0, fast, 0, aspect, fullscreen, 0, all, 1 | the other enhancement settings ([docs/enhance.md](docs/enhance.md#settings)) |
+| `MESA_WSI_ENHANCE_SHARPNESS`, `_FG_TARGET`, `_FG_QUALITY`, `_LOW_LATENCY`, `_FIT`, `_WINDOWS`, `_STATS`, `_SHOW`, `_D3D`, `_OVERLAY` | registry, else 50, 0, fast, 0, aspect, fullscreen, 0, all, 1, 0 | the other enhancement settings ([docs/enhance.md](docs/enhance.md#settings)) |
 | **Helios interface** | | |
 | `NVK_HELIOS_RESID`, `NVK_HELIOS_FORMATS` | 1 | resource ids for shared images; the wider shared-format set |
 | `NVK_HELIOS_MODIFIERS` | 1 | advertise `VK_EXT_image_drm_format_modifier` on Windows |
@@ -321,6 +321,7 @@ Each patch builds on its own.
 | 0013 | the `nis`, `cas`, `sgsr` and `xbr` scalers; `enhance/adapt.py` turns copies of the SGSR and xBR fragment shaders into functions and NIS's coefficient tables into constants at build time |
 | 0014 | Anime4K's CNN x2 upscalers (3DGraphics US, CNN M, CNN VL; MIT), vendored unmodified |
 | 0015 | the learned upscaler tier `a4k-3d`, `a4k`, `a4k-vl`: `adapt.py a4k` turns each mpv user shader into compute passes (one SPIR-V each) and a pass table at build time |
+| 0016 | the on-screen counter (`EnhanceOverlay`, `MESA_WSI_ENHANCE_OVERLAY`): base / shown frames per second, the frame generation mode and the scaler, drawn into every presented picture by `enh_text.comp` (a 5x7 font of its own); default off |
 
 ## `patches-common/`: generic NVK work
 
