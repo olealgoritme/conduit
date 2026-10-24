@@ -3579,37 +3579,62 @@ unsafe fn zero_paging_fences(values: *mut ddi12::UINT64, count: ddi12::UINT) {
     }
 }
 
-/// `pfnMakeResident`.
-///
-/// ⭐ **Hit twice inside one `D3D12CreateDevice` on the passing `D12-G7` run**,
-/// which is why it needed a real body before anything else could work.
-///
-/// The honest answer is `S_OK` with no paging fence, and the reasoning is
-/// `DDI_REFERENCE.md` §9.8's: **VidMm owns residency**, and it owns it for
-/// *allocations*, of which this driver has none. vkd3d's memory is minted by the
-/// Mesa venus ICD through its own `D3DKMT` path, so no object reachable from
-/// this DDI carries a `D3DKMT_HANDLE` this driver could hand to
-/// `pfnMakeResidentCb` — which is the same fact
-/// [`check_resource_allocation_handle`] reports. There is nothing to page in,
-/// so the operation is already complete, and "already complete" is `S_OK`.
-///
-/// ⛔ **`E_PENDING` is the one thing that must never be faked here.** §9.8: an
-/// `E_PENDING` without a valid `pPagingFenceValue` / `WaitMask` *"hangs the
-/// caller with no error anywhere"*. Returning `S_OK` makes the fence protocol
-/// unreachable by construction rather than merely unused.
-///
-/// ⚠ The paging fences and `WaitMask` are still written. The header marks them
-/// meaningful *"only if MakeResident returns E_PENDING"*, so a runtime that
-/// obeys its own comment never reads them — but the cost of writing zeros is
-/// nothing and the cost of being wrong about that is a device.
+/// Collect the adopted WDDM allocations for pageable objects. A committed
+/// heap's map anchor is its base resource, which keys the identity table;
+/// objects without an adopted allocation are managed by the ICD.
 ///
 /// # Safety
-/// `arg`, when non-null, must be a live `D3D12DDIARG_MAKERESIDENT_0001` whose
-/// `pPagingFenceValue` addresses `NumAdapters` writable `UINT64`s.
+/// `objects` must name `count` live runtime objects when `count` is nonzero.
+unsafe fn residency_allocations(
+    objects: *const ddi12::D3D12DDI_HANDLE_AND_TYPE,
+    count: ddi12::UINT,
+) -> Result<Vec<ddi12::D3DKMT_HANDLE>, Hresult> {
+    if count != 0 && objects.is_null() {
+        return Err(E_INVALIDARG);
+    }
+    let mut allocations = Vec::new();
+    for index in 0..count as usize {
+        // SAFETY: the runtime supplies count live, typed object handles.
+        let object = unsafe { &*objects.add(index) };
+        // SAFETY: Handle names the live private block selected by Type.
+        let resource = unsafe {
+            match object.Type {
+                ddi12::D3D12DDI_HANDLETYPE_D3D12DDI_HT_HEAP => {
+                    let heap = heap_state(ddi12::D3D12DDI_HHEAP {
+                        pDrvPrivate: object.Handle,
+                    })
+                    .ok_or(E_INVALIDARG)?;
+                    heap.map_anchor.as_ref()
+                }
+                ddi12::D3D12DDI_HANDLETYPE_D3D12DDI_HT_0012_RESOURCE => {
+                    engine_resource(ddi12::D3D12DDI_HRESOURCE {
+                        pDrvPrivate: object.Handle,
+                    })
+                }
+                _ => None,
+            }
+        };
+        if let Some(identity) = resource.and_then(|r| identity12::lookup(r.as_raw() as usize)) {
+            allocations.push(identity.h_allocation);
+        }
+    }
+    allocations.sort_unstable();
+    allocations.dedup();
+    Ok(allocations)
+}
+
+/// Make the driver's adopted WDDM allocations resident, independently of the
+/// engine's Vulkan memory. The runtime waits for any returned paging fence.
+///
+/// # Safety
+/// `h_device` must name a live device. `arg`, when non-null, must name a live
+/// `D3D12DDIARG_MAKERESIDENT_0001` with `NumObjects` live typed objects and
+/// `NumAdapters` paging queues and writable fence values.
 unsafe extern "system" fn make_resident(
-    _h_device: ddi12::D3D12DDI_HDEVICE,
+    h_device: ddi12::D3D12DDI_HDEVICE,
     arg: *mut ddi12::D3D12DDIARG_MAKERESIDENT_0001,
 ) -> Hresult {
+    const E_PENDING: Hresult = 0x8000_000Au32 as i32;
     ddi_time!("make_resident");
     if arg.is_null() {
         note_refusal(&L4_REFUSALS.residency_bad_arg);
@@ -3622,6 +3647,46 @@ unsafe extern "system" fn make_resident(
     a.WaitMask = 0;
 
     L4_REFUSALS.make_resident_calls.bump();
+    // SAFETY: the DDI supplies live objects and the device that owns them.
+    let allocations = match unsafe { residency_allocations(a.pObjects, a.NumObjects) } {
+        Ok(allocations) => allocations,
+        Err(hr) => {
+            note_refusal(&L4_REFUSALS.residency_bad_arg);
+            return hr;
+        }
+    };
+    if allocations.is_empty() {
+        return S_OK;
+    }
+    if a.NumAdapters != 1 || a.pRTPagingQueue.is_null() || a.pPagingFenceValue.is_null() {
+        note_refusal(&L4_REFUSALS.residency_bad_arg);
+        return E_INVALIDARG;
+    }
+    // SAFETY: the runtime supplies the live device for this DDI.
+    let Some(dev) = (unsafe { device12::device(h_device) }) else {
+        return E_INVALIDARG;
+    };
+    // SAFETY: create_device retains this table for the device's lifetime.
+    let Some(callbacks) = (unsafe { dev.um_callbacks.as_ref() }) else {
+        return E_NOTIMPL;
+    };
+    let Some(make_resident_cb) = callbacks.pfnMakeResidentCb else {
+        return E_NOTIMPL;
+    };
+    let mut request = ddi12::D3DDDI_MAKERESIDENT {
+        NumAllocations: allocations.len() as u32,
+        AllocationList: allocations.as_ptr(),
+        Flags: a.Flags,
+        ..Default::default()
+    };
+    // SAFETY: the callback and paging queue belong to this runtime device;
+    // request borrows the live allocation array for this call.
+    let hr = unsafe { make_resident_cb(dev.h_rt_device, *a.pRTPagingQueue, &mut request) };
+    if hr == E_PENDING {
+        // SAFETY: the runtime supplies one writable fence entry.
+        unsafe { core::ptr::write_unaligned(a.pPagingFenceValue, request.PagingFenceValue) };
+        a.WaitMask = 1;
+    }
     let n = L4_REFUSALS.make_resident_calls.get();
     if n <= LOG_BUDGET {
         // ⚠ `D3DDDI_MAKERESIDENT_FLAGS` is a bitfield struct, not an integer;
@@ -3631,24 +3696,24 @@ unsafe extern "system" fn make_resident(
         // runtime can have performed -- there is no invalid `u32`.
         let flags = unsafe { a.Flags.__bindgen_anon_1.Value };
         log_error!(
-            "L4: MakeResident objects={} adapters={} flags={flags:#x} -> S_OK, no paging fence \
-             (VidMm owns residency; this driver mints no allocations) (x{n})",
-            a.NumObjects,
-            a.NumAdapters,
+            "L4: MakeResident allocations={} flags={flags:#x} hr={:#010x} fence={} (x{n})",
+            allocations.len(),
+            hr as u32,
+            request.PagingFenceValue,
         );
     }
-    S_OK
+    hr
 }
 
 /// `pfnEvict`.
 ///
-/// The counterpart of [`make_resident`] and honest for the same reason: there is
-/// no allocation to evict, so there is nothing to fail.
+/// Release the residency references acquired by [`make_resident`].
 ///
 /// # Safety
-/// `arg`, when non-null, must be a live `D3D12DDIARG_EVICT`.
+/// `h_device` must name a live device. `arg`, when non-null, must name a live
+/// `D3D12DDIARG_EVICT` with `NumObjects` live typed objects.
 unsafe extern "system" fn evict(
-    _h_device: ddi12::D3D12DDI_HDEVICE,
+    h_device: ddi12::D3D12DDI_HDEVICE,
     arg: *const ddi12::D3D12DDIARG_EVICT,
 ) -> Hresult {
     ddi_time!("evict");
@@ -3657,7 +3722,37 @@ unsafe extern "system" fn evict(
         return E_INVALIDARG;
     }
     L4_REFUSALS.evict_calls.bump();
-    S_OK
+    // SAFETY: non-null DDI arguments and their live, typed object array.
+    let a = unsafe { &*arg };
+    let allocations = match unsafe { residency_allocations(a.pObjects, a.NumObjects) } {
+        Ok(allocations) => allocations,
+        Err(hr) => {
+            note_refusal(&L4_REFUSALS.residency_bad_arg);
+            return hr;
+        }
+    };
+    if allocations.is_empty() {
+        return S_OK;
+    }
+    // SAFETY: the runtime supplies the live device for this DDI.
+    let Some(dev) = (unsafe { device12::device(h_device) }) else {
+        return E_INVALIDARG;
+    };
+    // SAFETY: create_device retains this table for the device's lifetime.
+    let Some(callbacks) = (unsafe { dev.um_callbacks.as_ref() }) else {
+        return E_NOTIMPL;
+    };
+    let Some(evict_cb) = callbacks.pfnEvictCb else {
+        return E_NOTIMPL;
+    };
+    let request = ddi12::D3DDDICB_EVICT {
+        NumAllocations: allocations.len() as u32,
+        AllocationList: allocations.as_ptr(),
+        Flags: a.Flags,
+        ..Default::default()
+    };
+    // SAFETY: this device's callback, borrowing a live allocation array.
+    unsafe { evict_cb(dev.h_rt_device, &request) }
 }
 
 /// `pfnOfferResources`.
@@ -4596,8 +4691,7 @@ struct L4Refusals {
     /// `pfnReclaimResources` calls served, each of which reported every object
     /// as not discarded. ⚠ Not a refusal.
     reclaim_resources_calls: RefusalCounter,
-    /// A residency DDI arrived with a null argument struct. Expected 0 — all
-    /// four declare their argument non-optional.
+    /// A residency DDI received invalid arguments or object handles.
     residency_bad_arg: RefusalCounter,
     /// ⛔ **`D3D12DDI_HEAP_FLAG_PRIMARY` arrived and was dropped from the
     /// `D3D12_HEAP_FLAGS` word this driver hands the engine**, because the API
