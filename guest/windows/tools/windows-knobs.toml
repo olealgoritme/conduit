@@ -600,6 +600,60 @@ read = "each DWM start with DwmIcd=nvk"
 effect = "How many DWM starts on NVK within DwmNvkGuardSeconds that never got healthy (DwmNvkHealthySeconds) send the next start to Venus (the crash-loop guard; pending starts are kept in %ProgramData%\\Helios\\dwm-nvk-starts.txt; only starts of the installed driver build in other DWM processes count). If Venus then cannot create DWM's device, DWM runs on NVK after all. 0 disables the guard."
 see = "[dwm-on-nvk.md](dwm-on-nvk.md)"
 
+[umd.EnhanceFgQuality]
+class = "supported"
+read = "each swapchain creation and every registry change (composed present)"
+effect = "Optical flow of frame generation: fast (down to 1/4 of the frame) or quality (down to 1/2, one more coarse level, twice the reach and about twice the flow cost). A per-exe profile's FgQuality wins."
+see = "[enhance.md](../guest/nvk-rm/docs/enhance.md)"
+
+[umd.EnhanceFgTarget]
+class = "supported"
+read = "each swapchain creation and every registry change (composed present)"
+effect = "Adaptive frame generation fills to this many pictures per second; 0 or absent: the display's refresh. With LowLatency and a fixed multiplier, generation stops while the game reaches it. A per-exe profile's FgTarget wins."
+see = "[enhance.md](../guest/nvk-rm/docs/enhance.md)"
+
+[umd.EnhanceFit]
+class = "supported"
+read = "each swapchain creation and every registry change (composed present)"
+effect = "aspect (default): the upscaled picture keeps its aspect ratio with black bars; stretch fills the window. A change makes the application recreate its swapchain. A per-exe profile's Fit wins."
+see = "[enhance.md](../guest/nvk-rm/docs/enhance.md)"
+
+[umd.EnhanceFrameGen]
+class = "supported"
+read = "each swapchain creation and every registry change (composed present)"
+effect = "Frame generation in NVK's composed present: off (default), 2x, 3x, 4x or adaptive (fill to EnhanceFgTarget or the refresh, up to 8 pictures per frame). Generated pictures are interpolated from the last two frames by optical flow and presented between them, paced; native Vulkan and Zink swapchains only, not D3D11/D3D12. A per-exe profile under HKLM\\SOFTWARE\\Helios\\Enhance\\<exe> (value FrameGen) wins; the tray sets it."
+see = "[enhance.md](../guest/nvk-rm/docs/enhance.md)"
+
+[umd.EnhanceLowLatency]
+class = "supported"
+read = "each swapchain creation and every registry change (composed present)"
+effect = "1: generated pictures one refresh apart, so the real frame is held back less (the cadence gets uneven); with a fixed multiplier and EnhanceFgTarget, no generation while the game reaches the target. A per-exe profile's LowLatency wins."
+see = "[enhance.md](../guest/nvk-rm/docs/enhance.md)"
+
+[umd.EnhanceScaler]
+class = "supported"
+read = "each swapchain creation and every registry change (composed present)"
+effect = "Upscaling in NVK's composed present: off (default), fsr (FidelityFX FSR 1), bicubic, bilinear, nearest or integer. The surface then reports no current extent, so the application renders at its own size and the picture is scaled to the window. Native Vulkan and Zink swapchains only, not D3D11/D3D12. A per-exe profile under HKLM\\SOFTWARE\\Helios\\Enhance\\<exe> (value Scaler) wins; the tray sets it."
+see = "[enhance.md](../guest/nvk-rm/docs/enhance.md)"
+
+[umd.EnhanceSharpness]
+class = "supported"
+read = "each swapchain creation and every registry change (composed present)"
+effect = "0..100, FSR's RCAS sharpening (0: EASU alone); absent: 50. A per-exe profile's Sharpness wins."
+see = "[enhance.md](../guest/nvk-rm/docs/enhance.md)"
+
+[umd.EnhanceStats]
+class = "debug"
+read = "each swapchain creation and every registry change (composed present)"
+effect = "1: a CSV row per frame (pictures, interval, GPU time per pass) in %ProgramData%\\Helios\\enhance-<pid>-<id>.csv; the 5 s summary in helios-wsi-<pid>.log is always written while enhancement runs."
+see = "[enhance.md](../guest/nvk-rm/docs/enhance.md)"
+
+[umd.EnhanceWindows]
+class = "supported"
+read = "each swapchain creation and every registry change (composed present)"
+effect = "fullscreen (default): the global Enhance settings apply to windows that cover their monitor (borderless and fullscreen); all: to every window. Per-exe profiles always apply to every window of that executable."
+see = "[enhance.md](../guest/nvk-rm/docs/enhance.md)"
+
 [umd.FeatureLevel11]
 class = "debug"
 read = "once per process"
@@ -1330,6 +1384,66 @@ effect = "Index of the DXGI adapter the Win32 WSI's composed present uses for it
 class = "tuning"
 read = "swapchain creation"
 effect = "1 hands composed presents to a WSI thread so the application's present call does not wait for the D3D11 flip; 0 presents on the calling thread."
+
+[env.MESA_WSI_ENHANCE_FG]
+class = "supported"
+read = "each swapchain creation"
+effect = "Frame generation for this process (off, 2x, 3x, 4x, adaptive); wins over the registry EnhanceFrameGen and per-exe profiles, and applies to every window of the process."
+see = "[enhance.md](../guest/nvk-rm/docs/enhance.md)"
+
+[env.MESA_WSI_ENHANCE_FG_QUALITY]
+class = "supported"
+read = "each swapchain creation"
+effect = "fast or quality optical flow; wins over EnhanceFgQuality."
+see = "[enhance.md](../guest/nvk-rm/docs/enhance.md)"
+
+[env.MESA_WSI_ENHANCE_FG_TARGET]
+class = "supported"
+read = "each swapchain creation"
+effect = "Pictures per second adaptive generation fills to (0: the refresh); wins over EnhanceFgTarget."
+see = "[enhance.md](../guest/nvk-rm/docs/enhance.md)"
+
+[env.MESA_WSI_ENHANCE_FIT]
+class = "supported"
+read = "each swapchain creation"
+effect = "aspect or stretch; wins over EnhanceFit."
+see = "[enhance.md](../guest/nvk-rm/docs/enhance.md)"
+
+[env.MESA_WSI_ENHANCE_LOW_LATENCY]
+class = "supported"
+read = "each swapchain creation"
+effect = "1 or 0; wins over EnhanceLowLatency."
+see = "[enhance.md](../guest/nvk-rm/docs/enhance.md)"
+
+[env.MESA_WSI_ENHANCE_SCALER]
+class = "supported"
+read = "each swapchain creation"
+effect = "Upscaling for this process (off, fsr, bicubic, bilinear, nearest, integer); wins over the registry EnhanceScaler and per-exe profiles, and applies to every window of the process."
+see = "[enhance.md](../guest/nvk-rm/docs/enhance.md)"
+
+[env.MESA_WSI_ENHANCE_SHARPNESS]
+class = "supported"
+read = "each swapchain creation"
+effect = "0..100 for FSR's RCAS; wins over EnhanceSharpness."
+see = "[enhance.md](../guest/nvk-rm/docs/enhance.md)"
+
+[env.MESA_WSI_ENHANCE_SHOW]
+class = "debug"
+read = "once per process"
+effect = "generated: only the generated pictures are presented (the real frames are dropped), to look at the interpolation."
+see = "[enhance.md](../guest/nvk-rm/docs/enhance.md)"
+
+[env.MESA_WSI_ENHANCE_STATS]
+class = "debug"
+read = "each swapchain creation"
+effect = "1: the per-frame CSV (as EnhanceStats)."
+see = "[enhance.md](../guest/nvk-rm/docs/enhance.md)"
+
+[env.MESA_WSI_ENHANCE_WINDOWS]
+class = "supported"
+read = "each swapchain creation"
+effect = "fullscreen or all; wins over EnhanceWindows."
+see = "[enhance.md](../guest/nvk-rm/docs/enhance.md)"
 
 [env.MESA_WSI_SCANOUT_HZ]
 class = "experiment"
