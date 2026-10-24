@@ -115,15 +115,16 @@ static uint64_t fnv64(const void *data, uint64_t n, uint64_t h)
 
 /* ------------------------------------------------------------------------------------------- options */
 static struct {
-    int n, warm, reset, compile_only, list, robust, verbose, no_draw, split, ts_only;
+    int n, warm, reset, compile_only, list, robust, verbose, no_draw, split, ts_only, seq, seq_barriers;
     const char *dev, *dump, *csv, *label, *dump_cache;
     int grid_override; uint32_t grid[3];
-} O = { 15, 5, 1, 0, 0, 1, 0, 0, 0, 0, NULL, NULL, NULL, NULL, NULL, 0, { 0, 0, 0 } };
+} O = { 15, 5, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, NULL, NULL, NULL, NULL, NULL, 0, { 0, 0, 0 } };
 
 static void usage(void)
 {
     fprintf(stderr,
         "usage: dispatch-replay [options] CAPTURE_DIR\n"
+        "       dispatch-replay --seq [options] CAPTURE_DIR...  (the dispatches of an NVK_DISPATCH_CAPTURE_SEQ sequence)\n"
         "  -n N            timed dispatches (default 15; the median is reported)\n"
         "  -w N            warm-up dispatches before them (default 5)\n"
         "  --no-reset      do not restore writable resources before each dispatch\n"
@@ -139,6 +140,9 @@ static void usage(void)
         "  --no-robust     do not enable robustBufferAccess / robustness2 (vkd3d-proton enables them)\n"
         "  --compile-only  create the pipeline and exit (works with drm-shim)\n"
         "  --dump-cache F  create the pipeline with an empty pipeline cache and write its data to F\n"
+        "  --seq           replay several dispatch captures of one sequence (manifest \"sequence\") in their order in one\n"
+        "                  command buffer, a compute barrier where the game had a pipeline barrier; the time is per sequence\n"
+        "  --seq-barriers M  with --seq: captured (default), all (a barrier between every two dispatches) or none\n"
         "  -v              print every resource\n");
     exit(2);
 }
@@ -930,6 +934,131 @@ static void write_descriptors(void)
 /* ------------------------------------------------------------------------------------------- run */
 static int cmp_d(const void *a, const void *b) { double x = *(const double *)a, y = *(const double *)b; return x < y ? -1 : x > y; }
 
+/* --seq: the dispatches of one NVK_DISPATCH_CAPTURE_SEQ sequence, each with its own captured resources (no
+ * data flows from one to the next: every dispatch reads the inputs it had in the game), replayed in their
+ * order in one command buffer, with a compute-to-compute barrier where the game recorded a pipeline barrier;
+ * dispatches without a barrier between them may run concurrently, as in the game */
+struct seq_item {
+    char *dir; uint32_t index; int barrier; char hash[32];
+    VkPipeline pipe; VkPipelineLayout pl; VkDescriptorSet sets[8]; uint32_t nsets;
+    uint8_t push[256]; uint32_t push_size; uint32_t base[3], grid[3];
+};
+
+static int cmp_seq(const void *a, const void *b)
+{
+    const struct seq_item *x = a, *y = b;
+    return x->index < y->index ? -1 : x->index > y->index;
+}
+
+static void compute_barrier(VkCommandBuffer cb)
+{
+    VkMemoryBarrier mb = { VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_SHADER_WRITE_BIT,
+                           VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT };
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL,
+                         0, NULL);
+}
+
+static int run_seq(int ndirs, char **dirs)
+{
+    struct seq_item *S = calloc((size_t)ndirs, sizeof *S);
+    uint32_t seq_id = 0;
+    create_device();
+    double compile_ms = 0; uint64_t bytes = 0; int nres = 0, nerr = 0;
+    for (int d = 0; d < ndirs; d++) {
+        struct seq_item *it = &S[d];
+        it->dir = dirs[d]; g_dir = dirs[d];
+        char *text = read_file("manifest.json", NULL, 1);
+        struct json *m = json_parse(text);
+        if (!m || strcmp(jstr(m, "format", ""), "nvk-dispatch-capture")) die("%s: not an nvk-dispatch-capture manifest", g_dir);
+        if (!strcmp(jstr(m, "kind", "dispatch"), "draw")) die("%s: --seq replays dispatches only", g_dir);
+        const struct json *sq = jget(m, "sequence");
+        if (!sq || jnum(sq, "id", 0) == 0) die("%s: not part of a sequence (NVK_DISPATCH_CAPTURE_SEQ)", g_dir);
+        if (seq_id == 0) seq_id = (uint32_t)jnum(sq, "id", 0);
+        else if ((uint32_t)jnum(sq, "id", 0) != seq_id) die("%s: sequence %u, not %u", g_dir, (uint32_t)jnum(sq, "id", 0), seq_id);
+        it->index = (uint32_t)jnum(sq, "index", 0); it->barrier = jbool(sq, "barrier_before", 0);
+        snprintf(it->hash, sizeof it->hash, "%s", jstr(m, "src_hash", "?"));
+        snprintf(g_hash, sizeof g_hash, "%s", it->hash);
+        uint64_t spv_size = 0; uint32_t *spv = read_file(jstr(m, "spirv", "shader.spv"), &spv_size, 1);
+        { uint64_t n = 0; uint8_t *pp = read_file(jstr(m, "push", "push.bin"), &n, 1); memcpy(it->push, pp, n < 256 ? n : 256); free(pp); }
+        it->push_size = (uint32_t)jnum(m, "push_size", 0);
+        for (int k = 0; k < 3; k++) {
+            it->grid[k] = (uint32_t)(jidx(jget(m, "grid"), k) ? jidx(jget(m, "grid"), k)->num : 1);
+            it->base[k] = (uint32_t)(jidx(jget(m, "base_group"), k) ? jidx(jget(m, "base_group"), k)->num : 0);
+        }
+        if (jbool(m, "indirect", 0)) fprintf(stderr, "%s: indirect dispatch, replayed with its captured grid %ux%ux%u\n",
+                                             g_dir, it->grid[0], it->grid[1], it->grid[2]);
+        NR = 0; NB = 0; memset(B, 0, sizeof B);
+        load_manifest(m);
+        create_pipeline(spv, spv_size, it->push_size);
+        compile_ms += g_compile_ms;
+        create_resources(it->push);
+        upload_all();
+        write_descriptors();
+        for (int k = 0; k < NR; k++) { bytes += R[k].size; nerr += R[k].kind == R_ERROR; }
+        nres += NR;
+        it->pipe = g_pipe; it->pl = g_pl; it->nsets = g_nsets; memcpy(it->sets, g_sets, sizeof it->sets);
+    }
+    qsort(S, (size_t)ndirs, sizeof *S, cmp_seq);
+    for (int d = 0; d < ndirs; d++)
+        if (S[d].index != S[0].index + (uint32_t)d)
+            fprintf(stderr, "warning: sequence %u: dispatch %u is missing\n", seq_id, S[0].index + (uint32_t)d);
+    int nbar = 0;
+    for (int d = 1; d < ndirs; d++) nbar += O.seq_barriers == 1 ? 1 : O.seq_barriers == 2 ? 0 : S[d].barrier;
+
+    const uint32_t total = (uint32_t)(O.warm + O.n);
+    if (total > 4096) die("too many repeats");
+    VkQueryPoolCreateInfo qpi = { VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, NULL, 0, VK_QUERY_TYPE_TIMESTAMP, 2 * total, 0 };
+    VkQueryPool qp; VK(vkCreateQueryPool(g_dev, &qpi, NULL, &qp));
+    VkCommandBuffer cb = begin_cmd();
+    vkCmdResetQueryPool(cb, qp, 0, 2 * total);
+    for (uint32_t r = 0; r < total; r++) {
+        full_barrier(cb);
+        vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, qp, 2 * r);
+        for (int d = 0; d < ndirs; d++) {
+            const struct seq_item *it = &S[d];
+            int bar = O.seq_barriers == 1 ? d > 0 : O.seq_barriers == 2 ? 0 : (d > 0 && it->barrier);
+            if (bar) compute_barrier(cb);
+            vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, it->pipe);
+            for (uint32_t s2 = 0; s2 < it->nsets; s2++)
+                vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, it->pl, s2, 1, &it->sets[s2], 0, NULL);
+            if (it->push_size) vkCmdPushConstants(cb, it->pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, (it->push_size + 3) & ~3u, it->push);
+            vkCmdDispatchBase(cb, it->base[0], it->base[1], it->base[2], it->grid[0], it->grid[1], it->grid[2]);
+        }
+        vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, qp, 2 * r + 1);
+    }
+    full_barrier(cb);
+    double t0 = now_ms();
+    submit_wait(cb);
+    double wall = now_ms() - t0;
+    uint64_t ts[2 * 4096];
+    VK(vkGetQueryPoolResults(g_dev, qp, 0, 2 * total, sizeof(uint64_t) * 2 * total, ts, sizeof(uint64_t),
+                             VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT));
+    double *us = calloc(O.n, sizeof *us), sum = 0;
+    for (int k = 0; k < O.n; k++) {
+        uint32_t r = (uint32_t)(O.warm + k);
+        us[k] = (double)(ts[2 * r + 1] - ts[2 * r]) * g_pp.limits.timestampPeriod / 1000.0;
+        sum += us[k];
+    }
+    qsort(us, O.n, sizeof *us, cmp_d);
+    double med = O.n % 2 ? us[O.n / 2] : 0.5 * (us[O.n / 2 - 1] + us[O.n / 2]);
+    const char *bm = O.seq_barriers == 1 ? "all" : O.seq_barriers == 2 ? "none" : "captured";
+    printf("sequence %u on %s: %d dispatches (indices %u..%u), %d barriers (%s), %d resources (%d not captured), "
+           "%.1f MiB, pipelines %.1f ms\n", seq_id, g_pp.deviceName, ndirs, S[0].index, S[ndirs - 1].index, nbar, bm,
+           nres, nerr, bytes / 1048576.0, compile_ms);
+    printf("gpu_us median %.2f min %.2f mean %.2f max %.2f per sequence (n=%d, warm-up %d), %.2f per dispatch, wall %.1f ms\n",
+           med, us[0], sum / O.n, us[O.n - 1], O.n, O.warm, med / ndirs, wall);
+    if (O.csv) {
+        FILE *f = fopen(O.csv, "a");
+        if (f) {
+            fprintf(f, "seq%u\t%s\t%d.dispatches.%d.barriers.%s\t%.2f\t%.2f\t%.2f\t%.2f\t%d\tnoreset\t-\t%.1f\n", seq_id,
+                    O.label ? O.label : g_pp.deviceName, ndirs, nbar, bm, med, us[0], sum / O.n, us[O.n - 1], O.n, compile_ms);
+            fclose(f);
+        }
+    }
+    vkDeviceWaitIdle(g_dev);
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -952,9 +1081,20 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--compile-only")) O.compile_only = 1;
         else if (!strcmp(a, "--dump-cache") && i + 1 < argc) O.dump_cache = argv[++i];
         else if (!strcmp(a, "-v")) O.verbose = 1;
+        else if (!strcmp(a, "--seq")) O.seq = 1;
+        else if (!strcmp(a, "--seq-barriers") && i + 1 < argc) {
+            const char *v = argv[++i];
+            O.seq_barriers = !strcmp(v, "all") ? 1 : !strcmp(v, "none") ? 2 : 0;
+        }
         else usage();
     }
     if (O.list) { create_device(); return 0; }
+    if (O.seq) {
+        if (i >= argc) usage();
+        if (O.n < 1) O.n = 1;
+        if (O.warm < 0) O.warm = 0;
+        return run_seq(argc - i, argv + i);
+    }
     if (i != argc - 1) usage();
     g_dir = argv[i];
     if (O.n < 1) O.n = 1;
