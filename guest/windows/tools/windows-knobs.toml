@@ -1376,6 +1376,11 @@ class = "tuning"
 read = "first shader compile (once per process)"
 effect = "Unset: in compute shaders, a register copy of an immediate (needed when an instruction cannot take two immediates, such as an FFMA by two constants) serves the following uses of that immediate in its block, as long as each is at most 16 instructions after the previous one. 1 does it in every stage (it can cost occupancy in fragment and vertex shaders), 0 never. Part of the shader cache key."
 
+[env.NAK_TEX_UHANDLE]
+class = "experiment"
+read = "first shader compile (once per process)"
+effect = "1 (SM100+): a bindless texture handle that is the same in every lane goes in the uniform register field of TEX, TLD and TLD4 instead of the second source vector, so the sources often use the scalar form (.SCR) without copies to build contiguous vectors, as in the reference compiler's code. Default 0. Part of the shader cache key."
+
 [env.NAK_UADDR_PIN]
 class = "tuning"
 read = "first shader compile (once per process)"
