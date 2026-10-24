@@ -562,3 +562,123 @@ pub fn promote_tray_icon(exe: &str) -> bool {
     }
     false
 }
+
+// ---- Upscaling and frame generation (gpu_tray::enhance) -----------------
+
+const HELIOS_KEY: &str = r"SOFTWARE\Helios";
+
+fn enhance_key(exe: Option<&str>) -> Option<String> {
+    match exe {
+        None => Some(HELIOS_KEY.to_string()),
+        Some(e) => gpu_tray::enhance::profile_key(e),
+    }
+}
+
+/// The stored value of a setting, globally or in `exe`'s profile (a DWORD
+/// as its decimal text)
+pub fn enhance_get(exe: Option<&str>, s: &gpu_tray::enhance::Setting) -> Option<String> {
+    let key = enhance_key(exe)?;
+    let name = if exe.is_some() {
+        s.profile_name()
+    } else {
+        s.name
+    };
+    let b = get(HKEY_LOCAL_MACHINE, &key, name)?;
+    if s.dword {
+        Some(u32::from_le_bytes(b.get(..4)?.try_into().ok()?).to_string())
+    } else {
+        let w: Vec<u16> = b
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .take_while(|&c| c != 0)
+            .collect();
+        Some(String::from_utf16_lossy(&w))
+    }
+}
+
+/// Writes a setting (HKLM: the tray runs elevated); false when it could not
+pub fn enhance_set(exe: Option<&str>, s: &gpu_tray::enhance::Setting, value: &str) -> bool {
+    let Some(key) = enhance_key(exe) else {
+        return false;
+    };
+    let name = if exe.is_some() {
+        s.profile_name()
+    } else {
+        s.name
+    };
+    if s.dword {
+        let Ok(v) = value.parse::<u32>() else {
+            return false;
+        };
+        set(HKEY_LOCAL_MACHINE, &key, name, REG_DWORD, &v.to_le_bytes())
+    } else {
+        let bytes: Vec<u8> = wide(value).iter().flat_map(|u| u.to_le_bytes()).collect();
+        set(HKEY_LOCAL_MACHINE, &key, name, REG_SZ, &bytes)
+    }
+}
+
+/// Whether `exe` has a profile
+pub fn enhance_has_profile(exe: &str) -> bool {
+    let Some(key) = gpu_tray::enhance::profile_key(exe) else {
+        return false;
+    };
+    match open(HKEY_LOCAL_MACHINE, &key, false) {
+        Some(k) => {
+            unsafe { RegCloseKey(k) };
+            true
+        }
+        None => false,
+    }
+}
+
+/// Deletes `exe`'s profile (the global settings apply to it again)
+pub fn enhance_remove_profile(exe: &str) -> bool {
+    let Some(key) = gpu_tray::enhance::profile_key(exe) else {
+        return false;
+    };
+    let k = wide(&key);
+    unsafe {
+        RegDeleteTreeW(HKEY_LOCAL_MACHINE, k.as_ptr());
+        RegDeleteKeyW(HKEY_LOCAL_MACHINE, k.as_ptr()) == ERROR_SUCCESS
+    }
+}
+
+/// The executables of the visible, titled top-level windows, front to back
+pub fn windowed_exes() -> Vec<String> {
+    use windows_sys::Win32::Foundation::{CloseHandle, BOOL, HWND, LPARAM};
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetWindow, GetWindowTextLengthW, GetWindowThreadProcessId, IsWindowVisible,
+        GW_OWNER,
+    };
+    unsafe extern "system" fn each(h: HWND, lp: LPARAM) -> BOOL {
+        let out = &mut *(lp as *mut Vec<String>);
+        if IsWindowVisible(h) == 0
+            || GetWindowTextLengthW(h) == 0
+            || !GetWindow(h, GW_OWNER).is_null()
+        {
+            return 1;
+        }
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(h, &mut pid);
+        let p = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if p.is_null() {
+            return 1;
+        }
+        let mut buf = [0u16; 1024];
+        let mut len = buf.len() as u32;
+        if QueryFullProcessImageNameW(p, 0, buf.as_mut_ptr(), &mut len) != 0 {
+            let path = String::from_utf16_lossy(&buf[..len as usize]);
+            if let Some(name) = path.rsplit('\\').next() {
+                out.push(name.to_string());
+            }
+        }
+        CloseHandle(p);
+        1
+    }
+    let mut out: Vec<String> = Vec::new();
+    unsafe { EnumWindows(Some(each), &mut out as *mut Vec<String> as LPARAM) };
+    out
+}

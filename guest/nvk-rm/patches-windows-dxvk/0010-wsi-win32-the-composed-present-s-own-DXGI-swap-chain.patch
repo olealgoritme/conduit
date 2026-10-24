@@ -1,0 +1,112 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Sat, 24 Oct 2026 15:30:25 +0200
+Subject: [PATCH] wsi/win32: the composed present's own DXGI swap chains
+ pass the D3D swap chain hooks
+
+In a Vulkan process the composed present's D3D11 device loads the Helios
+UMD, so NVK hooks DXGI there too, and the composed present's own flip
+swap chain was then taken by the D3D swap chain proxy: every picture went
+through the enhancement twice.  The composed present marks its own swap
+chain creation (wsi_win32_dxgi_internal), which the hooks pass through.
+---
+ src/vulkan/wsi/wsi_common_win32_compose.cpp |  4 ++++
+ src/vulkan/wsi/wsi_common_win32_dxgi.cpp    | 21 ++++++++++++---------
+ src/vulkan/wsi/wsi_common_win32_dxgi.h      |  4 ++++
+ 3 files changed, 20 insertions(+), 9 deletions(-)
+
+diff --git a/src/vulkan/wsi/wsi_common_win32_compose.cpp b/src/vulkan/wsi/wsi_common_win32_compose.cpp
+index 892b49c..77e7cfa 100644
+--- a/src/vulkan/wsi/wsi_common_win32_compose.cpp
++++ b/src/vulkan/wsi/wsi_common_win32_compose.cpp
+@@ -53,6 +53,7 @@
+ 
+ #include "util/log.h"
+ #include "util/u_debug.h"
++#include "wsi_common_win32_dxgi.h"
+ 
+ /* ---- D3DKMT, the subset this needs (d3dkmthk.h is not in MinGW) ------- */
+ 
+@@ -514,8 +515,11 @@ wsi_win32_compose_open(struct wsi_win32_compose **inout, void *window,
+    desc.Scaling = DXGI_SCALING_STRETCH;
+    desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    desc.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
++   /* our own chain: not one for the D3D swap chain hooks to take */
++   wsi_win32_dxgi_internal(true);
+    hr = factory->CreateSwapChainForHwnd(c->device, hwnd, &desc, NULL, NULL,
+                                         &c->swapchain);
++   wsi_win32_dxgi_internal(false);
+    if (SUCCEEDED(hr))
+       factory->MakeWindowAssociation(hwnd, DXGI_MWA_NO_WINDOW_CHANGES |
+                                            DXGI_MWA_NO_ALT_ENTER);
+diff --git a/src/vulkan/wsi/wsi_common_win32_dxgi.cpp b/src/vulkan/wsi/wsi_common_win32_dxgi.cpp
+index 3b74cb2..b048998 100644
+--- a/src/vulkan/wsi/wsi_common_win32_dxgi.cpp
++++ b/src/vulkan/wsi/wsi_common_win32_dxgi.cpp
+@@ -502,7 +502,14 @@ struct wsi_dxgi_proxy final : public IDXGISwapChain4 {
+ 
+ /* ---- set-up -------------------------------------------------------------- */
+ 
+-static thread_local bool internal_create;
++static thread_local int internal_depth;
++#define internal_create (internal_depth > 0)
++
++void
++wsi_win32_dxgi_internal(bool on)
++{
++   internal_depth += on ? 1 : -1;
++}
+ 
+ VkResult
+ wsi_dxgi_proxy::build()
+@@ -517,9 +524,7 @@ wsi_dxgi_proxy::build()
+       if (client.width && client.height)
+          out = client;
+    }
+-   internal_create = true;
+    r = wsi_win32_compose_open(&compose, hwnd, out.width, out.height, vk_format, 3);
+-   internal_create = false;
+    if (r != VK_SUCCESS)
+       return r;
+ 
+@@ -1304,10 +1309,9 @@ hook_create_hwnd(IDXGIFactory2 *f, IUnknown *dev, HWND hwnd,
+       }
+    }
+    passed++;
+-   const bool was = internal_create;
+-   internal_create = true;
++   wsi_win32_dxgi_internal(true);
+    HRESULT hr = orig_create_hwnd(f, dev, hwnd, d, fs, o, sc);
+-   internal_create = was;
++   wsi_win32_dxgi_internal(false);
+    return hr;
+ }
+ 
+@@ -1345,10 +1349,9 @@ hook_create_sc(IDXGIFactory *f, IUnknown *dev, DXGI_SWAP_CHAIN_DESC *d,
+       }
+    }
+    passed++;
+-   const bool was = internal_create;
+-   internal_create = true;
++   wsi_win32_dxgi_internal(true);
+    HRESULT hr = orig_create_sc(f, dev, d, sc);
+-   internal_create = was;
++   wsi_win32_dxgi_internal(false);
+    return hr;
+ }
+ 
+diff --git a/src/vulkan/wsi/wsi_common_win32_dxgi.h b/src/vulkan/wsi/wsi_common_win32_dxgi.h
+index f6296ef..e517bdf 100644
+--- a/src/vulkan/wsi/wsi_common_win32_dxgi.h
++++ b/src/vulkan/wsi/wsi_common_win32_dxgi.h
+@@ -19,6 +19,10 @@ extern "C" {
+  * driver runs on this NVK and the enhancement settings are on */
+ void wsi_win32_dxgi_install(void);
+ 
++/* Swap chains the driver creates itself (the composed present's) on this
++ * thread between on and off pass the hooks untouched; nests */
++void wsi_win32_dxgi_internal(bool on);
++
+ struct wsi_dxgi12;
+ /* NULL when `queue` is not an ID3D12CommandQueue */
+ struct wsi_dxgi12 *wsi_dxgi12_create(void *queue);

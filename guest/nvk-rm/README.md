@@ -130,6 +130,9 @@ Patch numbers are file numbers in the directory named in the patch tables.
 | `MESA_WSI_WIN32_FIFO_ONLY` | 0 | offer FIFO only (otherwise IMMEDIATE and MAILBOX too) |
 | `MESA_WSI_COMPOSE_THREAD` | 1 | composed presents on a per-swapchain thread |
 | `MESA_WSI_COMPOSE_ADAPTER` | auto | D3D11 adapter index of the composed path |
+| `MESA_WSI_ENHANCE_SCALER` | registry, else off | upscaling in the composed present: `off`, `fsr`, `nis`, `sgsr`, `cas`, `bicubic`, `bilinear`, `nearest`, `integer`, `xbr`, `a4k-3d`, `a4k`, `a4k-vl` (see [docs/enhance.md](docs/enhance.md); dxvk 0008, 0013, 0015) |
+| `MESA_WSI_ENHANCE_FG` | registry, else off | frame generation in the composed present: `off`, `2x`, `3x`, `4x`, `adaptive` |
+| `MESA_WSI_ENHANCE_SHARPNESS`, `_FG_TARGET`, `_FG_QUALITY`, `_LOW_LATENCY`, `_FIT`, `_WINDOWS`, `_STATS`, `_SHOW`, `_D3D`, `_OVERLAY` | registry, else 50, 0, fast, 0, aspect, fullscreen, 0, all, 1, 0 | the other enhancement settings ([docs/enhance.md](docs/enhance.md#settings)) |
 | **Helios interface** | | |
 | `NVK_HELIOS_RESID`, `NVK_HELIOS_FORMATS` | 1 | resource ids for shared images; the wider shared-format set |
 | `NVK_HELIOS_MODIFIERS` | 1 | advertise `VK_EXT_image_drm_format_modifier` on Windows |
@@ -328,6 +331,16 @@ Each patch builds on its own.
 | 0004 | `NVK_RM_WAIT_SPIN` and `NVK_RM_WAIT_POLL_MS` for the CPU wait loop |
 | 0005 | composed present by default under a DWM on NVK (`NVK_HELIOS_WSI_COMPOSE=0` = GDI); with a Helios present path the surface offers IMMEDIATE, MAILBOX and FIFO (`MESA_WSI_WIN32_FIFO_ONLY=1` = FIFO only); composed presents on a per-swapchain thread (`MESA_WSI_COMPOSE_THREAD`) that waits for the frame's fence, copies and presents, so `vkQueuePresentKHR` does not wait for the GPU; three DXGI buffers; IMMEDIATE/MAILBOX show only the newest queued frame |
 | 0006 | CPU waits without a host round trip per wake (the non-stall event is dataless, so the data read never finds anything; `NVK_RM_EVENT_DRAIN=1` reads it); CPU signals and raised pending values kick waiters through `crm_win_event_kick` (`NVK_RM_CPU_KICK=0` off); `NVK_RM_WAIT_SPIN_US` |
+| 0007 | AMD FidelityFX FSR 1 (`ffx_a.h`, `ffx_fsr1.h`, MIT), vendored unmodified under `src/vulkan/wsi/enhance/third_party` for 0008 |
+| 0008 | upscaling and frame generation in the composed present, off by default (`MESA_WSI_ENHANCE_*`, `HKLM\SOFTWARE\Helios` `Enhance*`, per-exe profiles): compute passes on the application's queue before the present's fence (`wsi_swapchain::present_cmd`) into output slots of the window's size, paced by the present thread; FSR 1 / bicubic / bilinear / nearest / integer scaling, 2x / 3x / 4x / adaptive generation from optical flow; with a scaler the surface reports no current extent. See [docs/enhance.md](docs/enhance.md) |
+| 0009 | D3D11 and D3D12 swap chains through the same: where a Helios D3D driver runs on NVK and enhancement is on, NVK hooks DXGI's swap chain creation and hands the application an `IDXGISwapChain4` of its own whose presents are copied into shared ring textures, enhanced on an NVK device of its own and presented through the composed present (`MESA_WSI_ENHANCE_D3D`, `EnhanceD3D`; see [docs/enhance.md](docs/enhance.md#d3d-swap-chains)) |
+| 0010 | the composed present's own DXGI swap chains pass the D3D swap chain hooks (`wsi_win32_dxgi_internal`): in a Vulkan process the composed present's D3D11 device loads the Helios UMD, NVK hooked DXGI there too, and its own flip swap chain was taken by the proxy (every picture enhanced twice) |
+| 0011 | frame generation: flow propagation (`fg_flow` mode 2, one round per level), a motion cost per frame pixel, a 1/32 coarsest level, nine interpolation candidates; tuned with `tools/enhance-eval` (see [docs/enhance.md](docs/enhance.md#measuring-the-interpolation)) |
+| 0012 | NVIDIA Image Scaling SDK v1.0.3 (MIT), FidelityFX CAS (MIT), Snapdragon Game Super Resolution 1 (BSD-3-Clause), Hyllian's xBR-lv2 (MIT), vendored unmodified under `src/vulkan/wsi/enhance/third_party` |
+| 0013 | the `nis`, `cas`, `sgsr` and `xbr` scalers; `enhance/adapt.py` turns copies of the SGSR and xBR fragment shaders into functions and NIS's coefficient tables into constants at build time |
+| 0014 | Anime4K's CNN x2 upscalers (3DGraphics US, CNN M, CNN VL; MIT), vendored unmodified |
+| 0015 | the learned upscaler tier `a4k-3d`, `a4k`, `a4k-vl`: `adapt.py a4k` turns each mpv user shader into compute passes (one SPIR-V each) and a pass table at build time |
+| 0016 | the on-screen counter (`EnhanceOverlay`, `MESA_WSI_ENHANCE_OVERLAY`): base / shown frames per second, the frame generation mode and the scaler, drawn into every presented picture by `enh_text.comp` (a 5x7 font of its own); default off |
 
 ## `patches-common/`: generic NVK work
 
@@ -654,7 +667,8 @@ DLLs in `OUT_DIR/debug`). Compiles run under
 
 Host needs (Ubuntu 24.04): `gcc-mingw-w64-x86-64` (GCC 13, win32 threads),
 `rustup target add x86_64-pc-windows-gnu`, meson >= 1.7, bindgen + libclang,
-cbindgen; `wine64` only to run tests. For `ARCH=i686`: `gcc-mingw-w64-i686`
+cbindgen, `glslangValidator` (`glslang-tools`; the Win32 WSI's enhancement
+shaders, dxvk 0008); `wine64` only to run tests. For `ARCH=i686`: `gcc-mingw-w64-i686`
 (dwarf2) and the `i686-pc-windows-gnu` rustup target for the toolchain meson
 uses (`rustup target add --toolchain stable ...` if a `rust-toolchain` file
 pins another one). LLVM is off for the Windows build (NAK is Rust and needs
