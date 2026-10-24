@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Ole Algoritme <olealgoritme@gmail.com>
-Date: Sat, 24 Oct 2026 04:26:43 +0200
+Date: Sat, 24 Oct 2026 07:15:29 +0200
 Subject: [PATCH] nvk: NVK_DISPATCH_CAPTURE captures draws too
 
 A hash in NVK_DISPATCH_CAPTURE that matches the bound fragment shader
@@ -21,8 +21,10 @@ SPIR-V of each graphics shader of a new pipeline, and graphics shaders
 get their SPIR-V source hash.  While the hook is installed, graphics
 stages are precompiled from their SPIR-V, not taken from the pipeline
 cache (a cached precompiled shader has no SPIR-V).  NVK notes the bound vertex and
-index buffers for this whatever the state tracking.  A listed fragment shader bound
-for vkCmdExecuteGeneratedCommandsEXT is logged, not captured.  Draws with
+index buffers for this whatever the state tracking.  Multi-draws and device-generated
+commands with a listed fragment shader are logged, not captured.  The
+log also lists the first draw with every fragment shader (source and
+code hash, kind of draw), to pick the hashes from a run.  Draws with
 tessellation, geometry or mesh shaders, multisampling or multiview are
 logged, not captured.
 
@@ -30,13 +32,13 @@ A capture whose staging with the outputs (NVK_DISPATCH_CAPTURE_POST)
 cannot be mapped is made without the outputs.
 ---
  src/nouveau/vulkan/nvk_cmd_buffer.h       |  11 +
- src/nouveau/vulkan/nvk_cmd_draw.c         | 193 +++++
+ src/nouveau/vulkan/nvk_cmd_draw.c         | 199 +++++
  src/nouveau/vulkan/nvk_cmd_indirect.c     |   4 +
- src/nouveau/vulkan/nvk_dispatch_capture.c | 885 ++++++++++++++++++++--
+ src/nouveau/vulkan/nvk_dispatch_capture.c | 915 ++++++++++++++++++++--
  src/nouveau/vulkan/nvk_dispatch_capture.h |  28 +
  src/vulkan/runtime/vk_device.h            |  14 +
  src/vulkan/runtime/vk_pipeline.c          |  66 +-
- 7 files changed, 1153 insertions(+), 48 deletions(-)
+ 7 files changed, 1189 insertions(+), 48 deletions(-)
 
 diff --git a/src/nouveau/vulkan/nvk_cmd_buffer.h b/src/nouveau/vulkan/nvk_cmd_buffer.h
 index cf35fbb..1033a5c 100644
@@ -61,7 +63,7 @@ index cf35fbb..1033a5c 100644
     struct vk_vertex_input_state _dynamic_vi;
     struct vk_sample_locations_state _dynamic_sl;
 diff --git a/src/nouveau/vulkan/nvk_cmd_draw.c b/src/nouveau/vulkan/nvk_cmd_draw.c
-index 0b3bb8d..65e610b 100644
+index 0b3bb8d..ec1f521 100644
 --- a/src/nouveau/vulkan/nvk_cmd_draw.c
 +++ b/src/nouveau/vulkan/nvk_cmd_draw.c
 @@ -5,6 +5,7 @@
@@ -141,7 +143,17 @@ index 0b3bb8d..65e610b 100644
     if (unlikely(!vertexCount || !instanceCount))
        return;
  
-@@ -5973,6 +6015,14 @@ nvk_mme_draw_indexed(struct mme_builder *b)
+@@ -5816,6 +5858,9 @@ nvk_CmdDrawMultiEXT(VkCommandBuffer commandBuffer,
+ {
+    VK_FROM_HANDLE(nvk_cmd_buffer, cmd, commandBuffer);
+ 
++   if (unlikely(nvk_cmd_buffer_device(cmd)->dcap != NULL))
++      nvk_dcap_note_draw(cmd, "vkCmdDrawMultiEXT");
++
+    if (unlikely(!drawCount || !pVertexInfo->vertexCount || !instanceCount))
+       return;
+ 
+@@ -5973,6 +6018,14 @@ nvk_mme_draw_indexed(struct mme_builder *b)
     nvk_mme_build_draw_indexed(b, draw_index);
  }
  
@@ -156,7 +168,7 @@ index 0b3bb8d..65e610b 100644
  VKAPI_ATTR void VKAPI_CALL
  nvk_CmdDrawIndexed(VkCommandBuffer commandBuffer,
                     uint32_t indexCount,
-@@ -5983,6 +6033,33 @@ nvk_CmdDrawIndexed(VkCommandBuffer commandBuffer,
+@@ -5983,6 +6036,33 @@ nvk_CmdDrawIndexed(VkCommandBuffer commandBuffer,
  {
     VK_FROM_HANDLE(nvk_cmd_buffer, cmd, commandBuffer);
  
@@ -190,7 +202,17 @@ index 0b3bb8d..65e610b 100644
     if (unlikely(!indexCount || !instanceCount))
        return;
  
-@@ -6346,11 +6423,40 @@ nvk_cmd_draw_indirect_batched(struct nvk_cmd_buffer *cmd, bool indexed,
+@@ -6023,6 +6103,9 @@ nvk_CmdDrawMultiIndexedEXT(VkCommandBuffer commandBuffer,
+ {
+    VK_FROM_HANDLE(nvk_cmd_buffer, cmd, commandBuffer);
+ 
++   if (unlikely(nvk_cmd_buffer_device(cmd)->dcap != NULL))
++      nvk_dcap_note_draw(cmd, "vkCmdDrawMultiIndexedEXT");
++
+    if (unlikely(!drawCount || !pIndexInfo->indexCount || !instanceCount))
+       return;
+ 
+@@ -6346,11 +6429,40 @@ nvk_cmd_draw_indirect_batched(struct nvk_cmd_buffer *cmd, bool indexed,
     return true;
  }
  
@@ -231,7 +253,7 @@ index 0b3bb8d..65e610b 100644
     uint64_t stride = pInfo->addressRange.stride;
  
     if (unlikely(!pInfo->drawCount))
-@@ -6475,11 +6581,40 @@ nvk_mme_draw_indexed_indirect(struct mme_builder *b)
+@@ -6475,11 +6587,40 @@ nvk_mme_draw_indexed_indirect(struct mme_builder *b)
     }
  }
  
@@ -272,7 +294,7 @@ index 0b3bb8d..65e610b 100644
     uint64_t stride = pInfo->addressRange.stride;
  
     /* From the Vulkan 1.3.238 spec:
-@@ -6589,12 +6724,41 @@ nvk_mme_draw_indirect_count(struct mme_builder *b)
+@@ -6589,12 +6730,41 @@ nvk_mme_draw_indirect_count(struct mme_builder *b)
     }
  }
  
@@ -314,7 +336,7 @@ index 0b3bb8d..65e610b 100644
     /* TODO: Indirect count draw pre-Turing */
     assert(nvk_cmd_buffer_3d_cls(cmd) >= TURING_A);
  
-@@ -6646,12 +6810,41 @@ nvk_mme_draw_indexed_indirect_count(struct mme_builder *b)
+@@ -6646,12 +6816,41 @@ nvk_mme_draw_indexed_indirect_count(struct mme_builder *b)
     }
  }
  
@@ -357,7 +379,7 @@ index 0b3bb8d..65e610b 100644
     assert(nvk_cmd_buffer_3d_cls(cmd) >= TURING_A);
  
 diff --git a/src/nouveau/vulkan/nvk_cmd_indirect.c b/src/nouveau/vulkan/nvk_cmd_indirect.c
-index 55d2c67..fe779f9 100644
+index 55d2c67..126b3a8 100644
 --- a/src/nouveau/vulkan/nvk_cmd_indirect.c
 +++ b/src/nouveau/vulkan/nvk_cmd_indirect.c
 @@ -4,6 +4,7 @@
@@ -373,13 +395,13 @@ index 55d2c67..fe779f9 100644
     const struct nvk_physical_device *pdev = nvk_device_physical(dev);
  
 +   if (unlikely(dev->dcap != NULL))
-+      nvk_dcap_note_dgc(cmd);
++      nvk_dcap_note_draw(cmd, "device-generated commands");
 +
     /* The generated commands call MME macros, which only a channel with
      * every engine has loaded
      */
 diff --git a/src/nouveau/vulkan/nvk_dispatch_capture.c b/src/nouveau/vulkan/nvk_dispatch_capture.c
-index 7725c19..06997f8 100644
+index 7725c19..21c9039 100644
 --- a/src/nouveau/vulkan/nvk_dispatch_capture.c
 +++ b/src/nouveau/vulkan/nvk_dispatch_capture.c
 @@ -52,6 +52,17 @@
@@ -400,7 +422,15 @@ index 7725c19..06997f8 100644
   * Limits: direct and indirect vkCmdDispatch only (not device-generated
   * commands); single-plane, single-sample, non-sparse-residency images
   * (color, or the depth or stencil aspect of a depth view); descriptors as
-@@ -115,6 +126,8 @@
+@@ -61,6 +72,7 @@
+  * (runtime arrays) are copied up to 16 MiB; a resource two descriptors
+  * alias (the same image as SRV and UAV) is captured twice.
+  */
++#include "util/u_atomic.h"
+ #include "nvk_dispatch_capture.h"
+ 
+ #include "nvk_buffer.h"
+@@ -115,6 +127,8 @@
  #define DCAP_MAX_MIPS   16
  #define DCAP_NONE       0xffffffffu
  #define DCAP_BDA_RUNTIME_MAX (16ull << 20)
@@ -409,7 +439,7 @@ index 7725c19..06997f8 100644
  #define DCAP_BUF_MAX    (256ull << 20)
  #define DCAP_HEADER_B   256u
  #define DCAP_MARKER     0xdc000000u
-@@ -172,6 +185,8 @@ struct dcap_bda {
+@@ -172,6 +186,8 @@ struct dcap_bda {
  
  struct nvk_dcap_recipe {
     uint64_t src_hash;
@@ -418,7 +448,16 @@ index 7725c19..06997f8 100644
     uint32_t *spirv;
     size_t spirv_size;
     uint32_t push_size;
-@@ -233,11 +248,62 @@ struct dcap_res {
+@@ -181,6 +197,8 @@ struct nvk_dcap_recipe {
+    struct dcap_bda bdas[DCAP_MAX_BDAS];
+    uint32_t nunsupported;
+    char unsupported[1024];
++   /* Graphics: set (atomically) once the census has logged a draw with it */
++   uint32_t drawn;
+ };
+ 
+ enum dcap_res_kind {
+@@ -233,11 +251,62 @@ struct dcap_res {
     uint32_t sampler_index;
     struct vk_sampler_state sampler;
  
@@ -481,7 +520,7 @@ index 7725c19..06997f8 100644
  struct nvk_dcap {
     struct list_head link;
     uint32_t serial, marker;
-@@ -264,6 +330,14 @@ struct nvk_dcap {
+@@ -264,6 +333,14 @@ struct nvk_dcap {
     /* Copy of the recipe's variables for the manifest's binding list */
     uint32_t nvars;
     struct dcap_var vars[DCAP_MAX_VARS];
@@ -496,7 +535,7 @@ index 7725c19..06997f8 100644
  };
  
  /* ------------------------------------------------------------------------ */
-@@ -1057,6 +1131,9 @@ nvk_dcap_compute_spirv_hook(struct vk_device *vk_dev,
+@@ -1057,6 +1134,9 @@ nvk_dcap_compute_spirv_hook(struct vk_device *vk_dev,
     if (r == NULL)
        return;
     r->src_hash = vk_shader->src_hash;
@@ -506,7 +545,7 @@ index 7725c19..06997f8 100644
  
     /* The bindings as the pipeline layout lays them out, for descriptor
      * buffers and push descriptors (a bound set has its own layout)
-@@ -1102,6 +1179,90 @@ nvk_dcap_compute_spirv_hook(struct vk_device *vk_dev,
+@@ -1102,6 +1182,90 @@ nvk_dcap_compute_spirv_hook(struct vk_device *vk_dev,
     }
  }
  
@@ -597,7 +636,7 @@ index 7725c19..06997f8 100644
  /* ------------------------------------------------------------------------ */
  /* Recording a capture */
  
-@@ -1212,12 +1373,12 @@ dcap_bound_at(struct nvk_device *dev, uint64_t addr)
+@@ -1212,12 +1376,12 @@ dcap_bound_at(struct nvk_device *dev, uint64_t addr)
  
  /* The descriptor of v at index, as the GPU will read it */
  static const void *
@@ -612,7 +651,7 @@ index 7725c19..06997f8 100644
  
     if (v->set >= NVK_MAX_SETS) {
        snprintf(err, err_size, "set %u out of range", v->set);
-@@ -1291,9 +1452,25 @@ dcap_desc_ptr(struct nvk_cmd_buffer *cmd, const struct dcap_var *v,
+@@ -1291,9 +1455,25 @@ dcap_desc_ptr(struct nvk_cmd_buffer *cmd, const struct dcap_var *v,
     }
  }
  
@@ -638,7 +677,7 @@ index 7725c19..06997f8 100644
  {
     const struct nvk_image *img =
        container_of(view->vk.image, struct nvk_image, vk);
-@@ -1325,7 +1502,9 @@ dcap_fill_image(struct nvk_device *dev, struct dcap_res *r,
+@@ -1325,7 +1505,9 @@ dcap_fill_image(struct nvk_device *dev, struct dcap_res *r,
     r->extent = vk_image_mip_level_extent(&img->vk, r->base_mip);
  
     VkImageAspectFlags aspect = view->vk.aspects;
@@ -649,7 +688,7 @@ index 7725c19..06997f8 100644
        aspect = VK_IMAGE_ASPECT_DEPTH_BIT;
     else if (aspect & VK_IMAGE_ASPECT_STENCIL_BIT)
        aspect = VK_IMAGE_ASPECT_STENCIL_BIT;
-@@ -1399,7 +1578,8 @@ dcap_fill_buffer(struct nvk_device *dev, struct dcap_res *r,
+@@ -1399,7 +1581,8 @@ dcap_fill_buffer(struct nvk_device *dev, struct dcap_res *r,
  }
  
  static void
@@ -659,7 +698,7 @@ index 7725c19..06997f8 100644
                   const struct dcap_var *v, uint32_t index, struct dcap_res *r)
  {
     struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
-@@ -1407,7 +1587,7 @@ dcap_resolve_ref(struct nvk_cmd_buffer *cmd, struct nvk_dcap *cap,
+@@ -1407,7 +1590,7 @@ dcap_resolve_ref(struct nvk_cmd_buffer *cmd, struct nvk_dcap *cap,
     struct nvk_dcap_dev *dcap = dev->dcap;
  
     bool edb = false;
@@ -668,7 +707,7 @@ index 7725c19..06997f8 100644
                                      sizeof(r->note));
     if (d == NULL) {
        r->kind = DCAP_RES_ERROR;
-@@ -1544,6 +1724,541 @@ dcap_resolve_ref(struct nvk_cmd_buffer *cmd, struct nvk_dcap *cap,
+@@ -1544,6 +1727,568 @@ dcap_resolve_ref(struct nvk_cmd_buffer *cmd, struct nvk_dcap *cap,
     }
  }
  
@@ -917,14 +956,34 @@ index 7725c19..06997f8 100644
 +   free(cap);
 +}
 +
++/* The census: the first draw with each fragment shader is logged with its
++ * hashes and the kind of draw, so the hashes to list can be picked from a
++ * run (code hashes depend on the build and the NAK knobs; the source hash
++ * does not)
++ */
++static void
++dcap_census(struct nvk_dcap_dev *dcap, const struct nvk_shader *fs,
++            const struct nvk_shader *vs, const char *kind)
++{
++   struct nvk_dcap_recipe *rc = (struct nvk_dcap_recipe *)fs->dcap_recipe;
++   if (p_atomic_xchg(&rc->drawn, 1) != 0)
++      return;
++   const struct nvk_dcap_recipe *vrc = vs != NULL ? vs->dcap_recipe : NULL;
++   dcap_log(dcap, "drawn: fragment shader %016" PRIx64 " (code %08x) by %s, "
++            "vertex shader %016" PRIx64 " (code %08x)", rc->src_hash,
++            rc->code_hash, kind, vrc != NULL ? vrc->src_hash : 0,
++            vrc != NULL ? vrc->code_hash : 0);
++}
++
 +void
-+nvk_dcap_note_dgc(struct nvk_cmd_buffer *cmd)
++nvk_dcap_note_draw(struct nvk_cmd_buffer *cmd, const char *kind)
 +{
 +   struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
 +   struct nvk_dcap_dev *dcap = dev->dcap;
 +   const struct nvk_shader *fs = cmd->state.gfx.shaders[MESA_SHADER_FRAGMENT];
 +   if (fs == NULL || fs->dcap_recipe == NULL)
 +      return;
++   dcap_census(dcap, fs, cmd->state.gfx.shaders[MESA_SHADER_VERTEX], kind);
 +   const int slot = dcap_draw_slot(dcap, fs->dcap_recipe);
 +   if (slot < 0)
 +      return;
@@ -932,8 +991,8 @@ index 7725c19..06997f8 100644
 +   if (!dcap_take(dcap, slot, &call_index, &serial))
 +      return;
 +   dcap_log(dcap, "shader %016" PRIx64 " (code %08x) draw %u: not captured: "
-+            "device-generated commands", fs->dcap_recipe->src_hash,
-+            fs->dcap_recipe->code_hash, call_index);
++            "%s", fs->dcap_recipe->src_hash, fs->dcap_recipe->code_hash,
++            call_index, kind);
 +}
 +
 +struct nvk_dcap *
@@ -953,6 +1012,13 @@ index 7725c19..06997f8 100644
 +   if (fs == NULL || fs->dcap_recipe == NULL)
 +      return NULL;
 +   const struct nvk_dcap_recipe *frc = fs->dcap_recipe;
++   dcap_census(dcap, fs, vs,
++               indirect ? (call->count_addr != 0 ?
++                           (indexed ? "vkCmdDrawIndexedIndirectCount" :
++                                      "vkCmdDrawIndirectCount") :
++                           (indexed ? "vkCmdDrawIndexedIndirect" :
++                                      "vkCmdDrawIndirect")) :
++               indexed ? "vkCmdDrawIndexed" : "vkCmdDraw");
 +   const int slot = dcap_draw_slot(dcap, frc);
 +   if (slot < 0)
 +      return NULL;
@@ -1210,7 +1276,7 @@ index 7725c19..06997f8 100644
  struct nvk_dcap *
  nvk_dcap_begin(struct nvk_cmd_buffer *cmd, const uint32_t base_group[3],
                 const uint32_t groups[3], uint64_t indirect_addr)
-@@ -1651,7 +2366,7 @@ nvk_dcap_begin(struct nvk_cmd_buffer *cmd, const uint32_t base_group[3],
+@@ -1651,7 +2396,7 @@ nvk_dcap_begin(struct nvk_cmd_buffer *cmd, const uint32_t base_group[3],
        r->pc_off = ref->pc_off;
        r->add = ref->add;
        r->writable = v->writable;
@@ -1219,7 +1285,7 @@ index 7725c19..06997f8 100644
     }
  
     /* Root buffer addresses */
-@@ -1670,44 +2385,10 @@ nvk_dcap_begin(struct nvk_cmd_buffer *cmd, const uint32_t base_group[3],
+@@ -1670,44 +2415,10 @@ nvk_dcap_begin(struct nvk_cmd_buffer *cmd, const uint32_t base_group[3],
     }
  
     /* Staging: header (marker, indirect arguments), inputs, outputs */
@@ -1266,7 +1332,7 @@ index 7725c19..06997f8 100644
     const uint64_t va = cap->mem->va->addr;
  
     dcap_flush_compute(cmd);
-@@ -1732,7 +2413,7 @@ nvk_dcap_begin(struct nvk_cmd_buffer *cmd, const uint32_t base_group[3],
+@@ -1732,7 +2443,7 @@ nvk_dcap_begin(struct nvk_cmd_buffer *cmd, const uint32_t base_group[3],
     dcap_log(dcap, "shader %016" PRIx64 " call %u recorded as capture %u: "
              "%u resources (%u not captured), %" PRIu64 " MiB of staging, "
              "%s grid %ux%ux%u", cap->src_hash, call_index, serial, cap->nres,
@@ -1275,7 +1341,7 @@ index 7725c19..06997f8 100644
              cap->groups[0], cap->groups[1], cap->groups[2]);
     return cap;
  }
-@@ -1827,6 +2508,105 @@ dcap_json_sampler(FILE *f, const struct vk_sampler_state *s)
+@@ -1827,6 +2538,105 @@ dcap_json_sampler(FILE *f, const struct vk_sampler_state *s)
             s->flags);
  }
  
@@ -1381,7 +1447,7 @@ index 7725c19..06997f8 100644
  static void
  dcap_write(struct nvk_dcap_dev *dcap, struct nvk_dcap *cap)
  {
-@@ -1843,6 +2623,8 @@ dcap_write(struct nvk_dcap_dev *dcap, struct nvk_dcap *cap)
+@@ -1843,6 +2653,8 @@ dcap_write(struct nvk_dcap_dev *dcap, struct nvk_dcap *cap)
     bool ok = true;
     if (cap->spirv != NULL)
        ok &= dcap_write_file(dir, "shader.spv", cap->spirv, cap->spirv_size);
@@ -1390,7 +1456,7 @@ index 7725c19..06997f8 100644
     ok &= dcap_write_file(dir, "push.bin", cap->push, sizeof(cap->push));
     uint64_t bytes = 0;
     for (uint32_t i = 0; i < cap->nres; i++) {
-@@ -1887,6 +2669,8 @@ dcap_write(struct nvk_dcap_dev *dcap, struct nvk_dcap *cap)
+@@ -1887,6 +2699,8 @@ dcap_write(struct nvk_dcap_dev *dcap, struct nvk_dcap *cap)
             groups[0], groups[1], groups[2], cap->indirect ? "true" : "false",
             cap->push_size, cap->post ? "true" : "false");
     dcap_json_str(f, cap->unsupported);
@@ -1399,7 +1465,7 @@ index 7725c19..06997f8 100644
     fprintf(f, ",\n  \"bindings\": [\n");
     for (uint32_t i = 0; i < cap->nvars; i++) {
        const struct dcap_var *v = &cap->vars[i];
-@@ -1915,6 +2699,15 @@ dcap_write(struct nvk_dcap_dev *dcap, struct nvk_dcap *cap)
+@@ -1915,6 +2729,15 @@ dcap_write(struct nvk_dcap_dev *dcap, struct nvk_dcap *cap)
        if (r->pc_off != DCAP_NONE)
           fprintf(f, "\"push_offset\": %u, \"add\": %u, ", r->pc_off, r->add);
        fprintf(f, "\"writable\": %s", r->writable ? "true" : "false");
@@ -1415,7 +1481,7 @@ index 7725c19..06997f8 100644
        if (r->size_B != 0) {
           fprintf(f, ", \"file\": \"r%03u.bin\", \"size\": %" PRIu64, i,
                   r->size_B);
-@@ -2009,9 +2802,7 @@ nvk_dcap_cmd_reset(struct nvk_cmd_buffer *cmd)
+@@ -2009,9 +2832,7 @@ nvk_dcap_cmd_reset(struct nvk_cmd_buffer *cmd)
                       cap->serial, cap->src_hash, marker);
           }
        }
@@ -1426,7 +1492,7 @@ index 7725c19..06997f8 100644
     }
  }
  
-@@ -2094,6 +2885,7 @@ nvk_dcap_init(struct nvk_device *dev)
+@@ -2094,6 +2915,7 @@ nvk_dcap_init(struct nvk_device *dev)
  
     dev->dcap = dcap;
     dev->vk.compute_spirv_hook = nvk_dcap_compute_spirv_hook;
@@ -1434,7 +1500,7 @@ index 7725c19..06997f8 100644
  
     char hashes[DCAP_MAX_HASHES * 18 + 1] = "";
     for (uint32_t i = 0; i < dcap->hash_count; i++) {
-@@ -2116,6 +2908,7 @@ nvk_dcap_finish(struct nvk_device *dev)
+@@ -2116,6 +2938,7 @@ nvk_dcap_finish(struct nvk_device *dev)
     if (dcap == NULL)
        return;
     dev->vk.compute_spirv_hook = NULL;
@@ -1443,7 +1509,7 @@ index 7725c19..06997f8 100644
     hash_table_u64_foreach(dcap->samplers, entry)
        free(entry.data);
 diff --git a/src/nouveau/vulkan/nvk_dispatch_capture.h b/src/nouveau/vulkan/nvk_dispatch_capture.h
-index 59ff238..4479c8c 100644
+index 59ff238..0cf2f3f 100644
 --- a/src/nouveau/vulkan/nvk_dispatch_capture.h
 +++ b/src/nouveau/vulkan/nvk_dispatch_capture.h
 @@ -53,6 +53,34 @@ struct nvk_dcap *nvk_dcap_begin(struct nvk_cmd_buffer *cmd,
@@ -1472,10 +1538,10 @@ index 59ff238..4479c8c 100644
 +struct nvk_dcap *nvk_dcap_draw_begin(struct nvk_cmd_buffer *cmd,
 +                                     const struct nvk_dcap_draw_call *call);
 +
-+/* vkCmdExecuteGeneratedCommandsEXT with a listed fragment shader bound:
-+ * logged (not captured)
++/* A draw that is not captured (vkCmdDrawMulti*, device-generated
++ * commands): in the census, and logged if a listed fragment shader is bound
 + */
-+void nvk_dcap_note_dgc(struct nvk_cmd_buffer *cmd);
++void nvk_dcap_note_draw(struct nvk_cmd_buffer *cmd, const char *kind);
 +void nvk_dcap_draw_end(struct nvk_cmd_buffer *cmd, struct nvk_dcap *cap);
 +
  /* The command buffer is reset or destroyed: the GPU is done with it, so

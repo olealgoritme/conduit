@@ -40,7 +40,9 @@ and a fragment shader, single sample, inside dynamic rendering (vkd3d-proton's r
 holds both shaders, their resources, the attachments' contents, the indices the draw reads (the whole bound
 index buffer for an indirect draw), every vertex buffer an attribute reads (as bound, up to 256 MiB each),
 for an indirect draw its records and count as they were when it ran, and the pipeline state with the vertex
-input layout. Hashes: use the DXIL source hash; a code hash changes with every NAK change.
+input layout. Hashes: use the DXIL source hash; a code hash changes with every NAK change. `nvk-dcap.log`
+lists the first draw with every fragment shader (`drawn: fragment shader <source hash> (code <hash>) by
+<call>`), so a run with any hash listed shows which shaders a pass draws with and how.
 
 Each capture goes to `<dir>\<hash>-p<pid>-<n>\` once the command buffer that recorded it is reset (a few
 frames after the dispatch). `<dir>\nvk-dcap.log` lists the scanned shaders, the recorded and written
