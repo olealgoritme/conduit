@@ -298,9 +298,10 @@ enum {
  * guest.
  *
  * CAP_CURSOR: the broker takes CMD_CURSOR and shows the image as the HOST
- * pointer's cursor while the pointer is over the guest and not grabbed.  A
- * client must not send CMD_CURSOR to a broker without it: an unknown command
- * is a protocol violation and ends the connection.
+ * pointer's cursor while the pointer is over the guest and not grabbed (under
+ * grab see CAP_CURSOR_POS).  A client must not send CMD_CURSOR to a broker
+ * without it: an unknown command is a protocol violation and ends the
+ * connection.
  */
 #define NVKVM_BROKER_CAP_MODE_HINTS   (1u << 10)
 #define NVKVM_BROKER_CAP_CURSOR       (1u << 11)
@@ -358,6 +359,14 @@ enum {
  * list, docs/SCANOUT.md "Mode list") and may send EV_MODE_EDIT.
  */
 #define NVKVM_BROKER_CAP_MODE_LIST    (1u << 17)
+/*
+ * CAP_CURSOR_POS (Conduit): the broker takes CMD_CURSOR_POS, the guest's own
+ * pointer position, and while the input is grabbed draws the guest cursor
+ * (CMD_CURSOR's image) there itself -- the host pointer is locked then and
+ * cannot show it.  Only with CAP_CURSOR.  A client sends CMD_CURSOR_POS only
+ * to a broker with the bit, and only while that broker said EV_GRAB x=1.
+ */
+#define NVKVM_BROKER_CAP_CURSOR_POS   (1u << 18)
 
 /* BYE reason codes. */
 enum {
@@ -507,8 +516,10 @@ enum {
      *
      * The broker shows the image as the host pointer's cursor while the
      * pointer is over the guest's picture and the input is not grabbed, so the
-     * cursor moves at host speed with no guest round trip.  Under grab it is
-     * hidden (the guest drives a relative pointer the host cannot place).
+     * cursor moves at host speed with no guest round trip.  Under grab the
+     * guest drives a relative pointer the host cannot place: a broker with
+     * NVKVM_BROKER_CAP_CURSOR_POS draws the image at the position the client
+     * reports (CMD_CURSOR_POS); without it nothing is shown.
      */
     NVKVM_BROKER_CMD_CURSOR = 7,
 
@@ -527,6 +538,19 @@ enum {
      * list once its last record arrived; a list cut short is dropped.
      */
     NVKVM_BROKER_CMD_MODES = 8,
+
+    /*
+     * CMD_CURSOR_POS (Conduit) -- where the guest's pointer is, in guest
+     * pixels of the scanout, as the guest reports it (a Windows guest's
+     * DxgkDdiSetPointerPosition: the hotspot's position).  Only to a broker
+     * advertising NVKVM_BROKER_CAP_CURSOR_POS, and only while it is grabbed:
+     *     width  = x, as int32_t
+     *     height = y, as int32_t
+     *     seq    = a per-update counter (advisory)
+     * No fd; every other field must be zero.  The newest one wins: a sender
+     * whose socket is full keeps only the latest position.
+     */
+    NVKVM_BROKER_CMD_CURSOR_POS = 9,
 };
 
 #define NVKVM_BROKER_MODES_MAX     64u

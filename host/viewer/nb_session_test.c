@@ -243,6 +243,13 @@ static int test_cursor(struct nb_session *s, const struct nb_buf_desc *d,
     return 0;
 }
 
+/* Conduit CMD_CURSOR_POS: said, so the selftest can assert on it. */
+static void test_cursor_pos(struct nb_session *s, int x, int y)
+{
+    (void)s;
+    nb_log("TEST cursor pos: %d,%d", x, y);
+}
+
 static int test_resize(struct nb_session *s, unsigned w, unsigned h)
 {
     struct nb_test *t = s->priv;
@@ -334,7 +341,7 @@ static int test_open(struct nb_session *s, const struct nb_config *cfg)
               NVKVM_BROKER_CAP_FULLSCREEN | NVKVM_BROKER_CAP_DMABUF |
               NVKVM_BROKER_CAP_MODIFIERS | NVKVM_BROKER_CAP_RELEASE |
               NVKVM_BROKER_CAP_RELEASE_SEQ |
-              NVKVM_BROKER_CAP_CURSOR;
+              NVKVM_BROKER_CAP_CURSOR | NVKVM_BROKER_CAP_CURSOR_POS;
     snprintf(s->grab_caveat, sizeof(s->grab_caveat),
              "THIS IS THE TEST BACKEND: nothing is displayed and no real input "
              "is captured");
@@ -361,6 +368,7 @@ static const struct nb_session_ops test_ops = {
     .set_clipboard = test_set_clipboard,
     .fetch_clipboard = test_fetch_clipboard,
     .cursor = test_cursor,
+    .cursor_pos = test_cursor_pos,
 };
 
 struct nb_session *nb_session_test(const struct nb_config *cfg)

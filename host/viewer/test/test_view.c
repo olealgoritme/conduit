@@ -918,8 +918,63 @@ static void test_sync(void)
           "bad sync ignored, rest kept");
 }
 
+/*
+ * The guest cursor the viewer draws under grab: at the hotspot's guest pixel,
+ * scaled like the picture, the hotspot where the host pointer's would be.
+ */
+static void test_cursor_rect(void)
+{
+    struct nb_view v = view(NB_SCALE_ASPECT, NB_AREA_FULL);
+    struct nb_place p;
+    struct nb_rect r;
+    bool on;
+
+    /* 1:1, no bars: the image's top-left is the hotspot minus the hotspot. */
+    nb_view_place(&v, 1920, 1080, 1920, 1080, 120, &p);
+    on = nb_view_cursor_rect(&p, 1920, 1080, 100, 200, 3, 5, 32, 32, &r);
+    CHECK(on, "1:1 on the picture");
+    rect_eq(&r, 97, 195, 32, 32, "1:1 cursor");
+
+    /* 32:9 pillarbox at half size (1920x1080 in 5120x1440 -> 2560x1440 at
+     * x=1280, k = 4/3): position, hotspot and size scale together. */
+    nb_view_place(&v, 1920, 1080, 5120, 1440, 120, &p);
+    on = nb_view_cursor_rect(&p, 1920, 1080, 960, 540, 6, 9, 48, 48, &r);
+    CHECK(on, "pillarbox centre on the picture");
+    rect_eq(&r, 1280 + 1280 - 8, 720 - 12, 64, 64, "pillarbox cursor");
+    /* The top-left guest pixel: the hotspot at the picture's corner, the
+     * image may hang over the bar (as the host pointer's would). */
+    on = nb_view_cursor_rect(&p, 1920, 1080, 0, 0, 6, 9, 48, 48, &r);
+    CHECK(on && r.x == 1280 - 8 && r.y == -12, "corner %d,%d", r.x, r.y);
+
+    /* Stretch: per-axis scale (1280x960 -> 1920x1080: 1.5 x 1.125). */
+    v = view(NB_SCALE_STRETCH, NB_AREA_FULL);
+    nb_view_place(&v, 1280, 960, 1920, 1080, 120, &p);
+    on = nb_view_cursor_rect(&p, 1280, 960, 640, 480, 4, 8, 32, 32, &r);
+    CHECK(on, "stretch on the picture");
+    rect_eq(&r, 960 - 6, 540 - 9, 48, 36, "stretch cursor");
+
+    /* 1:1 and cropped (2560x1440 in 1920x1080): a hotspot in the cropped
+     * margin is not drawn; one inside is, at its window position. */
+    v = view(NB_SCALE_NONE, NB_AREA_FULL);
+    nb_view_place(&v, 2560, 1440, 1920, 1080, 120, &p);
+    CHECK(!nb_view_cursor_rect(&p, 2560, 1440, 100, 100, 0, 0, 32, 32, &r),
+          "cropped-away hotspot not drawn");
+    on = nb_view_cursor_rect(&p, 2560, 1440, 320, 180, 0, 0, 32, 32, &r);
+    CHECK(on, "cropped origin drawn");
+    rect_eq(&r, 0, 0, 32, 32, "cropped origin cursor");
+
+    /* Off the guest's screen, or no picture: nothing. */
+    CHECK(!nb_view_cursor_rect(&p, 2560, 1440, -1, 10, 0, 0, 32, 32, &r),
+          "negative x");
+    CHECK(!nb_view_cursor_rect(&p, 2560, 1440, 2560, 10, 0, 0, 32, 32, &r),
+          "x past the screen");
+    CHECK(!nb_view_cursor_rect(&p, 0, 0, 10, 10, 0, 0, 32, 32, &r),
+          "no picture");
+}
+
 int main(void)
 {
+    test_cursor_rect();
     test_sync();
     test_fit();
     test_stretch();

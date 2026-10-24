@@ -2475,6 +2475,33 @@ static void nb_handle_cmd(struct nb_sink *s, const struct nvkvm_broker_cmd *c,
         }
         return;
 
+    case NVKVM_BROKER_CMD_CURSOR_POS:
+        /*
+         * Conduit: where the guest's pointer is (a Windows guest reports it
+         * from DxgkDdiSetPointerPosition).  Only to a broker that offered
+         * CAP_CURSOR_POS; no fd and nothing but x, y and the counter.  One
+         * that arrives just after the grab went off is not an error: the
+         * client sent it while the grab was still on.
+         */
+        if (!ss->ops->cursor_pos || !(ss->caps & NVKVM_BROKER_CAP_CURSOR_POS)) {
+            if (fd >= 0) {
+                close(fd);
+            }
+            nb_violation(s, "CURSOR_POS sent to a broker that did not offer it");
+            return;
+        }
+        if (fd >= 0 || c->flags != 0 || c->reserved1 != 0 || c->stride ||
+            c->offset || c->fourcc || c->modifier) {
+            if (fd >= 0) {
+                close(fd);
+            }
+            nb_violation(s, "CURSOR_POS carried an fd or buffer fields");
+            return;
+        }
+        s->n_cursor_pos++;
+        ss->ops->cursor_pos(ss, (int32_t)c->width, (int32_t)c->height);
+        return;
+
     case NVKVM_BROKER_CMD_MODES:
         /*
          * The display's mode list, one record per mode.  Only to a broker
