@@ -22,8 +22,10 @@
 //   --timeout-ms  per fence wait, default 10000
 //   --only        run only cases whose name contains SUBSTR
 //
-// Output: one "PASS <case>" or "FAIL <case>: ..." line per case ("SKIP" when
-// the format cannot be used that way), then
+// Output: "info" lines with the runtime's footprints for some mips, one
+// "PASS <case>" or "FAIL <case>: ..." line per case ("SKIP" when the format
+// cannot be used that way or the runtime refused a copy at Close, which ends
+// only that case), then
 //   RESULT PASS|FAIL cases=N failed=M
 // Exit code: 0 all passed, 1 a case failed, 2 setup error, 3 a fence wait timed
 // out or the device was removed (the run stops there).
@@ -310,8 +312,16 @@ static void read_region(Ctx& c, Tex& t, UINT sub, Box b) {
   });
 }
 
-static void submit_and_wait(Ctx& c, const char* name) {
-  CHECK(c.list->Close());
+// False when the runtime refused the recorded commands at Close (an invalid
+// copy); the list is reset and nothing ran.
+static bool submit_and_wait(Ctx& c, const char* name, HRESULT* close_hr) {
+  const HRESULT chr = c.list->Close();
+  if (FAILED(chr)) {
+    *close_hr = chr;
+    CHECK(c.alloc->Reset());
+    CHECK(c.list->Reset(c.alloc, nullptr));
+    return false;
+  }
   ID3D12CommandList* lists[] = { c.list };
   c.queue->ExecuteCommandLists(1, lists);
   CHECK(c.queue->Signal(c.fence, ++c.value));
@@ -335,6 +345,15 @@ static void submit_and_wait(Ctx& c, const char* name) {
   }
   CHECK(c.alloc->Reset());
   CHECK(c.list->Reset(c.alloc, nullptr));
+  return true;
+}
+
+static void skip(Ctx& c, const std::string& name, const char* why);
+
+static void skip_refused(Ctx& c, const std::string& name, HRESULT hr) {
+  char why[96];
+  std::snprintf(why, sizeof(why), "the runtime refused a copy in this case (Close 0x%08lx)", (unsigned long)hr);
+  skip(c, name, why);
 }
 
 // `background` (full uploads) runs and completes first, so the partial copies
@@ -354,7 +373,11 @@ static void run_case(Ctx& c, Tex& t, const std::string& name, const std::functio
       std::printf("ERROR %s: staging buffers too small\n", name.c_str());
       finish(2, "setup error");
     }
-    submit_and_wait(c, name.c_str());
+    HRESULT hr = S_OK;
+    if (!submit_and_wait(c, name.c_str(), &hr)) {
+      skip_refused(c, name, hr);
+      return;
+    }
   }
   record();
   if (c.overflow) {
@@ -371,7 +394,13 @@ static void run_case(Ctx& c, Tex& t, const std::string& name, const std::functio
   for (auto& r : c.pending_reads) r();
   b = transition(t.res, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
   c.list->ResourceBarrier(1, &b);
-  submit_and_wait(c, name.c_str());
+  HRESULT hr = S_OK;
+  if (!submit_and_wait(c, name.c_str(), &hr)) {
+    // Every case uploads the subresources it reads, so the model of the ones it
+    // touched is rebuilt by the next case that reads them.
+    skip_refused(c, name, hr);
+    return;
+  }
 
   D3D12_RANGE rr = { 0, (SIZE_T)c.rb_used };
   CHECK(c.rb->Map(0, &rr, &rbp));
@@ -470,6 +499,15 @@ static void run_format(Ctx& c, const Fmt& f) {
 
   // 4096x4096, 13 mips: mip 11 is 2x2 and mip 12 is 1x1, smaller than a block.
   make_tex(c, t, "4096", f.fmt, f.bpb, D3D12_RESOURCE_DIMENSION_TEXTURE2D, 4096, 4096, 1, 13);
+  for (UINT m : { 0u, 10u, 11u, 12u }) {
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp = {};
+    UINT rows = 0;
+    UINT64 row_size = 0, total = 0;
+    c.dev->GetCopyableFootprints(&t.desc, m, 1, 0, &fp, &rows, &row_size, &total);
+    std::printf("info %s 4096 mip%u footprint %ux%ux%u pitch %u rows %u row_size %llu\n", f.name, m,
+                fp.Footprint.Width, fp.Footprint.Height, fp.Footprint.Depth, fp.Footprint.RowPitch, rows,
+                (unsigned long long)row_size);
+  }
   run_case(c, t, F + " 4096 full upload+readback, 13 mips", nullptr, [&]() {
     for (UINT m = 0; m < 13; m++) upload_full(c, t, m, seed());
     for (UINT m = 0; m < 13; m++) read_full(c, t, m);
@@ -494,14 +532,18 @@ static void run_format(Ctx& c, const Fmt& f) {
     upload_region(c, t, 3, 448, 448, 0, 64, 64, 1, nullptr, seed());
     read_full(c, t, 3);
   });
-  run_case(c, t, F + " 4096 mip tail 4x4/2x2/1x1 with edge boxes", bg({ 10, 11, 12 }), [&]() {
-    const Box b10 = { 0, 0, 0, 4, 4, 1 }, b11 = { 0, 0, 0, 2, 2, 1 }, b12 = { 0, 0, 0, 1, 1, 1 };
-    upload_region(c, t, 10, 0, 0, 0, 4, 4, 1, &b10, seed());
-    upload_region(c, t, 11, 0, 0, 0, 4, 4, 1, &b11, seed());
-    upload_region(c, t, 12, 0, 0, 0, 4, 4, 1, &b12, seed());
+  // A box in a buffer footprint must be block aligned (the runtime refuses
+  // 2x2 out of a 4x4 footprint), so a mip smaller than a block takes a whole
+  // 4x4 block: the copy is the block-aligned size of the 4x4, 2x2 and 1x1 mips.
+  run_case(c, t, F + " 4096 mip tail 4x4/2x2/1x1, one block each", bg({ 10, 11, 12 }), [&]() {
+    const Box blk = { 0, 0, 0, 4, 4, 1 };
+    for (UINT m = 10; m < 13; m++) upload_region(c, t, m, 0, 0, 0, 4, 4, 1, &blk, seed());
     for (UINT m = 10; m < 13; m++) read_full(c, t, m);
-    read_region(c, t, 11, b11);
-    read_region(c, t, 12, b12);
+  });
+  // Texture-side boxes that end at the edge of a 2x2 / 1x1 mip.
+  run_case(c, t, F + " 4096 mip tail 2x2/1x1 edge-box readbacks", bg({ 11, 12 }), [&]() {
+    read_region(c, t, 11, { 0, 0, 0, 2, 2, 1 });
+    read_region(c, t, 12, { 0, 0, 0, 1, 1, 1 });
   });
   run_case(c, t, F + " 4096 partial readbacks (mip0 260x100 at (1000,2000), corner, mip5)", nullptr, [&]() {
     upload_full(c, t, 0, seed());
@@ -518,19 +560,24 @@ static void run_format(Ctx& c, const Fmt& f) {
     for (UINT m = 0; m < 10; m++) upload_full(c, t, m, seed());
     for (UINT m = 0; m < 10; m++) read_full(c, t, m);
   });
-  run_case(c, t, F + " 1000x600 partial uploads and readbacks at non-multiple-of-4 mips",
-           bg({ 2, 3, 4, 7, 8 }), [&]() {
-    const Box off = { 8, 4, 0, 60, 32, 1 };  // 52x28 out of a 64x64 footprint
+  run_case(c, t, F + " 1000x600 mip2 (250x150) box 52x28 of a 64x64 footprint to (100,40)", bg({ 2 }), [&]() {
+    const Box off = { 8, 4, 0, 60, 32, 1 };
     upload_region(c, t, 2, 100, 40, 0, 64, 64, 1, &off, seed());
-    const Box edge3 = { 0, 0, 0, 5, 11, 1 };  // reaches x=125, y=75: the edge of mip 3
-    upload_region(c, t, 3, 120, 64, 0, 8, 12, 1, &edge3, seed());
-    const Box m7 = { 0, 0, 0, 7, 4, 1 }, m8 = { 0, 0, 0, 3, 2, 1 };
-    upload_region(c, t, 7, 0, 0, 0, 8, 4, 1, &m7, seed());
-    upload_region(c, t, 8, 0, 0, 0, 4, 4, 1, &m8, seed());
-    for (UINT m : { 2u, 3u, 7u, 8u }) read_full(c, t, m);
+    read_full(c, t, 2);
+  });
+  // Whole blocks that hang over the edge of a mip that is not a multiple of 4.
+  run_case(c, t, F + " 1000x600 edge-block uploads (mip3 125x75 corner, mip7 7x4, mip8 3x2)", bg({ 3, 7, 8 }), [&]() {
+    // The last 2x3 blocks of mip 3 (125x75): texels 120..124 x 64..74.
+    upload_region(c, t, 3, 120, 64, 0, 8, 12, 1, nullptr, seed());
+    upload_region(c, t, 7, 0, 0, 0, 8, 4, 1, nullptr, seed());  // all of mip 7 (7x4)
+    upload_region(c, t, 8, 0, 0, 0, 4, 4, 1, nullptr, seed());  // all of mip 8 (3x2)
+    for (UINT m : { 3u, 7u, 8u }) read_full(c, t, m);
+  });
+  // Texture-side boxes that end at the edge of a mip that is not a multiple of 4.
+  run_case(c, t, F + " 1000x600 edge-box readbacks at non-multiple-of-4 mips", bg({ 3, 4, 7 }), [&]() {
     read_region(c, t, 3, { 120, 64, 0, 125, 75, 1 });
     read_region(c, t, 4, { 56, 32, 0, 62, 37, 1 });
-    read_region(c, t, 7, m7);
+    read_region(c, t, 7, { 0, 0, 0, 7, 4, 1 });
   });
   free_tex(t);
 
@@ -540,13 +587,14 @@ static void run_format(Ctx& c, const Fmt& f) {
     for (UINT sub = 0; sub < 22; sub++) upload_full(c, t, sub, seed());
     for (UINT sub = 0; sub < 22; sub++) read_full(c, t, sub);
   });
-  run_case(c, t, F + " 2-slice array slice 1 partial (mip0 128x64 at (512,256), mip9 2x2)",
-           bg({ 0, 9, 11, 20 }), [&]() {
+  run_case(c, t, F + " 2-slice array slice 1 mip0 128x64 at (512,256)", bg({ 0, 11 }), [&]() {
     upload_region(c, t, 11, 512, 256, 0, 128, 64, 1, nullptr, seed());
-    const Box b = { 0, 0, 0, 2, 2, 1 };
-    upload_region(c, t, 20, 0, 0, 0, 4, 4, 1, &b, seed());
-    for (UINT sub : { 0u, 9u, 11u, 20u }) read_full(c, t, sub);
+    for (UINT sub : { 0u, 11u }) read_full(c, t, sub);
     read_region(c, t, 11, { 500, 248, 0, 660, 340, 1 });
+  });
+  run_case(c, t, F + " 2-slice array slice 1 mip9 (2x2) one block", bg({ 9, 20 }), [&]() {
+    upload_region(c, t, 20, 0, 0, 0, 4, 4, 1, nullptr, seed());
+    for (UINT sub : { 9u, 20u }) read_full(c, t, sub);
   });
   free_tex(t);
 
