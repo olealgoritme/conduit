@@ -49,7 +49,7 @@ pacing settings take effect at once.
 | `EnhanceSharpness` (DWORD) | `Sharpness` | `MESA_WSI_ENHANCE_SHARPNESS` | 0..100 (FSR's RCAS; 0: EASU alone) | 50 |
 | `EnhanceFrameGen` (REG_SZ) | `FrameGen` | `MESA_WSI_ENHANCE_FG` | `off`, `2x`, `3x`, `4x`, `adaptive` | `off` |
 | `EnhanceFgTarget` (DWORD) | `FgTarget` | `MESA_WSI_ENHANCE_FG_TARGET` | adaptive: pictures per second to fill to; 0 = the display's refresh | 0 |
-| `EnhanceFgQuality` (REG_SZ) | `FgQuality` | `MESA_WSI_ENHANCE_FG_QUALITY` | `fast` (flow down to 1/4 of the frame), `quality` (down to 1/2, one more coarse level: twice the reach) | `fast` |
+| `EnhanceFgQuality` (REG_SZ) | `FgQuality` | `MESA_WSI_ENHANCE_FG_QUALITY` | `fast` (flow down to 1/4 of the frame), `quality` (down to 1/2, propagation on every level: about twice the flow's cost, for strong GPUs) | `fast` |
 | `EnhanceLowLatency` (DWORD) | `LowLatency` | `MESA_WSI_ENHANCE_LOW_LATENCY` | 1: pictures one refresh apart (the real frame is held less, the cadence is uneven); with fixed multipliers and `FgTarget`, no generation while the game reaches the target | 0 |
 | `EnhanceFit` (REG_SZ) | `Fit` | `MESA_WSI_ENHANCE_FIT` | `aspect` (black bars), `stretch` | `aspect` |
 | `EnhanceWindows` (REG_SZ) | | `MESA_WSI_ENHANCE_WINDOWS` | `fullscreen`, `all` | `fullscreen` |
@@ -91,17 +91,22 @@ Per real frame, in the present's submission:
 1. the scaler writes the frame into a history image at the picture's size;
 2. a luma pyramid of the frame (1/2 to 1/32) is made from the application's
    image;
-3. optical flow between the last two frames, coarse to fine: an exhaustive
-   block search at the coarsest level (4 texels, 64 frame pixels at `fast`,
-   128 at `quality`), then at each finer level the coarser vectors of the
-   texel and its neighbours, refined by one texel. The match is symmetric
-   about the generated moment, so every pixel of a generated picture has a
-   vector;
+3. optical flow between the last two frames, coarse to fine from 1/32 of
+   the frame: an exhaustive block search at the coarsest level (4 texels,
+   128 frame pixels of reach), then at each finer level the coarser vectors
+   of the texel and its neighbours, refined by one texel, and a
+   propagation round in which every texel also tries its eight neighbours'
+   vectors at the same level (correct vectors spread from edges into areas
+   the coarser levels saw as flat). The match is symmetric about the
+   generated moment, so every pixel of a generated picture has a vector;
+   the motion cost is per frame pixel, the same at every level. `fast`
+   ends at 1/4 of the frame and propagates from 1/8 down; `quality` ends at
+   1/2 and propagates on every level;
 4. each generated picture at phase k/n, at the output's resolution, straight
-   into its slot: per pixel, of the four nearest vectors and zero motion,
-   the one along which both frames agree best (a static HUD keeps zero
-   motion over a moving scene); where they disagree, the frame nearer in
-   time; where the flow match was poor, a cross-fade;
+   into its slot: per pixel, of the nine flow vectors around it and zero
+   motion, the one along which both frames agree best (a static HUD keeps
+   zero motion over a moving scene); where they disagree, the frame nearer
+   in time; where the flow match was poor, a cross-fade;
 5. the real frame is copied from the history into its slot.
 
 The present thread waits for the submission's fence (the application's
@@ -127,11 +132,36 @@ It steps aside (shows the real frame alone):
 - with low latency and `FgTarget`, while the game reaches the target;
 - on a new swapchain (a new history).
 
-Known artifacts: halos at the edges of fast-moving objects (the flow is one
-vector per 4x4 frame pixels at `fast`, 2x2 at `quality`), cross-fading
-beyond the search reach, wrong vectors on repeating patterns, particles and
-transparency, and HUD elements that move with the scene. The cursor DWM
-draws is never interpolated.
+Known artifacts: thin semi-transparent strips where a moving object covers
+or uncovers the background (the flow is one vector per 4x4 frame pixels at
+`fast`, 2x2 at `quality`), cross-fading beyond the search reach, wrong
+vectors on repeating patterns (fine scrolling text fails: at the flow's
+resolution its lines are periodic), particles and transparency, and HUD
+elements that move with the scene. The cursor DWM draws is never
+interpolated.
+
+### Measuring the interpolation
+
+`guest/nvk-rm/tools/enhance-eval/run.sh MESA_DIR [OUT_DIR]` compiles the
+frame-generation shaders of a Mesa tree, runs them on the host's GPU (any
+Vulkan driver) with the same dispatch sequence as the driver, on synthetic
+scenes rendered at t=0 and t=1, and compares the generated t=0.5 picture
+with the scene at t=0.5: PSNR, the mean error within 12 pixels of moving
+edges and over a static HUD, and the flow's endpoint error. `FG_*`
+environment variables override the flow parameters to compare variants.
+Over the six scenes other than scrolling text, the generated picture
+averages 38.2 dB (`fast`) and 38.6 dB (`quality`), the error at moving
+edges 5.6 and 5.3 (0..255):
+
+| Scene | `fast` dB | `quality` dB |
+|---|---|---|
+| white box over a grid, 40 px per frame | 42.2 | 42.2 |
+| textured box over texture, (32, 8) px | 41.4 | 41.1 |
+| background pan 24 px, static HUD, an object | 39.3 | 39.5 |
+| two objects crossing, 36 px each way | 36.0 | 37.2 |
+| eight small objects, each its own motion | 38.7 | 39.3 |
+| a box beyond the reach, 110 px | 31.4 | 32.0 |
+| fine text scrolling 18 px | 9.6 | 10.0 |
 
 ## D3D swap chains
 
@@ -192,31 +222,30 @@ ordinary DXGI presents of the process: PresentMon counts them.
 
 ## Cost
 
-Vulkan swapchains: RTX 5090, NVK on RM in the guest, a 240 Hz 5120x1440 desktop, the test
-pattern at 60 fps (`vk_enhance_pattern.exe`), GPU clocks not locked (light
-load: times vary up to about 2x between runs), microseconds per real frame:
+RTX 5090, NVK on RM in the guest, a 240 Hz 5120x1440 desktop, the test
+patterns at 60 fps, GPU clocks not locked (light load: times vary up to
+about 2x between runs), microseconds per real frame (scale, pyramid, flow,
+interpolation of all generated pictures, copy of the real frame):
 
-| Swapchain -> picture | Mode | scale | pyramid | flow | interp (all pictures) | copy | total |
-|---|---|---|---|---|---|---|---|
-| 1280x720 -> 1920x1080 | FSR, 2x | 59-63 | 37-38 | 68 | 25-28 | 20 | 211-216 |
-| 1920x1080 -> 1920x1080 | 2x | 28 | 45 | 157-175 | 26-28 | 39-59 | 313-317 |
-| 1920x1080 -> 2560x1440 | FSR | 90-97 | | | | | 90-97 |
-| 1920x1080 -> 2560x1440 | FSR, 2x | 93-98 | 47-48 | 80 | 39-47 | 33 | 293-307 |
-| 1920x1080 -> 2560x1440 | FSR, 2x, `quality` | 92 | 52 | 194 | 49 | 34 | 421 |
-| 1920x1080 -> 2560x1440 | FSR, 3x | 89-95 | 54-56 | 82 | 69-77 | 39-44 | 336-351 |
-| 1920x1080 -> 2560x1440 | FSR, 4x at 30 fps | 97-107 | 61-80 | 88-146 | 121-134 | 35-75 | 402-541 |
-| 1920x1080 -> 2560x1440 | FSR, adaptive at 30 fps (8 pictures) | 99-101 | 61-69 | 114-115 | 297-312 | 43-50 | 615-646 |
-| 2560x1421 -> 2560x1421 | 2x | 39-43 | 46-47 | 95 | 83-86 | 34 | 300-301 |
-| 2560x720 -> 5120x1440 | FSR, 2x | 167-178 | 49-50 | 80-82 | 70-88 | 63-65 | 430-460 |
-| 5120x1440 -> 5120x1440 | 2x | 63-66 | 66-70 | 154-155 | 103-109 | 122-123 | 513-518 |
-| 640x360 -> 2560x1440 | integer | 41-44 | | | | | 41-44 |
+| Swapchain -> picture | Mode | Vulkan | D3D12 |
+|---|---|---|---|
+| 1920x1080 -> 2560x1440 | FSR only | 90-97 (scale) | |
+| 640x360 -> 2560x1440 | integer only | 41-44 (scale) | |
+| 1920x1080 -> 1920x1080 | 2x `fast` | 26 / 47 / 261 / 69 / 22 = 424 | 350 |
+| 1920x1080 -> 1920x1080 | 2x `quality` | 26 / 46 / 533 / 71 / 22 = 698 | 726 |
+| 1920x1080 -> 2560x1440 | FSR + 2x `fast` | 93 / 49 / 260 / 113 / 37 = 552 | 484 |
+| 1920x1080 -> 2560x1440 | FSR + 2x `quality` | 138 / 61 / 648 / 116 / 34 = 997 | 822 |
+| 5120x1440 -> 5120x1440 | 2x `fast` | 63 / 64 / 452 / 220 / 63 = 861 | 802 |
+| 5120x1440 -> 5120x1440 | 2x `quality` | 61 / 64 / 1545 / 411 / 61 = 2143 | 2564 |
 
 The present thread's work (one D3D11 copy and `Present` per picture) is on
 top. `vkQueuePresentKHR` itself stayed at 0.02 ms on average (0.5 ms worst)
 with every mode: the application's thread never waits for a picture's time.
 
-D3D swap chains (`d3d11_enhance_pattern.exe`, `d3d12_enhance_pattern.exe`;
-PresentMon over 3 s; GPU microseconds per real frame):
+Pacing of D3D swap chains (`d3d11_enhance_pattern.exe`,
+`d3d12_enhance_pattern.exe`; PresentMon over 3 s; the GPU totals are from
+before the flow's propagation round, see the table above for the current
+cost):
 
 | API | Swapchain -> picture | Mode, game fps | Shown per second | PresentMon | GPU total |
 |---|---|---|---|---|---|
@@ -240,7 +269,11 @@ PresentMon over 3 s; GPU microseconds per real frame):
   buffer smaller than its borderless window, a moving object and a static
   HUD, a frame-rate cap, and optionally a `ResizeBuffers` half way. Run with
   `HELIOS_NVK_ICD=<test vulkan_nouveau.dll>` to test an NVK build in one
-  process.
+  process. A Vulkan test needs it too (with `VK_DIRECT_DRIVER`): the
+  composed present's D3D11 device otherwise loads the installed NVK beside
+  the test one.
+- `guest/nvk-rm/tools/enhance-eval`: the frame-generation passes on the
+  host's GPU against synthetic scenes (see "Measuring the interpolation").
 
 ## Not done yet
 
