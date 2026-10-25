@@ -1,0 +1,49 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: SR_team <me@sr.team>
+Date: Sun, 25 Oct 2026 22:55:00 +0500
+Subject: [PATCH] nak: handle the last active subgroup invocation
+
+nir_opt_uniform_atomics emits last_invocation when an atomic has a
+subgroup-uniform address, a divergent increment and a used return value.
+The combined scan/reduction path needs the last active lane, but NAK
+rejected that intrinsic and returned VK_ERROR_UNKNOWN from pipeline
+creation. Baldur's Gate 3 reaches this path through D3D11/DXVK.
+
+Lower it to ballot(true) followed by an unsigned find-most-significant-bit.
+The ballot reflects the executing lanes, so sparse masks and divergent
+control flow select the last active lane rather than assuming lane 31.
+Keep uniform-atomic optimization enabled.
+
+diff --git a/src/nouveau/compiler/nak/from_nir.rs b/src/nouveau/compiler/nak/from_nir.rs
+index b85aa5dc739..69bb280d164 100644
+--- a/src/nouveau/compiler/nak/from_nir.rs
++++ b/src/nouveau/compiler/nak/from_nir.rs
+@@ -2640,6 +2640,26 @@ impl<'a> ShaderFromNir<'a> {
+ 
+                 self.set_dst(&intrin.def, dst.into());
+             }
++            nir_intrinsic_last_invocation => {
++                // NVIDIA subgroups have 32 lanes. The highest set bit of
++                // ballot(true) is the last currently active invocation,
++                // including when control flow leaves holes in the mask.
++                let active = b.alloc_ssa(RegFile::GPR);
++                b.push_op(OpVote {
++                    op: VoteOp::Any,
++                    ballot: active.into(),
++                    vote: Dst::None,
++                    pred: true.into(),
++                });
++                let dst = b.alloc_ssa(RegFile::GPR);
++                b.push_op(OpFlo {
++                    dst: dst.into(),
++                    src: active.into(),
++                    signed: false,
++                    return_shift_amount: false,
++                });
++                self.set_dst(&intrin.def, dst.into());
++            }
+             nir_intrinsic_ballot => {
+                 assert!(srcs[0].bit_size() == 1);
+                 let src = self.get_src(&srcs[0]);
+-- 
+2.53.0
