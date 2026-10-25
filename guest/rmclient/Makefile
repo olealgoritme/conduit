@@ -18,7 +18,7 @@ all: $(O)/librmclient.a $(O)/librmclient.so $(O)/test_unit $(O)/test_win_wire $(
 $(O):
 	mkdir -p $(O)
 
-$(O)/%.o: src/%.c include/rmclient.h include/rmclient_transport.h src/nv_ioctl_defs.h src/crm_mutex.h | $(O)
+$(O)/%.o: src/%.c include/rmclient.h include/rmclient_transport.h src/nv_ioctl_defs.h src/crm_mutex.h src/win_wire.h | $(O)
 	$(CC) $(XCFLAGS) -c $< -o $@
 
 $(O)/librmclient.a: $(OBJS)
@@ -30,7 +30,7 @@ $(O)/librmclient.so: $(OBJS)
 $(O)/test_unit: tests/test_unit.c $(O)/librmclient.a
 	$(CC) $(XCFLAGS) $< $(O)/librmclient.a $(XLDFLAGS) -o $@
 
-$(O)/test_win_wire: tests/test_win_wire.c src/win_wire.h src/win_gen.h src/helios_nvrm_escape.h | $(O)
+$(O)/test_win_wire: tests/test_win_wire.c src/win_wire.h src/win_gen.h src/helios_nvrm_escape.h src/nv_ioctl_defs.h | $(O)
 	$(CC) $(XCFLAGS) $< -o $@
 
 $(O)/crm_smoke: tests/crm_smoke.c $(O)/librmclient.a

@@ -521,6 +521,7 @@ CLASS_PROBE = r"""
 #include "resource_desc_flags.h"
 @INCLUDES@
 @STUBS@
+@CHANNEL_GROUP_ABI@
 
 #define NVBIT(b) (1ULL << (b))
 #define RS_ROOT_OBJECT 0
@@ -541,6 +542,33 @@ int main(void) {
   return 0;
 }
 """
+
+
+def channel_group_abi(ogkm):
+    """Check the two channel-group layouts understood by the Windows transport."""
+    name = "NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS"
+    with open(os.path.join(ogkm, INC, "nvos.h")) as header:
+        text = header.read()
+    body = re.search(r"typedef struct\s*\{([^{}]*)\}\s*" + name + r"\s*;", text)
+    if body is None:
+        sys.exit(f"{name} is not declared in nvos.h")
+    fields = [("NvHandle", "hObjectError", 0, 4), ("NvHandle", "hObjectEccError", 4, 4),
+              ("NvHandle", "hVASpace", 8, 4), ("NvU32", "engineType", 12, 4),
+              ("NvBool", "bIsCallingContextVgpuPlugin", 16, 1)]
+    text = re.sub(r"/\*.*?\*/|//[^\n]*", "", body.group(1), flags=re.S)
+    members = sorted(" ".join(field.split()) for field in text.split(";") if field.strip())
+    size = 20
+    if "NvU32 internalFlags" in members:
+        fields += [("NvU32", "reserved", 20, 4), ("NvU32", "internalFlags", 24, 4)]
+        size = 28
+    # A new field can occupy padding without changing sizeof or existing offsets.
+    if members != sorted(f"{kind} {field}" for kind, field, _, _ in fields):
+        sys.exit(f"unsupported channel-group fields in {name}")
+    checks = [f'_Static_assert(sizeof({name}) == {size}, "unsupported channel-group ABI");']
+    for _, field, offset, width in fields:
+        checks += [f'_Static_assert(offsetof({name}, {field}) == {offset} && '
+                   f'sizeof((({name} *)0)->{field}) == {width}, "channel-group {field} layout");']
+    return "\n".join(checks)
 
 
 def class_probe(ogkm, defs, types):
@@ -570,6 +598,7 @@ def class_probe(ogkm, defs, types):
                 drop.add(e["name"])
     src = CLASS_PROBE.replace("@INCLUDES@", "\n".join(f'#include "{h}"' for h in sorted(hdrs)))
     src = src.replace("@STUBS@", "\n".join(stubs))
+    src = src.replace("@CHANNEL_GROUP_ABI@", channel_group_abi(ogkm))
     return src, entries, drop
 
 

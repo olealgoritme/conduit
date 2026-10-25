@@ -33,6 +33,8 @@
 #include <stdint.h>
 #include <string.h>
 
+#include "nv_ioctl_defs.h"
+
 #define CRM_WIRE_MSG_OPEN 1u
 #define CRM_WIRE_MSG_CLOSE 2u
 #define CRM_WIRE_MSG_IOCTL 3u
@@ -291,6 +293,60 @@ static inline uint32_t crm_wire_parse_alloc_sizes(const uint8_t *s, size_t len,
         at += 8;
     }
     return n;
+}
+
+struct crm_channel_group {
+    uint32_t hObjectError;
+    uint32_t hObjectEccError;
+    uint32_t hVASpace;
+    uint32_t engineType;
+    uint8_t bIsCallingContextVgpuPlugin;
+};
+
+/* NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS in NVIDIA 615.71.09. */
+struct crm_channel_group_615 {
+    struct crm_channel_group base;
+    uint32_t reserved;
+    uint32_t internalFlags;
+};
+
+_Static_assert(sizeof(struct crm_channel_group) == 20, "channel-group legacy size");
+_Static_assert(offsetof(struct crm_channel_group, hObjectError) == 0, "hObjectError");
+_Static_assert(offsetof(struct crm_channel_group, hObjectEccError) == 4, "hObjectEccError");
+_Static_assert(offsetof(struct crm_channel_group, hVASpace) == 8, "hVASpace");
+_Static_assert(offsetof(struct crm_channel_group, engineType) == 12, "engineType");
+_Static_assert(offsetof(struct crm_channel_group, bIsCallingContextVgpuPlugin) == 16, "vgpuPlugin");
+_Static_assert(sizeof(struct crm_channel_group_615) == 28, "channel-group 615 size");
+_Static_assert(offsetof(struct crm_channel_group_615, reserved) == 20, "reserved");
+_Static_assert(offsetof(struct crm_channel_group_615, internalFlags) == 24, "internalFlags");
+
+static inline int crm_wire_channel_group_prepare(const NVOS64_PARAMETERS *p,
+                                                  uint32_t host_size,
+                                                  NVOS64_PARAMETERS *wire,
+                                                  struct crm_channel_group_615 *params)
+{
+    if (p->hClass != KEPLER_CHANNEL_GROUP_A || !p->pAllocParms ||
+        p->paramsSize != sizeof(params->base) ||
+        host_size != sizeof(*params))
+        return 0;
+    *wire = *p;
+    memcpy(&params->base, (const void *)(uintptr_t)p->pAllocParms, sizeof(params->base));
+    params->reserved = 0;
+    /* Internal flags belong to kernel RM and GSP, not the client. */
+    params->internalFlags = 0;
+    wire->pAllocParms = (uint64_t)(uintptr_t)params;
+    wire->paramsSize = sizeof(*params);
+    return 1;
+}
+
+static inline void crm_wire_channel_group_finish(NVOS64_PARAMETERS *p,
+                                                 NVOS64_PARAMETERS wire,
+                                                 const struct crm_channel_group_615 *params)
+{
+    memcpy((void *)(uintptr_t)p->pAllocParms, &params->base, sizeof(params->base));
+    wire.pAllocParms = p->pAllocParms;
+    wire.paramsSize = p->paramsSize;
+    *p = wire;
 }
 
 #endif /* CRM_WIN_WIRE_H */

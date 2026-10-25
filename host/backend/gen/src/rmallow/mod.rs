@@ -643,6 +643,24 @@ mod tests {
         assert!(select(v(500, 0, 0)).is_none());
     }
 
+    #[test]
+    fn channel_group_sizes_need_an_exact_profile() {
+        for (version, size) in [
+            (v(610, 57, 4), 20),
+            (v(615, 71, 9), 28),
+            (v(615, 78, 8), 28),
+        ] {
+            let sel = select(version).unwrap();
+            assert_eq!(sel.class_entry(0xa06c).unwrap().params_size, size);
+        }
+        assert!(
+            select(v(615, 999, 0))
+                .unwrap()
+                .class_entry(0xa06c)
+                .is_none()
+        );
+    }
+
     /// RM's control entry point tries the deprecated table, then the
     /// GSP-forwarded commands, then the resource server, and the privilege
     /// rule is different in each. These are the commands the probe runs found
