@@ -84,8 +84,8 @@ None of this can be switched off from the command line.
   is a number of MiB, (2) the display default, when it applies, and (3) 2 GiB
   when safe mode is on. The display default applies for `gpu.vram_limit_mib
   auto`, and when it is unset while safe mode is on, and only when the NVIDIA
-  card has a monitor connected: the smaller of half the card's memory and its
-  memory minus 3 GiB (4 GiB when the card's memory size is not known), so a
+  card has a monitor connected: the card's memory minus 3 GiB, at least 1 GiB
+  (4 GiB when the card's memory size is not known), so a
   guest cannot fill the memory the desktop needs. `off` drops (1) and (2).
   Safe mode's 2 GiB is a ceiling that no number and no `off` raises; to lift
   it, turn safe mode off. On the tested setup (safe mode off, nothing set)
