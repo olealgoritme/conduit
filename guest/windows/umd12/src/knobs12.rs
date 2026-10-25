@@ -510,11 +510,11 @@ pub(crate) fn nvk12_completion_hint_us() -> u32 {
     NVK12_COMPLETION_HINT.get().min(MAX_COMPLETION_HINT_US)
 }
 
-/// `Nvk12EclFencePrefetch` (`Nvk12EclSync=2`): after an ECL is admitted, make
-/// the queue's next ECL fence right away (vkd3d patch 0009,
-/// helios_vkd3d_prepare_ecl_fence), so the next ECL's HE12 v4 Render does not
-/// wait for the fence-create escape, a host round trip. Absent = ON; 0 = make
-/// each fence inline, as before. Read once per process.
+/// `Nvk12EclFencePrefetch` (`Nvk12EclSync=2`): reserve the next ECL's
+/// timeline point ahead (vkd3d patch 0012). The timed RM fence is created only
+/// when that batch is committed, so a CPU idle gap cannot expire it before use.
+/// Absent = ON; 0 reserves the point inline. Read once per process.
+/// The legacy knob and export names are retained for compatibility.
 pub(crate) static NVK12_ECL_FENCE_PREFETCH: BoolKnob = BoolKnob::new(c"Nvk12EclFencePrefetch", true);
 
 pub(crate) fn nvk12_ecl_fence_prefetch() -> bool {
