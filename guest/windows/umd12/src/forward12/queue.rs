@@ -711,6 +711,7 @@ pub struct PoolState {
 /// ⚠ `pub` for the same E0446 reason as [`QueueState`]: it is named as the
 /// associated type of the `pub` `BoxedHandle` trait. Both fields are private.
 pub struct CommandListState {
+    pub(crate) msaa_present: Mutex<Option<super::present12::PendingMsaaPresent>>,
     /// The device this list was created against — the only error channel a
     /// `VOID`-returning recording slot has.
     h_device: ddi12::D3D12DDI_HDEVICE,
@@ -2189,6 +2190,7 @@ unsafe extern "system" fn create_command_list(
     // returned.
     unsafe {
         slot.store(CommandListState {
+            msaa_present: Mutex::new(None),
             h_device,
             h_rt_list,
             engine: list,
@@ -2921,6 +2923,34 @@ pub(crate) unsafe fn submit_present_identity<T: Copy>(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     // SAFETY: runtime-owned context and windows, on the entering Present thread.
+    unsafe { submit_present_identity_held(dev, queue, record) }
+}
+
+/// The post-resolve marker is emitted inside ECL's existing execution guard.
+/// Re-entering `submit_present_identity` here would lock that mutex twice.
+///
+/// # Safety
+/// Live queue, entering ECL DDI thread, queue execution lock already held.
+pub(crate) unsafe fn submit_present_identity_after_ecl<T: Copy>(
+    h_queue: ddi12::D3D12DDI_HCOMMANDQUEUE,
+    record: &T,
+) -> WddmSubmit {
+    let Some(queue) = (unsafe { queue_state(h_queue) }) else {
+        return WddmSubmit::Unavailable;
+    };
+    let Some(dev) = (unsafe { device12::device(queue.h_device) }) else {
+        return WddmSubmit::Unavailable;
+    };
+    unsafe { submit_present_identity_held(dev, queue, record) }
+}
+
+/// # Safety
+/// Live device/queue, entering DDI thread and queue execution lock held.
+unsafe fn submit_present_identity_held<T: Copy>(
+    dev: &device12::HeliosD3D12Device,
+    queue: &QueueState,
+    record: &T,
+) -> WddmSubmit {
     let outcome = unsafe { submit_wddm_render(dev, queue, record, "Present identity") };
     if matches!(outcome, WddmSubmit::Submitted) {
         // ⭐ Counted HERE and not in L8, because this function is present-scoped by
@@ -3756,7 +3786,11 @@ unsafe fn execute_command_lists_body(
         }
     }
     if boundary.0 == 0 {
-        if want_fence && crate::knobs12::umd12_merge_ecl() && ecl_fence.is_some() {
+        if want_fence
+            && crate::knobs12::umd12_merge_ecl()
+            && ecl_fence.is_some()
+            && !unsafe { has_pending_msaa_present(lists, count) }
+        {
             // Diagnostic `Umd12MergeEcl`: hold this batch's packet and merge it
             // with the ones that follow (see `MergePending`).
             // SAFETY: entering ECL thread, live device/queue, execution lock held.
@@ -3783,6 +3817,7 @@ unsafe fn execute_command_lists_body(
                 Ok(true) => {
                     L2_REFUSALS.ecl_nvk_ordered.bump();
                     note_refusal(&L2_REFUSALS.ecl_admission_queued);
+                    unsafe { finish_msaa_presents(h_queue, lists, count) };
                     // `Nvk12EclFencePrefetch`: the next ECL's fence now, with
                     // this batch already admitted, so its Render need not wait
                     // for the fence-create escape. Still under the execution
@@ -3813,6 +3848,7 @@ unsafe fn execute_command_lists_body(
             Ok(()) => {
                 L2_REFUSALS.ecl_nvk_ordered.bump();
                 note_refusal(&L2_REFUSALS.ecl_admission_queued);
+                unsafe { finish_msaa_presents(h_queue, lists, count) };
             }
             Err(hr) => {
                 note_refusal(&L2_REFUSALS.ecl_admission_failed);
@@ -3865,6 +3901,45 @@ unsafe fn execute_command_lists_body(
     if ecl_delay_us != 0 {
         note_refusal(&L2_REFUSALS.ecl_delayed);
         std::thread::sleep(Duration::from_micros(u64::from(ecl_delay_us)));
+    }
+}
+
+/// # Safety
+/// The caller already validated the runtime's list array and every handle.
+unsafe fn has_pending_msaa_present(lists: *const ddi12::D3D12DDI_HCOMMANDLIST, count: u32) -> bool {
+    (0..count as usize).any(|i| {
+        unsafe { command_list_state(*lists.add(i)) }.is_some_and(|state| {
+            state
+                .msaa_present
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some()
+        })
+    })
+}
+
+/// Publish only after the batch carrying the resolve has an admitted ECL
+/// boundary. A marker queued during Present would precede this batch and could
+/// wait for work whose admission is behind that same marker in WDDM's FIFO.
+///
+/// # Safety
+/// Validated array/handles, successful NVK ECL, queue execution lock held.
+unsafe fn finish_msaa_presents(
+    h_queue: ddi12::D3D12DDI_HCOMMANDQUEUE,
+    lists: *const ddi12::D3D12DDI_HCOMMANDLIST,
+    count: u32,
+) {
+    for i in 0..count as usize {
+        if let Some(state) = unsafe { command_list_state(*lists.add(i)) } {
+            let pending = state
+                .msaa_present
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
+            if let Some(present) = pending {
+                unsafe { present.submit(h_queue) };
+            }
+        }
     }
 }
 
