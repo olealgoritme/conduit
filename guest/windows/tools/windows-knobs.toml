@@ -767,7 +767,7 @@ see = "[rm-fence-marker.md](../guest/windows/docs/rm-fence-marker.md#completion-
 [umd.Nvk12EclFencePrefetch]
 class = "tuning"
 read = "once per process"
-effect = "With Nvk12EclSync=2: 1 makes the queue's next ECL fence as soon as an ECL is admitted, so the next submission does not wait for the fence-create round trip; 0 makes each fence inline."
+effect = "With Nvk12EclSync=2: 1 reserves the next queue point ahead; 0 reserves it at commit. Both create the timed RM fence at commit, after any CPU idle interval (vkd3d patch 0012)."
 
 [umd.Nvk12EclSpinUs]
 class = "tuning"
