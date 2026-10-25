@@ -1,0 +1,28 @@
+// SPDX-License-Identifier: Apache-2.0
+#version 450
+
+// One subgroup (32 lanes).  All active lanes atomically add a divergent
+// positive delta to the same counter and keep the returned old value.
+// Inactive lanes leave a sentinel in their output slot.
+layout(local_size_x = 32) in;
+
+layout(push_constant) uniform Push {
+    uint activeMask;
+} pc;
+
+layout(std430, set = 0, binding = 0) buffer Data {
+    uint counter;
+    uint oldValues[32];
+} data;
+
+void main() {
+    uint lane = gl_LocalInvocationID.x;
+    uint old = 0xDEADBEEFu;                 // sentinel for inactive lanes
+
+    if (((pc.activeMask >> lane) & 1u) != 0u) {
+        uint delta = (lane % 7u) + 1u;      // divergent increment, never zero
+        old = atomicAdd(data.counter, delta);
+    }
+
+    data.oldValues[lane] = old;             // returned value is used
+}
