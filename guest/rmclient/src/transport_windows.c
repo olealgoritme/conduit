@@ -1203,8 +1203,9 @@ static int win_ioctl(void *vctx, int fd, uint32_t nr, void *arg, uint32_t size)
                                                 &wire, &params)) {
                 const int r = ioctl_wire(c, fd, nr, &wire, sizeof(wire), &params,
                                           sizeof(params), 0, 0);
-                if (r == 0)
-                    crm_wire_channel_group_finish(p, wire, &params);
+                /* Like every other escape, the reply (RM status included) reaches
+                 * the caller even when the host returns an error. */
+                crm_wire_channel_group_finish(p, wire, &params);
                 return r;
             }
             nested = (void *)(uintptr_t)p->pAllocParms;
