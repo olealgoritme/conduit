@@ -18,25 +18,38 @@ pub(super) const VIDMM_MEMORY_BASE: u64 = 1 << 32;
 const VIDMM_VRAM_MIN_MB: u32 = helios_kmd_logic::vidmm_vram::MIN_MB;
 const VIDMM_VRAM_MAX_MB: u32 = helios_kmd_logic::vidmm_vram::MAX_MB;
 
+/// The ignored-backend-limit message is printed once per driver load.
+static LIMIT_IGNORED_LOGGED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 /// Resolve an absent `VidMmVramMB` registry value (`helios_kmd_logic::vidmm_vram`).
 ///
-/// The reported device-memory segment is the host GPU's video memory: the largest device-local
-/// heap the Venus device listed at bring-up. The segment is accounting only (VidMm charges the
-/// tracking allocations of memory the host GPU owns against it), so it is sized by what the card
-/// holds and not by the host-visible window, whose length (QEMU `hostmem`, 8 GiB by default) only
-/// bounds the CPU-visible blobs. When the Venus device could not tell, the exact virtio shared-
-/// memory capability length is used as before (QEMU may pad its containing PCI BAR to a power of
-/// two, but the capability retains the requested length), and failing that the legacy topology.
+/// The registry override, host heap, or fallback window supplies the capacity;
+/// the backend's enforced VRAM limit bounds it. This is VidMm accounting and
+/// does not enlarge the CPU-visible mapping window.
 pub(super) fn resolve_vidmm_vram_mb(
     knobs: &mut crate::adapter::AdapterKnobs,
     device_local_bytes: Option<u64>,
     host_visible_bytes: Option<u64>,
+    backend_limit_mb: u64,
 ) {
     let resolved = helios_kmd_logic::vidmm_vram::resolve(
         knobs.vidmm_vram_mb,
         device_local_bytes,
         host_visible_bytes,
+        backend_limit_mb,
     );
+    crate::diag::record_named_bytes(
+        b"VidVLmt",
+        backend_limit_mb.min(u64::from(u32::MAX)) as u32,
+    );
+    // An unusable limit never fails StartDevice: the size is chosen as if it were absent, and
+    // `VidVLIg` names the reason (`vidmm_vram::LIMIT_IGNORED_*`, 0 = not ignored).
+    let ignored = helios_kmd_logic::vidmm_vram::backend_limit_ignored(backend_limit_mb);
+    crate::diag::record_named_bytes(b"VidVLIg", ignored);
+    if ignored != 0 && !LIMIT_IGNORED_LOGGED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+        crate::kmsg(c"Helios: backend VRAM limit below 256 MiB ignored (VidVLmt, VidVLIg)\n");
+    }
     if let Some(bad_mb) = resolved.bad_mb {
         crate::diag::record_named_bytes(b"VidVBad", bad_mb);
     }

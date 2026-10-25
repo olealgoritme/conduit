@@ -533,6 +533,7 @@ pub unsafe extern "C" fn dxgkddi_start_device(
         crate::diag::read_config_dword(crate::diag::knobs::HW_CURSOR_Q, 1) != 0,
     ) {
         Ok(mut gpu) => {
+            let backend_limit_mb = gpu.vram_limit_mib();
             let Some(generation) = adapter.producer.start_transport() else {
                 crate::diag::record_named_bytes(b"PrGenF", 1);
                 return STATUS_INSUFFICIENT_RESOURCES;
@@ -577,10 +578,6 @@ pub unsafe extern "C" fn dxgkddi_start_device(
             // start-safe). See virtio::venus.
             venus_ctx_id = bring_up_venus(passive, adapter);
 
-            // An explicit VidMmVramMB registry value remains authoritative. When it is absent the
-            // reported device memory is the host GPU's video memory, read by the Venus bring-up
-            // just above (not the virtio host-visible window, which only bounds CPU-visible
-            // blobs). Nothing before this point reads the resolved value.
             let device_local_bytes = adapter
                 .with_venus_client(passive, |v| v.device_local_heap_bytes())
                 .ok()
@@ -589,6 +586,7 @@ pub unsafe extern "C" fn dxgkddi_start_device(
                 &mut knobs,
                 device_local_bytes,
                 host_visible_bytes,
+                backend_limit_mb,
             );
         }
         Err(e) => {
@@ -605,7 +603,7 @@ pub unsafe extern "C" fn dxgkddi_start_device(
                 .msi_state
                 .store(0, core::sync::atomic::Ordering::Release);
             adapter.set_virtio(None);
-            super::bar_segment::resolve_vidmm_vram_mb(&mut knobs, None, None);
+            super::bar_segment::resolve_vidmm_vram_mb(&mut knobs, None, None, 0);
         }
     }
 

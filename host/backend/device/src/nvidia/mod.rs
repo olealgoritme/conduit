@@ -607,7 +607,7 @@ impl NvidiaBackend {
     ///
     /// Announced in device config, where the VMM compares it against what it
     /// was configured with, so a backend that is not enforcing that limit
-    /// cannot go unnoticed. The guest is not told.
+    /// cannot go unnoticed. The Windows KMD also uses it to cap reported VRAM.
     pub fn vram_limit_mib(&self) -> u64 {
         self.vram.limit_mib()
     }
