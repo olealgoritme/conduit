@@ -138,7 +138,48 @@ struct Ctx {
   std::vector<ReadCheck> checks;
   std::string only;
   bool overflow = false;
+  // Command-list lifecycle, checked before every transition (see lifecycle()):
+  // the list is open (recording) or closed, and the allocator may be reset only
+  // with its list closed or released and its last submission complete.
+  bool list_open = false;
+  UINT64 alloc_last_submit = 0;
 };
+
+// A broken lifecycle rule is a bug in this test, not in the driver.
+static void lifecycle(bool ok, const char* rule) {
+  if (ok) return;
+  std::printf("ERROR command-list lifecycle: %s\n", rule);
+  finish(2, "test bug");
+}
+
+static void create_list(Ctx& c) {
+  lifecycle(c.list == nullptr, "a new list replaces a released one");
+  CHECK(c.dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, c.alloc, nullptr,
+                                 __uuidof(ID3D12GraphicsCommandList), (void**)&c.list));
+  c.list_open = true;  // a new list starts recording
+}
+
+// Reset the allocator (its list closed or gone, its work complete), then
+// reopen the list on it, or create a new one if it was released.
+static void reopen_list(Ctx& c) {
+  lifecycle(!c.list_open, "allocator reset with its list still recording");
+  lifecycle(c.fence->GetCompletedValue() >= c.alloc_last_submit,
+            "allocator reset before its last submission completed");
+  if (FAILED(c.alloc->Reset())) {
+    // Start over with a fresh allocator rather than abort the run.
+    if (c.list) { c.list->Release(); c.list = nullptr; }
+    c.alloc->Release();
+    c.alloc = nullptr;
+    CHECK(c.dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, __uuidof(ID3D12CommandAllocator),
+                                        (void**)&c.alloc));
+  }
+  if (c.list) {
+    CHECK(c.list->Reset(c.alloc, nullptr));
+    c.list_open = true;
+  } else {
+    create_list(c);
+  }
+}
 
 static UINT64 align(UINT64 v, UINT64 a) { return (v + a - 1) / a * a; }
 
@@ -315,16 +356,24 @@ static void read_region(Ctx& c, Tex& t, UINT sub, Box b) {
 // False when the runtime refused the recorded commands at Close (an invalid
 // copy); the list is reset and nothing ran.
 static bool submit_and_wait(Ctx& c, const char* name, HRESULT* close_hr) {
+  lifecycle(c.list_open, "Close of a list that is not recording");
   const HRESULT chr = c.list->Close();
   if (FAILED(chr)) {
+    // A list whose Close failed is neither executable nor known to be closed,
+    // so it is released (nothing then records into the allocator) and a new
+    // list is created on the reset allocator.
     *close_hr = chr;
-    CHECK(c.alloc->Reset());
-    CHECK(c.list->Reset(c.alloc, nullptr));
+    c.list->Release();
+    c.list = nullptr;
+    c.list_open = false;
+    reopen_list(c);
     return false;
   }
+  c.list_open = false;
   ID3D12CommandList* lists[] = { c.list };
   c.queue->ExecuteCommandLists(1, lists);
   CHECK(c.queue->Signal(c.fence, ++c.value));
+  c.alloc_last_submit = c.value;
   if (c.fence->GetCompletedValue() < c.value) {
     CHECK(c.fence->SetEventOnCompletion(c.value, c.event));
     if (WaitForSingleObject(c.event, c.timeout_ms) != WAIT_OBJECT_0) {
@@ -343,8 +392,7 @@ static bool submit_and_wait(Ctx& c, const char* name, HRESULT* close_hr) {
     std::printf("FAIL %s: device removed 0x%08lx\n", name, (unsigned long)removed);
     finish(3, "device removed");
   }
-  CHECK(c.alloc->Reset());
-  CHECK(c.list->Reset(c.alloc, nullptr));
+  reopen_list(c);
   return true;
 }
 
@@ -367,6 +415,7 @@ static void run_case(Ctx& c, Tex& t, const std::string& name, const std::functio
   c.overflow = false;
   c.pending_reads.clear();
   c.checks.clear();
+  lifecycle(c.list_open, "a case starts with its list recording");
   if (background) {
     background();
     if (c.overflow) {
@@ -692,9 +741,8 @@ int main(int argc, char** argv) {
   CHECK(c.dev->CreateCommandQueue(&qd, __uuidof(ID3D12CommandQueue), (void**)&c.queue));
   CHECK(c.dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, __uuidof(ID3D12CommandAllocator),
                                       (void**)&c.alloc));
-  CHECK(c.dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, c.alloc, nullptr,
-                                 __uuidof(ID3D12GraphicsCommandList), (void**)&c.list));
   CHECK(c.dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), (void**)&c.fence));
+  create_list(c);
   c.event = CreateEventA(nullptr, FALSE, FALSE, nullptr);
   if (!c.event) { std::printf("ERROR CreateEvent\n"); finish(2, "setup error"); }
 
