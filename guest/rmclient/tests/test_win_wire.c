@@ -214,6 +214,64 @@ static void test_alloc_sizes(void)
     }
 }
 
+static void test_channel_group_abi(void)
+{
+    uint8_t *original = malloc(20);
+    CHECK(original != NULL);
+    if (!original)
+        return;
+    for (unsigned i = 0; i < 20; i++)
+        original[i] = (uint8_t)(i + 1);
+    NVOS64_PARAMETERS p = {
+        .hRoot = 1, .hObjectParent = 2, .hObjectNew = 3, .hClass = KEPLER_CHANNEL_GROUP_A,
+        .pAllocParms = (uint64_t)(uintptr_t)original, .paramsSize = 20,
+    };
+    const NVOS64_PARAMETERS before = p;
+    NVOS64_PARAMETERS wire;
+    struct crm_channel_group_615 extended;
+    memset(&extended, 0xa5, sizeof(extended));
+    CHECK(crm_wire_channel_group_prepare(&p, 28, &wire, &extended) == 1);
+    CHECK(memcmp(&p, &before, sizeof(p)) == 0);
+    CHECK(wire.paramsSize == 28 && wire.pAllocParms == (uint64_t)(uintptr_t)&extended);
+    CHECK(memcmp(&extended.base, original, 20) == 0);
+    CHECK(extended.reserved == 0 && extended.internalFlags == 0);
+
+    uint8_t request[CRM_WIRE_HDR + CRM_WIRE_IOCTL_REQ + sizeof(wire) + sizeof(extended)];
+    CHECK(crm_wire_ioctl(request, 7, crm_wire_cmd(0x2b, sizeof(wire)), &wire,
+                         sizeof(wire), &extended, sizeof(extended)) == sizeof(request));
+    CHECK(crm_get32(request + CRM_WIRE_HDR + 12) == 28);
+    CHECK(memcmp(request + CRM_WIRE_HDR + CRM_WIRE_IOCTL_REQ + sizeof(wire), &extended, 28) == 0);
+
+    /* RM output reaches the caller, but its original buffer stays 20 bytes. */
+    wire.hObjectNew = 9;
+    wire.status = 0x29;
+    extended.base.hObjectError = 0x5a;
+    extended.reserved = extended.internalFlags = 0xffffffff;
+    crm_wire_channel_group_finish(&p, wire, &extended);
+    CHECK(p.hObjectNew == 9 && p.status == 0x29);
+    CHECK(p.hRoot == 1 && p.hObjectParent == 2 && p.hClass == KEPLER_CHANNEL_GROUP_A);
+    CHECK(p.pAllocParms == before.pAllocParms && p.paramsSize == 20);
+    CHECK(original[0] == 0x5a && memcmp(original, &extended.base, 20) == 0);
+
+    /* Missing tables, other classes and unknown sizes do not select a layout. */
+    const uint32_t sizes[] = { 0, 16, 20, 24, 28, 32 };
+    for (unsigned i = 0; i < sizeof(sizes) / sizeof(sizes[0]); i++) {
+        for (unsigned j = 0; j < sizeof(sizes) / sizeof(sizes[0]); j++) {
+            p = before;
+            p.paramsSize = sizes[i];
+            CHECK(crm_wire_channel_group_prepare(&p, sizes[j], &wire, &extended) ==
+                  (sizes[i] == 20 && sizes[j] == 28));
+        }
+    }
+    p = before;
+    p.hClass = 0x2080;
+    CHECK(crm_wire_channel_group_prepare(&p, 28, &wire, &extended) == 0);
+    p = before;
+    p.pAllocParms = 0;
+    CHECK(crm_wire_channel_group_prepare(&p, 28, &wire, &extended) == 0);
+    free(original);
+}
+
 /* What a Windows program sends to present RM memory: Open of a DRM render node,
  * DRM_NVIDIA_GEM_IMPORT_NVKMS_MEMORY with its NVKMS block, ScanoutFlip. */
 static void test_scanout_path(void)
@@ -421,6 +479,7 @@ int main(void)
     test_ioctl_layout();
     test_reply_parse();
     test_alloc_sizes();
+    test_channel_group_abi();
     test_scanout_path();
     if (failures) {
         fprintf(stderr, "%d check(s) failed\n", failures);

@@ -220,6 +220,10 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
+      - name: RM transport unit tests
+        run: make -C guest/rmclient CFLAGS="-O1 -g -fsanitize=address,undefined" LDFLAGS="-fsanitize=address,undefined" check
+      - name: RM allocation layout checks
+        run: python3 -m unittest discover -s host/backend/gen -p test_rmallow_extract.py -v
       - name: DWM crash-loop guard (umd_common/bridge/bridge_dwm_guard.h)
         run: |
           g++ -std=c++17 -Wall -Wextra -Werror -fsanitize=address,undefined \

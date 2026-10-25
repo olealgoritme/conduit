@@ -270,6 +270,7 @@ typedef struct {
 #define NV01_MEMORY_SYSTEM_OS_DESCRIPTOR  0x00000071
 #define NV01_EVENT_OS_EVENT               0x00000079
 #define FERMI_VASPACE_A                   0x000090f1
+#define KEPLER_CHANNEL_GROUP_A            0x0000a06c
 #define NV01_MEMORY_VIRTUAL               0x00000070
 #define NV50_MEMORY_VIRTUAL               0x000050a0
 
