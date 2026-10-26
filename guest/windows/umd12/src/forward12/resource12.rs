@@ -158,6 +158,7 @@
 //! Each is a named counter, never a silent stub (AGENTS.md rule 2).
 
 use core::ffi::c_void;
+use std::sync::Arc;
 
 use helios_umd_common::hr::{Hresult, E_FAIL, E_INVALIDARG, E_NOTIMPL, S_OK};
 use helios_umd_common::refusals::RefusalCounter;
@@ -476,6 +477,9 @@ struct HeapState {
 
 /// What this driver stores in `D3D12DDI_HRESOURCE::pDrvPrivate`.
 struct ResourceState {
+    /// Physical presentation storage established with an MSAA color resource,
+    /// before the runtime caches its allocation. Immutable after creation.
+    present_resolve: Option<Arc<PresentResolveTarget>>,
     /// The engine resource. `None` only for the whole-heap object of a heap
     /// whose flags deny buffers, where no covering resource can exist.
     resource: Option<ID3D12Resource>,
@@ -1415,6 +1419,7 @@ unsafe fn create_heap_only(
         // object being created, cleared by the caller and written exactly once.
         unsafe {
             resource_slot.store(ResourceState {
+                present_resolve: None,
                 resource: span_buffer.clone(),
                 span: Some(HeapSpan {
                     heap: heap.clone(),
@@ -2604,6 +2609,141 @@ enum DeallocateForm {
     ByHandleList,
 }
 
+/// Physical single-sample storage for one logical MSAA presentation resource.
+/// Its WDDM allocation is the logical source's allocation, freed by that
+/// source's ordinary destroy path. Application rendering still uses MSAA.
+pub(crate) struct PresentResolveTarget {
+    pub(crate) resource: ID3D12Resource,
+    _heap: ID3D12Heap,
+    pub(crate) identity: identity12::AllocationIdentity,
+}
+
+/// # Safety
+/// The source is a live handle from this device's resource create DDI.
+pub(crate) unsafe fn present_resolve_target(
+    h_source: ddi12::D3D12DDI_HRESOURCE,
+) -> Result<Arc<PresentResolveTarget>, Hresult> {
+    let source = unsafe { resource_state(h_source) }.ok_or(E_INVALIDARG)?;
+    source
+        .present_resolve
+        .as_ref()
+        .map(Arc::clone)
+        .ok_or(E_NOTIMPL)
+}
+
+/// # Safety
+/// Called inside the fused resource create, before publishing the source slot.
+/// h_rt_resource is that create's live runtime resource handle.
+unsafe fn create_present_resolve_target(
+    dev: &HeliosD3D12Device,
+    source: &ID3D12Resource,
+    source_desc: &D3D12_RESOURCE_DESC1,
+    h_rt_resource: ddi12::D3D12DDI_HRTRESOURCE,
+) -> Result<Arc<PresentResolveTarget>, Hresult> {
+    let mut desc = *source_desc;
+    if !dev.engine.is_nvk()
+        || desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        || desc.DepthOrArraySize != 1
+        || desc.MipLevels != 1
+        || desc.SampleDesc.Count <= 1
+        || !matches!(desc.Format.0, 28 | 29 | 87 | 88 | 91)
+    {
+        return Err(E_NOTIMPL);
+    }
+    desc.Alignment = 0;
+    // X8 is a presentation format, not a typed resolve format. D3D9On12's
+    // ordinary StretchRect resolve uses the corresponding BGRA8 storage.
+    if desc.Format.0 == 88 {
+        desc.Format = DXGI_FORMAT(87);
+    }
+    desc.SampleDesc = DXGI_SAMPLE_DESC {
+        Count: 1,
+        Quality: 0,
+    };
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    let device10 = engine_device10(dev).ok_or(E_FAIL)?;
+    let info = unsafe { device10.GetResourceAllocationInfo(1, &[resource_desc(&desc)]) };
+    if info.SizeInBytes == 0 || info.SizeInBytes == u64::MAX {
+        return Err(E_INVALIDARG);
+    }
+    let heap_desc = D3D12_HEAP_DESC {
+        SizeInBytes: info.SizeInBytes,
+        Properties: D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_CUSTOM,
+            CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE,
+            MemoryPoolPreference: D3D12_MEMORY_POOL_L1,
+            CreationNodeMask: 1,
+            VisibleNodeMask: 1,
+        },
+        Alignment: info.Alignment,
+        Flags: HELIOS_HEAP_FLAG_VENUS_EXPORT
+            | D3D12_HEAP_FLAG_DENY_BUFFERS
+            | D3D12_HEAP_FLAG_DENY_NON_RT_DS_TEXTURES,
+    };
+    let mut heap = None;
+    unsafe { device10.CreateHeap(&heap_desc, &mut heap) }.map_err(|e| e.code().0)?;
+    let heap = heap.ok_or(E_FAIL)?;
+    let mut resource = None;
+    unsafe {
+        device10.CreatePlacedResource2(
+            &heap,
+            0,
+            &desc,
+            D3D12_BARRIER_LAYOUT_COMMON,
+            None,
+            None,
+            &mut resource,
+        )
+    }
+    .map_err(|e| e.code().0)?;
+    let resource = resource.ok_or(E_FAIL)?;
+    let mut heap_arg = ddi12::D3D12DDIARG_CREATEHEAP_0001::default();
+    heap_arg.Flags = v::HEAP_ALLOW_RT_DS_TEXTURES;
+    let mut res_arg = ddi12::D3D12DDIARG_CREATERESOURCE_0109::default();
+    res_arg.ResourceType = v::RT_TEXTURE2D;
+    res_arg.Width = desc.Width;
+    res_arg.Height = desc.Height;
+    res_arg.DepthOrArraySize = 1;
+    res_arg.MipLevels = 1;
+    res_arg.Format = desc.Format.0;
+    res_arg.SampleDesc.Count = 1;
+    res_arg.Flags = v::RES_RENDER_TARGET | v::RES_SHADER_RESOURCE;
+    // This is the logical back buffer's FIRST allocation. D3D9On12 retains
+    // that association from creation and does not retarget it to an unrelated
+    // allocation introduced during Present.
+    unsafe {
+        adopt_committed_allocation_nvk(
+            dev,
+            &device10,
+            &resource,
+            &heap_arg,
+            &res_arg,
+            &desc,
+            h_rt_resource,
+        )
+    }?;
+    // The registry key is the logical source. The memory/layout fields name
+    // the physical single-sample image the KMD will present.
+    let id =
+        match identity12::reassign_resource(resource.as_raw() as usize, source.as_raw() as usize) {
+            Some(id) => id,
+            None => {
+                if let Some(id) = identity12::take(resource.as_raw() as usize) {
+                    unsafe {
+                        deallocate_adopted(dev, id.h_allocation, DeallocateForm::ByHandleList)
+                    };
+                }
+                return Err(E_FAIL);
+            }
+        };
+    Ok(Arc::new(PresentResolveTarget {
+        resource,
+        _heap: heap,
+        identity: id,
+    }))
+}
+
 /// Arm 1 of the fused create: both argument pointers -> an explicit engine heap
 /// plus an engine resource placed at offset zero.
 ///
@@ -2793,24 +2933,40 @@ unsafe fn create_fused_heap_and_resource(
     // SAFETY: `dev` is the live device this create is running on, `resource` the
     // engine resource just created (owned here, so alive for the call), and
     // `h_rt_resource` the runtime handle this DDI was invoked with.
-    if let Err(hr) = unsafe {
-        adopt_committed_allocation(
-            dev,
-            device10,
-            &resource,
-            heap_arg,
-            res_arg,
-            &desc,
-            h_rt_resource,
-        )
-    } {
-        return hr;
-    }
+    let msaa_present = dev.engine.is_nvk()
+        && desc.SampleDesc.Count > 1
+        && desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        && desc.DepthOrArraySize == 1
+        && desc.MipLevels == 1
+        && desc.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)
+        && matches!(desc.Format.0, 28 | 29 | 87 | 88 | 91);
+    let present_resolve = if msaa_present {
+        match unsafe { create_present_resolve_target(dev, &resource, &desc, h_rt_resource) } {
+            Ok(target) => Some(target),
+            Err(hr) => return hr,
+        }
+    } else {
+        if let Err(hr) = unsafe {
+            adopt_committed_allocation(
+                dev,
+                device10,
+                &resource,
+                heap_arg,
+                res_arg,
+                &desc,
+                h_rt_resource,
+            )
+        } {
+            return hr;
+        }
+        None
+    };
 
     // SAFETY: `resource_slot` is this driver's private block for the resource
     // being created, cleared by the caller and written exactly once.
     unsafe {
         resource_slot.store(ResourceState {
+            present_resolve,
             resource: Some(resource.clone()),
             // The fused DDI resource starts at zero in the explicit engine
             // heap. A later resource-only child names this resource and adds
@@ -2977,6 +3133,7 @@ unsafe fn create_placed_or_reserved(
     // caller and written exactly once.
     unsafe {
         resource_slot.store(ResourceState {
+            present_resolve: None,
             resource: Some(resource),
             span: Some(HeapSpan {
                 heap: heap.clone(),
@@ -3072,6 +3229,7 @@ unsafe fn create_reserved(
     // SAFETY: this driver's cleared, writable private resource block.
     unsafe {
         slot.store(ResourceState {
+            present_resolve: None,
             resource: Some(resource),
             span: None,
             desc,
