@@ -424,6 +424,11 @@ pub struct HeliosDevice {
     /// finished frame it held, `(namespaced ring key, (width, height, format), ID3D11Resource*,
     /// frame)`.
     pub nvk_flip_last: std::sync::Mutex<Vec<(u64, (u32, u32, u32), usize, u64)>>,
+    /// NVK, `FlipLedger`: the flip rings `rotate_ring` offered the bridge, as the sorted
+    /// `ID3D11Resource*` set, whether the bridge registered it and how often it was offered.
+    /// A ring is offered again only when its membership changes (a member is destroyed or
+    /// rotates in another set), or after a refusal for at most `FLIP_RING_ATTEMPTS` presents.
+    pub nvk_flip_rings: std::sync::Mutex<Vec<(Vec<usize>, bool, u32)>>,
     /// NVK, `FlipLedger` 1, dwm.exe: DWM's replacement views of opened app
     /// present buffers, `(ID3D11Resource*, view)` (`forward::bindings::dwm_flip_views`).
     pub nvk_flip_views: std::sync::Mutex<

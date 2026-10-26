@@ -1300,7 +1300,6 @@ bool HeliosDxvkDevice::register_flip_ring(const std::size_t* resources,
       if (!slots[i])
         return false;
     }
-    std::lock_guard<std::mutex> lock(impl->flip_chain_mutex);
     auto publish = [&](std::uint32_t token) {
       for (std::size_t i = 0; i < count; ++i) {
         const auto binding = helios_flip_chain::make_binding(token, ids[i]);
@@ -1311,25 +1310,39 @@ bool HeliosDxvkDevice::register_flip_ring(const std::size_t* resources,
           slots[i]->chain_binding.store(binding, std::memory_order_release);
       }
     };
-    for (const auto& ring : impl->flip_chains) {
-      if (ring.resources.size() == count
-       && std::is_permutation(ring.resources.begin(), ring.resources.end(), resources)
-       && std::is_permutation(ring.ids.begin(), ring.ids.end(), ids)) {
-        const auto token = helios_flip_chain::make_token(ring.record, ring.generation);
-        if (!helios_flip_chain::is_current(token,
-              t->devices[ring.record].gen.load(std::memory_order_acquire),
-              t->devices[ring.record].pid.load(std::memory_order_acquire) != 0))
-          return false;
-        publish(token);
-        return true;
+    // The ring already registered with exactly these members: republish its
+    // token and return true. A ring whose record is no longer ours (taken over
+    // as a dead process's) is forgotten without freeing that record. False: no
+    // such ring. Called with flip_chain_mutex held.
+    auto republish = [&]() -> bool {
+      for (auto it = impl->flip_chains.begin(); it != impl->flip_chains.end(); ++it) {
+        if (it->resources.size() == count
+         && std::is_permutation(it->resources.begin(), it->resources.end(), resources)
+         && std::is_permutation(it->ids.begin(), it->ids.end(), ids)) {
+          const auto token = helios_flip_chain::make_token(it->record, it->generation);
+          if (!helios_flip_chain::is_current(token,
+                t->devices[it->record].gen.load(std::memory_order_acquire),
+                t->devices[it->record].pid.load(std::memory_order_acquire) != 0)) {
+            impl->flip_chains.erase(it);
+            return false;
+          }
+          publish(token);
+          return true;
+        }
       }
+      return false;
+    };
+    {
+      std::lock_guard<std::mutex> lock(impl->flip_chain_mutex);
+      if (republish())
+        return true;
     }
-    // Allocate before changing any shared membership. A ledger record supplies
-    // a globally unique, generation-checked identity; it publishes no GPU point.
+    // A ledger record supplies a globally unique, generation-checked identity;
+    // it publishes no GPU point. Claimed outside flip_chain_mutex: a full table
+    // sweeps dead processes' records (OpenProcess per record).
     HeliosDxvkDeviceImpl::FlipChain ring{};
     ring.resources.assign(resources, resources + count);
     ring.ids.assign(ids, ids + count);
-    impl->flip_chains.reserve(impl->flip_chains.size() + 1);
     ring.record = helios_handoff::claim_device(t, &ring.generation);
     if (ring.record == UINT32_MAX)
       return false;
@@ -1340,6 +1353,13 @@ bool HeliosDxvkDevice::register_flip_ring(const std::size_t* resources,
     }
     // There is no outstanding GPU work on an identity-only record.
     t->devices[ring.record].completed.store(UINT64_MAX, std::memory_order_release);
+    std::lock_guard<std::mutex> lock(impl->flip_chain_mutex);
+    // Registered by another thread meanwhile: keep that one.
+    if (republish()) {
+      helios_handoff::free_device(t, ring.record);
+      return true;
+    }
+    impl->flip_chains.reserve(impl->flip_chains.size() + 1);
     impl->flip_chains.push_back(std::move(ring));
     for (std::size_t i = 0; i + 1 < impl->flip_chains.size();) {
       const auto& old = impl->flip_chains[i];

@@ -926,6 +926,16 @@ pub(crate) unsafe fn forget_nvk_keyed_resource(h: Hdevice, h_resource: ddi::D3D1
         return;
     };
     {
+        // A flip ring with this resource is a new membership the next time it rotates.
+        let mut rings = lock_ignore_poison(&dev.nvk_flip_rings);
+        if !rings.is_empty() {
+            if let Some(res) = load_resource(h_resource) {
+                let com = res.as_raw() as usize;
+                rings.retain(|r| !r.0.contains(&com));
+            }
+        }
+    }
+    {
         let key = h_resource.pDrvPrivate as usize;
         let mut flips = lock_ignore_poison(&dev.nvk_flip_buffers);
         if let Some(i) = flips.iter().position(|f| f.0 == key) {
