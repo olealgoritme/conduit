@@ -1513,8 +1513,11 @@ static NVK_PRIMARY_IFLIP: core::sync::atomic::AtomicUsize = core::sync::atomic::
 /// The foreign resource id `finish_wddm_tex2d_nvk` gave `shown`'s allocation: `Some(0)` for a
 /// KMD placeholder, `None` when this process did not make it (opened, or no allocation).
 unsafe fn nvk_source_resource_id(shown: ddi::D3D10DDI_HRESOURCE) -> Option<u32> {
-    let alloc = resource_allocation(shown);
-    lock_ignore_poison(&NVK_ALLOC_BOOK).iter().find(|e| e.0 == alloc).map(|e| e.1)
+    nvk_allocation_resource_id(resource_allocation(shown))
+}
+
+fn nvk_allocation_resource_id(allocation: u32) -> Option<u32> {
+    lock_ignore_poison(&NVK_ALLOC_BOOK).iter().find(|e| e.0 == allocation).map(|e| e.1)
 }
 
 /// `NvkPresent` 0: may DWM compose this frame? Only when DWM imports NVK surfaces and THIS
@@ -1684,12 +1687,17 @@ unsafe fn nvk_present_frame(
     // and a DWM on NVK composes only buffers whose frame is done there (`forward/bindings.rs`
     // `dwm_flip_views`), never waiting. Needs the RM fence path, the buffer's resource id and a
     // KMD that publishes the table; otherwise the frame completes as before.
+    // A WDDM primary may still be composed (for example an RGB10A2 chain that
+    // cannot be independently flipped). Its creation-time primary flag is not
+    // evidence that DWM will never sample it; the selected route is the guard.
+    // `must_complete` below still never waits for a primary: DXGI makes borderless and
+    // fullscreen game buffers primaries (IndepFlip), and their presents must not add a CPU
+    // wait whether or not their ring takes the ledger.
     let frame_resid = if !scanout
         && fences
         && dwm_reads_source
         && !crate::knobs::is_dwm_process()
         && crate::knobs::flip_ledger() != 0
-        && !nvk_source_is_primary(shown)
         && crate::scanout_acquire::frame_done_available()
         && nvk_flip_chain_len(dev, shown) >= 3
     {
@@ -1924,17 +1932,25 @@ unsafe fn dwm_flip_read_points(dev: &HeliosDevice) {
 
 static FLIP_NO_WAIT: AtomicUsize = AtomicUsize::new(0);
 
-/// How many present buffers of `shown`'s size and format this device holds (`FlipLedger`): a
-/// swap chain of three or more lets DWM show the frame before while this one renders; with two,
-/// the frame before is the buffer the app renders into next, so the frame completes before its
-/// present as without `FlipLedger`.
+/// How many present buffers belong to `shown`'s swap chain (`FlipLedger`): a swap chain of
+/// three or more lets DWM show the frame before while this one renders; with two, the frame
+/// before is the buffer the app renders into next, so the frame completes before its present as
+/// without `FlipLedger`. The chain is the DXGI ring `rotate_ring` registered; a ring the bridge
+/// did not register counts this device's present buffers of `shown`'s size and format, which is
+/// also how DWM groups such a producer's buffers (`forward/bindings.rs` `dwm_flip_views`).
 unsafe fn nvk_flip_chain_len(dev: &HeliosDevice, shown: ddi::D3D10DDI_HRESOURCE) -> usize {
     let Some(res) = load_resource(shown) else {
         return 0;
     };
     let raw = res.as_raw() as usize;
+    let chain = nvk_source_resource_id(shown)
+        .filter(|&id| id != 0)
+        .map_or(0, |id| dev.dxvk.flip_ring(id));
     let flips = lock_ignore_poison(&dev.nvk_flip_buffers);
-    let Some(&(_, _, w, h, f, _)) = flips.iter().find(|e| e.1 == raw) else {
+    if chain != 0 {
+        return flips.iter().filter(|e| e.5 != 0 && dev.dxvk.flip_ring(e.5) == chain).count();
+    }
+    let Some(&(_, _, w, h, f, _, _)) = flips.iter().find(|e| e.1 == raw) else {
         return 0;
     };
     flips.iter().filter(|e| e.2 == w && e.3 == h && e.4 == f).count()
@@ -3465,6 +3481,11 @@ pub(crate) enum RotationOutcome {
     NoDevice,
 }
 
+/// The most buffers of a flip ring the bridge registers (`register_flip_ring`).
+const FLIP_RING_MAX: usize = 16;
+/// Presents that offer a refused flip ring to the bridge again before it stops asking.
+const FLIP_RING_ATTEMPTS: u32 = 8;
+
 /// The DXVK backing rotation refused it.
 pub(crate) static ROTATE_REFUSED: AtomicUsize = AtomicUsize::new(0);
 /// A null resource handle or an untracked resource in the ring.
@@ -3549,6 +3570,50 @@ pub(crate) unsafe fn rotate_ring(
     (*last).ownership = first_ownership;
     (*last).present_private = first_present_private;
     (*last).snapshot_source = first_snapshot_source;
+
+    if crate::knobs::flip_ledger() != 0
+        && dev.dxvk.is_nvk()
+        && !crate::knobs::is_dwm_process()
+        && ptrs.len() <= FLIP_RING_MAX
+    {
+        // Allocation metadata is now rotated. Membership is the exact set DXGI
+        // supplied, not an inference from other windows of the same dimensions.
+        // Offered to the bridge once per membership (`HeliosDevice::nvk_flip_rings`):
+        // every present rotates the same set.
+        let mut members = [0usize; FLIP_RING_MAX];
+        let members = &mut members[..ptrs.len()];
+        members.copy_from_slice(&ptrs);
+        members.sort_unstable();
+        let offer = {
+            let mut rings = lock_ignore_poison(&dev.nvk_flip_rings);
+            match rings.iter_mut().find(|r| r.0 == *members) {
+                Some(r) if r.1 || r.2 >= FLIP_RING_ATTEMPTS => false,
+                Some(r) => {
+                    r.2 += 1;
+                    true
+                }
+                None => {
+                    rings.retain(|r| !r.0.iter().any(|p| members.binary_search(p).is_ok()));
+                    rings.push((members.to_vec(), false, 1));
+                    true
+                }
+            }
+        };
+        if offer {
+            let ids: Vec<u32> = states.iter().map(|&s| {
+                let allocation = (*s).allocation.as_ref().map_or(0, |a| a.handle());
+                nvk_allocation_resource_id(allocation).unwrap_or(0)
+            }).collect();
+            if dev.dxvk.register_flip_ring(&ptrs, &ids) {
+                if let Some(r) = lock_ignore_poison(&dev.nvk_flip_rings)
+                    .iter_mut()
+                    .find(|r| r.0 == *members)
+                {
+                    r.1 = true;
+                }
+            }
+        }
+    }
 
     RotationOutcome::Rotated
 }

@@ -908,7 +908,7 @@ unsafe fn note_nvk_flip_buffer(h: Hdevice, h_resource: ddi::D3D10DDI_HRESOURCE, 
         dev.dxvk.handoff_register(com);
         // The KMD resource id (the ledger key): the frame-done table's name for the buffer.
         let resid = dev.dxvk.handoff_refresh_key(com);
-        list.push((key, com, width, height, format, resid));
+        list.push((key, com, width, height, format, resid, 0));
         if list.len() <= 4 {
             log_error!(
                 "FlipLedger: present buffer hDrv=0x{key:x} ({}) holds its ledger key ({} live)",
@@ -926,10 +926,20 @@ pub(crate) unsafe fn forget_nvk_keyed_resource(h: Hdevice, h_resource: ddi::D3D1
         return;
     };
     {
+        // A flip ring with this resource is a new membership the next time it rotates.
+        let mut rings = lock_ignore_poison(&dev.nvk_flip_rings);
+        if !rings.is_empty() {
+            if let Some(res) = load_resource(h_resource) {
+                let com = res.as_raw() as usize;
+                rings.retain(|r| !r.0.contains(&com));
+            }
+        }
+    }
+    {
         let key = h_resource.pDrvPrivate as usize;
         let mut flips = lock_ignore_poison(&dev.nvk_flip_buffers);
         if let Some(i) = flips.iter().position(|f| f.0 == key) {
-            let (_, com, _, _, _, _) = flips.swap_remove(i);
+            let (_, com, _, _, _, _, _) = flips.swap_remove(i);
             lock_ignore_poison(&dev.nvk_flip_last).retain(|e| e.2 != com);
             drop(flips);
             lock_ignore_poison(&dev.nvk_flip_reads).retain(|&r| r != com);

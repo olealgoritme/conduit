@@ -501,9 +501,10 @@ pub(crate) static DWM_FLIP_NEW_FRAMES: AtomicUsize = AtomicUsize::new(0);
 ///
 /// * A bound app buffer the table does not track (an app that completes its frame before the
 ///   present, an older KMD) stays.
-/// * A bound buffer with nothing pending holds the newest presented frame, finished: it stays.
-/// * Otherwise the buffer of the same swap chain (the same presenting process, size and format;
-///   three buffers or more) that holds the newest finished frame and is not being written is
+/// * A bound buffer with nothing pending stays when it is at least as new as the frame
+///   already selected for composition. A prior substitution may have selected a newer buffer.
+/// * Otherwise the buffer of the same registered swap chain (three buffers or more) that
+///   holds the newest finished frame and is not being written is
 ///   bound instead (that can be the bound buffer itself, when its new frame is queued behind
 ///   others); when none is, the buffer DWM composed for that chain last time (the window keeps
 ///   its last frame). DWM's read of a replacement is published at DWM's present
@@ -512,13 +513,26 @@ pub(crate) static DWM_FLIP_NEW_FRAMES: AtomicUsize = AtomicUsize::new(0);
 ///   is; DWM still does not wait (the app publishes no points on its buffers).
 ///
 /// Every app buffer DWM ends up binding is noted as read this frame. `None`: nothing replaced.
+/// Untagged older producers retain the prior owner/size/format grouping and idle path.
 pub(crate) unsafe fn dwm_flip_views(
     h: Hdevice,
     views: &[Option<ID3D11ShaderResourceView>],
 ) -> Option<Vec<Option<ID3D11ShaderResourceView>>> {
     use crate::scanout_acquire::{frame_done_lookup, FrameDone};
     let dev = helios_device(h)?;
-    let flips = lock_ignore_poison(&dev.nvk_flip_buffers).clone();
+    let flips = {
+        let mut buffers = lock_ignore_poison(&dev.nvk_flip_buffers);
+        for buffer in buffers.iter_mut() {
+            // DWM may still sample an imported buffer after its producer has
+            // released the ring. Keep its last known identity until this local
+            // resource is destroyed; a newly published identity supersedes it.
+            let current = dev.dxvk.flip_ring(buffer.5);
+            if current != 0 {
+                buffer.6 = current;
+            }
+        }
+        buffers.clone()
+    };
     if flips.is_empty() {
         return None;
     }
@@ -532,11 +546,11 @@ pub(crate) unsafe fn dwm_flip_views(
             continue;
         };
         let raw = resource.as_raw() as usize;
-        let Some(&(_, _, width, height, format, resid)) = flips.iter().find(|f| f.1 == raw) else {
+        let Some(&(_, _, width, height, format, resid, bound_chain)) = flips.iter().find(|f| f.1 == raw) else {
             continue;
         };
         let dims = (width, height, format);
-        let same_dims = |f: &&(usize, usize, u32, u32, u32, u32)| f.2 == width && f.3 == height && f.4 == format;
+        let same_dims = |f: &&(usize, usize, u32, u32, u32, u32, u32)| f.2 == width && f.3 == height && f.4 == format;
         let Some(bound) = frame_done_lookup(resid) else {
             // An app that completes its frames before their present, or the chain's buffers the
             // KMD did not see yet.
@@ -548,19 +562,27 @@ pub(crate) unsafe fn dwm_flip_views(
             reads.push(raw);
             continue;
         };
-        if bound.idle() {
+        let group = helios_umd_common::frame_choice::history_key(bound.owner, bound_chain);
+        let last_completed = dwm_flip_last(dev, group, dims).map(|(_, completed)| completed);
+        // An older producer has no exact ring metadata: preserve its existing
+        // idle path rather than imposing a floor shared by unrelated windows.
+        if bound.idle() && (bound_chain == 0
+            || helios_umd_common::frame_choice::keep_bound(true, bound.completed, last_completed)) {
             DWM_FLIP_DONE.fetch_add(1, Ordering::Relaxed);
             reads.push(raw);
-            dwm_flip_note_shown(dev, bound.owner, dims, raw, bound.completed);
+            dwm_flip_note_shown(dev, group, dims, raw, bound.completed);
             continue;
         }
-        // The same swap chain: the same presenting process, size and format.
+        // Exact ring identity for current producers. Unknown/legacy rings
+        // remain separate from known rings and retain the old owner grouping.
         let chain: Vec<(usize, FrameDone)> = flips
             .iter()
             .filter(same_dims)
             .filter_map(|f| {
                 let d = if f.1 == raw { Some(bound) } else { frame_done_lookup(f.5) };
-                d.filter(|d| d.owner == bound.owner).map(|d| (f.1, d))
+                d.filter(|d| helios_umd_common::frame_choice::same_chain(
+                    bound.owner, bound_chain, d.owner, f.6
+                )).map(|d| (f.1, d))
             })
             .collect();
         let mut choice: Option<(usize, u64, bool)> = None;
@@ -571,7 +593,7 @@ pub(crate) unsafe fn dwm_flip_views(
                 .max_by_key(|(_, d)| d.completed)
                 .map(|&(c, d)| (c, d.completed, false));
             if choice.is_none() {
-                choice = dwm_flip_last(dev, bound.owner, dims)
+                choice = dwm_flip_last(dev, group, dims)
                     .filter(|&(c, _)| chain.iter().any(|&(cc, d)| cc == c && !d.writing))
                     .map(|(c, completed)| (c, completed, true));
             }
@@ -595,7 +617,7 @@ pub(crate) unsafe fn dwm_flip_views(
             DWM_FLIP_SUBSTITUTED.fetch_add(1, Ordering::Relaxed);
         }
         reads.push(chosen);
-        dwm_flip_note_shown(dev, bound.owner, dims, chosen, completed);
+        dwm_flip_note_shown(dev, group, dims, chosen, completed);
     }
     if !reads.is_empty() {
         let mut noted = lock_ignore_poison(&dev.nvk_flip_reads);
@@ -608,16 +630,16 @@ pub(crate) unsafe fn dwm_flip_views(
     out
 }
 
-/// The buffer DWM last composed for the swap chain `(owner, size and format)` and the finished
+/// The buffer DWM last composed for the swap chain `(group, size and format)` and the finished
 /// frame it held then.
 fn dwm_flip_last(
     dev: &crate::device_funcs::HeliosDevice,
-    owner: u32,
+    group: u64,
     dims: (u32, u32, u32),
 ) -> Option<(usize, u64)> {
     lock_ignore_poison(&dev.nvk_flip_last)
         .iter()
-        .find(|e| e.0 == owner && e.1 == dims)
+        .find(|e| e.0 == group && e.1 == dims)
         .map(|e| (e.2, e.3))
 }
 
@@ -625,13 +647,13 @@ fn dwm_flip_last(
 /// chain's previous bind counts as a new app frame shown.
 fn dwm_flip_note_shown(
     dev: &crate::device_funcs::HeliosDevice,
-    owner: u32,
+    group: u64,
     dims: (u32, u32, u32),
     com: usize,
     completed: u64,
 ) {
     let mut last = lock_ignore_poison(&dev.nvk_flip_last);
-    match last.iter_mut().find(|e| e.0 == owner && e.1 == dims) {
+    match last.iter_mut().find(|e| e.0 == group && e.1 == dims) {
         Some(e) => {
             if completed > e.3 {
                 DWM_FLIP_NEW_FRAMES.fetch_add(1, Ordering::Relaxed);
@@ -644,7 +666,7 @@ fn dwm_flip_note_shown(
                 last.remove(0);
             }
             DWM_FLIP_NEW_FRAMES.fetch_add(1, Ordering::Relaxed);
-            last.push((owner, dims, com, completed));
+            last.push((group, dims, com, completed));
         }
     }
 }

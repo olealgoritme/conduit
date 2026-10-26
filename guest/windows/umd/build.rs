@@ -302,6 +302,7 @@ fn main() {
         "../umd_common/bridge/bridge_icd_backend.h",
         "../protocol/include/helios_icd_interface.h",
         "../umd_common/bridge/bridge_util.h",
+        "../umd_common/bridge/flip_chain_token.h",
         "bridge/bridge_dxbc.cpp",
         "bridge/bridge_dxbc.h",
         "bridge/bridge_icd_exports.cpp",
