@@ -102,5 +102,5 @@ Driver 22.22.297.0 (`kmd_render/driver-version.env`):
   make Helios the only active display.
 
 Built by `.github/workflows/windows.yml` (on v* tags and by hand; Release and Debug,
-test-signed) or locally in a build VM (`ci/vm/`). Runs in a Windows 11 guest
+test-signed; the driver and UMDs also on pull requests that change `guest/windows`) or locally in a build VM (`ci/vm/`). Runs in a Windows 11 guest
 on QEMU with `--venus` (Unigine Heaven at about 150 fps on an RTX 5090).

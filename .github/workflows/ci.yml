@@ -8,9 +8,18 @@
 #   guest-agent   the guest clipboard agent's unit tests (Python, Xvfb)
 #   windows-guest-host  host tests of Windows guest driver logic that needs no
 #                 Windows (the DwmIcd=nvk crash-loop guard's decision)
+#   windows-guest-rust  unit tests of the Windows guest's Rust crates that build
+#                 on Linux (KMD logic, wire protocol, shared UMD code), and a
+#                 Windows-target check of the shared UMD code
+#   patches       every patch series applies on its pinned base, as the builds
+#                 apply it (.github/scripts/check-patches.sh): NVK on RM (Mesa),
+#                 DXVK, vkd3d-proton, DXVK-NVAPI, the Mesa Venus ICD fork
 #   packaging     shellcheck the packaging scripts, check the venus submodule pins
 #                 in flake.nix and the RPM spec, check that docs/WINDOWS-KNOBS.md
 #                 matches the code, build the DKMS source package
+#
+# The Windows guest builds themselves (NVK cross build, WDDM driver and UMDs)
+# run in windows.yml, on pull requests that touch the guest.
 #
 # Nothing here needs an NVIDIA GPU. Tests that open /dev/nvidiactl are skipped
 # by name (the --skip filters in the rust job); they run on the developer rig instead.
@@ -230,6 +239,65 @@ jobs:
             -o "$RUNNER_TEMP/dwm_guard_test" guest/windows/umd_common/bridge/bridge_dwm_guard_test.cpp
           "$RUNNER_TEMP/dwm_guard_test"
 
+  windows-guest-rust:
+    # The crates the KMD and the UMDs share that build without the WDK or
+    # Windows headers. kmd_logic's counter-name scans read kmd_render/src from
+    # the checkout; HELIOS_REQUIRE_NAME_SCAN=1 fails them instead of skipping.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Toolchain
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup target add x86_64-pc-windows-gnu
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: |
+            guest/windows/kmd_logic
+            guest/windows/protocol
+            guest/windows/umd_common
+      - name: kmd_logic
+        working-directory: guest/windows/kmd_logic
+        run: HELIOS_REQUIRE_NAME_SCAN=1 cargo test --locked
+      - name: protocol
+        working-directory: guest/windows/protocol
+        run: cargo test --locked
+      - name: umd_common
+        working-directory: guest/windows/umd_common
+        run: cargo test --locked
+      - name: umd_common (x86_64-pc-windows-gnu check)
+        # Its Windows-only code paths (cfg(windows), the windows crate).
+        working-directory: guest/windows/umd_common
+        run: cargo check --locked --all-targets --target x86_64-pc-windows-gnu
+
+  patches:
+    # Shallow fetches of each pinned base (Mesa, the DXVK, vkd3d-proton and
+    # Mesa fork submodules, DXVK-NVAPI), cached; a pin change fetches only the
+    # new commit.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - name: Cache key (the pinned commits)
+        id: pins
+        run: |
+          {
+            sed -n 's/^MESA_BASE=.*\([0-9a-f]\{40\}\).*/\1/p' guest/nvk-rm/build.sh guest/nvk-rm/build-windows.sh
+            sed -n 's/^COMMIT=\([0-9a-f]\{40\}\).*/\1/p' guest/windows/tools/build-dxvk-nvapi.sh
+            git ls-tree HEAD guest/windows/third_party/ | awk '$2 == "commit"'
+          } > "$RUNNER_TEMP/pins.txt"
+          cat "$RUNNER_TEMP/pins.txt"
+          echo "key=$(sha256sum "$RUNNER_TEMP/pins.txt" | cut -c1-16)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/patch-bases
+          key: patch-bases-${{ steps.pins.outputs.key }}
+          restore-keys: patch-bases-
+      - name: Every patch series applies
+        env:
+          CACHE_DIR: ${{ runner.temp }}/patch-bases
+        run: .github/scripts/check-patches.sh
+
   packaging:
     runs-on: ubuntu-24.04
     steps:
@@ -259,6 +327,7 @@ jobs:
             packaging/build.sh packaging/build-id.sh packaging/supported-drivers.sh packaging/common/conduit-integrate \
             packaging/tarball/*.sh packaging/deb/*/* \
             guest/system/conduit-guest-setup cli/assets/build-disk.sh \
+            .github/scripts/check-patches.sh guest/nvk-rm/series.sh \
             packaging/common/icons.sh packaging/test/icons.sh \
             packaging/bios/build.sh packaging/bios/install.sh \
             packaging/bios/fetch-src.sh packaging/bios/vms-using-bios packaging/test/bios-vms.sh
