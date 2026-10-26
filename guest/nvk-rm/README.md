@@ -456,6 +456,7 @@ backend. Numbers are file numbers (there is no 0016 or 0025).
 | 0112 | NAK: `NAK_RA_VEC_EVICT` (vector destinations evict the cheapest aligned range, not the one the previous load went to) |
 | 0113 | NAK, nvkmd/rm: Windows defaults `NAK_SCHED_SPILL_ROOM` 1, `NAK_SCHED_DELAY_WEIGHT` 16, `NAK_RA_VEC_EVICT` 1, `NVK_RM_PERF_BOOST` 1 |
 | 0114 | NVK: `NVK_QUERY_VRAM` (query pools in CPU-mapped VRAM, off) |
+| 0115 | NAK: lower `last_invocation` to an active-lane ballot and unsigned most-significant-bit index; fixes pipeline compilation for uniform-address atomics with divergent increments and used return values (BG3 D3D11 lighting). `NAK_UNIFORM_ATOMICS` stays enabled; `tests/uniform-atomic-return/` checks compilation and atomic results with full, sparse and empty active masks |
 
 ## Per-draw cost (common 0001-0007)
 
