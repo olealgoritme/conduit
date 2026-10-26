@@ -1513,8 +1513,11 @@ static NVK_PRIMARY_IFLIP: core::sync::atomic::AtomicUsize = core::sync::atomic::
 /// The foreign resource id `finish_wddm_tex2d_nvk` gave `shown`'s allocation: `Some(0)` for a
 /// KMD placeholder, `None` when this process did not make it (opened, or no allocation).
 unsafe fn nvk_source_resource_id(shown: ddi::D3D10DDI_HRESOURCE) -> Option<u32> {
-    let alloc = resource_allocation(shown);
-    lock_ignore_poison(&NVK_ALLOC_BOOK).iter().find(|e| e.0 == alloc).map(|e| e.1)
+    nvk_allocation_resource_id(resource_allocation(shown))
+}
+
+fn nvk_allocation_resource_id(allocation: u32) -> Option<u32> {
+    lock_ignore_poison(&NVK_ALLOC_BOOK).iter().find(|e| e.0 == allocation).map(|e| e.1)
 }
 
 /// `NvkPresent` 0: may DWM compose this frame? Only when DWM imports NVK surfaces and THIS
@@ -1684,12 +1687,14 @@ unsafe fn nvk_present_frame(
     // and a DWM on NVK composes only buffers whose frame is done there (`forward/bindings.rs`
     // `dwm_flip_views`), never waiting. Needs the RM fence path, the buffer's resource id and a
     // KMD that publishes the table; otherwise the frame completes as before.
+    // A WDDM primary may still be composed (for example an RGB10A2 chain that
+    // cannot be independently flipped). Its creation-time primary flag is not
+    // evidence that DWM will never sample it; the selected route is the guard.
     let frame_resid = if !scanout
         && fences
         && dwm_reads_source
         && !crate::knobs::is_dwm_process()
         && crate::knobs::flip_ledger() != 0
-        && !nvk_source_is_primary(shown)
         && crate::scanout_acquire::frame_done_available()
         && nvk_flip_chain_len(dev, shown) >= 3
     {
@@ -1714,7 +1719,7 @@ unsafe fn nvk_present_frame(
     let must_complete = !scanout
         && !ledger
         && crate::knobs::nvk_composed_complete()
-        && (crate::knobs::is_dwm_process() || (dwm_reads_source && !nvk_source_is_primary(shown)));
+        && (crate::knobs::is_dwm_process() || dwm_reads_source);
     if must_complete {
         let n = NVK_COMPOSED_COMPLETE.fetch_add(1, Ordering::Relaxed) + 1;
         if n == 1 || n % 4096 == 0 {
@@ -1924,20 +1929,20 @@ unsafe fn dwm_flip_read_points(dev: &HeliosDevice) {
 
 static FLIP_NO_WAIT: AtomicUsize = AtomicUsize::new(0);
 
-/// How many present buffers of `shown`'s size and format this device holds (`FlipLedger`): a
+/// How many present buffers belong to `shown`'s registered DXGI ring (`FlipLedger`): a
 /// swap chain of three or more lets DWM show the frame before while this one renders; with two,
 /// the frame before is the buffer the app renders into next, so the frame completes before its
 /// present as without `FlipLedger`.
 unsafe fn nvk_flip_chain_len(dev: &HeliosDevice, shown: ddi::D3D10DDI_HRESOURCE) -> usize {
-    let Some(res) = load_resource(shown) else {
+    let Some(resid) = nvk_source_resource_id(shown).filter(|&id| id != 0) else {
         return 0;
     };
-    let raw = res.as_raw() as usize;
+    let chain = dev.dxvk.flip_ring(resid);
+    if chain == 0 {
+        return 0;
+    }
     let flips = lock_ignore_poison(&dev.nvk_flip_buffers);
-    let Some(&(_, _, w, h, f, _)) = flips.iter().find(|e| e.1 == raw) else {
-        return 0;
-    };
-    flips.iter().filter(|e| e.2 == w && e.3 == h && e.4 == f).count()
+    flips.iter().filter(|e| dev.dxvk.flip_ring(e.5) == chain).count()
 }
 
 /// `FlipUpgrade` (`helios_umd_common::flip_upgrade`): install the swap-effect upgrade for this
@@ -3549,6 +3554,16 @@ pub(crate) unsafe fn rotate_ring(
     (*last).ownership = first_ownership;
     (*last).present_private = first_present_private;
     (*last).snapshot_source = first_snapshot_source;
+
+    if crate::knobs::flip_ledger() != 0 && dev.dxvk.is_nvk() && !crate::knobs::is_dwm_process() {
+        // Allocation metadata is now rotated. Membership is the exact set DXGI
+        // supplied, not an inference from other windows of the same dimensions.
+        let ids: Vec<u32> = states.iter().map(|&s| {
+            let allocation = (*s).allocation.as_ref().map_or(0, |a| a.handle());
+            nvk_allocation_resource_id(allocation).unwrap_or(0)
+        }).collect();
+        let _ = dev.dxvk.register_flip_ring(&ptrs, &ids);
+    }
 
     RotationOutcome::Rotated
 }

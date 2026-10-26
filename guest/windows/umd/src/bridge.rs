@@ -239,6 +239,16 @@ mod ffi {
         /// Hand-off ledger: the resource goes; this process lets go of its key.
         /// # Safety: a live `ID3D11Resource*`.
         unsafe fn handoff_unregister(self: &HeliosDxvkDevice, d3d11_resource_ptr: usize);
+        /// Record a live RotateResourceIdentities ring without sampling CS storage.
+        /// # Safety: both arrays contain `count` live resources and matching allocation IDs.
+        unsafe fn register_flip_ring(
+            self: &HeliosDxvkDevice,
+            resources: *const usize,
+            ids: *const u32,
+            count: usize,
+        ) -> bool;
+        /// Exact ring identity, or zero for an older/unregistered producer.
+        fn flip_ring(self: &HeliosDxvkDevice, resource_id: u32) -> u32;
         /// Hand-off ledger: publish a point on `resources`. 0 nothing new,
         /// 1 published, -1 unavailable/full, -2 failed.
         /// # Safety: `resources` addresses `resource_count` live resources.
@@ -1101,6 +1111,21 @@ impl BridgeDevice {
             // SAFETY: the caller passes a live resource pointer.
             unsafe { d.handoff_unregister(res) };
         }
+    }
+
+    pub(crate) fn register_flip_ring(&self, resources: &[usize], ids: &[u32]) -> bool {
+        let Some(d) = self.get() else {
+            return false;
+        };
+        if resources.len() != ids.len() {
+            return false;
+        }
+        // SAFETY: the caller retains all resources and both borrowed arrays for this call.
+        unsafe { d.register_flip_ring(resources.as_ptr(), ids.as_ptr(), resources.len()) }
+    }
+
+    pub(crate) fn flip_ring(&self, resource_id: u32) -> u32 {
+        self.get().map_or(0, |d| d.flip_ring(resource_id))
     }
 
     /// Hand-off ledger: publish this device's next point on `resources`.
