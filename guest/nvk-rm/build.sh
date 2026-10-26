@@ -41,10 +41,9 @@ if ! git -C "$MESA_DIR" cat-file -e "$MESA_BASE^{commit}" 2>/dev/null; then
   git -C "$MESA_DIR" fetch --depth 200 origin "$MESA_BASE"
 fi
 
-# 2. Apply the series on a local branch, unless it is already there:
-#    patches/ (NVK on RM), then patches-common/ (generic NVK patches that
-#    apply on top of the Windows stack as well)
-series=$(ls "$here"/patches/*.patch "$here"/patches-common/*.patch)
+# 2. Apply the series (series.sh: the same one the Windows build applies)
+#    on a local branch, unless it is already there
+series=$(sh "$here/series.sh")
 last_patch=$(printf "%s\n" $series | tail -1)
 last_subject=$(awk '/^Subject: /{s = $0; while ((getline l) > 0 && l ~ /^ /) s = s l;
                     sub(/^Subject: \[PATCH[^]]*\] /, "", s); print s; exit}' "$last_patch")
