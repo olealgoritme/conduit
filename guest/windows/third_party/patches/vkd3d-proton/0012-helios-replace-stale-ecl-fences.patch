@@ -1,0 +1,145 @@
+Helios: replace stale prefetched ECL fences at commit
+
+helios_vkd3d_prepare_ecl_fence (patch 0009) makes the RM fence for a queue's
+next ExecuteCommandLists as soon as the previous one is admitted, so the next
+commit does not pay the fence-create round trip. An RM fence times out on the
+host a fixed time after it is made (5 s, or 1 s with the backend's safe mode)
+and a timed-out fence counts as fired. When the application is idle between
+two ECLs for longer than that, the prepared fence fires before the next
+batch's GPU work and WDDM completes the batch early (a readback copy then
+overwrites the CPU's staging writes).
+
+Record when the prepared fence was made. A commit takes it while it is younger
+than VKD3D_HELIOS_ECL_PREPARED_MAX_US (250 ms); an older one keeps its queue
+value, the commit makes a fresh fence for that value through the inline path
+and closes the old fence afterwards. Queue ordering, exports and the stats
+layout are unchanged; a replaced fence counts in "created".
+
+diff --git a/libs/vkd3d/helios_producer.h b/libs/vkd3d/helios_producer.h
+index 821eb43..6f8cb2c 100644
+--- a/libs/vkd3d/helios_producer.h
++++ b/libs/vkd3d/helios_producer.h
+@@ -120,6 +120,14 @@ static uint64_t vkd3d_helios_qpc_us(int64_t from, int64_t to)
+     return to > from ? (uint64_t)(to - from) * 1000000ull / (uint64_t)freq.QuadPart : 0;
+ }
+ 
++/* An RM fence times out on the host a fixed time after it was made (5 s, or
++ * 1 s with the backend's safe mode), and a timed-out fence counts as fired. A
++ * fence made ahead (helios_vkd3d_prepare_ecl_fence) waits for the next ECL,
++ * which an idle application may not send for seconds; a commit takes it only
++ * when it is younger than this and makes a fresh one otherwise, so the batch's
++ * own work always has most of the fence's lifetime. */
++#define VKD3D_HELIOS_ECL_PREPARED_MAX_US 250000u
++
+ static unsigned int vkd3d_helios_ecl_bucket(uint64_t us)
+ {
+     unsigned int i;
+@@ -215,12 +223,15 @@ HRESULT helios_vkd3d_create_ecl_fence(ID3D12CommandQueue *iface, uint64_t value,
+  * fence-create escape (a host round trip) before its HE12 v4 Render. The
+  * caller serialises it with that queue's ECLs (the UMD calls it at the end of
+  * an ECL, under the queue's execution lock). S_OK when one is ready (made
+- * now or already), E_NOTIMPL without ECL fences, E_FAIL if refused. */
++ * now or already), E_NOTIMPL without ECL fences, E_FAIL if refused. A commit
++ * that comes later than VKD3D_HELIOS_ECL_PREPARED_MAX_US after the fence was
++ * made replaces it with a fresh one (patch 0012). */
+ HRESULT helios_vkd3d_prepare_ecl_fence(ID3D12CommandQueue *iface)
+ {
+ #ifdef _WIN32
+     const struct helios_icd_api *icd;
+     struct d3d12_command_queue *queue;
++    LARGE_INTEGER made;
+     uint64_t value = 0;
+     uint32_t fence = 0;
+     if (!iface)
+@@ -244,13 +255,16 @@ HRESULT helios_vkd3d_prepare_ecl_fence(ID3D12CommandQueue *iface)
+     /* The escape runs outside queue_lock; no commit of this queue can run
+      * meanwhile (the caller holds its ECL lock). A value whose fence is
+      * refused is still taken by the next commit and signalled (it is the
+-     * next in order); that batch makes its fence inline. */
++     * next in order); that batch makes its fence inline. The age is taken
++     * before the escape, so it never understates the host's clock. */
++    QueryPerformanceCounter(&made);
+     if (icd->ecl_fence_create((VkDevice)queue->device->vk_device, (uint64_t)(uintptr_t)queue,
+             value, &fence) != VK_SUCCESS)
+         fence = 0;
+     pthread_mutex_lock(&queue->queue_lock);
+     queue->helios_ecl_prepared_value = value;
+     queue->helios_ecl_prepared_fence = fence;
++    queue->helios_ecl_prepared_qpc = made.QuadPart;
+     pthread_mutex_unlock(&queue->queue_lock);
+     if (!fence)
+     {
+@@ -488,7 +502,7 @@ static bool vkd3d_helios_commit_execute(struct d3d12_command_queue *queue,
+     struct vkd3d_helios_execution *op;
+     struct vkd3d_helios_stream *stream;
+     LARGE_INTEGER qpc;
+-    uint32_t prepared_fence = 0;
++    uint32_t prepared_fence = 0, stale_fence = 0;
+     uint64_t rm_value = 0, op_value = 0;
+     bool committed = false;
+     if (rm)
+@@ -523,9 +537,18 @@ static bool vkd3d_helios_commit_execute(struct d3d12_command_queue *queue,
+         if (icd && queue->helios_ecl_prepared_value)
+         {
+             /* Made ahead by helios_vkd3d_prepare_ecl_fence (patch 0009): its
+-             * value was the next one reserved, so the order holds. */
++             * value was the next one reserved, so the order holds. A fence
++             * made too long ago (the application was idle) may time out on
++             * the host before this batch runs: keep its value, close it and
++             * make a fresh fence for that value below. */
+             op->rm_value = rm_value = queue->helios_ecl_prepared_value;
+             prepared_fence = queue->helios_ecl_prepared_fence;
++            if (prepared_fence && vkd3d_helios_qpc_us(queue->helios_ecl_prepared_qpc, qpc.QuadPart)
++                    >= VKD3D_HELIOS_ECL_PREPARED_MAX_US)
++            {
++                stale_fence = prepared_fence;
++                prepared_fence = 0;
++            }
+             queue->helios_ecl_prepared_value = 0;
+             queue->helios_ecl_prepared_fence = 0;
+             InterlockedIncrement64((LONG64 *)&vkd3d_helios_ecl_stats.prepared_used);
+@@ -558,7 +581,9 @@ static bool vkd3d_helios_commit_execute(struct d3d12_command_queue *queue,
+     }
+     /* `op` belongs to the worker now; only the local copy is used. The fence
+      * escape runs outside queue_lock. A reserved value without a fence is
+-     * still signalled by the worker (harmless; the timeline stays dense). */
++     * still signalled by the worker (harmless; the timeline stays dense). A
++     * stale prepared fence is closed after the fresh one is made, so the
++     * batch's own fence comes first. */
+     if (rm && rm_value && prepared_fence)
+     {
+         rm->fence = prepared_fence;
+@@ -579,6 +604,8 @@ static bool vkd3d_helios_commit_execute(struct d3d12_command_queue *queue,
+         else
+             InterlockedIncrement64((LONG64 *)&vkd3d_helios_ecl_stats.create_failed);
+     }
++    if (stale_fence)
++        icd->rm_fence_close((VkDevice)queue->device->vk_device, stale_fence);
+     return true;
+ #else
+     (void)queue; (void)sub; (void)admission_event; (void)ctx; (void)value; (void)cookie; (void)rm;
+@@ -1111,6 +1138,7 @@ void vkd3d_helios_queue_cleanup(struct d3d12_command_queue *queue)
+             icd->rm_fence_close((VkDevice)queue->device->vk_device, queue->helios_ecl_prepared_fence);
+         queue->helios_ecl_prepared_fence = 0;
+         queue->helios_ecl_prepared_value = 0;
++        queue->helios_ecl_prepared_qpc = 0;
+     }
+ #endif
+     if (!queue->helios_producer) return;
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index 11583d4..f2bb12a 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -4048,9 +4048,11 @@ struct d3d12_command_queue
+     struct vkd3d_helios_ts *helios_ts;
+     /* Helios: an ECL fence made ahead for the next batch
+      * (helios_vkd3d_prepare_ecl_fence), consumed by its commit; under
+-     * queue_lock. value 0 = none. */
++     * queue_lock. value 0 = none. prepared_qpc is when its fence was made:
++     * a commit replaces a fence older than VKD3D_HELIOS_ECL_PREPARED_MAX_US. */
+     uint64_t helios_ecl_prepared_value;
+     uint32_t helios_ecl_prepared_fence;
++    int64_t helios_ecl_prepared_qpc;
+     /* Helios: completion hints (patch 0011). The ECL fences of committed
+      * batches, in commit order, with the producer value each batch signals;
+      * under queue_lock. The worker names a batch's fence to the UMD once the

@@ -17,6 +17,10 @@
 //! `pfnPresent`, `pfnCheckResourceAllocationHandle` and the unwind path all need
 //! the same record.
 //!
+//! NVK MSAA presentation resources use a single-sample physical image for the
+//! WDDM allocation. Their key is the application's MSAA engine resource; memory
+//! and geometry describe its resolve target, retained in that ResourceState.
+//!
 //! ⚠ **No longer inert, and the entry condition changed with it.** At UP-4 nothing
 //! consumed this table and every entry's `vk_memory`/`venus_res_id` halves were 0
 //! and counted. UP-5 landed the `pfnAllocateCb` call, and the rule is now stronger
@@ -397,6 +401,31 @@ pub(crate) fn record(identity: AllocationIdentity) -> RecordOutcome {
 /// this table provides.
 pub(crate) fn lookup(engine_resource: usize) -> Option<AllocationIdentity> {
     identities().by_resource.get(&engine_resource).copied()
+}
+
+/// Associate a newly adopted physical presentation image with its logical
+/// MSAA source before publishing either resource. This moves one allocation's
+/// identity and updates both indexes atomically; it creates no second entry.
+/// Failure leaves the physical entry intact for the caller's rollback.
+pub(crate) fn reassign_resource(physical: usize, logical: usize) -> Option<AllocationIdentity> {
+    let mut registry = identities();
+    if logical == 0 || registry.by_resource.contains_key(&logical) {
+        return None;
+    }
+    let mut id = *registry.by_resource.get(&physical)?;
+    if id.venus_res_id == 0
+        || registry.by_venus_res_id.get(&id.venus_res_id) != Some(&physical)
+        || registry.by_resource.try_reserve(1).is_err()
+    {
+        return None;
+    }
+    registry.by_resource.remove(&physical);
+    id.engine_resource = logical;
+    registry.by_resource.insert(logical, id);
+    if let Some(holder) = registry.by_venus_res_id.get_mut(&id.venus_res_id) {
+        *holder = logical;
+    }
+    Some(id)
 }
 
 /// Take the entry for `engine_resource`, if there is one.

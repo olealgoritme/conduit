@@ -487,6 +487,17 @@ unsafe extern "system" fn reset_command_list(
         return;
     }
 
+    // An abandoned recording must not publish its old presentation on a later
+    // use of this command list.
+    if super::present12::msaa_presents_pending() {
+        drop(
+            state
+                .msaa_present
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take(),
+        );
+    }
     // SAFETY: `allocator` is an owned reference live for this call, `engine()`
     // borrows the list this box owns, and `None` is the DDI's own answer for the
     // initial pipeline state -- it carries none.
