@@ -859,7 +859,8 @@ pub(crate) fn set_completion_hint(cb: usize, spin_us: u32) {
 }
 
 /// NVK (vkd3d patch 0009): make `queue`'s next ECL fence now, so that ECL's
-/// HE12 v4 Render does not wait for the fence-create escape.
+/// HE12 v4 Render does not wait for the fence-create escape. That ECL replaces
+/// it with a fresh fence when it comes 250 ms or more later (patch 0012).
 ///
 /// # Safety
 /// `queue` is a borrowed live engine `ID3D12CommandQueue*`, called under the
