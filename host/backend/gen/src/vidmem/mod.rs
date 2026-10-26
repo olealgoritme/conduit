@@ -35,9 +35,12 @@ pub mod v535_129_03;
 pub mod v565_77_00;
 pub mod v580_178_04;
 pub mod v595_104_02;
+pub mod v595_112_07;
+pub mod v595_44_11;
 pub mod v595_44_13;
 pub mod v595_44_14;
 pub mod v595_44_15;
+pub mod v595_44_16;
 pub mod v595_45_04;
 pub mod v595_58_03;
 pub mod v595_71_05;
@@ -49,6 +52,7 @@ pub mod v610_43_02;
 pub mod v610_43_03;
 pub mod v610_57_04;
 pub mod v615_71_09;
+pub mod v615_71_10;
 pub mod v615_78_08;
 
 use crate::version::DriverVersion;
@@ -182,9 +186,11 @@ static PROFILES: &[(DriverVersion, &Layout)] = &[
     (DriverVersion::new(535, 129, 3), &v535_129_03::LAYOUT),
     (DriverVersion::new(565, 77, 0), &v565_77_00::LAYOUT),
     (DriverVersion::new(580, 178, 4), &v580_178_04::LAYOUT),
+    (DriverVersion::new(595, 44, 11), &v595_44_11::LAYOUT),
     (DriverVersion::new(595, 44, 13), &v595_44_13::LAYOUT),
     (DriverVersion::new(595, 44, 14), &v595_44_14::LAYOUT),
     (DriverVersion::new(595, 44, 15), &v595_44_15::LAYOUT),
+    (DriverVersion::new(595, 44, 16), &v595_44_16::LAYOUT),
     (DriverVersion::new(595, 45, 4), &v595_45_04::LAYOUT),
     (DriverVersion::new(595, 58, 3), &v595_58_03::LAYOUT),
     (DriverVersion::new(595, 71, 5), &v595_71_05::LAYOUT),
@@ -193,10 +199,12 @@ static PROFILES: &[(DriverVersion, &Layout)] = &[
     (DriverVersion::new(595, 91, 7), &v595_91_07::LAYOUT),
     (DriverVersion::new(595, 99, 2), &v595_99_02::LAYOUT),
     (DriverVersion::new(595, 104, 2), &v595_104_02::LAYOUT),
+    (DriverVersion::new(595, 112, 7), &v595_112_07::LAYOUT),
     (DriverVersion::new(610, 43, 2), &v610_43_02::LAYOUT),
     (DriverVersion::new(610, 43, 3), &v610_43_03::LAYOUT),
     (DriverVersion::new(610, 57, 4), &v610_57_04::LAYOUT),
     (DriverVersion::new(615, 71, 9), &v615_71_09::LAYOUT),
+    (DriverVersion::new(615, 71, 10), &v615_71_10::LAYOUT),
     (DriverVersion::new(615, 78, 8), &v615_78_08::LAYOUT),
 ];
 
