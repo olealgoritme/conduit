@@ -418,12 +418,12 @@ pub struct HeliosDevice {
     pub nvk_keyed_resources: std::sync::Mutex<Vec<(usize, bool)>>,
     /// NVK, `FlipLedger`: DXGI present buffers this device created or opened
     /// that hold their hand-off ledger key, as `(pDrvPrivate, ID3D11Resource*,
-    /// width, height, DXGI format, KMD resource id)` (`forward::resource::note_nvk_flip_buffer`).
-    pub nvk_flip_buffers: std::sync::Mutex<Vec<(usize, usize, u32, u32, u32, u32)>>,
+    /// width, height, DXGI format, KMD resource id, last known chain token)` (`forward::resource::note_nvk_flip_buffer`).
+    pub nvk_flip_buffers: std::sync::Mutex<Vec<(usize, usize, u32, u32, u32, u32, u32)>>,
     /// NVK, `FlipLedger` 1, dwm.exe: the buffer DWM composed last per app swap chain and the
-    /// finished frame it held, `(presenting process, (width, height, format), ID3D11Resource*,
+    /// finished frame it held, `(namespaced ring key, (width, height, format), ID3D11Resource*,
     /// frame)`.
-    pub nvk_flip_last: std::sync::Mutex<Vec<(u32, (u32, u32, u32), usize, u64)>>,
+    pub nvk_flip_last: std::sync::Mutex<Vec<(u64, (u32, u32, u32), usize, u64)>>,
     /// NVK, `FlipLedger` 1, dwm.exe: DWM's replacement views of opened app
     /// present buffers, `(ID3D11Resource*, view)` (`forward::bindings::dwm_flip_views`).
     pub nvk_flip_views: std::sync::Mutex<
