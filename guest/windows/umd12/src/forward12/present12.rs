@@ -28,11 +28,13 @@
 //! `D3DKMT_HANDLE`, the WDDM context to submit on, and a few scalars — and nothing
 //! here touches the scanout.
 //!
-//! D3D9On12's MSAA source is an exception to the metadata-only recording path:
-//! Present appends a resolve to the supplied list and sets `AddedGpuWork`.
-//! The physical allocation was associated at resource creation. Its identity
-//! marker is submitted after ECL commits the list, so it names the resolve's
-//! completion point without introducing a CPU wait.
+//! D3D9On12's MSAA back buffer is an exception to the metadata-only recording
+//! path: Present appends a resolve into the buffer's single-sample present image
+//! (made with it, `resource12::create_present_resolve_target`) to the supplied
+//! list and sets `AddedGpuWork`. The identity marker is submitted by the
+//! ExecuteCommandLists that admits that list, after it released the queue's
+//! execution lock, so the marker names the resolve's completion point and no
+//! CPU wait happens under the lock.
 //!
 //! ⚠ **This block used to say *"it is not a submission … nothing here builds a
 //! packet"*, and UP-9 made that false.** The frame's identity has nowhere else to
@@ -312,11 +314,15 @@ unsafe fn present_body(
     // D3D9On12 can hand Present an unresolved MSAA back buffer. The NVK
     // compositor and scanout both consume single-sample images. Record the
     // resolve on the runtime's still-open list, then publish its identity only
-    // after that list is submitted (the runtime observes AddedGpuWork).
-    if unsafe { engine.GetDesc() }.SampleDesc.Count > 1 && unsafe { queue::queue_is_nvk(h_queue) } {
-        if let Err(hr) =
-            unsafe { record_msaa_present(h_command_list, h_queue, arg, surface, p_out, p_contexts) }
-        {
+    // after that list is submitted (the runtime observes AddedGpuWork). Only a
+    // buffer that was given a present image at creation takes this path; the
+    // test is a field of the resource's private block.
+    // SAFETY: the runtime's handle from this driver's own create, as above.
+    let resolve_target = unsafe { resource12::present_resolve_target(surface.hSurface) };
+    if let Some(target) = resolve_target.filter(|_| unsafe { queue::queue_is_nvk(h_queue) }) {
+        if let Err(hr) = unsafe {
+            record_msaa_present(h_command_list, h_queue, arg, surface, engine, target, p_out, p_contexts)
+        } {
             L8_REFUSALS.present_msaa_failed.bump();
             static FAILURES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
             let n = FAILURES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -426,7 +432,7 @@ unsafe fn present_body(
         let flags = unsafe { arg.Flags.__bindgen_anon_1.Value };
         // SAFETY: live runtime arguments of this pfnPresent, on its thread.
         unsafe {
-            present_nvk::<false>(
+            present_nvk(
                 h_queue,
                 h_context,
                 engine.as_raw() as usize,
@@ -658,8 +664,21 @@ unsafe fn present_body(
     }
 }
 
-/// Kept on the exact command list containing the resolve, never on a device
-/// global. ECL publishes the marker after committing this batch's RM point.
+/// D3D9On12 MSAA presents recorded on some command list and not yet published
+/// or dropped. ExecuteCommandLists and command-list Reset look at their lists
+/// only while this is non-zero, so applications without one pay no lock.
+static PENDING_MSAA_PRESENTS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Is any D3D9On12 MSAA present waiting for its command list's submission?
+pub(crate) fn msaa_presents_pending() -> bool {
+    PENDING_MSAA_PRESENTS.load(core::sync::atomic::Ordering::Acquire) != 0
+}
+
+/// A D3D9On12 MSAA present whose resolve was recorded on one command list
+/// (kept in that list's state, never on a device global). The ExecuteCommandLists
+/// that admits the list publishes it; any other end (a failed submission, a
+/// Reset, the list's destruction) drops it, which [`msaa_presents_pending`]
+/// counts.
 pub(crate) struct PendingMsaaPresent {
     target: std::sync::Arc<resource12::PresentResolveTarget>,
     optimize_for_composition: bool,
@@ -667,19 +686,45 @@ pub(crate) struct PendingMsaaPresent {
 }
 
 impl PendingMsaaPresent {
+    fn new(
+        target: std::sync::Arc<resource12::PresentResolveTarget>,
+        optimize_for_composition: bool,
+        flags: u32,
+    ) -> Self {
+        PENDING_MSAA_PRESENTS.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+        Self {
+            target,
+            optimize_for_composition,
+            flags,
+        }
+    }
+
+    /// Publish the frame: the marker of the present image, as an ordinary NVK
+    /// Present would have sent it. Skipped when the back buffer was destroyed
+    /// meanwhile (its WDDM allocation, the present image's, is gone or reused).
+    ///
     /// # Safety
-    /// Called on this list's owning queue after its successful ECL submission,
-    /// while the queue's execution lock and runtime DDI context are held.
-    pub(crate) unsafe fn submit(self, h_queue: ddi12::D3D12DDI_HCOMMANDQUEUE) {
+    /// Called inside the ExecuteCommandLists DDI of this list's queue, on its
+    /// entering thread, after the batch was admitted and with the queue's
+    /// execution lock released.
+    pub(crate) unsafe fn submit(&self, h_queue: ddi12::D3D12DDI_HCOMMANDQUEUE) {
+        let identity = &self.target.identity;
+        let current = identity12::lookup(identity.engine_resource);
+        if current.is_none_or(|c| c.h_allocation != identity.h_allocation) {
+            L8_REFUSALS.present_msaa_stale.bump();
+            return;
+        }
         let Some(context) = (unsafe { queue::present_context(h_queue) }) else {
             return;
         };
+        // SAFETY: forwarded precondition; the present image is kept alive by
+        // `target`.
         unsafe {
-            present_nvk::<true>(
+            present_nvk(
                 h_queue,
                 context,
                 self.target.resource.as_raw() as usize,
-                &self.target.identity,
+                identity,
                 self.optimize_for_composition,
                 self.flags,
                 core::ptr::null_mut(),
@@ -689,13 +734,33 @@ impl PendingMsaaPresent {
     }
 }
 
+impl Drop for PendingMsaaPresent {
+    fn drop(&mut self) {
+        PENDING_MSAA_PRESENTS.fetch_sub(1, core::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// Record the resolve of a D3D9On12 MSAA back buffer into its present image on
+/// the runtime's Present command list.
+///
+/// Resource states: D3D12 requires a back buffer to be in PRESENT (== COMMON)
+/// when it is presented, and D3D9On12 transitions it there before calling
+/// Present, so the list leaves `src` in PRESENT again after the resolve. The
+/// present image is this driver's own: nothing but this resolve touches it on
+/// a queue, it is created in the COMMON layout and every resolve returns it to
+/// COMMON, which is also the state the KMD's copy and the scanout read it in.
+///
 /// # Safety
-/// All arguments are live inputs/outputs of the current Present DDI.
+/// All arguments are live inputs/outputs of the current Present DDI; `src` is
+/// the engine resource of `surface`, `target` its present image.
+#[allow(clippy::too_many_arguments)]
 unsafe fn record_msaa_present(
     h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     h_queue: ddi12::D3D12DDI_HCOMMANDQUEUE,
     arg: &ddi12::D3D12DDIARG_PRESENT_0001,
     surface: &ddi12::D3D12DDI_ARG_PRESENTSURFACE,
+    src: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    target: std::sync::Arc<resource12::PresentResolveTarget>,
     p_out: *mut ddi12::D3D12DDI_PRESENT_0051,
     p_contexts: *mut ddi12::D3D12DDI_PRESENT_CONTEXTS_0051,
 ) -> Result<(), i32> {
@@ -712,9 +777,6 @@ unsafe fn record_msaa_present(
     if pending.is_some() {
         return Err(E_FAIL);
     }
-    let src = unsafe { resource12::engine_resource(surface.hSurface) }.ok_or(E_FAIL)?;
-    let target = unsafe { resource12::present_resolve_target(surface.hSurface) }?;
-    let format = unsafe { target.resource.GetDesc() }.Format;
     // Borrow COM identities: these barrier descriptions take no references and
     // cannot outlive the two resources borrowed by this recording call.
     let barrier = |res: &ID3D12Resource, before, after| D3D12_RESOURCE_BARRIER {
@@ -745,7 +807,7 @@ unsafe fn record_msaa_present(
             ),
         ]);
         list.engine()
-            .ResolveSubresource(&target.resource, 0, src, 0, format);
+            .ResolveSubresource(&target.resource, 0, src, 0, target.format);
         list.engine().ResourceBarrier(&[
             barrier(
                 src,
@@ -760,11 +822,11 @@ unsafe fn record_msaa_present(
         ]);
     }
     let allocation = target.identity.h_allocation;
-    *pending = Some(PendingMsaaPresent {
+    *pending = Some(PendingMsaaPresent::new(
         target,
-        optimize_for_composition: arg.OptimizeForComposition != 0,
-        flags: unsafe { arg.Flags.__bindgen_anon_1.Value },
-    });
+        arg.OptimizeForComposition != 0,
+        unsafe { arg.Flags.__bindgen_anon_1.Value },
+    ));
     unsafe {
         (*p_out).BroadcastSrcAllocation[0] = allocation;
         (*p_out).AddedGpuWork = 1;
@@ -892,7 +954,7 @@ fn desktop_extent() -> Option<(u32, u32)> {
 /// # Safety
 /// The live runtime arguments of the `pfnPresent` that called this, on its thread.
 #[allow(clippy::too_many_arguments)]
-unsafe fn present_nvk<const AFTER_ECL: bool>(
+unsafe fn present_nvk(
     h_queue: ddi12::D3D12DDI_HCOMMANDQUEUE,
     h_context: *mut core::ffi::c_void,
     engine_resource: usize,
@@ -1101,12 +1163,12 @@ unsafe fn present_nvk<const AFTER_ECL: bool>(
                 };
                 let outcome = match rm_copy {
                     Some(copy) => unsafe {
-                        submit_nvk_identity::<AFTER_ECL, _>(
+                        queue::submit_present_identity(
                             h_queue,
                             &helios_protocol::HeliosPresentRenderCmdRmCopy::new(fenced, copy),
                         )
                     },
-                    None => unsafe { submit_nvk_identity::<AFTER_ECL, _>(h_queue, &fenced) },
+                    None => unsafe { queue::submit_present_identity(h_queue, &fenced) },
                 };
                 if !matches!(outcome, queue::WddmSubmit::Submitted) {
                     // SAFETY: forwarded precondition.
@@ -1114,7 +1176,7 @@ unsafe fn present_nvk<const AFTER_ECL: bool>(
                 }
                 outcome
             }
-            None => unsafe { submit_nvk_identity::<AFTER_ECL, _>(h_queue, &record) },
+            None => unsafe { queue::submit_present_identity(h_queue, &record) },
         };
         match submitted {
             queue::WddmSubmit::Submitted => {}
@@ -1153,20 +1215,6 @@ pub(crate) fn install_core(
     filling.advance()
 }
 
-/// # Safety
-/// Live queue on its entering DDI thread. AFTER_ECL additionally requires the
-/// execution lock already held; the ordinary Present path acquires it here.
-unsafe fn submit_nvk_identity<const AFTER_ECL: bool, T: Copy>(
-    h_queue: ddi12::D3D12DDI_HCOMMANDQUEUE,
-    record: &T,
-) -> queue::WddmSubmit {
-    if AFTER_ECL {
-        unsafe { queue::submit_present_identity_after_ecl(h_queue, record) }
-    } else {
-        unsafe { queue::submit_present_identity(h_queue, record) }
-    }
-}
-
 /// Install L8's command-list slots.
 ///
 /// Chain position: `CopySlots` -> `PresentSlots` on the command-list table.
@@ -1191,6 +1239,9 @@ struct L8Refusals {
     present_msaa_recorded: RefusalCounter,
     /// MSAA Presents refused before returning a usable descriptor.
     present_msaa_failed: RefusalCounter,
+    /// Recorded MSAA presents not published because their back buffer was
+    /// destroyed before the command list was submitted.
+    present_msaa_stale: RefusalCounter,
     /// `pfnGetPresentPrivateDriverDataSize` calls served, all answering 0. ⚠ **Not a
     /// refusal — the census**, and the only instrument that says whether the runtime
     /// asks at all. Non-zero with `PresentBadArg` at 0 and no present hits would say
@@ -1318,6 +1369,7 @@ struct L8Refusals {
 static L8_REFUSALS: L8Refusals = L8Refusals {
     present_msaa_recorded: RefusalCounter::new("PresentMsaaResolveRecorded"),
     present_msaa_failed: RefusalCounter::new("PresentMsaaResolveFailed"),
+    present_msaa_stale: RefusalCounter::new("PresentMsaaResolveStale"),
     present_private_data_size_queries: RefusalCounter::new("PresentPrivateDataSizeQueries"),
     present_bad_arg: RefusalCounter::new("PresentBadArg"),
     present_no_out_struct: RefusalCounter::new("PresentNoOutStruct"),
@@ -1394,4 +1446,5 @@ pub(crate) static REFUSALS: &[&RefusalCounter] = &[
     &L8_REFUSALS.nvk_copy_record_refused,
     &L8_REFUSALS.present_msaa_recorded,
     &L8_REFUSALS.present_msaa_failed,
+    &L8_REFUSALS.present_msaa_stale,
 ];

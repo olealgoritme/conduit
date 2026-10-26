@@ -1,13 +1,55 @@
 // d3d9_msaa_present.cpp - native Windows x86 D3D9 MSAA presentation regression probe.
-// Build: i686-w64-mingw32-g++ -std=c++17 -O2 -static d3d9_msaa_present.cpp \
-//        -o d3d9_msaa_present.exe -ld3d9 -lgdi32 -luser32
-// Exit: 0 PASS, 1 API/setup failure, 2 oracle mismatch/incomplete, 77 SKIP.
-// Readback: GetBackBuffer (MSAA) -> StretchRect(full-size, filter NONE) -> matching
-// single-sample RT -> GetRenderTargetData -> SYSTEMMEM. Never GetRenderTargetData(MSAA).
-// --present-only disables readback synchronization; --no-screen-check disables GetPixel.
-// --reset-cycles N resets the SAME device between phases, alternating the client/backbuffer
-// size so the swap chain and MSAA allocation must be recreated. --argb selects
-// D3DFMT_A8R8G8B8 instead of D3DFMT_X8R8G8B8.
+//
+// Direct3D 9 runs on D3D9On12 here. An MSAA back buffer reaches the D3D12 UMD's
+// Present unresolved; the UMD gives each D3D9On12 MSAA render target a
+// single-sample present image at creation and records a resolve into it on the
+// Present command list (umd12 present12.rs, record_msaa_present). The probe
+// renders a clear color plus one triangle, presents with D3DSWAPEFFECT_DISCARD,
+// and checks two oracles separately: a GPU readback of the back buffer and the
+// composed desktop pixels. A passing readback with failing screen pixels means
+// correct rendering and a failed presentation; --present-only checks that the
+// readback's synchronization is not hiding a presentation failure.
+//
+// Build (from the repository root, mingw-w64 i686):
+//   i686-w64-mingw32-g++ -std=c++17 -O2 -static -Wall -Wextra
+//       guest/windows/tools/d3d9_msaa_present.cpp -o d3d9_msaa_present.exe
+//       -ld3d9 -lgdi32 -luser32
+//
+// Run in an interactive session with a visible, unoccluded window (the screen
+// oracle samples the desktop with GetPixel; the window is made topmost):
+//   d3d9_msaa_present.exe --samples 4 --reset-cycles 4
+//   d3d9_msaa_present.exe --samples 4 --reset-cycles 4 --present-only
+//   d3d9_msaa_present.exe --samples 4 --reset-cycles 4 --argb
+// and the same with --samples 1 (single-sample control), 2 and 8.
+//
+// Usage: d3d9_msaa_present.exe [--samples 1|2|4|8] [--argb] [--reset-cycles 1..8]
+//                              [--log PATH] [--present-only] [--no-screen-check]
+//   --samples N       MSAA sample count (default 4); an unsupported windowed
+//                     format/sample combination (CheckDeviceMultiSampleType) is SKIP.
+//   --argb            D3DFMT_A8R8G8B8 instead of D3DFMT_X8R8G8B8; alpha (255) is
+//                     then compared too, X8 ignores it.
+//   --reset-cycles N  Reset the SAME device N times between phases, alternating the
+//                     client/back buffer between 640x450 and 704x480 so the swap
+//                     chain and the MSAA allocations are recreated (default 0: one
+//                     80-frame phase; with resets every phase has 40 frames).
+//   --log PATH        stdout to a file.
+//   --present-only    no readback (GetBackBuffer/StretchRect/GetRenderTargetData);
+//                     cannot be combined with --no-screen-check.
+//   --no-screen-check no desktop GetPixel checks.
+// With screen checks the probe sets HELIOS_NVK_PRESENT=2 (DWM composition rather
+// than direct scanout); without them it keeps the caller's policy.
+//
+// Samples per phase: readback before Present at frames 0/30/50 (0/15/30 with
+// resets) and screen after Present at 20/40/60 (10/25/35): the clear color at
+// (4,4) and the triangle color at the center. Readback path: GetBackBuffer
+// (MSAA) -> StretchRect(full size, filter NONE) -> single-sample RT ->
+// GetRenderTargetData -> SYSTEMMEM; never GetRenderTargetData on the MSAA
+// surface. Every default-pool surface and back-buffer reference of a phase is
+// released before the next Reset. Failures are sticky across phases.
+//
+// Exit: 0 PASS, 1 API/setup failure (a failed Reset included), 2 oracle
+// mismatch, incomplete sampling, WM_QUIT or fewer resets than requested, 77 SKIP.
+// Not covered: exclusive fullscreen, device loss, multiple adapters, edge quality.
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <d3d9.h>

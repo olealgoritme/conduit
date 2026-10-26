@@ -2616,19 +2616,52 @@ pub(crate) struct PresentResolveTarget {
     pub(crate) resource: ID3D12Resource,
     _heap: ID3D12Heap,
     pub(crate) identity: identity12::AllocationIdentity,
+    /// The format of both the source and this image, the resolve's format.
+    pub(crate) format: DXGI_FORMAT,
 }
 
+/// The present image of an MSAA back buffer, when it was given one at
+/// creation (`create_present_resolve_target`). A field read, no engine call.
+///
 /// # Safety
 /// The source is a live handle from this device's resource create DDI.
 pub(crate) unsafe fn present_resolve_target(
     h_source: ddi12::D3D12DDI_HRESOURCE,
-) -> Result<Arc<PresentResolveTarget>, Hresult> {
-    let source = unsafe { resource_state(h_source) }.ok_or(E_INVALIDARG)?;
-    source
-        .present_resolve
-        .as_ref()
-        .map(Arc::clone)
-        .ok_or(E_NOTIMPL)
+) -> Option<Arc<PresentResolveTarget>> {
+    // SAFETY: forwarded precondition.
+    unsafe { resource_state(h_source) }?.present_resolve.as_ref().map(Arc::clone)
+}
+
+/// Does this process run Direct3D 9 through D3D9On12? Only its back buffers
+/// need a present image (`create_present_resolve_target`); a native D3D12
+/// application presents through DXGI, which resolves MSAA itself. D3D9On12 is
+/// loaded before it creates its D3D12 device, so a `true` is final.
+fn d3d9on12_process() -> bool {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetModuleHandleW(name: *const u16) -> *mut c_void;
+    }
+    static SEEN: AtomicBool = AtomicBool::new(false);
+    if SEEN.load(Ordering::Relaxed) {
+        return true;
+    }
+    const NAME: [u16; 13] = {
+        let ascii = *b"d3d9on12.dll\0";
+        let mut wide = [0u16; 13];
+        let mut i = 0;
+        while i < ascii.len() {
+            wide[i] = ascii[i] as u16;
+            i += 1;
+        }
+        wide
+    };
+    // SAFETY: a NUL-terminated UTF-16 module name; no reference is taken.
+    let loaded = !unsafe { GetModuleHandleW(NAME.as_ptr()) }.is_null();
+    if loaded {
+        SEEN.store(true, Ordering::Relaxed);
+    }
+    loaded
 }
 
 /// # Safety
@@ -2651,11 +2684,8 @@ unsafe fn create_present_resolve_target(
         return Err(E_NOTIMPL);
     }
     desc.Alignment = 0;
-    // X8 is a presentation format, not a typed resolve format. D3D9On12's
-    // ordinary StretchRect resolve uses the corresponding BGRA8 storage.
-    if desc.Format.0 == 88 {
-        desc.Format = DXGI_FORMAT(87);
-    }
+    // The source's own format, B8G8R8X8 included: the image is presented with
+    // it, so the compositor and scanout ignore an X8 buffer's undefined alpha.
     desc.SampleDesc = DXGI_SAMPLE_DESC {
         Count: 1,
         Quality: 0,
@@ -2741,6 +2771,7 @@ unsafe fn create_present_resolve_target(
         resource,
         _heap: heap,
         identity: id,
+        format: desc.Format,
     }))
 }
 
@@ -2933,19 +2964,43 @@ unsafe fn create_fused_heap_and_resource(
     // SAFETY: `dev` is the live device this create is running on, `resource` the
     // engine resource just created (owned here, so alive for the call), and
     // `h_rt_resource` the runtime handle this DDI was invoked with.
+    // A D3D9On12 MSAA render target in a present format (its back buffer is
+    // one) gets a single-sample present image whose allocation becomes its own
+    // (`create_present_resolve_target`). Any failure there falls back to the
+    // ordinary allocation below: the resource is still created, and Present
+    // shows it as it would without the image.
     let msaa_present = dev.engine.is_nvk()
         && desc.SampleDesc.Count > 1
         && desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
         && desc.DepthOrArraySize == 1
         && desc.MipLevels == 1
         && desc.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)
-        && matches!(desc.Format.0, 28 | 29 | 87 | 88 | 91);
+        && matches!(desc.Format.0, 28 | 29 | 87 | 88 | 91)
+        && d3d9on12_process();
     let present_resolve = if msaa_present {
+        // SAFETY: as the ordinary adoption below.
         match unsafe { create_present_resolve_target(dev, &resource, &desc, h_rt_resource) } {
             Ok(target) => Some(target),
-            Err(hr) => return hr,
+            Err(hr) => {
+                note_refusal(&L4_REFUSALS.msaa_present_image_failed);
+                if L4_REFUSALS.msaa_present_image_failed.get() <= LOG_BUDGET {
+                    log_error!(
+                        "L4: no present image for the D3D9On12 MSAA render target {}x{} fmt={} \
+                         samples={} (hr={:#010x}) -- ordinary allocation",
+                        desc.Width,
+                        desc.Height,
+                        desc.Format.0,
+                        desc.SampleDesc.Count,
+                        hr as u32,
+                    );
+                }
+                None
+            }
         }
     } else {
+        None
+    };
+    if present_resolve.is_none() {
         if let Err(hr) = unsafe {
             adopt_committed_allocation(
                 dev,
@@ -2959,8 +3014,7 @@ unsafe fn create_fused_heap_and_resource(
         } {
             return hr;
         }
-        None
-    };
+    }
 
     // SAFETY: `resource_slot` is this driver's private block for the resource
     // being created, cleared by the caller and written exactly once.
@@ -5060,6 +5114,9 @@ struct L4Refusals {
     nvk_present_candidates: RefusalCounter,
     /// S5: fused resources on NVK given a one-page KMD placeholder allocation.
     nvk_committed_placeholder: RefusalCounter,
+    /// A D3D9On12 MSAA render target whose single-sample present image could
+    /// not be made; it got the ordinary allocation instead.
+    msaa_present_image_failed: RefusalCounter,
     /// S5: present candidates on NVK without a KMD resource id (IMPORT_RM closed):
     /// scanout present only. Expected zero with an IMPORT_RM-serving KMD.
     nvk_primary_placeholder: RefusalCounter,
@@ -5136,6 +5193,7 @@ static L4_REFUSALS: L4Refusals = L4Refusals {
     identity_registry_alloc_failed: RefusalCounter::new("IdentityRegistryAllocFailed"),
     nvk_present_candidates: RefusalCounter::new("Nvk12PresentCandidates"),
     nvk_committed_placeholder: RefusalCounter::new("Nvk12CommittedPlaceholder"),
+    msaa_present_image_failed: RefusalCounter::new("MsaaPresentImageFailed"),
     nvk_primary_placeholder: RefusalCounter::new("Nvk12PrimaryPlaceholder"),
     nvk_primary_adopted: RefusalCounter::new("Nvk12PrimaryAdopted"),
 };
@@ -5219,6 +5277,7 @@ pub(crate) static REFUSALS: &[&RefusalCounter] = &[
     &L4_REFUSALS.identity_registry_alloc_failed,
     &L4_REFUSALS.nvk_present_candidates,
     &L4_REFUSALS.nvk_committed_placeholder,
+    &L4_REFUSALS.msaa_present_image_failed,
     &L4_REFUSALS.nvk_primary_placeholder,
     &L4_REFUSALS.nvk_primary_adopted,
 ];
