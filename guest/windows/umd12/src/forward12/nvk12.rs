@@ -244,7 +244,7 @@ fn log_engine_timing(frames: u64) {
         log_error!(
             "vkd3d batches: {admits} admitted, commit-to-admission avg {} us, hist <50us {} <200us {} \
              <1ms {} <2ms {} <5ms {} <20ms {} >=20ms {}; ECL fence admission-to-signal avg {} us; \
-             producer signal inline {} separate {}; ECL points prepared ahead {} taken {}",
+             producer signal inline {} separate {}; ECL fences made ahead {} taken {}",
             st[15] / admits,
             st[16],
             st[17],

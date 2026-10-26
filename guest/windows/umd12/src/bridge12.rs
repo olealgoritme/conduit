@@ -839,8 +839,8 @@ pub(crate) const MEMORY_STATS_LEN: usize = 385;
 /// made, creates failed, then 7 histogram buckets; then (vkd3d patch 0006)
 /// admissions, commit-to-admission sum (us), its 7 buckets, the ECL fences'
 /// admission-to-signal sum (us), inline producer signals, separate ones; then
-/// (patch 0009/0012) ECL points prepared ahead and those taken; then (patch
-/// 0011) completion hint calls, fences named, ring entries overwritten unseen, and the
+/// (patch 0009) fences made ahead and those taken; then (patch 0011) completion
+/// hint calls, fences named, ring entries overwritten unseen, and the
 /// done-to-admission sum (us) and count. An engine without a patch leaves its
 /// values zero.
 pub(crate) fn ecl_fence_stats() -> [u64; ECL_FENCE_STATS_LEN] {
@@ -858,8 +858,9 @@ pub(crate) fn set_completion_hint(cb: usize, spin_us: u32) {
     ffi::helios_vkd3d_bridge_set_completion_hint(cb, spin_us);
 }
 
-/// NVK (vkd3d patch 0012): reserve `queue`'s next ECL point ahead.
-/// Its timed RM fence is created at commit, after any CPU idle interval.
+/// NVK (vkd3d patch 0009): make `queue`'s next ECL fence now, so that ECL's
+/// HE12 v4 Render does not wait for the fence-create escape. That ECL replaces
+/// it with a fresh fence when it comes 250 ms or more later (patch 0012).
 ///
 /// # Safety
 /// `queue` is a borrowed live engine `ID3D12CommandQueue*`, called under the

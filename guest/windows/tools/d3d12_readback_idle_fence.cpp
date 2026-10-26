@@ -39,27 +39,35 @@
 // work and command-list recording. No drain is inserted before it. This is
 // outside the wait -> memcpy -> upload critical window. Zero skips Sleep.
 //
-// Regression: timed RM fences prepared for a future ECL can expire while
-// the application's CPU is idle. Reusing that failed fence for new GPU work
-// can let the native D3D12 fence complete before image -> staging finishes.
-// The subsequent CPU write is overwritten by the pending readback; the upload
-// then loses the font pattern. This models D3D9On12's dynamic-texture Lock(0)
-// sequence with public D3D12 calls. The byte oracle is independent of private
-// diagnostics. See README-d3d12-ecl-idle.md for setup and A/B results.
+// What it guards: the UMD makes the RM fence for a queue's next
+// ExecuteCommandLists ahead of time (Nvk12EclFencePrefetch, vkd3d patch 0009).
+// An RM fence times out on the host a fixed time after it is made (5 s, 1 s
+// with the backend's safe mode) and then counts as fired. vkd3d patch 0012
+// replaces a prepared fence that is 250 ms or older at commit, so an idle gap
+// between ECLs cannot hand the next batch an expired fence. With an expired
+// fence the native D3D12 fence completes before image -> staging finishes, the
+// pending readback overwrites the CPU write, and the upload loses the pattern
+// (D3D9On12's dynamic-texture Lock(0), e.g. a font atlas). The byte oracle is
+// the verdict; the native fence counter alone cannot prove GPU completion.
 //
-// Deliberate deviations from the production path, documented in README-d3d12-ecl-idle.md:
+// Stress copies lengthen a valid readback batch so a premature completion
+// overwrites the pattern consistently; one copy can pass despite the ordering
+// bug because the copy finishes before the CPU writes. Expected on the current
+// driver: PASS for idle 0, 1200 and 6000 ms, with Nvk12EclFencePrefetch on or
+// off.
+//
+// Deliberate deviations from the production path:
 //   * the wait timeout is bounded instead of INFINITE;
 //   * the staging mapping is taken once and kept for the whole run, so no
 //     Map/Unmap driver calls sit inside the critical window;
 //   * the readback copies are repeated in one command list (stress control).
 //
 // Hard rules encoded below:
-//   * diag=0 (reproduction mode): after the wait returns, the only thing that
-//     happens is the CPU memcpy, immediately followed by ExecuteCommandLists
-//     of the pre-recorded upload list and its Signal. No GetCompletedValue,
-//     no QPC, no printf, no private probe precedes the memcpy; a driver query
-//     would let GPU completion "repair" a premature event before the
-//     overwrite and hide the defect. Only the two CPU-side driver calls of the
+//   * After the wait returns, the only thing that happens is the CPU memcpy,
+//     immediately followed by ExecuteCommandLists of the pre-recorded upload
+//     list and its Signal. No GetCompletedValue, no QPC, no printf precedes
+//     the memcpy; a driver query would let GPU completion "repair" a
+//     premature event before the overwrite and hide the defect. Only the two CPU-side driver calls of the
 //     upload submission sit between the memcpy and the GPU upload; the window
 //     metric is therefore labelled wait+write+submit, not a wait latency.
 //   * The upload/verification list is recorded and closed BEFORE the critical
@@ -68,10 +76,6 @@
 //     possibly early fence. Objects stay alive until a bounded drain proves
 //     their work complete; otherwise they are deliberately leaked.
 //   * No pre-wait drain: readback copies are queued behind earlier GPU work.
-//   * Counters are labelled by their real namespace. helios_bc_font_completion
-//     and helios_bc_font_fence_probe report PRODUCER/RM information, not the
-//     native D3D12 fence. The native ID3D12Fence::GetCompletedValue sample is
-//     taken first; private probes are sampled afterwards.
 //   * RESULT PASS is printed only after every round verified, every wait was
 //     satisfied, and the final bounded drain completed.
 //
@@ -80,14 +84,26 @@
 //             event, incomplete verification or incomplete drain),
 //             5 observed data corruption.
 //
-// Build (x86, installed cross compiler):
-//   i686-w64-mingw32-g++ -std=c++17 -O2 -static d3d12_readback_idle_fence.cpp \
+// Build (x86 or x64 with the matching MinGW cross compiler):
+//   i686-w64-mingw32-g++ -std=c++17 -O2 -static d3d12_readback_idle_fence.cpp
 //       -o d3d12_readback_idle_fence-x86.exe -ld3d12 -ldxgi -ldxguid
+//   x86_64-w64-mingw32-g++ -std=c++17 -O2 -static d3d12_readback_idle_fence.cpp
+//       -o d3d12_readback_idle_fence-x64.exe -ld3d12 -ldxgi -ldxguid
+//   (mingw-w64 headers new enough to declare ID3D12Device9)
 //
 // Usage:
 //   d3d12_readback_idle_fence <rounds> <readback_copies> <warmup_batches>
-//       [on12_creator:0|1] [diag:0|1] [timeout_ms] [idle_before_read_ms]
-//   defaults: on12_creator=0 diag=0 timeout_ms=10000 idle_before_read_ms=0
+//       [on12_creator:0|1] [timeout_ms] [idle_before_read_ms]
+//   defaults: on12_creator=0 timeout_ms=10000 idle_before_read_ms=0
+//   on12_creator=1 creates the queue through ID3D12Device9::CreateCommandQueue1
+//   with the D3D12TranslationLayer creator GUID (unsupported: setup error).
+//
+//   d3d12_readback_idle_fence-x86.exe 1 128 672 1 10000 0      no-idle control
+//   d3d12_readback_idle_fence-x86.exe 1 128 672 1 10000 1200   past the 1 s safe-mode lifetime
+//   d3d12_readback_idle_fence-x86.exe 1 128 672 1 10000 6000   past the 5 s host lifetime
+//
+// The process prints the path of the loaded Helios D3D12 UMD; a registry
+// change to the UMD path takes effect only after the display adapter restarts.
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -104,11 +120,6 @@ namespace {
 constexpr UINT kWidth = 1024;
 constexpr UINT kHeight = 2048;
 constexpr UINT kPixelBytes = 4;
-
-// helios_bc_font_completion writes out[0..2]; helios_bc_font_fence_probe
-// writes out[0..5] (see helios_producer.h, helios_vkd3d_bc_font_fence_probe).
-constexpr unsigned kCompletionFields = 3;
-constexpr unsigned kProbeFields = 6;
 
 enum {
     kExitPass = 0,
@@ -133,7 +144,6 @@ struct RunParams {
     unsigned copies = 1;
     unsigned warmup = 0;
     bool on12_creator = false;
-    bool diag = false;
     DWORD timeout_ms = 10000;
     // CPU idle gap inserted once per round immediately before the readback
     // command list submission. 0 = no Sleep call, original timing preserved.
@@ -323,7 +333,7 @@ bool parse_u32(const char* text, unsigned lo, unsigned hi, unsigned& out) {
 void usage(const char* exe) {
     std::printf(
         "usage: %s <rounds:1-64> <readback_copies:1-256> <warmup_batches:0-1024>\n"
-        "          [on12_creator:0|1] [diag:0|1] [timeout_ms:100-120000]\n"
+        "          [on12_creator:0|1] [timeout_ms:100-120000]\n"
         "          [idle_before_read_ms:0-15000]\n"
         "  rounds         lock/write/upload/validate cycles (>=1)\n"
         "  readback_copies image->staging copies per cycle, each pair separated by\n"
@@ -331,7 +341,6 @@ void usage(const char* exe) {
         "  warmup_batches zero-fill batches queued before the first cycle (not drained)\n"
         "  on12_creator   1 = create the queue with the D3D12TranslationLayer creator\n"
         "                 GUID via ID3D12Device9::CreateCommandQueue1; unavailable -> error\n"
-        "  diag           1 = call private UMD producer/RM probes AFTER the CPU write\n"
         "  timeout_ms     bounded wait timeout for every fence wait\n"
         "  idle_before_read_ms  CPU Sleep() once per round immediately before the\n"
         "                 readback list is submitted (after warmup ECLs and after\n"
@@ -394,26 +403,25 @@ int run(const RunParams& params) {
         return kExitSetup;
     }
 
+    // The Helios D3D12 UMD of this process's architecture (helios_kmd_render.inx).
+    const char* const umd_name =
+        sizeof(void*) == 8 ? "helios_umd12.dll" : "helios_umd12_32.dll";
+    const char* const exe_name = sizeof(void*) == 8 ? "d3d12_readback_idle_fence-x64.exe"
+                                                    : "d3d12_readback_idle_fence-x86.exe";
     char module_path[MAX_PATH] = {};
-    HMODULE umd = GetModuleHandleA("helios_umd12_32.dll");
+    HMODULE umd = GetModuleHandleA(umd_name);
     if (umd) GetModuleFileNameA(umd, module_path, sizeof(module_path));
 
-    std::printf("UMD=%s rounds=%u copies=%u warmup=%u on12_creator=%d diag=%d "
+    std::printf("UMD=%s rounds=%u copies=%u warmup=%u on12_creator=%d "
                 "timeout_ms=%lu idle_before_read_ms=%lu\n",
-                umd ? module_path : "(helios_umd12_32.dll not loaded)", params.rounds,
+                umd ? module_path : "(not loaded)", params.rounds,
                 params.copies, params.warmup, params.on12_creator ? 1 : 0,
-                params.diag ? 1 : 0, static_cast<unsigned long>(params.timeout_ms),
+                static_cast<unsigned long>(params.timeout_ms),
                 static_cast<unsigned long>(params.idle_before_read_ms));
-    {
-        char replay[512] = {};
-        std::snprintf(replay, sizeof(replay),
-                      "REPLAY d3d12_readback_idle_fence-x86.exe %u %u %u %d %d %lu %lu",
-                      params.rounds, params.copies, params.warmup,
-                      params.on12_creator ? 1 : 0, params.diag ? 1 : 0,
-                      static_cast<unsigned long>(params.timeout_ms),
-                      static_cast<unsigned long>(params.idle_before_read_ms));
-        std::puts(replay);
-    }
+    std::printf("REPLAY %s %u %u %u %d %lu %lu\n", exe_name, params.rounds, params.copies,
+                params.warmup, params.on12_creator ? 1 : 0,
+                static_cast<unsigned long>(params.timeout_ms),
+                static_cast<unsigned long>(params.idle_before_read_ms));
 
     // --------------------------------------------------------------- objects
     Objects objects;
@@ -585,24 +593,6 @@ int run(const RunParams& params) {
         if (i && i % 2 == 0) CHECK_HR(objects.queue->Signal(objects.fence, ++point));
     }
 
-    // --------------------------------------------------------- optional diag
-    using GpuStatusFn = int(__cdecl*)(uint64_t*);
-    GpuStatusFn completion_probe = nullptr;
-    GpuStatusFn fence_probe = nullptr;
-    if (params.diag) {
-        if (umd) {
-            completion_probe =
-                reinterpret_cast<GpuStatusFn>(GetProcAddress(umd, "helios_bc_font_completion"));
-            fence_probe =
-                reinterpret_cast<GpuStatusFn>(GetProcAddress(umd, "helios_bc_font_fence_probe"));
-        }
-        std::printf("DIAG completion_probe=%s fence_probe=%s "
-                    "(private, optional; sampled only after the CPU write; "
-                    "fence_probe writes %u uint64 values, completion writes %u)\n",
-                    completion_probe ? "present" : "absent",
-                    fence_probe ? "present" : "absent", kProbeFields, kCompletionFields);
-    }
-
     // ----------------------------------------------------------------- rounds
     std::vector<unsigned char> expected(static_cast<size_t>(buffer_bytes));
     unsigned rounds_with_mismatch = 0;
@@ -705,7 +695,7 @@ int run(const RunParams& params) {
         const WaitOutcome wait =
             wait_ms_style(objects.fence, wait_event, read_point, params.timeout_ms);
 
-        // diag=0: the only operation between the wait returning and the
+        // The only operation between the wait returning and the
         // ExecuteCommandLists below is this memcpy. Nothing can observe or
         // "repair" an early event before the CPU data is in place.
         if (wait.status == WAIT_OBJECT_0) {
@@ -752,32 +742,10 @@ int run(const RunParams& params) {
                                : 0.0;
 
         // --- sampling, strictly AFTER the CPU write and the upload submit.
-        // Native D3D12 fence counter first: that is the API under
-        // investigation. The private exports report PRODUCER/RM state and are
-        // sampled second; their target values are not the native fence target.
         const NativeSample native_after_write = sample_native(objects.fence);
         if (native_after_write.device_removed) {
             std::printf("SETUP_ERROR device_removed_after_write round=%u\n", round + 1);
             return kExitSetup;
-        }
-        uint64_t probe_values[kProbeFields];
-        for (unsigned i = 0; i < kProbeFields; ++i) {
-            probe_values[i] = static_cast<uint64_t>(static_cast<int64_t>(-99));
-        }
-        const char* probe_kind = "none";
-        int probe_rc = -99;
-        if (params.diag) {
-            // fence_probe internally calls the completion probe first and then
-            // writes [0..5], so calling it alone is both sufficient and safe.
-            if (fence_probe) {
-                probe_kind = "fence_probe";
-                probe_rc = fence_probe(probe_values);
-            } else if (completion_probe) {
-                probe_kind = "completion";
-                probe_rc = completion_probe(probe_values);  // writes [0..2] only
-            } else {
-                probe_kind = "absent";
-            }
         }
 
         const bool early_wait =
@@ -841,31 +809,6 @@ int run(const RunParams& params) {
             static_cast<unsigned long long>(cmp.bad),
             static_cast<unsigned long long>(cmp.zeros),
             static_cast<long long>(cmp.first));
-        if (params.diag) {
-            // Field decoding of helios_bc_font_fence_probe (helios_producer.h):
-            // [0] producer target, [1] producer done before probe, [2] RM target,
-            // [3] VkResult of the bounded RM wait (2 ms), [4] producer done
-            // after the probe, [5] VkResult of RM fence creation.
-            // helios_bc_font_completion writes only [0..2]. Target association
-            // is conditional: command.c bc_engine_note_i2b records any matching
-            // 1024x2048 I2B command buffer, and the target is published only
-            // for a submission that contains it, so which point is named must
-            // be checked at runtime for this pre-recorded harness.
-            std::printf("DIAG round=%u probe=%s probe_rc=%d association=conditional "
-                        "producer_target=%llu "
-                        "producer_done_before=%llu rm_target=%llu rm_wait_rc=%lld "
-                        "producer_done_after=%llu rm_create_rc=%lld "
-                        "native_target=see_read_target native_done=%llu\n",
-                        round + 1, probe_kind, probe_rc,
-                        static_cast<unsigned long long>(probe_values[0]),
-                        static_cast<unsigned long long>(probe_values[1]),
-                        static_cast<unsigned long long>(probe_values[2]),
-                        static_cast<long long>(static_cast<int64_t>(probe_values[3])),
-                        static_cast<unsigned long long>(probe_values[4]),
-                        static_cast<long long>(static_cast<int64_t>(probe_values[5])),
-                        static_cast<unsigned long long>(native_after_write.value));
-        }
-
         if (cmp.bad) {
             rounds_with_mismatch++;
             // Forensics only, and only after the verdict data is captured. A
@@ -903,11 +846,11 @@ int run(const RunParams& params) {
         readback->Unmap(0, &empty_range);
     }
 
-    std::printf("SUMMARY rounds=%u copies=%u warmup=%u on12_creator=%d diag=%d "
+    std::printf("SUMMARY rounds=%u copies=%u warmup=%u on12_creator=%d "
                 "timeout_ms=%lu idle_before_read_ms=%lu mismatched=%u early_wait=%u "
                 "wait_failure=%u\n",
                 params.rounds, params.copies, params.warmup, params.on12_creator ? 1 : 0,
-                params.diag ? 1 : 0, static_cast<unsigned long>(params.timeout_ms),
+                static_cast<unsigned long>(params.timeout_ms),
                 static_cast<unsigned long>(params.idle_before_read_ms),
                 rounds_with_mismatch, rounds_with_early_wait, rounds_with_wait_failure);
 
@@ -930,7 +873,7 @@ int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
 
     RunParams params;
-    bool ok = (argc >= 4 && argc <= 8);
+    bool ok = (argc >= 4 && argc <= 7);
     ok = ok && parse_u32(argv[1], 1, 64, params.rounds);
     ok = ok && parse_u32(argv[2], 1, 256, params.copies);
     ok = ok && parse_u32(argv[3], 0, 1024, params.warmup);
@@ -940,15 +883,11 @@ int main(int argc, char** argv) {
         params.on12_creator = flag != 0;
     }
     if (ok && argc >= 6) {
-        ok = parse_u32(argv[5], 0, 1, flag);
-        params.diag = flag != 0;
-    }
-    if (ok && argc >= 7) {
-        ok = parse_u32(argv[6], 100, 120000, flag);
+        ok = parse_u32(argv[5], 100, 120000, flag);
         params.timeout_ms = static_cast<DWORD>(flag);
     }
-    if (ok && argc >= 8) {
-        ok = parse_u32(argv[7], 0, 15000, flag);
+    if (ok && argc >= 7) {
+        ok = parse_u32(argv[6], 0, 15000, flag);
         params.idle_before_read_ms = static_cast<DWORD>(flag);
     }
     if (!ok) {

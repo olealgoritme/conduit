@@ -3783,9 +3783,10 @@ unsafe fn execute_command_lists_body(
                 Ok(true) => {
                     L2_REFUSALS.ecl_nvk_ordered.bump();
                     note_refusal(&L2_REFUSALS.ecl_admission_queued);
-                    // Reserve the next ECL point while this queue's execution
-                    // lock is held. Patch 0012 defers the timed RM fence's
-                    // creation to commit, after any CPU idle gap.
+                    // `Nvk12EclFencePrefetch`: the next ECL's fence now, with
+                    // this batch already admitted, so its Render need not wait
+                    // for the fence-create escape. Still under the execution
+                    // lock, so no other ECL of this queue interleaves.
                     if crate::knobs12::nvk12_ecl_fence_prefetch() {
                         // SAFETY: the live engine queue, execution lock held.
                         let made = unsafe {
@@ -4495,8 +4496,8 @@ pub(crate) struct L2Refusals {
     queue_context_node1: RefusalCounter,
     /// Node 1 was refused (one-node KMD); the queue is on node 0.
     queue_context_node_refused: RefusalCounter,
-    /// `Nvk12EclFencePrefetch`: the next ECL's point could not be reserved
-    /// ahead (that ECL reserves it inline).
+    /// `Nvk12EclFencePrefetch`: the next ECL's fence could not be made ahead
+    /// (that ECL makes it inline).
     ecl_fence_prefetch_failed: RefusalCounter,
 }
 
