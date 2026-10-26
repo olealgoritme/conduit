@@ -28,6 +28,7 @@
 // headers below.
 #include "bridge_common.h"
 #include "bridge_util.h"
+#include "flip_chain_token.h"
 
 #include "bridge_dxbc.h"
 
@@ -435,11 +436,22 @@ struct HeliosDxvkDeviceImpl {
   dxvk::Rc<dxvk::DxvkFence> handoff_fence;
   std::uint64_t handoff_value = 0;
 
+  struct FlipChain {
+    std::uint32_t record;
+    std::uint32_t generation;
+    std::vector<std::size_t> resources;
+    std::vector<std::uint32_t> ids;
+  };
+  std::mutex flip_chain_mutex;
+  std::vector<FlipChain> flip_chains;
+  void release_flip_chains(std::size_t resource = 0);
+
   // Defined after helios_handoff: free this device's ledger record once its
   // last point is done (so no late completion lands in a reused record).
   void release_handoff_record();
 
   ~HeliosDxvkDeviceImpl() {
+    release_flip_chains();
     release_handoff_record();
     if (vehicle_semaphore_handle) CloseHandle(vehicle_semaphore_handle);
     if (context) context->Release();
@@ -578,7 +590,10 @@ namespace helios_handoff {
     std::atomic<std::uint32_t> extra_holders; // holders beyond `pids`
     std::atomic<std::uint32_t> pids[kPids];
     std::atomic<std::uint64_t> points[kEntries]; // packed, one per publishing device
-    std::uint64_t reserved;
+    // Formerly reserved. The low word binds the token to this exact resource
+    // id, so an older UMD reclaiming this slot for another key cannot expose
+    // the previous resource's chain identity. Older UMDs ignore this word.
+    std::atomic<std::uint64_t> chain_binding;
   };
   struct Table {
     std::atomic<std::uint32_t> magic;
@@ -597,6 +612,10 @@ namespace helios_handoff {
   };
   static_assert(sizeof(Device) == 16 + 8 * kRecent + 8 && sizeof(Slot) == 64, "ledger layout");
   static_assert(sizeof(Table) == 40 + sizeof(Device) * kDevices + sizeof(Slot) * kSlots, "ledger header");
+  static_assert(offsetof(Slot, chain_binding) == 56, "reserved ledger slot ABI");
+  static_assert(sizeof(std::atomic<std::uint64_t>) == 8
+             && std::atomic<std::uint64_t>::is_always_lock_free, "shared chain binding ABI");
+  static_assert(kDevices == (1u << helios_flip_chain::kIndexBits), "chain record index ABI");
 
   inline std::uint64_t pack(std::uint32_t dev, std::uint32_t gen, std::uint64_t point) {
     return (std::uint64_t(dev) << 52) | (std::uint64_t(gen & kGenMask) << 40) | (point & kPointMask);
@@ -816,6 +835,7 @@ namespace helios_handoff {
           return &s;
         if (k == 0 || k == kTombstone) {
           if (s.key.compare_exchange_strong(k, key)) {
+            s.chain_binding.store(0, std::memory_order_release);
             for (auto& e : s.points)
               e.store(0, std::memory_order_release);
             s.extra_holders.store(0);
@@ -1219,6 +1239,176 @@ namespace helios_handoff {
   }
 }
 
+namespace {
+void release_flip_chain(helios_handoff::Table* t,
+                        const HeliosDxvkDeviceImpl::FlipChain& ring) {
+  if (!t)
+    return;
+  const auto token = helios_flip_chain::make_token(ring.record, ring.generation);
+  for (auto id : ring.ids) {
+    if (auto* slot = helios_handoff::find(t, id)) {
+      auto expected = helios_flip_chain::make_binding(token, id);
+      slot->chain_binding.compare_exchange_strong(expected, 0,
+        std::memory_order_acq_rel, std::memory_order_acquire);
+    }
+  }
+  helios_handoff::free_device(t, ring.record);
+}
+}
+
+void HeliosDxvkDeviceImpl::release_flip_chains(std::size_t resource) {
+  std::lock_guard<std::mutex> lock(flip_chain_mutex);
+  if (flip_chains.empty())
+    return;
+  auto* t = helios_handoff::table();
+  for (auto it = flip_chains.begin(); it != flip_chains.end();) {
+    if (!resource || std::find(it->resources.begin(), it->resources.end(), resource)
+                       != it->resources.end()) {
+      release_flip_chain(t, *it);
+      it = flip_chains.erase(it);
+    } else {
+      ++it;
+    }
+  }
+}
+
+bool HeliosDxvkDevice::register_flip_ring(const std::size_t* resources,
+                                         const std::uint32_t* ids,
+                                         std::size_t count) const noexcept {
+  return bridge_guard("register_flip_ring", false, [&]() -> bool {
+    if (!impl || !helios_handoff::enabled()
+     || impl->backend != helios_bridge::IcdBackend::NvkRm
+     || !resources || !ids || count < 2 || count > 16)
+      return false;
+    auto* t = helios_handoff::table();
+    if (!t)
+      return false;
+    std::array<helios_handoff::Slot*, 16> slots{};
+    for (std::size_t i = 0; i < count; ++i) {
+      if (!resources[i] || !ids[i])
+        return false;
+      auto* texture = dxvk::GetCommonTexture(
+        reinterpret_cast<ID3D11Resource*>(resources[i]));
+      if (!texture || !texture->GetImage()
+       || texture->GetImage()->info().sharing.mode == dxvk::DxvkSharedHandleMode::Import)
+        return false;
+      for (std::size_t j = 0; j < i; ++j) {
+        if (resources[j] == resources[i] || ids[j] == ids[i])
+          return false;
+      }
+      slots[i] = helios_handoff::find(t, ids[i]);
+      if (!slots[i])
+        return false;
+    }
+    auto publish = [&](std::uint32_t token) {
+      for (std::size_t i = 0; i < count; ++i) {
+        const auto binding = helios_flip_chain::make_binding(token, ids[i]);
+        // Our live producer resources hold these slots. Revalidate cached
+        // pointers nevertheless, so a reclaimed slot cannot get a stale tag.
+        if (slots[i]->key.load(std::memory_order_acquire) == ids[i]
+         && slots[i]->chain_binding.load(std::memory_order_acquire) != binding)
+          slots[i]->chain_binding.store(binding, std::memory_order_release);
+      }
+    };
+    // The ring already registered with exactly these members: republish its
+    // token and return true. A ring whose record is no longer ours (taken over
+    // as a dead process's) is forgotten without freeing that record. False: no
+    // such ring. Called with flip_chain_mutex held.
+    auto republish = [&]() -> bool {
+      for (auto it = impl->flip_chains.begin(); it != impl->flip_chains.end(); ++it) {
+        if (it->resources.size() == count
+         && std::is_permutation(it->resources.begin(), it->resources.end(), resources)
+         && std::is_permutation(it->ids.begin(), it->ids.end(), ids)) {
+          const auto token = helios_flip_chain::make_token(it->record, it->generation);
+          if (!helios_flip_chain::is_current(token,
+                t->devices[it->record].gen.load(std::memory_order_acquire),
+                t->devices[it->record].pid.load(std::memory_order_acquire) != 0)) {
+            impl->flip_chains.erase(it);
+            return false;
+          }
+          publish(token);
+          return true;
+        }
+      }
+      return false;
+    };
+    {
+      std::lock_guard<std::mutex> lock(impl->flip_chain_mutex);
+      if (republish())
+        return true;
+    }
+    // A ledger record supplies a globally unique, generation-checked identity;
+    // it publishes no GPU point. Claimed outside flip_chain_mutex: a full table
+    // sweeps dead processes' records (OpenProcess per record).
+    HeliosDxvkDeviceImpl::FlipChain ring{};
+    ring.resources.assign(resources, resources + count);
+    ring.ids.assign(ids, ids + count);
+    ring.record = helios_handoff::claim_device(t, &ring.generation);
+    if (ring.record == UINT32_MAX)
+      return false;
+    const auto token = helios_flip_chain::make_token(ring.record, ring.generation);
+    if (!token) {
+      helios_handoff::free_device(t, ring.record);
+      return false;
+    }
+    // There is no outstanding GPU work on an identity-only record.
+    t->devices[ring.record].completed.store(UINT64_MAX, std::memory_order_release);
+    std::lock_guard<std::mutex> lock(impl->flip_chain_mutex);
+    // Registered by another thread meanwhile: keep that one.
+    if (republish()) {
+      helios_handoff::free_device(t, ring.record);
+      return true;
+    }
+    impl->flip_chains.reserve(impl->flip_chains.size() + 1);
+    impl->flip_chains.push_back(std::move(ring));
+    for (std::size_t i = 0; i + 1 < impl->flip_chains.size();) {
+      const auto& old = impl->flip_chains[i];
+      const bool overlaps = std::any_of(old.resources.begin(), old.resources.end(),
+        [&](std::size_t p) { return std::find(resources, resources + count, p) != resources + count; });
+      if (overlaps) {
+        release_flip_chain(t, old);
+        impl->flip_chains.erase(impl->flip_chains.begin() + i);
+      } else {
+        ++i;
+      }
+    }
+    publish(token);
+    static std::atomic<std::uint32_t> registrations{0};
+    const auto n = registrations.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n <= 8) {
+      char message[128];
+      std::snprintf(message, sizeof(message), "FlipLedger: exact ring #%u token=%08x buffers=%zu",
+                    n, token, count);
+      umd_log(message);
+    }
+    return true;
+  });
+}
+
+std::uint32_t HeliosDxvkDevice::flip_ring(std::uint32_t resource_id) const noexcept {
+  return bridge_guard("flip_ring", std::uint32_t(0), [&]() -> std::uint32_t {
+    if (!impl || !resource_id || !helios_handoff::enabled())
+      return 0;
+    auto* t = helios_handoff::table();
+    auto* slot = t ? helios_handoff::find(t, resource_id) : nullptr;
+    if (!slot)
+      return 0;
+    const auto binding = slot->chain_binding.load(std::memory_order_acquire);
+    const auto token = helios_flip_chain::binding_token(binding, resource_id);
+    if (!token)
+      return 0;
+    const auto& record = t->devices[helios_flip_chain::index(token)];
+    if (!helios_flip_chain::is_current(token,
+          record.gen.load(std::memory_order_acquire),
+          record.pid.load(std::memory_order_acquire) != 0)
+     || slot->key.load(std::memory_order_acquire) != resource_id
+     || slot->chain_binding.load(std::memory_order_acquire) != binding
+     || slot->key.load(std::memory_order_acquire) != resource_id)
+      return 0;
+    return token;
+  });
+}
+
 void HeliosDxvkDeviceImpl::release_handoff_record() {
   if (handoff_device == UINT32_MAX || !handoff_table)
     return;
@@ -1297,6 +1487,7 @@ void HeliosDxvkDevice::handoff_unregister(std::size_t d3d11_resource_ptr) const 
   bridge_guard("handoff_unregister", false, [&]() -> bool {
     if (!impl || !helios_handoff::enabled())
       return false;
+    impl->release_flip_chains(d3d11_resource_ptr);
     auto* texture = dxvk::GetCommonTexture(reinterpret_cast<ID3D11Resource*>(d3d11_resource_ptr));
     if (!texture || !texture->GetImage())
       return false;
