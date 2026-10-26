@@ -324,7 +324,7 @@ mod tests {
     fn a_release_between_profiles_gets_the_older_one_inexactly() {
         let s = select(DriverVersion::new(600, 0, 0)).expect("a profile");
         assert!(!s.exact);
-        assert!(std::ptr::eq(s.layout, &v595_104_02::LAYOUT));
+        assert!(std::ptr::eq(s.layout, &v595_112_07::LAYOUT));
         assert!(select(DriverVersion::new(615, 71, 9)).unwrap().exact);
         assert!(select(DriverVersion::new(500, 0, 0)).is_none());
     }

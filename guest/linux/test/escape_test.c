@@ -26,7 +26,7 @@ static int failures;
     }                                                                          \
   } while (0)
 
-#define MAX_RELEASES 16
+#define MAX_RELEASES 64
 #define MAX_ROWS 64
 
 struct release {

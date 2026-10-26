@@ -470,8 +470,8 @@ mod tests {
 
     #[test]
     fn a_version_between_tables_takes_the_lower_one() {
-        let t = table_for(DriverVersion::new(600, 0, 0)).expect("falls back to 595.104.02");
-        assert!(std::ptr::eq(t, v595_104_02::TABLE));
+        let t = table_for(DriverVersion::new(600, 0, 0)).expect("falls back to 595.112.07");
+        assert!(std::ptr::eq(t, v595_112_07::TABLE));
         assert!(table_for(DriverVersion::new(470, 0, 0)).is_none());
     }
 
