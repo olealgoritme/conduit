@@ -26,20 +26,18 @@ Design background: [docs/research/nvk-rm.md](../../docs/research/nvk-rm.md).
 
 | Directory | What | Used by |
 |---|---|---|
-| `patches/` | the RM backend (0001-0013), and the Linux versions of host-visible VRAM, cached system memory, compression and ZCULL (0014-0017) | Linux: 0001-0017; Windows: 0001-0013 |
-| `patches-windows/` | the Windows build, Win32 WSI, Helios scanout, shared surfaces and composed present, RM fences, Zink, NVDEC | Windows |
-| `patches-windows-dxvk/` | what DXVK needs on Windows, CPU waits, composed present by default | Windows |
+| `patches/` | the RM backend (0001-0013) | both |
+| `patches-windows/` | the Windows build, Win32 WSI, Helios scanout, shared surfaces and composed present, RM fences, Zink, NVDEC; host-visible VRAM, cached system memory, compression and ZCULL for both | both |
+| `patches-windows-dxvk/` | what DXVK needs on Windows, CPU waits, composed present by default | both |
 | `patches-common/` | generic NVK work (per-draw cost, compression, deferred frees, profiling, waits), applied last | both |
 
-Order of application:
-
-- Linux: base + `patches/*` + `patches-common/*` (`build.sh`).
-- Windows: base + `patches/0001-0013` + `patches-windows/*` +
-  `patches-windows-dxvk/*` + `patches-common/*` (`build-windows.sh`).
-
-Both apply with `git am` on the base commit, and the Windows stack also
-builds for Linux (the tests run natively on it). `windows/stage-helios-package.sh`
-stages the Windows build for the driver package.
+Linux (`build.sh`) and Windows (`build-windows.sh`) apply the same series
+with `git am` on the base commit: base + `patches/*` + `patches-windows/*` +
+`patches-windows-dxvk/*` + `patches-common/*`, as `series.sh` lists it. The
+Windows parts are guarded by platform and build for Linux too (the tests run
+natively on it). `windows/stage-helios-package.sh` stages the Windows build
+for the driver package. CI (`.github/scripts/check-patches.sh`) checks on
+every pull request that the series applies on the base.
 
 ## Base
 
@@ -272,10 +270,6 @@ Each patch builds on its own.
 | 0011 | a non-stall event whose data cannot be read is not polled; waits sleep instead of spinning through refused `NV_ESC_RM_GET_EVENT_DATA` escapes |
 | 0012 | `wsi_device::wait_before_present`, set by NVK when the backend has dma-bufs but no sync_file export (RM): the WSI waits for rendering before presenting |
 | 0013 | dma-buf export and import through nvidia-drm, DRM format modifiers (`has_dma_buf` + `has_alloc_tiled`): `OS_UNIX_EXPORT/IMPORT_OBJECT`, GEM import/export, DRM node discovery, `VK_EXT_image_drm_format_modifier` |
-| 0014 | Linux version of host-visible VRAM, see `patches-windows/0022` and "Host-visible VRAM" |
-| 0015 | Linux version of GPU-cacheable host-visible system memory (`NVK_RM_SYSMEM_CACHED`) |
-| 0016 | Linux version of compressible VRAM for images (`NVK_RM_COMPRESSION`) |
-| 0017 | Linux version of ZCULL (`NVK_RM_ZCULL`) |
 
 ## `patches-windows/`: the Windows build and the Helios integration
 
@@ -356,7 +350,7 @@ Each patch builds on its own.
 
 ## `patches-common/`: generic NVK work
 
-Apply on top of both lineages, unchanged. One patch (5) also touches the RM
+Applied last, on top of the rest of the series. One patch (5) also touches the RM
 backend. Numbers are file numbers (there is no 0016 or 0025).
 
 | # | what |
@@ -553,7 +547,7 @@ writes PTEs; NVK maps images with 0x8.
 
 | knob (default) | what it compresses |
 |---|---|
-| `NVK_RM_COMPRESSION` (1) | images in dedicated allocations: the memory is COMPR_ANY (block linear, 32 bpp, as NVKMS does) and mapped with the image's compressible kind; if RM declines, the uncompressed GMK kind (`patches-windows/0028`, `patches/0016`) |
+| `NVK_RM_COMPRESSION` (1) | images in dedicated allocations: the memory is COMPR_ANY (block linear, 32 bpp, as NVKMS does) and mapped with the image's compressible kind; if RM declines, the uncompressed GMK kind (`patches-windows/0028`) |
 | `NVK_RM_COMPRESS_ALL` (1 for vkd3d-proton, else 0) | images in sub-allocated memory (common 0011, default common 0068); vkd3d-proton places every D3D12 resource in a heap, so images are rarely dedicated |
 | `NVK_RM_COMPRESS_ZS` (1) | separate depth/stencil images (common 0012): Blackwell splits D24S8 and D32S8X24 into planes, which `nvk_image_can_compress` otherwise rejects; both planes are compressed and the draw path sets `SET_Z_COMPRESSION` and `SET_STENCIL_COMPRESSION` from `is_compressed` |
 | `NVK_RM_COMPRESS_TYPE` (0) | images in a second DEVICE_LOCAL memory type (common 0013) |
@@ -633,8 +627,7 @@ ninja -C build-rm src/nouveau/vulkan/libvulkan_nouveau.so \
     src/nouveau/vulkan/nouveau_devenv_icd.x86_64.json
 ```
 
-By hand: `git am guest/nvk-rm/patches/*.patch guest/nvk-rm/patches-common/*.patch`
-on the base commit, then the two commands above. librmclient is not needed
+By hand: `git am $(guest/nvk-rm/series.sh)` on the base commit, then the two commands above. librmclient is not needed
 to build (only its header, and a copy is in patch 0002). The series builds
 with `-Dnvk-rm=enabled` and without it (plain nouveau NVK).
 
@@ -955,7 +948,7 @@ presents.
 
 ## Host-visible VRAM
 
-`patches-windows/0022` (Linux: `patches/0014`) adds the DEVICE_LOCAL |
+`patches-windows/0022` adds the DEVICE_LOCAL |
 HOST_VISIBLE | HOST_COHERENT type on a heap of its own, backed by VRAM the CPU
 maps through BAR1, as NVIDIA's driver and NVK on nouveau without ReBAR do. It
 is off by default (`NVK_RM_BAR_MB=0`): DXVK writes its constant, dynamic and

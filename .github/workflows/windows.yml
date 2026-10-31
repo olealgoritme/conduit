@@ -1,16 +1,28 @@
-# Registered on main; run by hand with workflow_dispatch.
 # Builds the Windows guest stack (WDDM driver, D3D11/12 UMDs, Mesa Venus ICD,
-# loaders, installer) from guest/windows, adapted from Helios's
-# windows-stack.yml (guest/windows/HELIOS.md). Artifacts: the installable
-# package per configuration, and the Release driver zip for the GitHub release.
+# loaders, installer) from guest/windows with windows-build.yml. Artifacts:
+# the installable package per configuration, and the Release driver zip for
+# the GitHub release.
 name: Windows guest driver (Venus)
 
 # Runs on v* tags (the release attaches conduit-windows-gpu-driver-<version>.zip)
-# and by hand (Actions > Run workflow, or `gh workflow run windows.yml`); a full
-# run takes an hour on Windows runners, which bill at twice the rate.
+# and by hand (Actions > Run workflow, or `gh workflow run windows.yml`): the
+# whole bundle, about an hour on Windows runners.
+#
+# On pull requests that touch the guest, only what the change can break, and
+# nothing is signed or uploaded to a release:
+#   guest/nvk-rm, guest/rmclient       NVK on RM and Zink (MinGW cross build)
+#   guest/windows, these workflows     that, then the WDDM driver and UMDs
+#                                      (Release and Debug)
 on:
   push:
     tags: ['v*']
+  pull_request:
+    paths:
+      - guest/nvk-rm/**
+      - guest/rmclient/**
+      - guest/windows/**
+      - .github/workflows/windows.yml
+      - .github/workflows/windows-build.yml
   workflow_dispatch:
 
 permissions:
@@ -20,499 +32,46 @@ concurrency:
   group: windows-guest-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  # git am in the Mesa/NVK builds commits locally on the runner (never pushed)
-  GIT_AUTHOR_NAME: Conduit CI
-  GIT_AUTHOR_EMAIL: ci@conduit.invalid
-  GIT_COMMITTER_NAME: Conduit CI
-  GIT_COMMITTER_EMAIL: ci@conduit.invalid
-  PYTHON_VERSION: '3.12'
-  MESON_VERSION: '1.11.2'
-  RUST_TOOLCHAIN: nightly-2026-07-14
-  CARGO_MAKE_VERSION: '0.37.24'
-  RUST_SCRIPT_VERSION: '0.36.0'
-  # Matches the active DXVK/vkd3d compiler and shader tools on win11 (2026-09-07).
-  LLVM_VERSION: '22.1.8'
-  VULKAN_SDK_VERSION: '1.4.350.0'
-  CLVK_REPOSITORY: https://github.com/winboat-org/clvk-helios.git
-  CLVK_COMMIT: 56c626132782bf083a80a6c17f5ca763be0ff8fb
-  VULKAN_LOADER_COMMIT: 06830240f7a70599053f47b5f10af543e8c3daf6
-  VULKAN_HEADERS_COMMIT: 11d6898377797e07dbd543aaaa367e4465074597
-  OPENCL_LOADER_COMMIT: 18fdcd58286376124f938948aa8ed156079c1c16
-  OPENCL_HEADERS_COMMIT: 6fe718c31a45fe25151362a72ef041c3a1047cbd
-  # WinFsp, which the VirtIO-FS mounts of shared folders need; the installer
-  # carries the MSI and installs it when the guest has none.
-  WINFSP_VERSION: '2.1.25156'
-  WINFSP_RELEASE: v2.1
-  WINFSP_SHA256: 073a70e00f77423e34bed98b86e600def93393ba5822204fac57a29324db9f7a
-  # Red Hat's signed vioinput driver (virtio-input keyboard, mouse and tablet),
-  # taken from this virtio-win ISO and shipped unmodified.
-  VIRTIO_WIN_ISO_URL: https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/archive-virtio/virtio-win-0.1.302-1/virtio-win-0.1.302.iso
-  VIRTIO_WIN_ISO_SHA256: 303f7ae40dad495d6ae474fdc571df58958a4dbc5c37a522d80f9a203867949d
-
 jobs:
-  # NVK on RM (Vulkan) and Zink (OpenGL) for the Helios adapter, cross-built
-  # with MinGW-w64 (guest/nvk-rm/README.md, "Windows build"); the driver
-  # package's INF installs them into the driver store.
-  nvk:
-    name: NVK on RM and Zink (x64 + x86, MinGW cross build)
+  # What a pull request changes: the driver build runs when guest/windows or
+  # the workflows do (an NVK-only change cannot break it). Tags and manual
+  # runs build everything.
+  scope:
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 5
+    outputs:
+      driver: ${{ steps.scope.outputs.driver }}
+      package: ${{ steps.scope.outputs.package }}
     steps:
       - uses: actions/checkout@v7
+        if: github.event_name == 'pull_request'
         with:
-          submodules: false
-          fetch-depth: 1
-      - name: Install the cross toolchain and Mesa's build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-mingw-w64-x86-64 gcc-mingw-w64-i686 g++-mingw-w64-x86-64 g++-mingw-w64-i686 \
-            bison flex glslang-tools python3-mako python3-yaml python3-packaging \
-            llvm-20-dev clang-20 libclang-20-dev libclang-cpp20-dev libpolly-20-dev \
-            libllvmspirvlib-20-dev llvm-spirv-20 libclc-20-dev
-          python3 -m pip install --break-system-packages "meson>=1.7" ninja
-          rustup target add x86_64-pc-windows-gnu i686-pc-windows-gnu
-          # Mesa builds outside the checkout, on the default toolchain, not the repo's pinned one
-          (cd "$RUNNER_TEMP" && rustup target add x86_64-pc-windows-gnu i686-pc-windows-gnu)
-          # bindgen links libclang when it is built: LLVM 20's, not the runner's default 18
-          LIBCLANG_PATH=/usr/lib/llvm-20/lib cargo install --locked bindgen-cli cbindgen
-      - name: Build and stage NVK and Zink
+          # the merge commit and its first parent, the base
+          fetch-depth: 2
+      - id: scope
         env:
-          MESA_DIR: ${{ runner.temp }}/mesa
-          # also for bindgen at run time; LLVM 18's headers reject MinGW's mmintrin.h
-          LIBCLANG_PATH: /usr/lib/llvm-20/lib
-          # bindgen takes clang's own header directory from this clang
-          CLANG_PATH: /usr/lib/llvm-20/bin/clang
-          JOBS: '4'
-          MEMORY_MAX: ''
-        run: sh ./guest/nvk-rm/windows/stage-helios-package.sh "$RUNNER_TEMP/helios-nvk"
-      - uses: actions/upload-artifact@v7
-        with:
-          name: helios-nvk
-          path: ${{ runner.temp }}/helios-nvk
-          if-no-files-found: error
-          retention-days: 14
-
-  driver:
-    name: WDDM driver and x64/x86 Direct3D 11/12 UMDs (${{ matrix.configuration }})
-    runs-on: windows-2022
-    needs: [nvk]
-    timeout-minutes: 120
-    strategy:
-      fail-fast: false
-      matrix:
-        configuration: [Release, Debug]
-    steps:
-      # The DXVK and vkd3d-proton patches apply to LF sources; keep the checkout LF
-      - run: git config --global core.autocrlf false
-      - uses: actions/checkout@v7
-        with:
-          submodules: false
-          fetch-depth: 1
-      - name: Initialize DXVK and vkd3d sources
-        shell: pwsh
-        run: git submodule update --init --recursive guest/windows/third_party/dxvk guest/windows/third_party/vkd3d-proton
-      - name: Check registry snapshot preservation (PowerShell 7)
-        shell: pwsh
-        run: ./guest/windows/packaging/windows/Test-HeliosRegistrySnapshots.ps1
-      - name: Check registry snapshot preservation (Windows PowerShell)
-        shell: powershell
-        run: ./guest/windows/packaging/windows/Test-HeliosRegistrySnapshots.ps1
-      - name: Check the Conduit package scripts (PowerShell 7)
-        shell: pwsh
-        run: ./guest/windows/packaging/windows/Test-ConduitPackaging.ps1
-      - name: Check the Conduit package scripts (Windows PowerShell)
-        shell: powershell
-        run: ./guest/windows/packaging/windows/Test-ConduitPackaging.ps1
-      - uses: actions/setup-python@v7
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-      - name: Install Meson and Ninja
-        shell: pwsh
-        run: python -m pip install "meson==${env:MESON_VERSION}" ninja
-      - name: Install Wine IDL compiler
-        id: widl
-        uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884
-        with:
-          msystem: UCRT64
-          install: mingw-w64-ucrt-x86_64-tools
-      - name: Expose native widl to Meson
-        shell: pwsh
-        env:
-          MSYS2_LOCATION: ${{ steps.widl.outputs.msys2-location }}
+          EVENT: ${{ github.event_name }}
         run: |
-          Join-Path $env:MSYS2_LOCATION 'ucrt64/bin' >> $env:GITHUB_PATH
-      - name: Install LLVM
-        uses: KyleMayes/install-llvm-action@ebc0426251bc40c7cd31162802432c68818ab8f0
-        with:
-          version: ${{ env.LLVM_VERSION }}
-          # This action revision's asset table stops at LLVM 21. Use the
-          # official Windows installer explicitly for the VM-matched version.
-          force-url: https://github.com/llvm/llvm-project/releases/download/llvmorg-${{ env.LLVM_VERSION }}/LLVM-${{ env.LLVM_VERSION }}-win64.exe
-      - name: Restore Vulkan SDK
-        uses: actions/cache@v4
-        with:
-          path: C:/VulkanSDK/${{ env.VULKAN_SDK_VERSION }}
-          key: vulkan-sdk-windows-x64-full-v1-${{ env.VULKAN_SDK_VERSION }}
-      - name: Install and validate Vulkan SDK
-        shell: pwsh
-        run: ./guest/windows/ci/windows/Install-VulkanSdk.ps1 -Version $env:VULKAN_SDK_VERSION
-      - name: Install Rust nightly
-        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
-        with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
-          components: rust-src
-          targets: i686-pc-windows-msvc
-      - name: Install Rust build helpers
-        shell: pwsh
-        run: |
-          cargo install cargo-make --locked --version $env:CARGO_MAKE_VERSION
-          cargo install rust-script --locked --version $env:RUST_SCRIPT_VERSION
-      - name: Ensure Windows Driver Kit is installed
-        shell: pwsh
-        run: ./guest/windows/ci/windows/Install-WindowsDriverKit.ps1
-      - uses: actions/download-artifact@v8
-        with:
-          name: helios-nvk
-          path: ${{ runner.temp }}/helios-nvk
-      - name: Build driver package
-        shell: pwsh
-        run: ./guest/windows/ci/windows/Build-Driver.ps1 -RepoRoot "$env:GITHUB_WORKSPACE/guest/windows" -OutputDir "$env:RUNNER_TEMP/helios-driver" -Configuration ${{ matrix.configuration }} -NvkArtifact "$env:RUNNER_TEMP/helios-nvk"
-      - uses: actions/upload-artifact@v7
-        with:
-          name: helios-driver-${{ matrix.configuration }}
-          path: ${{ runner.temp }}/helios-driver
-          if-no-files-found: error
-          retention-days: 14
+          if [ "$EVENT" != pull_request ]; then
+            echo "driver=true" >> "$GITHUB_OUTPUT"
+            echo "package=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          changed=$(git diff --name-only HEAD^1 HEAD)
+          printf '%s\n' "$changed"
+          if printf '%s\n' "$changed" | grep -qE '^(guest/windows/|\.github/workflows/windows(-build)?\.yml$)'; then
+            echo "driver=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "driver=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "package=false" >> "$GITHUB_OUTPUT"
 
-  # Mesa, CLVK and the Khronos loaders are built once (release) and shared by
-  # both bundles: they are externally-maintained native libraries, and a debug
-  # variant of them is not what a "debug Helios build" is for. The debug bundle
-  # is the first-party code — KMD, both UMDs, and the installer — with symbols.
-  # To make a component configuration-aware, give it a -Configuration parameter
-  # and add it to the package job's per-configuration download list.
-  mesa:
-    name: Mesa Venus Vulkan and Zink OpenGL (x64)
-    runs-on: windows-2022
-    timeout-minutes: 120
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          submodules: false
-          fetch-depth: 1
-      - name: Initialize Mesa fork
-        shell: pwsh
-        run: git submodule update --init guest/windows/third_party/mesa
-      - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884
-        with:
-          msystem: UCRT64
-          update: true
-          install: >-
-            git
-            mingw-w64-ucrt-x86_64-gcc
-            mingw-w64-ucrt-x86_64-meson
-            mingw-w64-ucrt-x86_64-ninja
-            mingw-w64-ucrt-x86_64-python
-            mingw-w64-ucrt-x86_64-python-mako
-            mingw-w64-ucrt-x86_64-python-packaging
-            mingw-w64-ucrt-x86_64-python-yaml
-            mingw-w64-ucrt-x86_64-pkgconf
-            mingw-w64-ucrt-x86_64-vulkan-headers
-            mingw-w64-ucrt-x86_64-vulkan-loader
-            bison
-            flex
-      - name: Build Mesa runtime
-        shell: msys2 {0}
-        run: bash ./guest/windows/ci/windows/build-mesa.sh "$GITHUB_WORKSPACE/guest/windows" "$RUNNER_TEMP/helios-mesa"
-      - uses: actions/upload-artifact@v7
-        with:
-          name: helios-mesa
-          path: ${{ runner.temp }}/helios-mesa
-          if-no-files-found: error
-          retention-days: 14
-
-  mesa_x86:
-    name: Mesa Venus Vulkan and Zink OpenGL (WoW64 x86)
-    runs-on: windows-2022
-    timeout-minutes: 120
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          submodules: false
-          fetch-depth: 1
-      - name: Initialize Mesa fork
-        shell: pwsh
-        run: git submodule update --init guest/windows/third_party/mesa
-      - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884
-        with:
-          msystem: MINGW32
-          update: true
-          install: >-
-            git
-            mingw-w64-i686-gcc
-            mingw-w64-i686-meson
-            mingw-w64-i686-ninja
-            mingw-w64-i686-python
-            mingw-w64-i686-python-mako
-            mingw-w64-i686-python-packaging
-            mingw-w64-i686-python-pip
-            mingw-w64-i686-python-setuptools
-            mingw-w64-i686-pkgconf
-            mingw-w64-i686-vulkan-headers
-            mingw-w64-i686-vulkan-loader
-            bison
-            flex
-      # Mesa needs PyYAML at build time; MSYS2's 32-bit repository no longer
-      # has it. The pinned sdist, built against the runner's own setuptools.
-      - name: PyYAML for the WoW64 Mesa build
-        shell: msys2 {0}
-        run: |
-          printf '%s\n' 'pyyaml==6.0.3 --hash=sha256:d76623373421df22fb4cf8817020cbb7ef15c725b9d5e45f17e189bfc384190f' > pyyaml-req.txt
-          python -m pip install --break-system-packages --no-build-isolation --require-hashes -r pyyaml-req.txt
-          rm pyyaml-req.txt
-          python -c 'import yaml; print("PyYAML", yaml.__version__)'
-      - name: Build WoW64 Mesa runtime
-        shell: msys2 {0}
-        run: bash ./guest/windows/ci/windows/build-mesa.sh "$GITHUB_WORKSPACE/guest/windows" "$RUNNER_TEMP/helios-mesa-x86"
-      - uses: actions/upload-artifact@v7
-        with:
-          name: helios-mesa-x86
-          path: ${{ runner.temp }}/helios-mesa-x86
-          if-no-files-found: error
-          retention-days: 14
-
-  opencl:
-    name: CLVK with embedded clspv
-    runs-on: windows-2022
-    timeout-minutes: 180
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          submodules: false
-          fetch-depth: 1
-      - uses: actions/setup-python@v7
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-      - name: Install Ninja
-        uses: seanmiddleditch/gha-setup-ninja@7e868db0f3406270dd46e1dac26c65f621456723
-      - name: Set up MSVC for Ninja
-        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756
-      - name: Restore CLVK compiler cache
-        uses: hendrikmuhs/ccache-action@5ebbd400eff9e74630f759d94ddd7b6c26299639
-        with:
-          variant: sccache
-          max-size: 2G
-          key: windows-2022-clvk-online
-      - name: Restore Vulkan SDK
-        uses: actions/cache@v4
-        with:
-          path: C:/VulkanSDK/${{ env.VULKAN_SDK_VERSION }}
-          key: vulkan-sdk-windows-x64-full-v1-${{ env.VULKAN_SDK_VERSION }}
-      - name: Install and validate Vulkan SDK
-        shell: pwsh
-        run: ./guest/windows/ci/windows/Install-VulkanSdk.ps1 -Version $env:VULKAN_SDK_VERSION
-      - name: Build CLVK
-        shell: pwsh
-        run: ./guest/windows/ci/windows/Build-OpenCL.ps1 -OutputDir "$env:RUNNER_TEMP/helios-opencl" -ClvkRepository $env:CLVK_REPOSITORY -ClvkCommit $env:CLVK_COMMIT
-      - uses: actions/upload-artifact@v7
-        with:
-          name: helios-opencl
-          path: ${{ runner.temp }}/helios-opencl
-          if-no-files-found: error
-          retention-days: 14
-
-  loaders:
-    name: Khronos loaders and smoke probes
-    runs-on: windows-2022
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          submodules: false
-          fetch-depth: 1
-      - name: Build official loaders and probes
-        shell: pwsh
-        run: >-
-          ./guest/windows/ci/windows/Build-KhronosLoaders.ps1
-          -RepoRoot "$env:GITHUB_WORKSPACE/guest/windows"
-          -OutputDir "$env:RUNNER_TEMP/helios-loaders"
-          -VulkanLoaderCommit $env:VULKAN_LOADER_COMMIT
-          -VulkanHeadersCommit $env:VULKAN_HEADERS_COMMIT
-          -OpenClLoaderCommit $env:OPENCL_LOADER_COMMIT
-          -OpenClHeadersCommit $env:OPENCL_HEADERS_COMMIT
-      - uses: actions/upload-artifact@v7
-        with:
-          name: helios-loaders
-          path: ${{ runner.temp }}/helios-loaders
-          if-no-files-found: error
-          retention-days: 14
-
-  compatibility:
-    name: Application compatibility shims
-    runs-on: windows-2022
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          submodules: false
-          fetch-depth: 1
-      - name: Build and validate compatibility shims
-        shell: pwsh
-        run: >-
-          ./guest/windows/ci/windows/Build-CompatibilityShims.ps1
-          -RepoRoot "$env:GITHUB_WORKSPACE/guest/windows"
-          -OutputDir "$env:RUNNER_TEMP/helios-compatibility"
-      - uses: actions/upload-artifact@v7
-        with:
-          name: helios-compatibility
-          path: ${{ runner.temp }}/helios-compatibility
-          if-no-files-found: error
-          retention-days: 14
-
-  package:
-    name: Sign and assemble installable bundle (${{ matrix.configuration }})
-    needs: [driver, mesa, mesa_x86, opencl, loaders, compatibility]
-    runs-on: windows-2022
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        configuration: [Release, Debug]
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          submodules: false
-          fetch-depth: 1
-      - uses: actions/download-artifact@v8
-        with:
-          name: helios-driver-${{ matrix.configuration }}
-          path: ${{ runner.temp }}/artifacts/driver
-      - uses: actions/download-artifact@v8
-        with:
-          name: helios-mesa
-          path: ${{ runner.temp }}/artifacts/mesa
-      - uses: actions/download-artifact@v8
-        with:
-          name: helios-mesa-x86
-          path: ${{ runner.temp }}/artifacts/mesa-x86
-      - uses: actions/download-artifact@v8
-        with:
-          name: helios-opencl
-          path: ${{ runner.temp }}/artifacts/opencl
-      - uses: actions/download-artifact@v8
-        with:
-          name: helios-loaders
-          path: ${{ runner.temp }}/artifacts/loaders
-      - uses: actions/download-artifact@v8
-        with:
-          name: helios-compatibility
-          path: ${{ runner.temp }}/artifacts/compatibility
-      - name: Ensure Windows Driver Kit is installed
-        shell: pwsh
-        run: ./guest/windows/ci/windows/Install-WindowsDriverKit.ps1
-      # The installer is built here, not in a separate job: it is fast, and the
-      # final self-contained exe must be produced after the payload is assembled.
-      - name: Install LLVM
-        uses: KyleMayes/install-llvm-action@ebc0426251bc40c7cd31162802432c68818ab8f0
-        with:
-          version: ${{ env.LLVM_VERSION }}
-          force-url: https://github.com/llvm/llvm-project/releases/download/llvmorg-${{ env.LLVM_VERSION }}/LLVM-${{ env.LLVM_VERSION }}-win64.exe
-      - name: Install Rust nightly
-        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
-        with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
-      - name: Build the self-contained installer skeleton
-        shell: pwsh
-        run: ./guest/windows/ci/windows/Build-Installer.ps1 -RepoRoot "$env:GITHUB_WORKSPACE/guest/windows" -OutputDir "$env:RUNNER_TEMP/helios-installer" -Configuration ${{ matrix.configuration }}
-      - name: Build the GPU tray app and its context menu command
-        shell: pwsh
-        run: |
-          # The exe's icon resource (build.rs) is compiled with the Windows
-          # SDK's rc.exe; CI=true makes a missing compiler a build error.
-          $rc = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\10.*\x64\rc.exe" -ErrorAction SilentlyContinue |
-            Sort-Object FullName -Descending | Select-Object -First 1
-          if (-not $rc) { throw "rc.exe (Windows SDK) not found: the tray exe needs its icon resource" }
-          $env:RC = $rc.FullName
-          cargo build --release --locked --manifest-path guest/windows/tools/conduit-gpu-tray/Cargo.toml
-          cargo build --release --locked --manifest-path guest/windows/tools/conduit-shell-menu/Cargo.toml
-      - name: Download WinFsp
-        shell: pwsh
-        run: |
-          $msi = "$env:RUNNER_TEMP/winfsp-$env:WINFSP_VERSION.msi"
-          Invoke-WebRequest -Uri "https://github.com/winfsp/winfsp/releases/download/$env:WINFSP_RELEASE/winfsp-$env:WINFSP_VERSION.msi" -OutFile $msi
-          $hash = (Get-FileHash -LiteralPath $msi -Algorithm SHA256).Hash
-          if ($hash -ne $env:WINFSP_SHA256.ToUpperInvariant()) { throw "winfsp-$env:WINFSP_VERSION.msi has SHA-256 $hash, expected $env:WINFSP_SHA256" }
-      - name: Download the vioinput driver
-        shell: pwsh
-        run: >-
-          ./guest/windows/ci/windows/Get-VirtioInput.ps1
-          -OutputDir "$env:RUNNER_TEMP/artifacts/vioinput"
-          -IsoUrl $env:VIRTIO_WIN_ISO_URL
-          -IsoSha256 $env:VIRTIO_WIN_ISO_SHA256
-      - name: Read package metadata
-        id: metadata
-        shell: pwsh
-        run: |
-          $version = (Get-Content guest/windows/kmd_render/driver-version.env | Where-Object { $_ -match '^HELIOS_KMD_VERSION=' }) -replace '^HELIOS_KMD_VERSION=', ''
-          "version=$version" >> $env:GITHUB_OUTPUT
-          "mesa=$(git rev-parse HEAD:guest/windows/third_party/mesa)" >> $env:GITHUB_OUTPUT
-          "dxvk=$(git rev-parse HEAD:guest/windows/third_party/dxvk)" >> $env:GITHUB_OUTPUT
-          "vkd3d=$(git rev-parse HEAD:guest/windows/third_party/vkd3d-proton)" >> $env:GITHUB_OUTPUT
-      - name: Assemble and test-sign bundle
-        shell: pwsh
-        run: >-
-          ./guest/windows/ci/windows/Assemble-Package.ps1
-          -RepoRoot "$env:GITHUB_WORKSPACE/guest/windows"
-          -DriverArtifact "$env:RUNNER_TEMP/artifacts/driver"
-          -MesaArtifact "$env:RUNNER_TEMP/artifacts/mesa"
-          -MesaX86Artifact "$env:RUNNER_TEMP/artifacts/mesa-x86"
-          -OpenClArtifact "$env:RUNNER_TEMP/artifacts/opencl"
-          -LoadersArtifact "$env:RUNNER_TEMP/artifacts/loaders"
-          -CompatibilityArtifact "$env:RUNNER_TEMP/artifacts/compatibility"
-          -InstallerArtifact "$env:RUNNER_TEMP/helios-installer"
-          -TrayExe "$env:GITHUB_WORKSPACE/guest/windows/tools/conduit-gpu-tray/target/release/conduit-gpu-tray.exe"
-          -ShellMenuDll "$env:GITHUB_WORKSPACE/guest/windows/tools/conduit-shell-menu/target/release/conduit_shell_menu.dll"
-          -WinFspMsi "$env:RUNNER_TEMP/winfsp-$env:WINFSP_VERSION.msi"
-          -VirtioInputArtifact "$env:RUNNER_TEMP/artifacts/vioinput"
-          -OutputDir "$env:RUNNER_TEMP/helios-package"
-          -Configuration '${{ matrix.configuration }}'
-          -Version '${{ steps.metadata.outputs.version }}'
-          -RepositoryCommit $env:GITHUB_SHA
-          -MesaCommit '${{ steps.metadata.outputs.mesa }}'
-          -DxvkCommit '${{ steps.metadata.outputs.dxvk }}'
-          -Vkd3dCommit '${{ steps.metadata.outputs.vkd3d }}'
-          -ClvkCommit $env:CLVK_COMMIT
-          -VulkanLoaderCommit $env:VULKAN_LOADER_COMMIT
-          -VulkanHeadersCommit $env:VULKAN_HEADERS_COMMIT
-          -OpenClLoaderCommit $env:OPENCL_LOADER_COMMIT
-          -OpenClHeadersCommit $env:OPENCL_HEADERS_COMMIT
-      - uses: actions/upload-artifact@v7
-        with:
-          name: helios-windows-x64-${{ steps.metadata.outputs.version }}-${{ matrix.configuration }}
-          path: |
-            ${{ runner.temp }}/helios-package/*.zip
-            ${{ runner.temp }}/helios-package/*.sha256
-          if-no-files-found: error
-          retention-days: 30
-      # The GitHub release asset: the signed driver package, symbols, licenses,
-      # test certificate and install.ps1 in one folder.
-      - name: Build the release driver zip
-        if: matrix.configuration == 'Release'
-        shell: pwsh
-        run: >-
-          ./guest/windows/ci/windows/New-ReleaseZip.ps1
-          -RepoRoot "$env:GITHUB_WORKSPACE/guest/windows"
-          -DriverArtifact "$env:RUNNER_TEMP/artifacts/driver"
-          -PackageOutputDir "$env:RUNNER_TEMP/helios-package"
-          -OutputDir "$env:RUNNER_TEMP/release-zip"
-          -Version '${{ steps.metadata.outputs.version }}'
-      - uses: actions/upload-artifact@v7
-        if: matrix.configuration == 'Release'
-        with:
-          name: conduit-windows-gpu-driver
-          path: ${{ runner.temp }}/release-zip/*.zip
-          if-no-files-found: error
-          retention-days: 30
+  build:
+    needs: scope
+    uses: ./.github/workflows/windows-build.yml
+    with:
+      driver: ${{ needs.scope.outputs.driver == 'true' }}
+      package: ${{ needs.scope.outputs.package == 'true' }}
 
   # On a v* tag, attach the driver zip and the full Release package
   # (HeliosSetup.exe, as conduit-windows-gpu-setup-<version>.zip) to the
@@ -523,7 +82,7 @@ jobs:
   # two finishes last.
   release:
     name: Attach the driver zip and the setup package to the release
-    needs: package
+    needs: build
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
     timeout-minutes: 200

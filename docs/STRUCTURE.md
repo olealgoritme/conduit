@@ -59,11 +59,14 @@ conduit/
 │                  NVK on RM)
 └── .github/workflows/
     ├── ci.yml         every push: Rust tests, guest module build against
-    │                  Ubuntu/Debian/Fedora headers, viewer selftests, agent tests
+    │                  Ubuntu/Debian/Fedora headers, viewer selftests, agent tests,
+    │                  Windows guest Rust tests, patch series apply checks
     ├── abi.yml        weekly: new NVIDIA driver release → regenerate ABI
     │                  tables → open a PR
     ├── release.yml    tag → build every package below and attach to the release
-    └── windows.yml    Windows guest stack; on v* tags attaches the driver zip to the release
+    ├── windows.yml    Windows guest stack; on v* tags attaches the driver zip to the release;
+    │                  on PRs that touch the guest builds NVK, and the driver and UMDs
+    └── windows-build.yml  the build jobs windows.yml calls
 ```
 
 ## Release artifacts (built by release.yml on every tag)

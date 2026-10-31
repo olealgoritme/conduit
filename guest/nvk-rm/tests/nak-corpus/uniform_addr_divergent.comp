@@ -1,0 +1,22 @@
+#version 460
+// Uniform 64-bit buffer addresses used inside divergent ifs (vkd3d-proton's
+// root constants through a BDA held in a bound constant buffer).
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+layout(local_size_x = 64) in;
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer Consts { vec4 v[]; };
+layout(set = 0, binding = 0) uniform Root { uvec2 consts_va; uvec2 more_va; uint count; uint mode; };
+layout(set = 0, binding = 1, std430) buffer Out { vec4 o[]; };
+void main() {
+  uint i = gl_GlobalInvocationID.x;
+  vec4 acc = vec4(0.0);
+  if ((i & 3u) == 1u) {
+    Consts c = Consts(consts_va);
+    acc += c.v[mode] * c.v[mode + 1u];
+  } else if ((i & 7u) == 2u) {
+    Consts c = Consts(more_va);
+    for (uint k = 0u; k < count; k++)
+      acc = fma(acc, c.v[k], vec4(0.5));
+  }
+  o[i] = acc;
+}

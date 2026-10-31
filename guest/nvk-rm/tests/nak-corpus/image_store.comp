@@ -1,0 +1,19 @@
+#version 460
+// Image stores of splats and of computed vectors, image loads and an
+// immediate used many times.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0, rgba16f) uniform writeonly image2D dst;
+layout(set = 0, binding = 1, rgba8) uniform readonly image2D src;
+layout(set = 0, binding = 2, r32ui) uniform uimage2D mask;
+void main() {
+  ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+  vec4 c = imageLoad(src, p);
+  float l = dot(c.rgb, vec3(0.2126, 0.7152, 0.0722));
+  if (imageLoad(mask, p).x != 0u) {
+    imageStore(dst, p, vec4(l));
+  } else {
+    imageStore(dst, p, vec4(c.rgb * 0.7152, 0.7152));
+    imageAtomicOr(mask, p, 0x10u);
+  }
+  imageStore(dst, p + ivec2(1, 0), vec4(0.7152));
+}

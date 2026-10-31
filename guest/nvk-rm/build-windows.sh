@@ -67,23 +67,16 @@ capped() {
   fi
 }
 
-# 1. Mesa checkout with the series: patches/ (NVK on RM), patches-windows/
-#    (the Windows build), patches-windows-dxvk/ and patches-common/ on a
-#    local branch
+# 1. Mesa checkout with the series (series.sh): patches/ (NVK on RM),
+#    patches-windows/ (the Windows build), patches-windows-dxvk/ and
+#    patches-common/ on a local branch
 if [ ! -d "$MESA_DIR/.git" ] && [ ! -f "$MESA_DIR/.git" ]; then
   git clone --depth 200 "$MESA_URL" "$MESA_DIR"
 fi
 if ! git -C "$MESA_DIR" cat-file -e "$MESA_BASE^{commit}" 2>/dev/null; then
   git -C "$MESA_DIR" fetch --depth 200 origin "$MESA_BASE"
 fi
-# patches-windows-dxvk/: what a D3D11 game on DXVK needs (32-bit build fix,
-# no present wait on Win32, R/B order of the GDI present).
-# patches-common/: generic NVK patches (per-draw cost) shared with the Linux
-# series, applied after everything else.
-# patches/0014-0017 are the Linux series' versions of patches-windows/0022 and
-# 0027-0029 (BAR heap, cached sysmem, compression, ZCULL); the Windows stack
-# takes patches/ only up to 0013.
-series="$(ls "$here"/patches/00*.patch | awk -F/ '{ n = substr($NF, 1, 4) + 0 } n <= 13') $here/patches-windows/*.patch $here/patches-windows-dxvk/*.patch $here/patches-common/*.patch"
+series=$(sh "$here/series.sh")
 # The whole series, in order (the start of each subject: a folded Subject:
 # line only holds its beginning), must be what is on top of the base; a tree
 # with an older or different series (another branch's patches) is rebuilt.

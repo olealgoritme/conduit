@@ -33,11 +33,27 @@ those shaders (see "Reference SASS").
 | `compare.py [--ref REF] NAME=DIR ...` | Per-shader table and totals of several runs, plus the reference driver's GPRs, warps and code size |
 | `nvstats.c` | The pipeline/statistics tool: `nvstats a.spv ...` (compute), `-g fs-pairs.txt` (fragment), `-v vs-pairs.txt` (vertex), `-s a.spv ...` (each file alone as a shader object, any stage). `NVSTATS_DUMP=DIR` also writes each pipeline's own pipeline cache data and internal representations |
 | `genvs.py`, `genfs.py` | Make the matching vertex shaders for fragment shaders and fragment shaders for vertex shaders (`spirv-dis`, `glslangValidator`), printing the pair lists |
-| `run-objects.sh BUILD DIR OUT` | Compiles every SPIR-V file of a directory alone (`nvstats -s`), tessellation and geometry included; one line of statistics per shader (`objmerge.py`) |
+| `run-objects.sh BUILD DIR OUT` | Compiles every SPIR-V file of a directory alone (`nvstats -s`), tessellation and geometry included; one line of statistics per shader (`objmerge.py`). `BATCH=1` runs each shader in its own process, so a crash fails only that shader |
 | `objcmp.py A B` | Per-stage totals of two `run-objects.sh` runs: instructions, static cycles, memory spills, shaders with more/fewer GPRs or warps |
 | `refsass.py CACHE_DIR OUT` | The machine code of our pipelines from the reference driver's pipeline cache data (`NVSTATS_DUMP`), for `nvdisasm` |
 | `naksass.sh BUILD CORPUS OUT HASH...` | NAK's machine code for corpus shaders (`NAK_DEBUG=print`, `enc2bin.py`), disassembled with `nvdisasm` |
 | `sassdiff.py REF.sass NAK.sass ...` | Instruction counts of two disassemblies by gap pattern (and `--opcodes`) |
+
+## CI
+
+`ci.yml` runs the same loop on every push and pull request
+(`.github/scripts/nak-build.sh`, `.github/scripts/nak-shaders.sh`): NVK with
+the RM backend and the whole series, built with Rust debug assertions,
+compiles a public corpus (`guest/nvk-rm/tests/nak-corpus/`, the other GLSL
+shaders in `guest/nvk-rm/tests/`, and the built-in GLSL shaders of the pinned
+DXVK and vkd3d-proton) on GB202 and AD102 with `run-objects.sh`, and with
+`NAK_DEBUG=spill`. A shader NAK fails fails the job; NAK's statistics against
+the base commit's series go to the step summary. Locally:
+
+```sh
+.github/scripts/nak-build.sh . /tmp/nak-head
+.github/scripts/nak-shaders.sh /tmp/nak-head [/tmp/nak-base]
+```
 
 ## Corpus layout
 
