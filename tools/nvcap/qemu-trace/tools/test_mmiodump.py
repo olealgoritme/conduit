@@ -421,6 +421,74 @@ class NewViewsTest(unittest.TestCase):
         out = run(["timeline", p, "--types", "mmio"])
         self.assertIn("<PRAMIN -> VRAM 0x120000>", out)
 
+    def test_gsplog(self):
+        # libos log buffer: put, then ring of [args..., meta, timestamp]
+        def meta(va, nargs, task=3):
+            return va | ((nargs + 2) << 48) | (task << 56)
+        words = [0x2a, meta(0x1000, 1), 111,              # 1 arg
+                 meta(0x1040, 0), 222,                    # no args
+                 7, 8, meta(0x1000, 2), 333]              # 2 args
+        ring = words + [0] * (64 - len(words))
+        buf = struct.pack("<Q", len(words)) + struct.pack(f"<{len(ring)}Q", *ring)
+        put, recs = md.libos_records(buf)
+        self.assertEqual(put, 9)
+        self.assertEqual([(r["meta"], r["args"], r["ts"], r["task"]) for r in recs],
+                         [(0x1000, [0x2a], 111, "RM"), (0x1040, [], 222, "RM"),
+                          (0x1000, [7, 8], 333, "RM")])
+        self.assertEqual(md.libos_records(buf, prev_put=5)[1][0]["ts"], 333)
+        # a minimal log ELF: .fwlogging_rm at 0x1000 with metadata + strings
+        sec = bytearray(0x200)
+        struct.pack_into("<QQQBBB", sec, 0, 0x1100, 0x1120, 42, 1, 0, 0)
+        struct.pack_into("<QQQBBB", sec, 0x40, 0x1100, 0x1140, 7, 0, 0, 0)
+        sec[0x100:0x110] = b"src/rm/foo.c\0\0\0\0"
+        sec[0x120:0x135] = b"value %d hex 0x%llx\n\0"
+        sec[0x140:0x146] = b"hello\0"
+        shstr = b"\0.fwlogging_rm\0.shstrtab\0"
+        elf = bytearray(64)
+        off_sec, off_str = 64, 64 + len(sec)
+        shoff = off_str + len(shstr)
+        elf[:4] = b"\x7fELF"
+        struct.pack_into("<Q", elf, 0x28, shoff)
+        struct.pack_into("<HHH", elf, 0x3a, 64, 3, 2)
+        shdrs = struct.pack("<IIQQQQIIQQ", 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+        shdrs += struct.pack("<IIQQQQIIQQ", 1, 1, 0, 0x1000, off_sec, len(sec),
+                             0, 0, 1, 0)
+        shdrs += struct.pack("<IIQQQQIIQQ", 15, 3, 0, 0, off_str, len(shstr),
+                             0, 0, 1, 0)
+        p = self.path("log.elf")
+        with open(p, "wb") as f:
+            f.write(bytes(elf) + bytes(sec) + shstr + shdrs)
+        le = md.LogElf(p)
+        self.assertEqual(le.format(recs[0]), "foo.c:42 value 42 hex 0x0")
+        self.assertEqual(le.format({"meta": 0x1040, "args": []}),
+                         "foo.c:7 hello")
+        self.assertEqual(le.format({"meta": 0x1000, "args": [5, 0x2a]}),
+                         "foo.c:42 value 5 hex 0x2a")
+        # the gsplog command over a GSPLOG snapshot
+        w = TraceWriter()
+        w.snap(0x1010000, "GSPLOG:LOGRM", buf)
+        t = self.path("g.nvt")
+        w.save(t)
+        out = run(["gsplog", t, "--log-elf", p])
+        self.assertIn("foo.c:7 hello", out)
+        self.assertIn("RM", out)
+        out = run(["gsplog", t, "--summary"])
+        self.assertIn("3 records, 2 distinct messages", out)
+
+    def test_pushbuf_decode(self):
+        n = md.Names()
+        mn = md.MethodNames(n)
+        pb = struct.pack("<6I", 0x20010000, 0xcb97, 0x20010040, 0,
+                         0x80050080, 0xe0000000)
+        sub = {}
+        out = list(md.decode_pushbuffer(mn, pb, sub))
+        self.assertEqual(sub, {0: 0xcb97})
+        self.assertEqual(mn.name(0xcb97, 0x100), "NVCB97_NO_OPERATION")
+        self.assertEqual(mn.name(0xce97, 0x100), "NVCB97_NO_OPERATION")  # fallback
+        self.assertEqual([(m, v, op) for _, _, m, v, op in out],
+                         [(0, 0xcb97, "INC"), (0x100, 0, "INC"),
+                          (0x200, 5, "IMMD"), (None, None, "END_PB_SEGMENT")])
+
     def test_struct_decoder_tables(self):
         n = md.Names()
         st = n.struct("NV_CHANNEL_ALLOC_PARAMS")

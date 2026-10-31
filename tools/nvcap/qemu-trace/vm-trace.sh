@@ -19,7 +19,8 @@
 #                  escaped for -device here)
 #   NVTRACE_BUF_MB, NVTRACE_ROTATE_MB, NVTRACE_MIN_FREE_GB, NVTRACE_LOSSY,
 #   NVTRACE_GSP_POLL_US, NVTRACE_GSP_LOG_MS, NVTRACE_PAIR_BUDGET_MB,
-#   NVTRACE_FOLLOW, NVTRACE_WATCH_*, NVTRACE_DIRTY_*:
+#   NVTRACE_FOLLOW, NVTRACE_WATCH_*, NVTRACE_DIRTY_*, NVTRACE_VRAM (default
+#   1 here), NVTRACE_VRAM_*, NVTRACE_PB_MAX_KB, NVTRACE_FW_DUMP_MB:
 #                  passed to QEMU (see qemu-trace/README.md)
 set -eu
 N=/steam/conduit-scratch/nvcap
@@ -33,6 +34,9 @@ TRAP=${NVTRACE_TRAP:-0x1}
 case "$TRACE" in *,*|*" "*) echo "trace path must not contain , or space" >&2; exit 1;; esac
 
 export NVTRACE_BUF_MB=${NVTRACE_BUF_MB:-128}
+# GPU memory from the host side (VRAM via static BAR1 / PRAMIN, GMMU walks,
+# GPFIFO + pushbuffers); 0 disables. Sweep: NVTRACE_VRAM_SWEEP_MB_MIN.
+export NVTRACE_VRAM=${NVTRACE_VRAM:-1}
 export NVTRACE_ROTATE_MB=${NVTRACE_ROTATE_MB:-4096}
 export NVTRACE_MIN_FREE_GB=${NVTRACE_MIN_FREE_GB:-20}
 

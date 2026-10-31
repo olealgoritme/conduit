@@ -1,7 +1,7 @@
 From ccf82ac7fdedda527e2f93abca121ca1a7aa3920 Mon Sep 17 00:00:00 2001
 From: Ole Algoritme <olealgoritme@gmail.com>
 Date: Sat, 31 Oct 2026 16:47:53 +0100
-Subject: [PATCH 103/104] vfio: nvtrace - review fixes
+Subject: [PATCH 103/105] vfio: nvtrace - review fixes
 
 - BAR0 reads no longer take the per-device GSP lock (only writes and the
   FSP EMEM/MSGQ reads feed the GSP/FSP state machine).

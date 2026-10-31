@@ -15,6 +15,7 @@ firmware access onwards. Purpose: the blueprint for emulating a 5090 later
 | `patches/0102-...` | Test-only: `NVTRACE_TEST_QUIRKS=1` makes `vfio-user-pci` set up the vfio-pci BAR quirks. No effect without the variable. |
 | `patches/0103-...` | Review fixes to 0101 (lock-free BAR0 read path, queue walker limits). |
 | `patches/0104-...` | VRAM aperture pages (KVM dirty log), trap windows, buffers followed from GSP RPCs (memory, channels, display pushbuffers, doorbells). |
+| `patches/0105-...` | GPU memory from the host side (VRAM via static BAR1 / PRAMIN, GMMU walks, GPFIFO + pushbuffers, VRAM sweep), large RPC reassembly, firmware images and GSP-RM areas from sysmem, PCI config dumps. |
 | `vm-trace.sh` | `vm.sh` with this QEMU and tracing on (`/steam/conduit-scratch/nvcap/vm-trace.sh` links here). |
 | `tools/mmiodump.py` | Decoder (Python 3 stdlib). |
 | `tools/gen_tables.py` → `tools/nvtables.json.gz` | Register, RPC, class, control-command and status names, structure layouts (RPC, alloc and control parameters), display methods, from open-gpu-kernel-modules 610.57.04. `tools/cstructs.py` is its C layout parser. |
@@ -54,10 +55,17 @@ Further `vm-trace.sh` variables: `NVTRACE_TRAP` (x-trap-bars mask),
 BAR1+BAR3; off by default), `NVTRACE_WINDOWS` (x-trap-windows list; the
 script escapes the commas for `-device`). Examples:
 
+`vm-trace.sh` turns on host-side GPU memory capture (`NVTRACE_VRAM=1`)
+by default; `NVTRACE_VRAM=0` switches it off.
+
 ```sh
-NVTRACE_DIRTY=0x8 /steam/conduit-scratch/nvcap/vm-trace.sh      # + BAR3 pages
+/steam/conduit-scratch/nvcap/vm-trace.sh                         # default: BAR0 + RPCs + GPU memory on events
+NVTRACE_DIRTY=0x8 /steam/conduit-scratch/nvcap/vm-trace.sh      # + BAR3 pages the CPU writes
+NVTRACE_DIRTY=0x8 NVTRACE_VRAM_SWEEP_MB_MIN=512 \
+    /steam/conduit-scratch/nvcap/vm-trace.sh                     # everything: + slow full-VRAM sweep
 NVTRACE_DIRTY=0xa NVTRACE_DIRTY_BUDGET_MB=32 /steam/conduit-scratch/nvcap/vm-trace.sh
 NVTRACE_TRAP=0x9 /steam/conduit-scratch/nvcap/vm-trace.sh        # BAR3 fully trapped
+NVTRACE_VRAM=0 /steam/conduit-scratch/nvcap/vm-trace.sh          # no host-side GPU reads
 ```
 
 PCI BAR numbering vs NVIDIA's: PCI BAR0 = registers, PCI BAR1 = NVIDIA
@@ -100,6 +108,17 @@ is still readable up to the cut.
 | `NVTRACE_DIRTY_MS` | 250 | Dirty-page collection period for `x-nvtrace-dirty-bars`. |
 | `NVTRACE_DIRTY_BUDGET_MB` | 16 | BAR pages read per second at most (token bucket); the rest is counted as skipped. |
 | `NVTRACE_DIRTY_RESCAN_MS` | 0 | Also re-read every page seen so far this often (catches GPU writes to them); 0 = off. |
+| `NVTRACE_VRAM` | 0 (`vm-trace.sh`: 1) | GPU memory capture from the host side (see "GPU memory"). |
+| `NVTRACE_VRAM_BUDGET_MB` | 32 | VRAM bytes per second read through BAR1. |
+| `NVTRACE_VRAM_PRAMIN_KB` | 1024 | VRAM KiB per second read through the PRAMIN window (each 4 KiB holds the BQL ~0.5 ms). |
+| `NVTRACE_VRAM_PERIOD_MS` | 1000 | Re-read all followed VRAM buffers and walk all channels at least this often. |
+| `NVTRACE_VRAM_EVENT_US` | 1000 | Minimum gap between event-driven passes (doorbell, status message, interrupt, display PUT). |
+| `NVTRACE_VRAM_SWEEP_MB_MIN` | 0 = off | Sweep all VRAM below gspFwRsvdStart at this rate: hashes of every page, contents of pages that changed since the last pass. |
+| `NVTRACE_VRAM_SWEEP_FIRST` | 0 | 1 = also log the contents of every page in the first pass. |
+| `NVTRACE_PB_MAX_KB` | 256 | Bytes captured per pushbuffer segment. |
+| `NVTRACE_VRAM_BAR1_DYNAMIC` | 0 | 1 = use a non-static BAR1 mapping too (risk: stale mapping -> BAR1 fault). |
+| `NVTRACE_VRAM_UNSAFE` | 0 | 1 = read VRAM before the WPR layout is known / inside the GSP reserved area. Do not. |
+| `NVTRACE_FW_DUMP_MB` | 128 | Size cap for firmware images / GSP-RM sysmem areas dumped from guest memory; 0 = off. |
 
 Put traces on `/steam` (the default): a full root file system pauses VMs.
 
@@ -128,13 +147,23 @@ Record header (32 bytes): `u16 type; u8 dev; u8 flags; u32 len` (whole record, 8
 | 13 | GSP_QINFO | `u64 shared_pa; u32 npte, elem_hdr; u64 cmd_off, stat_off; u32 cmd_size, stat_size, source` (1 FSP COT, 2 falcon mailbox, 3 RAM scan) `; u32 0` |
 | 14 | DEV | `u16 vendor, device; u32 class, trap_mask, flags; u64 0`, then the device name |
 | 15 | BAR_PAGE | `u8 bar, reason` (0 guest CPU wrote it, 1 periodic re-read) `; u16 0; u32 len; u64 off` (in the BAR) `; u64 hash`, then the 4 KiB page. Only logged when the content differs from the last logged version. |
+| 16 | GPU_PAGE | `u8 aperture` (0 VRAM, 2 sysmem, 3 sysmem non-coherent) `, reason` (0 event, 1 period, 2 sweep, 3 page-table page) `; u16 0; u32 len; u64 pa; u64 hash; char tag[24]`, then the bytes. GPU memory read from the host side, logged when its hash changed. |
+| 17 | GPU_HASHES | `u64 first_pa; u32 count, pass`, then `count` u64 hashes of consecutive 4 KiB VRAM pages (0 = not readable). |
+| 18 | PUSHBUF | `u32 hClient, hChannel, gp_index, gp_put, gp_get, flags` (1 entry unreadable, 2 truncated, 4 partial) `; u64 gpfifo_entry, va; u32 len, got`, then the pushbuffer segment. |
 
 DMA_SNAP labels: `GSP_*`, `LIBOS_INIT_ARGS`, `GSPLOG:<id>` (boot structures,
 logs), `pair:<reg><<shift>` (register-pair heuristic), `EXPANSION_ROM`,
 `mem<hMemory>` (ALLOC_MEMORY pages), `ch<hChannel>.<inst|userd|ramfc|mthdbuf|errnotif|eccnotif>`
 (channel memory), `dispPB:<chn>` (display pushbuffer at registration),
 `dispPB:<chn>@<start>` (bytes between the old and new PUT), `w:<tag>`
-(re-read, content changed).
+(re-read, content changed), `PCI_CONFIG` (whole config space, at start
+and after resets), and images (flag 8: `gpa` = byte offset in the image,
+chunks of 1 MiB): `FW:GSP_RM_ELF` (the GSP-RM ELF the driver loaded,
+followed through its radix3 page lists), `FW:BOOTLOADER`, `FW:SIGNATURE`,
+`FW:FMC` (first 512 KiB at the COT address), `LIBOS:<id>` (every other
+libos region in sysmem), `ARGS:{profiler,sysmemHeap,rmStateMonitor,bindata}`
+(GSP_ARGUMENTS_CACHED areas; the first three are also watched). An image
+identical to the previous dump is not dumped again.
 
 ## How the GSP queues are found and captured
 
@@ -301,22 +330,94 @@ branch but a different changelist and ships its own GSP firmware.
   (address space, sizes), so a changed layout only means fewer buffers, not
   bad reads.
 - The doorbell/PUT/PRAMIN offsets are hardware, not driver, properties.
+- The Windows 610.74 package (`DriverVer 32.0.16.1074`) ships GSP firmware
+  whose `.fwversion` is "610.53", not 610.57.04: GSP-side structures can
+  differ from the Linux sources in either direction; trust the LAYOUT
+  MISMATCH marks over the tables.
+
+## GPU memory from the host side (`NVTRACE_VRAM=1`)
+
+A worker thread (`nvtrace-gpu`) reads GPU memory itself, independent of
+what the guest CPU touches:
+
+- **VRAM paths.** (1) BAR1, if RM maps VRAM statically into it: the BAR1
+  page tables are walked from `GspStaticConfigInfo.bar1PdeBase` (taken from
+  the `GET_GSP_STATIC_INFO` reply) and the reverse map VRAM address -> BAR1
+  offset is used with `pread()` on the device fd, no BQL. A dynamic BAR1
+  mapping is not used (it can vanish between walk and read). (2) The BAR0
+  PRAMIN window (0x700000, 64 KiB granules via `NV_XAL_EP_ZB_BAR0_WINDOW`
+  0xd40, BASE 22:0): runs as a main-loop bottom half with the BQL held; as
+  all of BAR0 traps, the guest cannot touch BAR0 meanwhile; the window
+  register is saved, moved and restored. Only with BAR0 fully trapped.
+- **Never read:** anything before the WPR meta is seen, anything in
+  `[gspFwRsvdStart, fbSize)` (WPR2, FRTS, GSP heaps, VGA workspace) or
+  beyond fbSize, and a page that once returned PRI error words
+  (`0xbad0....`/`0xbadf....`, the page is noted and blacklisted).
+- **What is read:**
+  - every buffer an RPC names in VRAM: channel instance block, USERD,
+    RAMFC, method buffer, error notifiers (`ch<h>.<name>`), `LIST_FBMEM`
+    memory (`mem<h>`), vidmem display pushbuffers (`dispPB:<chn>`; on each
+    PUT the new bytes); sysmem buffers as before;
+  - every GPFIFO channel: the PDB from its instance block
+    (`NV_RAMIN_PAGE_DIR_BASE`, word 128), the GMMU walk (ver3: PD4 56,
+    PD3 55:47, PD2 46:38, PD1 37:29, PD0 28:21 dual PDE, 64/128 KiB or 4 KiB
+    PT; 512 MB / 2 MB PTEs at PD1/PD0; `kern_gmmu_fmt_gh10x.c`), every
+    page-table page on the way (`pt:*`, logged when changed), USERD
+    `GP_GET`/`GP_PUT` (words 34/35), then for every new GPFIFO entry the
+    entry and the pushbuffer segment it points to (`PUSHBUF`; GPU VA from
+    `GP_ENTRY0/1`, `SET_PB_SEGMENT_EXTENDED_BASE` honoured). Without a USERD
+    memdesc, USERD and the ring come from RAMFC (USERD at +8 [nouveau
+    layout], `NV_RAMFC_GP_BASE` words 18/19);
+  - with `NVTRACE_VRAM_SWEEP_MB_MIN`, all of VRAM below gspFwRsvdStart,
+    page by page: a `GPU_HASHES` record per 256 pages each pass, the
+    contents of pages that changed since the previous pass (`sweep`).
+- **When:** usermode doorbell, every GSP status-queue message, every
+  interrupt and display PUT (at most every `NVTRACE_VRAM_EVENT_US`), plus
+  every `NVTRACE_VRAM_PERIOD_MS`. Only content whose hash changed is logged.
+
+Decoders: `mmiodump.py gpu` (pages per tag, sweep passes, `--extract`),
+`pushbuf` (GPFIFO entries and methods; `SET_OBJECT` binds subchannels to
+classes; method names from the class headers, Blackwell 3D/compute fall
+back to Hopper's `cb97`/`cbc0` because their methods are not published).
+
+## GSP-RM's own log
+
+`GSPLOG:<id>` snapshots (LOGINIT, LOGRM, LOGINTR, ...) and
+`EVENT_UCODE_LIBOS_PRINT` RPCs are libos log buffers: u64 put, then a ring
+of records `args..., metadata, timestamp` (metadata = VA 47:0, record
+length 55:48, task 63:56; `liblogdecode.c`). `mmiodump.py gsplog` lists the
+records (task, PTIMER timestamp, metadata address, arguments) and, with
+`--log-elf gsp_log_*.bin`, the source file, line and formatted message. The
+format strings live only in that log ELF (`.fwlogging*` sections, stripped
+from the firmware): neither the Linux 610.57.04 firmware nor the Windows
+package (`Display.Driver/gsp_ga10x.bin`, `.fwversion` "610.53") contains
+them, so without it the log is message ids + arguments (`--summary` counts
+them).
+
+## Physically or practically unreadable
+
+| What | Why |
+|---|---|
+| WPR2 (GSP-RM code, data, heap in VRAM), FRTS, other protected FB ranges | Hardware write-protected regions: CPU/BAR reads return `0xbad0....` and raise PRI errors the driver sees. Never read; their layout is logged (WPR meta). The GSP-RM *image* is captured from sysmem before it is copied in. |
+| Falcon/RISC-V IMEM, DMEM, TCM, caches of GSP, FSP, SEC2, PMU | Only reachable through the falcons' PRI ports, which are locked down after boot and use auto-incrementing index registers that the running firmware also uses. FSP EMEM is captured only for the RM channel. |
+| GPU L2 / MMU TLB / engine state not yet in memory | On-chip. BAR1/PRAMIN reads are served coherently, but state that only exists in SRAM (in-flight contexts, PBDMA, ROP/ZROP caches, TLBs) is not memory. Context buffers become readable when an engine saves them. |
+| BAR0 registers the driver does not read | QEMU does not read registers on its own: some clear on read or raise PRI errors. Every register the driver reads is logged with its value. |
+| Compressed surfaces | Read back raw (compressed) through BAR1/PRAMIN; the compression tags are in on-chip/hidden storage. |
+| Sysmem the GPU uses that no RPC names | E.g. UMD-private sysmem mapped only through GPU page tables: reachable through the GMMU walk when a pushbuffer or GPFIFO points there, not otherwise. |
+| VRAM beyond the static BAR1 mapping at speed | PRAMIN only (~1 MB/s default); a full sweep through PRAMIN takes many hours. |
+| Encrypted queues/memory (Confidential Compute) | Not used on GeForce. |
 
 ## Gaps (what an emulator still needs that this does not record)
 
-- GPU virtual addresses: GPFIFO rings and pushbuffers are GPU VAs. The page
-  tables behind them live in VRAM (written via BAR3/PRAMIN: visible with
-  dirty pages or trap windows) or in sysmem (not followed). A GMMU walker
-  (ver3, 5 levels) over the captured pages is the next step for replaying
-  user submissions.
-- Vidmem display pushbuffers: the PUT writes are logged, the bytes only show
-  up as BAR pages, without the VRAM-address-to-BAR-offset mapping (BAR1
-  page tables) to tie them together.
-- Everything the GPU writes into VRAM; GPU writes into sysmem only for the
-  followed buffers (re-read on doorbells, interrupts and the watch period).
-- Large RPCs split into `CONTINUATION_RECORD`s are re-assembled by the
-  decoder; the follow-up in QEMU only sees the first record (e.g. the first
-  ~8000 PTEs of a huge ALLOC_MEMORY).
+- Display surfaces: window methods reference context DMAs, not physical
+  addresses; the surfaces are covered by the VRAM sweep / dirty BAR pages
+  but not tied to the flip that shows them.
+- Subroutine GPFIFO entries (`LEVEL_SUBROUTINE`) and CALL/JUMP inside
+  pushbuffers are logged as bytes, not followed further.
+- GPU writes to VRAM between two reads of the same page are seen only as
+  the final state (hash per pass), and the sweep sees a page once per pass.
+- Large RPCs are re-assembled both in QEMU (follow-up sees all
+  continuation records) and in the decoder.
 
 ## What is and is not captured
 
@@ -328,16 +429,15 @@ MSI/MSI-X setup and every delivered interrupt, QEMU resets and guest FLRs,
 FSP packets, GSP RPCs in both directions (commands, replies, events and
 notifier posts), the GSP boot structures, GSP log buffers (raw; decoding
 needs the firmware's log metadata), pages pointed to by address register
-pairs, the buffers named in GSP RPCs (above), and with
-`x-nvtrace-dirty-bars` the VRAM-aperture pages the guest CPU writes.
+pairs, the buffers named in GSP RPCs (above), with
+`x-nvtrace-dirty-bars` the VRAM-aperture pages the guest CPU writes, with
+`NVTRACE_VRAM=1` GPU memory read from the host side (VRAM buffers, page
+tables, GPFIFO entries and pushbuffers, optional full-VRAM sweep), the
+GSP-RM firmware image and GSP-RM's sysmem areas, and the whole PCI config
+space.
 
 Not captured:
-- GSP/FSP/PMU internal state, copy-engine traffic, VRAM written by the GPU
-  (except pages re-read with `NVTRACE_DIRTY_RESCAN_MS`), sysmem written by
-  the GPU outside the queues, logs and followed buffers.
-- Guest memory the GPU reads through GPU virtual addresses (GPFIFO,
-  pushbuffers, page tables in sysmem) unless it is a followed buffer or an
-  address-pair snapshot happens to hit it. See "Gaps".
+- See "Physically or practically unreadable" and "Gaps".
 - The GSP firmware ELF and FMC image contents (addresses only; the images
   ship in the driver package).
 - Confidential-compute encrypted queues (not used on GeForce).
@@ -350,6 +450,14 @@ Not captured:
 ## Expected slowdown
 
 Estimates unless marked measured; not measured on the 5090.
+
+| Mode | Cost |
+|---|---|
+| default (BAR0 trapped, follow, `NVTRACE_VRAM=1` from vm-trace.sh) | BAR0 accesses 3-10 µs each; GPU worker: per event pass a few 8-byte reads per channel plus one 4 KiB read per page-table page touched; through PRAMIN each 4 KiB read holds the BQL ~0.5 ms, capped at 1 MB/s (≤ ~13% of BQL time); through a static BAR1 no BQL, ≤ 32 MB/s of PCIe reads in the worker |
+| `NVTRACE_VRAM_SWEEP_MB_MIN=512` | worker reads 8.5 MB/s through static BAR1 (one 4 KiB `pread` ≈ 0.3-0.5 ms, so ~10-15 MB/s is the ceiling per thread); 32 GB takes ~65 min per pass; first pass logs 8 bytes per page (~64 MB of hashes), later passes the changed pages |
+| `NVTRACE_DIRTY=0x8` (BAR3 dirty pages) | ~0.6 µs per written page per 250 ms period (measured, fake device) |
+| firmware dumps | once per boot: ~80 MB GSP-RM ELF + bootloader/FMC/args read from guest RAM in the poller (~25 MB after zstd) |
+| trap windows | only accesses inside them exit |
 
 - Each BAR0 access becomes a VM exit + BQL + `pread`/`pwrite` on the vfio
   fd: roughly 3-10 µs instead of ~1 µs (reads) or ~0.1 µs (posted writes).
@@ -390,6 +498,10 @@ tools/mmiodump.py fsp      TRACE...         # FSP messages (COT fields, response
 tools/mmiodump.py disp     TRACE...         # display channels, PUT writes, decoded methods
 tools/mmiodump.py bars     TRACE... [--extract DIR]      # BAR_PAGE records, most rewritten pages
 tools/mmiodump.py pramin   TRACE...         # VRAM accesses through the BAR0 PRAMIN window
+tools/mmiodump.py gpu      TRACE... [--extract DIR]      # GPU memory read from the host side
+tools/mmiodump.py pushbuf  TRACE... [--channel H]        # GPFIFO entries, pushbuffer methods by class
+tools/mmiodump.py fw       TRACE... --extract DIR        # GSP-RM ELF, bootloader, FMC, libos/args areas
+tools/mmiodump.py gsplog   TRACE... [--log-elf F] [--summary]   # GSP-RM's own log
 tools/mmiodump.py snaps    TRACE... --extract DIR
 tools/mmiodump.py regs     TRACE... --top 200
 tools/mmiodump.py json     TRACE...         # one JSON object per record
@@ -435,7 +547,13 @@ BAR1 with both BARs otherwise mmapped, and, if `/dev/kvm` is usable, the
 dirty-page path under KVM: a 64 KiB test firmware (source in the test)
 stores into BAR1 from the guest CPU; the test checks the `BAR_PAGE`
 records and that unchanged rewrites are not logged again. It runs a 1-vCPU
-VM for about a second.
+VM for about a second. `test_gpu_memory` (fake device with a PRAMIN window
+over its BAR1-backed VRAM and one PRI-error page) builds BAR1 page tables,
+a channel's instance block, page tables, USERD, GPFIFO and a sysmem
+pushbuffer, the WPR meta with a radix3 GSP-RM image, and checks the BAR1
+map, PRAMIN reads, the protected and PRI-error pages, the GMMU walk down to
+the pushbuffer bytes and their decoded methods, a VRAM sweep change, the
+firmware image and a continuation-record reassembly.
 
 Not covered without the GPU: the vfio-pci kernel-driver path itself
 (vfio-user shares all of `hw/vfio/pci.c` and `region.c` except the kernel

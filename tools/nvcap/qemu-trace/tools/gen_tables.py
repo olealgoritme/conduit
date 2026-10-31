@@ -62,6 +62,8 @@ STRUCT_FILES = [
     "src/nvidia/inc/kernel/gpu/gpu_engine_type.h",
     "src/nvidia/inc/kernel/gpu/gsp/gsp_init_args.h",
     "src/nvidia/arch/nvalloc/common/inc/gsp/gspifpub.h",
+    "src/nvidia/arch/nvalloc/common/inc/gsp/gsp_fw_wpr_meta.h",
+    "src/common/uproc/os/common/include/libos_init_args.h",
     "src/nvidia/generated/g_chipset_nvoc.h",
     "src/nvidia/generated/g_os_nvoc.h",
 ]
@@ -69,6 +71,14 @@ NEEDED = [SWREF, RPC_ENUMS, SDK_INC, RPC_C, RES_LIST] + STRUCT_FILES
 # Display classes whose methods are decoded (GB20x: NVCA7x; older as fallback)
 DISP_CLASSES = ["ca7d", "ca7e", "ca7b", "ca7a", "cb7d", "cb7e", "cb7b", "cb7a",
                 "c97d", "c97e", "c67d", "c67e", "c57d", "c57e", "c37d", "c37e"]
+# Engine classes for pushbuffer method names: host (GPFIFO), 3D, compute,
+# copy, video. Blackwell's 3D/compute headers are not published with
+# methods; the decoder falls back to the newest class of the same family.
+ENGINE_CLASSES = ["ca6f", "c96f", "c86f", "c76f", "c56f", "c46f", "c36f",
+                  "ce97", "cd97", "cb97", "c997", "c797", "c697", "c597",
+                  "cec0", "cdc0", "cbc0", "c9c0", "c7c0", "c6c0", "c5c0",
+                  "cab5", "c9b5", "c8b5", "c7b5", "c6b5", "c5b5",
+                  "cefa", "cdfa", "c9fa", "c7fa"]
 # RPCs whose parameters are not an rpc_<name>_v structure
 RPC_PARAM_OVERRIDE = {
     "GSP_SET_SYSTEM_INFO": "GspSystemInfo",
@@ -383,25 +393,36 @@ def parse_alloc_params(tree, classes, structs):
     return out
 
 
-def parse_disp_methods(tree):
-    """Display class -> {method offset: name} from the class headers."""
+def parse_disp_methods(tree, classes=DISP_CLASSES):
+    """Class -> {method offset: name} from the class headers."""
     out = {}
     rx = re.compile(r"^#define\s+(NV[0-9A-F]{4}_\w+?)(\(([a-z])\))?\s+"
-                    r"\((0x[0-9A-Fa-f]+)(?:\s*\+\s*\(\3\)\s*\*\s*(0x[0-9A-Fa-f]+))?\)",
+                    r"\(?(0x[0-9A-Fa-f]+)(?:\s*\+\s*\(\3\)\s*\*\s*(0x[0-9A-Fa-f]+))?\)?\s*(?:/\*.*)?$",
                     re.M)
     rfield = re.compile(r"^#define\s+(NV[0-9A-F]{4}_\w+?)(\([a-z]\))?\s+\d+:\d+", re.M)
-    for c in DISP_CLASSES:
+    for c in classes:
         path = f"{CLASS_DIR}/cl{c}.h"
         if not tree.exists(path):
             continue
         text = tree.read(path)
         fields = set(m.group(1) for m in rfield.finditer(text))
+        cands = [m for m in rx.finditer(text)]
+        names = set(m.group(1) for m in cands)
         meth = {}
-        for m in rx.finditer(text):
+        for m in cands:
             name, idx, base, stride = m.group(1), m.group(3), \
                 int(m.group(4), 16), m.group(5)
-            if base % 4 or not any(f.startswith(name + "_") for f in fields):
+            if base % 4:
                 continue
+            if not any(f.startswith(name + "_") for f in fields):
+                # a method without fields: parenthesised value and no
+                # method or field name is a prefix of it (that would make
+                # it a field value)
+                parts = name.split("_")
+                pre = ["_".join(parts[:k]) for k in range(2, len(parts))]
+                if "(0x" not in m.group(0) or \
+                        any(x in names or x in fields for x in pre):
+                    continue
             if idx and stride:
                 cnt = 32 if "WINDOW" in name else 8
                 for k in range(cnt):
@@ -467,6 +488,8 @@ def main():
         "alloc_params": {f"{k:x}": v for k, v in sorted(alloc_params.items())},
         "disp_methods": {f"{k:x}": v for k, v in
                          sorted(parse_disp_methods(tree).items())},
+        "methods": {f"{k:x}": v for k, v in
+                    sorted(parse_disp_methods(tree, ENGINE_CLASSES).items())},
         "status": {f"{k:x}": v for k, v in sorted(parse_status(tree).items())},
     }
     with gzip.open(a.out, "wt", encoding="utf-8") as f:

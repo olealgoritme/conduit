@@ -1,7 +1,7 @@
 From d1bdbf5898ed680279bdad7d0d4ace0c80e6a843 Mon Sep 17 00:00:00 2001
 From: Ole Algoritme <olealgoritme@gmail.com>
 Date: Sat, 31 Oct 2026 16:47:54 +0100
-Subject: [PATCH 104/104] vfio: nvtrace - VRAM aperture pages, trap windows,
+Subject: [PATCH 104/105] vfio: nvtrace - VRAM aperture pages, trap windows,
  buffers from GSP RPCs
 
 New vfio-pci properties:

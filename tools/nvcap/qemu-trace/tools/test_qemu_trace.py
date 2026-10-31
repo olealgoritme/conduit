@@ -447,7 +447,7 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(qi[0].f["source"], 1)
         self.assertEqual((qi[0].f["cmd_size"], qi[0].f["stat_size"]), (QSIZE, QSIZE))
         labels = {r.f["label"]: r for r in by_type(recs, md.T_DMA_SNAP)}
-        for lab in ("GSP_FMC_BOOT_PARAMS", "GSP_WPR_META", "LIBOS_INIT_ARGS",
+        for lab in ("PCI_CONFIG", "GSP_FMC_BOOT_PARAMS", "GSP_WPR_META", "LIBOS_INIT_ARGS",
                     "GSP_ARGUMENTS_CACHED", "GSP_QUEUE_PTES", "GSPLOG:LOGINIT",
                     "GSPLOG:LOGRM"):
             self.assertIn(lab, labels)
@@ -616,6 +616,139 @@ class EndToEnd(unittest.TestCase):
             self.assertIn("BLACKWELL_CHANNEL_GPFIFO_A", out)
             self.assertIn("NV2080_CTRL_CMD_INTERNAL_DISPLAY_CHANNEL_PUSHBUFFER",
                           out)
+        finally:
+            run.cleanup()
+
+    def test_gpu_memory(self):
+        """Host-side GPU memory capture (NVTRACE_VRAM=1): BAR1 map from the
+        static info, PRAMIN for the rest, protected/PRI-error pages skipped,
+        GMMU walk of a channel -> GPFIFO entry -> pushbuffer bytes, VRAM
+        sweep, firmware image from the radix3 list, continuation records."""
+        V = 0x100000                                  # BAR1 PD4 in VRAM
+        run = Run("gpu", {"x-nvtrace": True, "x-nvtrace-file": "@TRACE"},
+                  env={"NVTRACE_VRAM": "1", "NVTRACE_VRAM_SWEEP_MB_MIN": "6000",
+                       "NVTRACE_VRAM_PRAMIN_KB": "262144",
+                       "NVTRACE_VRAM_BUDGET_MB": "512",
+                       "NVTRACE_WATCH_MS": "0"})
+        g, q = run.g, run.q
+        hc, hdev, hch = 0xc1d00001, 0xde000001, 0xc4a00001
+        pb = struct.pack("<5I", 0x20010000, 0xcb97, 0x20010040, 0, 0x80050080)
+        elf = (b"\x7fELF" + bytes(range(256)) * 47)[:3 * 4096 - 100]
+
+        def vram(off, data):
+            q.mem(BAR1 + off, data)
+
+        def pde(addr, aper=1):
+            return struct.pack("<Q", addr | (aper << 1))
+
+        try:
+            g.setup_pci()
+            g.setup_boot_structs()
+            # WPR meta: radix3 GSP-RM ELF, gspFwRsvdStart, fbSize
+            meta = bytearray(256)
+            struct.pack_into("<QQQQ", meta, 0, 0xdc3aae21371a60b3, 1,
+                             0x1400000, len(elf))
+            struct.pack_into("<Q", meta, 88, 0x3e00000)
+            struct.pack_into("<Q", meta, 176, 0x4000000)
+            q.mem(WPR_PA, bytes(meta))
+            q.mem(0x1400000, struct.pack("<Q", 0x1401000))
+            q.mem(0x1401000, struct.pack("<Q", 0x1402000))
+            q.mem(0x1402000, struct.pack("<QQQ", 0x1410000, 0x1412000,
+                                         0x1414000))
+            for i in range(3):
+                q.mem(0x1410000 + 0x2000 * i, elf[i * 4096:(i + 1) * 4096])
+            # BAR1 page tables: VA [0, 32 MB) -> VRAM 1:1 in 2 MB pages
+            for lvl in range(4):
+                vram(V + lvl * 0x1000, pde(V + (lvl + 1) * 0x1000))
+            vram(V + 0x4000, b"".join(struct.pack("<QQ", (i << 21) | 1, 0)
+                                      for i in range(16)))
+            # channel address space: GPFIFO in VRAM, pushbuffer in sysmem
+            C = 0x210000
+            for lvl, idx in enumerate((0, 0, 0)):
+                vram(C + lvl * 0x1000 + idx * 8, pde(C + (lvl + 1) * 0x1000))
+            vram(C + 0x3000 + 0x3f * 8, pde(C + 0x4000))           # PD1
+            vram(C + 0x4000 + 0x80 * 16, struct.pack("<QQ", 0,
+                                                     (C + 0x5000) | 2))
+            vram(C + 0x5000, struct.pack("<Q", 0x220000 | 1))     # GPFIFO
+            vram(C + 0x5000 + 0x10 * 8,
+                 struct.pack("<Q", 0x1300000 | (2 << 1) | 1))     # PB sysmem
+            vram(0x200000 + 0x200, struct.pack("<II", C | (1 << 11), 0))
+            vram(0x230000 + 0x88, struct.pack("<II", 0, 1))       # GET, PUT
+            va = 0x7f0010000
+            vram(0x220000, struct.pack("<II", va & 0xfffffffc,
+                                       ((va >> 32) & 0xff) | (5 << 10)))
+            q.mem(0x1300000, pb)
+            vram(0x2100000, b"FBMEM-PRAMIN" * 300)                # > 32 MB
+            vram(0x1500000, b"\x11" * 4096)
+            g.fsp_cot()
+            static = bytearray(1600)
+            struct.pack_into("<Q", static, 1504, V)
+            g.gsp_reply(65, bytes(static), 0)                    # static info
+            q.writel(BAR0 + 0xfff000, 0)                         # irq: drain
+            for pa, h in ((0x2100000, 0x3e000002), (0x2200000, 0x3e000003),
+                          (0x3f00000, 0x3e000004)):
+                g.send(FN_ALLOC_MEMORY, struct.pack(
+                    "<7I4xQI4xI4x", hc, hdev, h, 0x82, 0, 0, 0, 0x1000, 1, 0) +
+                    struct.pack("<Q", pa >> 12))
+            chan = bytearray(channel_alloc_params(0))
+            struct.pack_into("<QQII", chan, 152, 0x200000, 0x1000, 2, 0)
+            struct.pack_into("<QQII", chan, 176, 0x230000, 512, 2, 0)
+            g.send(FN["GSP_RM_ALLOC"], struct.pack(
+                "<IIIIIII4x", hc, hdev, hch, 0xc96f, 0, len(chan), 0) +
+                bytes(chan))
+            # a large ALLOC_MEMORY split into a CONTINUATION_RECORD
+            big = struct.pack("<7I4xQI4xI4x", hc, hdev, 0x3e0000ff, 0x81, 0, 0,
+                              0, 9000 << 12, 9000, 0) + \
+                b"".join(struct.pack("<Q", 0x1600 + i) for i in range(9000))
+            g.send(FN_ALLOC_MEMORY, big[:65520 - 32])
+            g.send(71, big[65520 - 32:])
+            time.sleep(1.5)                                       # sweep pass 0
+            q.writel(BAR0 + 0xbb0090, 0x40000000)                 # doorbell
+            vram(0x1500000, b"\x22" * 4096)
+            time.sleep(1.5)                                       # pass 1
+        finally:
+            run.finish()
+        try:
+            recs = run.records()
+            nt = notes(recs)
+            pages = by_type(recs, md.T_GPU_PAGE)
+            tags = {}
+            for r in pages:
+                tags.setdefault(r.f["tag"], []).append(r)
+            self.assertTrue(any("BAR1 map rebuilt" in n and "1 ranges, 32 MB"
+                                in n and "identity" in n for n in nt), nt)
+            pbs = by_type(recs, md.T_PUSHBUF)
+            self.assertTrue(pbs, nt)
+            self.assertEqual((pbs[0].f["hobject"], pbs[0].f["gp_index"],
+                              pbs[0].f["va"], pbs[0].f["len"]),
+                             (hch, 0, va, 20))
+            self.assertEqual(pbs[0].data, pb)
+            self.assertTrue(any(t.startswith("pt:") for t in tags))
+            self.assertEqual(tags["chc4a00001.userd"][0].data[0x8c:0x90],
+                             struct.pack("<I", 1))
+            self.assertTrue(tags["mem3e000002"][0].data.startswith(b"FBMEM"))
+            self.assertNotIn("mem3e000004", tags)                 # protected
+            self.assertTrue(any("PRI error" in n and "0x2200000" in n
+                                for n in nt), nt)
+            self.assertTrue(by_type(recs, md.T_GPU_HASHES))
+            sw = [r for r in pages if r.f["reason"] == 2]
+            self.assertTrue(any(r.f["pa"] == 0x1500000 and r.data[0] == 0x22
+                                for r in sw), [hex(r.f["pa"]) for r in sw])
+            self.assertTrue(any("reassembled from 1 continuation" in n
+                                for n in nt), nt)
+            out = subprocess.run([sys.executable, os.path.join(HERE, "mmiodump.py"),
+                                  "pushbuf", run.trace], capture_output=True,
+                                 text=True, check=True).stdout
+            self.assertIn("SET_OBJECT = 0xcb97", out)
+            self.assertIn("NVCB97_NO_OPERATION = 0x0", out)
+            self.assertIn("HOPPER_A", out)
+            fwdir = os.path.join(run.dir, "fw")
+            subprocess.run([sys.executable, os.path.join(HERE, "mmiodump.py"),
+                            "fw", run.trace, "--extract", fwdir], check=True,
+                           capture_output=True)
+            imgs = [f for f in os.listdir(fwdir) if f.startswith("FW_GSP_RM_ELF")]
+            with open(os.path.join(fwdir, imgs[0]), "rb") as f:
+                self.assertEqual(f.read(), elf)
         finally:
             run.cleanup()
 

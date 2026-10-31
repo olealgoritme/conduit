@@ -18,6 +18,13 @@ Usage:
                                            INIT_DONE: the emulator's fake table
   mmiodump.py disp     TRACE...            display channel pushbuffers, decoded
   mmiodump.py bars     TRACE... [--extract DIR]   BAR (VRAM aperture) pages
+  mmiodump.py gpu      TRACE... [--extract DIR]   GPU memory read from the
+                                           host side (VRAM, page tables, sweep)
+  mmiodump.py pushbuf  TRACE... [--channel H]  GPFIFO entries + pushbuffer
+                                           methods by class
+  mmiodump.py fw       TRACE... [--extract DIR]   firmware images / GSP-RM
+                                           sysmem areas dumped from the guest
+  mmiodump.py gsplog   TRACE... [--log-elf F]     GSP-RM's own log records
   mmiodump.py pramin   TRACE...            VRAM accesses through the BAR0
                                            PRAMIN window
   mmiodump.py snaps    TRACE... [--extract DIR]   DMA snapshots
@@ -51,13 +58,14 @@ REC_HDR = struct.Struct("<HBBIQQhHI")             # 32 bytes
 
 T_MMIO, T_CFG, T_IRQ, T_VEC, T_RESET, T_BAR, T_GSP_MSG, T_DMA_SNAP, \
     T_NOTE, T_GSP_QSTATE, T_LOST, T_FSP_PKT, T_GSP_QINFO, T_DEV, \
-    T_BAR_PAGE = range(1, 16)
+    T_BAR_PAGE, T_GPU_PAGE, T_GPU_HASHES, T_PUSHBUF = range(1, 19)
 
 TYPE_NAMES = {
     T_MMIO: "MMIO", T_CFG: "CFG", T_IRQ: "IRQ", T_VEC: "VEC", T_RESET: "RESET",
     T_BAR: "BAR", T_GSP_MSG: "GSP_MSG", T_DMA_SNAP: "DMA_SNAP", T_NOTE: "NOTE",
     T_GSP_QSTATE: "GSP_QSTATE", T_LOST: "LOST", T_FSP_PKT: "FSP_PKT",
     T_GSP_QINFO: "GSP_QINFO", T_DEV: "DEV", T_BAR_PAGE: "BAR_PAGE",
+    T_GPU_PAGE: "GPU_PAGE", T_GPU_HASHES: "GPU_HASHES", T_PUSHBUF: "PUSHBUF",
 }
 
 BODY = {
@@ -84,8 +92,17 @@ BODY = {
             ("vendor", "device", "class_code", "trap_mask", "dflags", "_r")),
     T_BAR_PAGE: (struct.Struct("<BBHIQQ"),
                  ("bar", "reason", "_r", "len", "off", "hash")),
+    T_GPU_PAGE: (struct.Struct("<BBHIQQ24s"),
+                 ("aper", "reason", "_r", "len", "pa", "hash", "tag")),
+    T_GPU_HASHES: (struct.Struct("<QII"), ("first_pa", "count", "pass")),
+    T_PUSHBUF: (struct.Struct("<IIIIIIQQII"),
+                ("hclient", "hobject", "gp_index", "gp_put", "gp_get",
+                 "pflags", "entry", "va", "len", "got")),
 }
-SNAP_NODATA, SNAP_BLOB, SNAP_CHANGED = 1, 2, 4
+SNAP_NODATA, SNAP_BLOB, SNAP_CHANGED, SNAP_IMAGE = 1, 2, 4, 8
+APERTURES = {0: "vid", 1: "peer", 2: "sys", 3: "sysnc"}
+GPU_REASONS = {0: "event", 1: "period", 2: "sweep", 3: "pagetable"}
+PB_F = {1: "no-entry", 2: "truncated", 4: "partial"}
 
 ORIGINS = {0: "", 1: "mirror", 2: "quirk-int", 3: "window", 4: "ioeventfd",
            5: "msix-table", 6: "msix-pba", 7: "rom"}
@@ -202,8 +219,16 @@ def iter_records(paths, warn=True):
                         "ascii", "replace")
                     r.data = r.data[:r.f["len"]] if not r.f["sflags"] & 1 \
                         else b""
-                elif typ in (T_FSP_PKT, T_BAR_PAGE):
+                elif typ in (T_FSP_PKT, T_BAR_PAGE, T_GPU_PAGE):
                     r.data = r.data[:r.f["len"]]
+                    if typ == T_GPU_PAGE:
+                        r.f["tag"] = r.f["tag"].rstrip(b"\0").decode(
+                            "ascii", "replace")
+                elif typ == T_GPU_HASHES:
+                    n = r.f["count"]
+                    r.data = struct.unpack_from(f"<{n}Q", r.data)
+                elif typ == T_PUSHBUF:
+                    r.data = r.data[:r.f["got"]]
                 elif typ in (T_NOTE,):
                     r.data = r.data.rstrip(b"\0")
                 elif typ == T_DEV:
@@ -241,6 +266,8 @@ class Names:
         self.disp = {int(c, 16): {int(k, 16): n for k, n in m.items()}
                      for c, m in t.get("disp_methods", {}).items()}
         self.status = {int(k, 16): v for k, v in t.get("status", {}).items()}
+        self.methods = {int(c, 16): {int(k, 16): n for k, n in m.items()}
+                        for c, m in t.get("methods", {}).items()}
         self.source = t.get("source", "no tables")
 
     def block(self, off):
@@ -542,7 +569,7 @@ def fmt_ts(r, t0):
 
 NV_DOORBELL = 0xb80000 + 0x30090
 NV_PRAMIN_LO, NV_PRAMIN_HI = 0x700000, 0x800000
-NV_BAR0_WINDOW = 0xd40          # NV_XAL_EP_ZB_BAR0_WINDOW (BASE << 16)
+NV_BAR0_WINDOW = 0xd40          # NV_XAL_EP_ZB_BAR0_WINDOW (BASE 22:0 << 16)
 DISP_CORE, DISP_WIN0 = 0x680000, 0x690000
 
 
@@ -559,7 +586,7 @@ def mmio_note(f):
     if DISP_WIN0 <= off < DISP_WIN0 + 32 * 0x1000 and not off & 0xfff:
         return f"  <disp window {(off - DISP_WIN0) >> 12} PUT 0x{v:x}>"
     if off == NV_BAR0_WINDOW:
-        return f"  <PRAMIN -> VRAM 0x{(v & 0xffffff) << 16:x}>"
+        return f"  <PRAMIN -> VRAM 0x{(v & 0x7fffff) << 16:x}>"
     return ""
 
 
@@ -604,6 +631,8 @@ def line(names, r, t0, rpc=None):
         return head + f"GSP {q} slot {f['slot']} raw len={f['len']}{fl}"
     if t == T_DMA_SNAP:
         where = "blob" if f["sflags"] & 2 else f"gpa=0x{f['gpa']:x}"
+        if f["sflags"] & SNAP_IMAGE:
+            where = f"image+0x{f['gpa']:x}"
         return (head + f"SNAP {f['label']} {where} len=0x{f['len']:x}"
                 + (" (not RAM)" if f["sflags"] & 1 else "")
                 + (" (changed)" if f["sflags"] & SNAP_CHANGED else ""))
@@ -630,6 +659,19 @@ def line(names, r, t0, rpc=None):
         return (head + f"DEV  {r.data.decode()} {f['vendor']:04x}:{f['device']:04x} "
                 f"class {f['class_code']:06x} trap_mask=0x{f['trap_mask']:x} "
                 f"gsp={f['dflags'] & 1}")
+    if t == T_GPU_PAGE:
+        return (head + f"GPUPAGE {APERTURES.get(f['aper'], f['aper'])}:"
+                f"0x{f['pa']:010x} len=0x{f['len']:x} "
+                f"{GPU_REASONS.get(f['reason'], f['reason'])} {f['tag']}")
+    if t == T_GPU_HASHES:
+        return (head + f"GPUHASHES pass {f['pass']} 0x{f['first_pa']:010x} "
+                f"+{f['count']} pages")
+    if t == T_PUSHBUF:
+        fl = ",".join(v for k, v in PB_F.items() if f["pflags"] & k)
+        return (head + f"PUSHBUF ch 0x{f['hobject']:08x} gp[{f['gp_index']}] "
+                f"(get {f['gp_get']} put {f['gp_put']}) "
+                f"entry=0x{f['entry']:016x} va=0x{f['va']:x} len={f['len']} "
+                f"got={f['got']}" + (f" [{fl}]" if fl else ""))
     if t == T_BAR_PAGE:
         return (head + f"BARPAGE bar{f['bar']}+0x{f['off']:09x} "
                 f"{'rescan' if f['reason'] else 'cpu-write'} "
@@ -1183,7 +1225,7 @@ def cmd_pramin(a, names):
             continue
         off = r.f["off"]
         if off == NV_BAR0_WINDOW:
-            base = (r.f["val"] & 0xffffff) << 16 if r.f["write"] or \
+            base = (r.f["val"] & 0x7fffff) << 16 if r.f["write"] or \
                 base is None else base
             if r.f["write"] and not a.quiet:
                 print(line(names, r, t0))
@@ -1200,6 +1242,300 @@ def cmd_pramin(a, names):
     print(f"\nVRAM pages touched through PRAMIN: {len(set(k[0] for k in per))}")
     for (pg, rw), n in sorted(per.items())[:a.top]:
         print(f"  0x{pg:010x} {rw} {n}")
+
+
+# ------------------------------------------------------------ GPU memory --
+
+
+def cmd_gpu(a, names):
+    """GPU memory read from the host side (VRAM/sysmem), sweep summary."""
+    t0 = None
+    tags = collections.Counter()
+    sweep = {}
+    if a.extract:
+        os.makedirs(a.extract, exist_ok=True)
+    for r in iter_records(a.trace):
+        t0 = r.ts if t0 is None else t0
+        if r.type == T_NOTE and r.data.startswith(b"gpu:"):
+            print(line(names, r, t0))
+        elif r.type == T_GPU_PAGE:
+            tags[(r.f["tag"], GPU_REASONS.get(r.f["reason"]))] += 1
+            if not a.quiet:
+                print(line(names, r, t0))
+            if a.extract:
+                lab = re.sub(r"[^A-Za-z0-9_.-]", "_", r.f["tag"])
+                fn = os.path.join(a.extract, f"{r.seq:010d}_{lab}_"
+                                  f"{APERTURES.get(r.f['aper'])}_{r.f['pa']:x}.bin")
+                with open(fn, "wb") as f:
+                    f.write(r.data)
+        elif r.type == T_GPU_HASHES:
+            p = r.f["pass"]
+            s = sweep.setdefault(p, [0, 0])
+            s[0] += r.f["count"]
+            s[1] += sum(1 for h in r.data if h == 0)
+    print("\nGPU pages logged per tag/reason:")
+    for (tag, why), n in tags.most_common(a.top):
+        print(f"  {tag:24s} {why:10s} {n}")
+    for p, (n, bad) in sorted(sweep.items()):
+        print(f"sweep pass {p}: {n} pages hashed, {bad} unreadable")
+
+
+# Pushbuffer method format (clc56f.h NVC56F_DMA_*): SEC_OP 31:29,
+# COUNT/IMMD 28:16, SUBCHANNEL 15:13, ADDRESS 11:0 (dwords).
+PB_OPS = {0: "GRP0", 1: "INC", 2: "GRP2", 3: "NONINC", 4: "IMMD", 5: "ONEINC",
+          6: "RSVD6", 7: "END_SEG"}
+
+
+class MethodNames:
+    def __init__(self, names):
+        self.t = names.methods
+        self.host = {}
+        for c in sorted(self.t):
+            if c & 0xff == 0x6f:
+                self.host.update(self.t[c])
+
+    def table(self, cls):
+        if cls in self.t:
+            return self.t[cls]
+        fam = [c for c in self.t if c & 0xff == cls & 0xff]
+        if not fam:
+            return {}
+        older = [c for c in fam if c <= cls]
+        return self.t[max(older) if older else max(fam)]
+
+    def name(self, cls, m):
+        if m < 0x100:
+            return self.host.get(m, f"host_0x{m:x}")
+        return self.table(cls).get(m, f"0x{m:04x}")
+
+
+def decode_pushbuffer(mn, data, subch):
+    """Yield (subchannel, class, method, value, op) from pushbuffer bytes;
+    subch: dict subchannel -> class, updated by SET_OBJECT (method 0)."""
+    n = len(data) // 4
+    w = struct.unpack_from(f"<{n}I", data)
+    i = 0
+    while i < n:
+        h = w[i]
+        i += 1
+        op, cnt, sub, addr = h >> 29, (h >> 16) & 0x1fff, (h >> 13) & 7, \
+            (h & 0xfff) * 4
+        if op == 4:
+            vals = [(addr, cnt)]
+        elif op in (1, 3, 5):
+            vals = []
+            for k in range(cnt):
+                if i >= n:
+                    break
+                m = addr + 4 * k if op == 1 else \
+                    (addr if op == 3 or k == 0 else addr + 4)
+                vals.append((m, w[i]))
+                i += 1
+        elif op == 7:
+            yield sub, None, None, None, "END_PB_SEGMENT"
+            return
+        else:
+            if h:
+                yield sub, None, None, h, PB_OPS[op]
+            continue
+        for m, v in vals:
+            if m == 0:
+                subch[sub] = v & 0xffff
+            yield sub, subch.get(sub), m, v, PB_OPS[op]
+
+
+def cmd_pushbuf(a, names):
+    t0 = None
+    mn = MethodNames(names)
+    chans = {}
+    for r in iter_records(a.trace):
+        t0 = r.ts if t0 is None else t0
+        if r.type != T_PUSHBUF:
+            continue
+        print(line(names, r, t0))
+        if a.channel and r.f["hobject"] != int(a.channel, 0):
+            continue
+        subch = chans.setdefault((r.f["hclient"], r.f["hobject"]), {})
+        shown = 0
+        for sub, cls, m, v, op in decode_pushbuffer(mn, r.data, subch):
+            if a.max and shown >= a.max:
+                print(f"{'':>24}...")
+                break
+            shown += 1
+            if m is None:
+                print(f"{'':>24}[{sub}] {op}" +
+                      (f" 0x{v:08x}" if v is not None else ""))
+                continue
+            cn = names.class_name(cls) if cls is not None else "?"
+            print(f"{'':>24}[{sub}:{cn}] {mn.name(cls or 0, m)} = 0x{v:x}"
+                  + ("" if op == "INC" else f" ({op})"))
+
+# -------------------------------------------------- firmware images --
+
+
+def cmd_fw(a, names):
+    """Firmware images and GSP-RM sysmem areas dumped from guest memory."""
+    t0 = None
+    imgs = collections.OrderedDict()
+    for r in iter_records(a.trace):
+        t0 = r.ts if t0 is None else t0
+        if r.type == T_NOTE and r.data.startswith(b"fw:"):
+            print(line(names, r, t0))
+        if r.type == T_DMA_SNAP and r.f["sflags"] & SNAP_IMAGE:
+            key = r.f["label"]
+            if r.f["gpa"] == 0:             # a new dump of this image
+                imgs[(key, r.seq)] = bytearray()
+                cur = (key, r.seq)
+            else:
+                cur = next((k for k in reversed(imgs) if k[0] == key), None)
+                if cur is None:
+                    continue
+            buf = imgs[cur]
+            if len(buf) < r.f["gpa"]:
+                buf.extend(b"\0" * (r.f["gpa"] - len(buf)))
+            buf[r.f["gpa"]:r.f["gpa"] + len(r.data)] = r.data
+    if a.extract:
+        os.makedirs(a.extract, exist_ok=True)
+    for (label, seq), buf in imgs.items():
+        kind = "ELF" if buf[:4] == b"\x7fELF" else buf[:4].hex()
+        print(f"{seq:10d} {label:24s} {len(buf):10d} bytes  starts {kind}")
+        if a.extract:
+            fn = os.path.join(a.extract, re.sub(r"[^A-Za-z0-9_.-]", "_",
+                                                label) + f"_{seq}.bin")
+            with open(fn, "wb") as f:
+                f.write(buf)
+
+# ------------------------------------------------------------- GSP logs --
+
+LIBOS_TASKS = {1: "KERNEL", 2: "INIT", 3: "RM", 4: "INTR", 5: "VGPU",
+               6: "MNOC", 7: "DEBUG", 8: "ROOT", 9: "RMON"}
+
+
+def libos_records(buf, prev_put=0):
+    """Records of a libos log buffer (liblogdecode.c): u64 put, then a ring
+    of u64; each record is args..., packed metadata (VA 47:0, total words
+    55:48, task 63:56), timestamp. Returns (put, [records oldest first])."""
+    if len(buf) < 16:
+        return 0, []
+    n = len(buf) // 8 - 1
+    w = struct.unpack_from(f"<{n + 1}Q", buf)
+    put = w[0]
+    lo = max(prev_put, put - n if put > n else 0)
+    out = []
+    i = put
+    while i - 2 >= lo:
+        ts = w[1 + (i - 1) % n]
+        meta = w[1 + (i - 2) % n]
+        total, task = (meta >> 48) & 0xff, meta >> 56
+        if not 2 <= total <= 22 or task not in LIBOS_TASKS or i - total < lo:
+            break
+        args = [w[1 + (i - total + k) % n] for k in range(total - 2)]
+        out.append({"idx": i - total, "ts": ts, "meta": meta & ((1 << 48) - 1),
+                    "task": LIBOS_TASKS[task], "args": args})
+        i -= total
+    out.reverse()
+    return put, out
+
+
+class LogElf:
+    """Format strings from a gsp_log_*.bin (.fwlogging*) if one is given."""
+
+    def __init__(self, path):
+        self.secs = []
+        if not path:
+            return
+        with open(path, "rb") as f:
+            d = f.read()
+        if d[:4] != b"\x7fELF":
+            raise ValueError(f"{path}: not an ELF file")
+        shoff, = struct.unpack_from("<Q", d, 0x28)
+        shentsize, shnum, shstrndx = struct.unpack_from("<HHH", d, 0x3a)
+        hdrs = [struct.unpack_from("<IIQQQQIIQQ", d, shoff + i * shentsize)
+                for i in range(shnum)]
+        strtab = hdrs[shstrndx]
+        for h in hdrs:
+            name = d[strtab[4] + h[0]:].split(b"\0", 1)[0].decode()
+            if h[3] and h[5]:
+                self.secs.append((h[3], h[5], d[h[4]:h[4] + h[5]], name))
+
+    def read(self, va, n):
+        for addr, size, data, _ in self.secs:
+            if addr <= va < addr + size:
+                return data[va - addr:va - addr + n]
+        return None
+
+    def string(self, va):
+        b = self.read(va, 4096)
+        return b.split(b"\0", 1)[0].decode("latin-1") if b else None
+
+    def format(self, rec):
+        m = self.read(rec["meta"], 27)
+        if not m or len(m) < 27:
+            return None
+        fname, fmt, line = struct.unpack_from("<QQQ", m)
+        f = self.string(fmt)
+        if f is None:
+            return None
+        args = iter(rec["args"])
+
+        def sub(mo):
+            if mo.group(0) == "%%":
+                return "%"
+            v = next(args, 0)
+            c = mo.group(5)
+            if c == "s":
+                return self.string(v) or f"<str@0x{v:x}>"
+            if c in "di":
+                v = v - (1 << 64) if v >> 63 else v
+                return str(v)
+            if c in "xXp":
+                return f"{v:x}" if c != "X" else f"{v:X}"
+            if c == "c":
+                return chr(v & 0xff)
+            return str(v)
+        txt = re.sub(r"%%|%([-0 #+]*)(\d*)(\.\d+)?(hh|h|ll|l|z|j|t)?([diuxXcsp])",
+                     sub, f)
+        src = self.string(fname) or "?"
+        return f"{os.path.basename(src)}:{line} {txt.rstrip()}"
+
+
+def cmd_gsplog(a, names):
+    """GSP-RM's own log: the libos log buffers (GSPLOG snapshots) and
+    EVENT_UCODE_LIBOS_PRINT RPCs."""
+    elf = LogElf(a.log_elf)
+    last = {}
+    metas = collections.Counter()
+    t0 = None
+    for r in iter_records(a.trace):
+        t0 = r.ts if t0 is None else t0
+        src = None
+        if r.type == T_DMA_SNAP and r.f["label"].startswith("GSPLOG:"):
+            src, buf = r.f["label"][7:], r.data
+        elif r.type == T_GSP_MSG and r.f["queue"] == 1:
+            rpc = parse_rpc(r)
+            if rpc and names.rpc_name(rpc["function"]) == \
+                    "EVENT_UCODE_LIBOS_PRINT" and len(rpc["params"]) > 8:
+                sz = struct.unpack_from("<I", rpc["params"], 4)[0]
+                src, buf = "PRINT", rpc["params"][8:8 + sz]
+        if src is None:
+            continue
+        put, recs = libos_records(buf, last.get(src, 0))
+        if src != "PRINT":
+            last[src] = put
+        for rec in recs:
+            metas[(rec["task"], rec["meta"])] += 1
+            txt = elf.format(rec) if elf.secs else None
+            if txt is None:
+                txt = (f"meta=0x{rec['meta']:x} args=[" +
+                       ",".join(f"0x{x:x}" for x in rec["args"]) + "]")
+            if not a.summary:
+                print(f"{r.seq:10d} {src:8s} {rec['task']:6s} "
+                      f"ptimer={rec['ts']} {txt}")
+    if a.summary or not elf.secs:
+        print(f"\n{sum(metas.values())} records, {len(metas)} distinct "
+              f"messages (format strings need gsp_log_*.bin: --log-elf)")
+        for (task, meta), n in metas.most_common(a.top):
+            print(f"  {task:6s} meta=0x{meta:x} {n}")
 
 
 def main(argv=None):
@@ -1248,6 +1584,19 @@ def main(argv=None):
     p.add_argument("--extract", metavar="DIR")
     p.add_argument("--quiet", action="store_true")
     p.add_argument("--top", type=int, default=20)
+    p = add("gpu", cmd_gpu)
+    p.add_argument("--extract", metavar="DIR")
+    p.add_argument("--quiet", action="store_true")
+    p.add_argument("--top", type=int, default=40)
+    p = add("pushbuf", cmd_pushbuf)
+    p.add_argument("--channel", help="only this channel handle")
+    p.add_argument("--max", type=int, default=0, help="methods per segment")
+    p = add("fw", cmd_fw)
+    p.add_argument("--extract", metavar="DIR")
+    p = add("gsplog", cmd_gsplog)
+    p.add_argument("--log-elf", help="gsp_log_*.bin with .fwlogging sections")
+    p.add_argument("--summary", action="store_true")
+    p.add_argument("--top", type=int, default=40)
     p = add("pramin", cmd_pramin)
     p.add_argument("--quiet", action="store_true")
     p.add_argument("--top", type=int, default=40)

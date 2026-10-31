@@ -12,8 +12,12 @@ Device model:
           FSP EMEM channel 0 (EMEMC/EMEMD auto-increment), QUEUE_HEAD/TAIL,
           MSGQ_HEAD/TAIL: every CPU->FSP packet gets an NVDM FSP_RESPONSE.
           0xfff000: write N -> raise MSI-X vector N (or INTx if MSI-X off).
+          PRAMIN: 0x700000-0x7fffff reads/writes VRAM at
+          (NV_XAL_EP_ZB_BAR0_WINDOW 0xd40 & 0x7fffff) << 16; VRAM page
+          0x2200000 reads PRI error words (0xbad0ac01) through PRAMIN.
         MSI-X table at BAR0+0xff0000, PBA at +0xff1000 (QEMU emulates them).
-  BAR1  64 MiB (64-bit prefetchable), MMAP-capable memfd ("VRAM").
+  BAR1  64 MiB (64-bit prefetchable), MMAP-capable memfd: the VRAM, mapped
+        1:1 (like RM's static BAR1 mapping).
   config 256 bytes, MSI-X capability with 4 vectors, INTA.
 Logs every request it serves to stderr with -v.
 
@@ -40,6 +44,8 @@ CFG_SIZE = 256
 EMEMC0, EMEMD0 = 0x8f2ac0, 0x8f2ac4
 QHEAD0, QTAIL0, MHEAD0, MTAIL0 = 0x8f2c00, 0x8f2c04, 0x8f2c80, 0x8f2c84
 TEST_IRQ = 0xfff000
+BAR0_WINDOW, PRAMIN, PRAMIN_END = 0xd40, 0x700000, 0x800000
+PRI_BAD_PAGE = 0x2200000
 
 IRQ_INTX, IRQ_MSI, IRQ_MSIX, IRQ_ERR, IRQ_REQ = range(5)
 SET_DATA_NONE, SET_DATA_BOOL, SET_DATA_EVENTFD = 1, 2, 4
@@ -80,7 +86,17 @@ class FakeGpu:
             print("fakegpu:", msg, file=sys.stderr)
 
     # ---- device behaviour ----
+    def pramin(self, off, n):
+        base = (struct.unpack_from("<I", self.bar0, BAR0_WINDOW)[0] & 0x7fffff) << 16
+        return base + off - PRAMIN
+
     def bar0_read(self, off, n):
+        if PRAMIN <= off < PRAMIN_END:
+            v = self.pramin(off, n)
+            if v & ~0xfff == PRI_BAD_PAGE:
+                return struct.pack("<I", 0xbad0ac01) * (n // 4) + b"\0" * (n % 4)
+            self.stats["pramin"] = self.stats.get("pramin", 0) + 1
+            return bytes(self.bar1[v:v + n])
         if off == EMEMD0 and n == 4:
             v = self.emem[self.emem_ptr] if self.emem_ptr < 1024 else 0
             if self.aincr:
@@ -91,6 +107,10 @@ class FakeGpu:
     def bar0_write(self, off, data):
         n = len(data)
         val = int.from_bytes(data, "little")
+        if PRAMIN <= off < PRAMIN_END:
+            v = self.pramin(off, n)
+            self.bar1[v:v + n] = data
+            return
         if off == EMEMC0:
             self.emem_ptr = ((val >> 8) & 0xff) * 64 + ((val >> 2) & 0x3f)
             self.aincw = bool(val >> 24 & 1)
