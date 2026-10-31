@@ -14,6 +14,12 @@
 #   patches       every patch series applies on its pinned base, as the builds
 #                 apply it (.github/scripts/check-patches.sh): NVK on RM (Mesa),
 #                 DXVK, vkd3d-proton, DXVK-NVAPI, the Mesa Venus ICD fork
+#   nak-build     NVK for Linux with the RM backend and the whole NVK-on-RM
+#                 series, nouveau's drm-shim and NAK's unit tests
+#                 (.github/scripts/nak-build.sh), for this commit and its base
+#   nak-shaders   a public shader corpus through NVK and NAK on faked GPUs
+#                 (.github/scripts/nak-shaders.sh): fails when NAK fails a
+#                 shader, NAK's statistics against the base in the step summary
 #   packaging     shellcheck the packaging scripts, check the venus submodule pins
 #                 in flake.nix and the RPM spec, check that docs/WINDOWS-KNOBS.md
 #                 matches the code, build the DKMS source package
@@ -298,6 +304,175 @@ jobs:
           CACHE_DIR: ${{ runner.temp }}/patch-bases
         run: .github/scripts/check-patches.sh
 
+  nak-build:
+    # This commit and its base (the first parent: the base branch on a pull
+    # request, the previous commit on a push), built the same way. Cached by
+    # the Mesa base, the series' contents and the build script, so a change
+    # outside guest/nvk-rm builds nothing; a pull request reads the caches
+    # main's pushes leave. A base without guest/nvk-rm/series.sh, or whose
+    # build fails, leaves the comparison out and fails nothing.
+    name: nak build (${{ matrix.side }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    continue-on-error: ${{ matrix.side == 'base' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        side: [head, base]
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 2
+      - name: Tree and cache key
+        id: tree
+        env:
+          SIDE: ${{ matrix.side }}
+        run: |
+          echo "image=$ImageOS-$ImageVersion" >> "$GITHUB_OUTPUT"
+          tree=$GITHUB_WORKSPACE
+          if [ "$SIDE" = base ]; then
+            if ! git cat-file -e HEAD^1:guest/nvk-rm/series.sh 2>/dev/null; then
+              echo "The base commit has no guest/nvk-rm/series.sh: no baseline."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            tree=$RUNNER_TEMP/base-tree
+            git worktree add -q --detach "$tree" HEAD^1
+            git -C "$tree" log -1 --format='Base: %h %s'
+          fi
+          key=nak-build-$(.github/scripts/nak-build.sh --key "$tree")
+          {
+            echo "tree=$tree"
+            echo "key=$key"
+            echo "skip=false"
+          } >> "$GITHUB_OUTPUT"
+      - name: Restore the build
+        if: steps.tree.outputs.skip == 'false'
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/nak-build
+          key: ${{ steps.tree.outputs.key }}
+      - name: Restore the apt packages
+        if: steps.tree.outputs.skip == 'false' && steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/apt-archives
+          key: apt-nak-build-${{ steps.tree.outputs.image }}-${{ hashFiles('.github/workflows/ci.yml') }}
+          restore-keys: apt-nak-build-${{ steps.tree.outputs.image }}-
+      - name: Restore bindgen and cbindgen
+        if: steps.tree.outputs.skip == 'false' && steps.cache.outputs.cache-hit != 'true'
+        id: cargo-bin
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/bindgen
+            ~/.cargo/bin/cbindgen
+          key: cargo-bin-bindgen-0.71.1-cbindgen-0.28.0-${{ steps.tree.outputs.image }}
+      - name: Build dependencies
+        if: steps.tree.outputs.skip == 'false' && steps.cache.outputs.cache-hit != 'true'
+        env:
+          APT_ARCHIVES: ${{ runner.temp }}/apt-archives
+          CARGO_BIN_HIT: ${{ steps.cargo-bin.outputs.cache-hit }}
+        run: |
+          # Mesa's own (Python modules, LLVM 20 + libclc + SPIRV-LLVM-Translator
+          # for mesa_clc, as the Windows build), libdrm and libelf for Linux
+          # NVK, gtest for -Dbuild-tests, Vulkan headers and loader for nvstats
+          .github/scripts/apt-install.sh pkg-config bison flex glslang-tools \
+            python3-mako python3-yaml python3-packaging \
+            llvm-20-dev clang-20 libclang-20-dev libclang-cpp20-dev libpolly-20-dev \
+            libllvmspirvlib-20-dev llvm-spirv-20 libclc-20-dev spirv-tools \
+            libdrm-dev libelf-dev libexpat1-dev zlib1g-dev libzstd-dev \
+            libgtest-dev libvulkan-dev
+          python3 -m pip install --break-system-packages "meson==1.11.2" ninja
+          # Mesa builds outside the checkout, on the runner's default
+          # toolchain, not the one rust-toolchain.toml pins
+          if [ "$CARGO_BIN_HIT" != true ]; then
+            cd "$RUNNER_TEMP" && cargo install --locked bindgen-cli@0.71.1 cbindgen@0.28.0
+          fi
+      - name: Build NVK, the drm-shim and NAK's tests
+        if: steps.tree.outputs.skip == 'false' && steps.cache.outputs.cache-hit != 'true'
+        env:
+          TREE: ${{ steps.tree.outputs.tree }}
+          WORK_DIR: ${{ runner.temp }}/nak-work
+          LLVM_CONFIG: /usr/lib/llvm-20/bin/llvm-config
+        run: .github/scripts/nak-build.sh "$TREE" "$RUNNER_TEMP/nak-build"
+      - name: NAK unit tests
+        # The hardware tests need a GPU, the nvdisasm ones NVIDIA's disassembler
+        if: steps.tree.outputs.skip == 'false' && matrix.side == 'head'
+        run: '"$RUNNER_TEMP/nak-build/nak-tests" --skip hw_tests:: --skip nvdisasm_tests::'
+      - name: Pack
+        if: steps.tree.outputs.skip == 'false'
+        # a tar keeps the executable bits an artifact would drop
+        run: tar -C "$RUNNER_TEMP" -cf "$RUNNER_TEMP/nak-build.tar" nak-build
+      - uses: actions/upload-artifact@v7
+        if: steps.tree.outputs.skip == 'false'
+        with:
+          name: nak-build-${{ matrix.side }}
+          path: ${{ runner.temp }}/nak-build.tar
+          retention-days: 3
+          if-no-files-found: error
+
+  nak-shaders:
+    # The corpus: guest/nvk-rm/tests/nak-corpus and the other GLSL tests in
+    # guest/nvk-rm/tests, and the built-in GLSL shaders of the pinned DXVK and
+    # vkd3d-proton (compiled here, not stored); no game or benchmark shaders.
+    # On GB202 and AD102; fails when NAK fails a shader (also with
+    # NAK_DEBUG=spill), or a shader of our own is not valid GLSL.
+    needs: nak-build
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - name: DXVK and vkd3d-proton sources (shallow, at the submodule pins)
+        run: |
+          for sub in dxvk vkd3d-proton; do
+            path=guest/windows/third_party/$sub
+            url=$(git config -f .gitmodules --get "submodule.$path.url")
+            rev=$(git ls-tree HEAD "$path" | awk '{print $3}')
+            dir=$RUNNER_TEMP/src/$sub
+            git init -q "$dir"
+            timeout 600 git -C "$dir" fetch -q --depth 1 --no-tags "$url" "$rev"
+            git -C "$dir" checkout -q --detach FETCH_HEAD
+            echo "$sub $rev"
+          done
+      - name: Runtime dependencies
+        run: .github/scripts/apt-install.sh glslang-tools libvulkan1 libelf1t64 libdrm2 libexpat1 libzstd1
+      - uses: actions/download-artifact@v8
+        with:
+          name: nak-build-head
+          path: ${{ runner.temp }}/head
+      - uses: actions/download-artifact@v8
+        # absent when the base has no series or its build failed
+        continue-on-error: true
+        with:
+          name: nak-build-base
+          path: ${{ runner.temp }}/base
+      - name: Compile the corpus
+        env:
+          OUT_DIR: ${{ runner.temp }}/nak-shaders
+          DXVK_DIR: ${{ runner.temp }}/src/dxvk
+          VKD3D_DIR: ${{ runner.temp }}/src/vkd3d-proton
+        run: |
+          tar -C "$RUNNER_TEMP/head" -xf "$RUNNER_TEMP/head/nak-build.tar"
+          base=()
+          if [ -f "$RUNNER_TEMP/base/nak-build.tar" ]; then
+            tar -C "$RUNNER_TEMP/base" -xf "$RUNNER_TEMP/base/nak-build.tar"
+            base=("$RUNNER_TEMP/base/nak-build")
+          fi
+          .github/scripts/nak-shaders.sh "$RUNNER_TEMP/head/nak-build" "${base[@]}"
+      - uses: actions/upload-artifact@v7
+        if: ${{ !cancelled() }}
+        with:
+          name: nak-shaders
+          path: |
+            ${{ runner.temp }}/nak-shaders/*.txt
+            ${{ runner.temp }}/nak-shaders/*.md
+            ${{ runner.temp }}/nak-shaders/glslang
+          retention-days: 14
+          if-no-files-found: warn
+
   packaging:
     runs-on: ubuntu-24.04
     steps:
@@ -328,6 +503,8 @@ jobs:
             packaging/tarball/*.sh packaging/deb/*/* \
             guest/system/conduit-guest-setup cli/assets/build-disk.sh \
             .github/scripts/check-patches.sh guest/nvk-rm/series.sh \
+            .github/scripts/apt-install.sh .github/scripts/nak-build.sh .github/scripts/nak-shaders.sh \
+            guest/nvk-rm/tools/nak-offline/run-objects.sh \
             packaging/common/icons.sh packaging/test/icons.sh \
             packaging/bios/build.sh packaging/bios/install.sh \
             packaging/bios/fetch-src.sh packaging/bios/vms-using-bios packaging/test/bios-vms.sh
