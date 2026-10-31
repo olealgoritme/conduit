@@ -171,9 +171,19 @@ VF_REL = {"dev_vm.h"}
 VF_FULL_PHYS = 0xb80000
 
 
+# Array sizes the published headers leave out (falcon IMEM/DMEM ports:
+# 4 IMEM and 8 DMEM port register sets; IMEMC(4) would be DMEMC(0)).
+KNOWN_SIZES = {"NV_PFALCON_FALCON_IMEMC": 4, "NV_PFALCON_FALCON_IMEMD": 4,
+               "NV_PFALCON_FALCON_IMEMT": 4, "NV_PFALCON_FALCON_DMEMC": 8,
+               "NV_PFALCON_FALCON_DMEMD": 8}
+
+
 def _header_regs(text):
-    """Yield (name, offset) for every register / array element in a header."""
-    sizes = {}
+    """Yield (name, offset, guessed) for every register / array element in a
+    header. guessed: an element beyond index 0 of an array whose __SIZE_1 the
+    header does not give (expanded to 16 at most); such names only fill
+    offsets no definite register claims (IMEMC(4) must not hide DMEMC(0))."""
+    sizes = {(n, 1): v for n, v in KNOWN_SIZES.items()}
     for line in text.splitlines():
         m = RE_SIZE.match(line)
         if m:
@@ -181,7 +191,7 @@ def _header_regs(text):
     for line in text.splitlines():
         m = RE_REG.match(line)
         if m:
-            yield m.group(1), int(m.group(2), 16)
+            yield m.group(1), int(m.group(2), 16), False
             continue
         m = RE_ARR.match(line)
         if not m:
@@ -191,6 +201,8 @@ def _header_regs(text):
         strides = {v: int(st, 0) for v, st in RE_TERM.findall(m.group(4))}
         if len(params) not in (1, 2) or any(p not in strides for p in params):
             continue
+        known1 = (name, 1) in sizes
+        known2 = len(params) == 1 or (name, 2) in sizes
         n1 = min(sizes.get((name, 1), 16), 4096)
         n2 = min(sizes.get((name, 2), 1), 256) if len(params) == 2 else 1
         for i in range(n1):
@@ -200,15 +212,18 @@ def _header_regs(text):
                 if len(params) == 2:
                     off += j * strides[params[1]]
                     label = f"{name}({i},{j})"
-                yield label, off
+                yield label, off, (i and not known1) or (j and not known2)
 
 
 def parse_regs(tree):
     regs = {}
     ranges = []
+    later = []                  # guessed array elements, added last
 
-    def add(off, name, src):
-        if 0 <= off < (1 << 26):
+    def add(off, name, src, guessed=False):
+        if guessed:
+            later.append((off, name, src))
+        elif 0 <= off < (1 << 26):
             regs.setdefault(off, [name, src])
 
     for d in ARCH_DIRS:
@@ -224,24 +239,32 @@ def parse_regs(tree):
                     hi, lo = int(m.group(2), 16), int(m.group(3), 16)
                     if lo <= hi < (1 << 26):
                         ranges.append([lo, hi, m.group(1), src])
-            for name, off in _header_regs(text):
+            for name, off, gs in _header_regs(text):
                 if fname in FALCON_REL:
                     prefix, extra, infix = FALCON_REL[fname]
                     if not name.startswith(prefix) or off >= 0x1000:
                         continue
                     for unit, base in FALCONS:
                         add(base + extra + off,
-                            f"NV_P{unit}_{infix}{name[len(prefix):]}", src)
+                            f"NV_P{unit}_{infix}{name[len(prefix):]}", src, gs)
                 elif fname in PCFG_REL:
                     if off < 0x1000:
-                        add(PCFG_BASE + off, "NV_PCFG+" + name, src)
+                        add(PCFG_BASE + off, "NV_PCFG+" + name, src, gs)
                 elif fname in VF_REL:
                     if off < 0x40000:
-                        add(VF_FULL_PHYS + off, name + "@FULL_PHYS", src)
+                        add(VF_FULL_PHYS + off, name + "@FULL_PHYS", src, gs)
                     else:
-                        add(off, name, src)
+                        add(off, name, src, gs)
                 else:
-                    add(off, name, src)
+                    add(off, name, src, gs)
+    for off, name, src in later:
+        add(off, name, src)
+    # falcon RTOS message queue registers (GSP/SEC/PWR headers omit them;
+    # same layout as NV_PFSP_MSGQ_HEAD/TAIL)
+    for unit, base in FALCONS:
+        for i in range(8):
+            add(base + 0xc80 + 8 * i, f"NV_P{unit}_MSGQ_HEAD({i})", "falcon")
+            add(base + 0xc84 + 8 * i, f"NV_P{unit}_MSGQ_TAIL({i})", "falcon")
     seen = set()
     uniq = []
     for lo, hi, name, src in ranges:

@@ -545,6 +545,97 @@ class EndToEnd(unittest.TestCase):
         finally:
             run.cleanup()
 
+    def test_gsp_rtos_queues(self):
+        """COT without GSP-RM boot args (Windows): GSP RTOS DMEM queues, the
+        sysmem buffer a command names (before and after the reply), and the
+        print buffer read through DMEM port 1."""
+        G = BAR0 + 0x110000
+        BOOTP, BUF = 0x3000000, 0x4000000
+        run = Run("rtos", {"x-nvtrace": True, "x-nvtrace-file": "@TRACE"},
+                  env={"NVTRACE_GSP_DMEM_LOG": "1"}, trace_name="trace.nvt.gz")
+        g, q = run.g, run.q
+
+        def gsp_write(addr, words):         # the "GSP" itself: port 2
+            q.writel(G + 0x1d0, (1 << 24) | addr)
+            for v in words:
+                q.writel(G + 0x1d4, v)
+
+        def rm_read(addr, n):               # the driver: port 0, AINCR
+            q.writel(G + 0x1c0, (1 << 25) | addr)
+            return [q.readl(G + 0x1c4) for _ in range(n)]
+        try:
+            g.setup_pci()
+            q.mem(BOOTP, b"\0" * 88)          # boot params without GSP-RM
+            cot = struct.pack("<HHQQIQI", 2, 860, 0x5000000, 0x6000000,
+                              0x100000, 0x2000000, 0x100000)
+            cot += b"\0" * (852 - len(cot)) + struct.pack("<Q", BOOTP)
+            pkt = struct.pack("<II", 0xC0000001,
+                              0x7e | (0x10de << 8) | (0x14 << 24)) + cot
+            q.writel(BAR0 + 0x8f2ac0, 1 << 24)
+            for i in range(0, len(pkt), 4):
+                q.writel(BAR0 + 0x8f2ac4, struct.unpack_from("<I", pkt, i)[0])
+            q.writel(BAR0 + 0x8f2c04, len(pkt) - 4)
+            q.writel(BAR0 + 0x8f2c00, 0)
+            # RTOS INIT event + print buffer (trailer at 0x37ff0)
+            gsp_write(0x36f00, [0x00042002, 0x02000200, 0x00036f80, 0x80,
+                                0x00036f00, 0x01000080])
+            text = b"rm_proxy: hello.\0"
+            text += b"\0" * (-len(text) % 4)
+            gsp_write(0x37000, list(struct.unpack(f"<{len(text) // 4}I", text)))
+            gsp_write(0x37ff0, [0, len(text), 0xff0, 0xf007ba11])
+            q.writel(G + 0xc84, 0x36f00)
+            q.readl(G + 0xc84)
+            rm_read(0x36f00, 6)
+            q.writel(G + 0xc84, 0x36f18)
+            rm_read(0x37ff0, 4)                       # print trailer
+            # a command naming an 8 KiB sysmem buffer
+            q.mem(BUF, b"\x5a" * 0x2000)
+            q.writel(G + 0xc00, 0x36f80)
+            q.writel(G + 0x1c0, (1 << 24) | 0x36f80)
+            for v in [0x0101140f, 5, BUF, 0x94000000, 0x2000]:
+                q.writel(G + 0x1c4, v)
+            q.writel(G + 0xc00, 0x36f94)
+            time.sleep(0.2)
+            # GSP: buffer changed, reply, more log text
+            q.mem(BUF + 0x100, b"\xa5" * 16)
+            gsp_write(0x36f18, [0x0100140f, 5, 0, 0, 0])
+            more = b"rm_proxy: second.\0\0\0"
+            gsp_write(0x37000 + len(text),
+                      list(struct.unpack(f"<{len(more) // 4}I", more)))
+            gsp_write(0x37ff4, [len(text) + len(more)])
+            rm_read(0x36f18, 5)
+            q.writel(G + 0xc84, 0x36f2c)
+            time.sleep(0.3)
+        finally:
+            run.finish()
+        try:
+            recs = run.records()
+            n = "\n".join(notes(recs))
+            self.assertIn("no GSP-RM boot args", n)
+            self.assertNotIn("RAM scan", n)
+            self.assertIn("print buffer trailer at DMEM 0x37ff0", n)
+            self.assertNotIn("capture off", n)
+            snaps = {r.f["label"]: r for r in by_type(recs, md.T_DMA_SNAP)}
+            c = snaps.get("fq:c1.0")
+            self.assertTrue(c, n)
+            self.assertEqual((c.f["gpa"], c.f["len"]), (BUF, 0x2000))
+            self.assertEqual(c.data, b"\x5a" * 0x2000)
+            r = snaps.get("fq:r1.0")
+            self.assertTrue(r, n)
+            self.assertTrue(r.f["sflags"] & md.SNAP_CHANGED)
+            self.assertEqual(r.data[0x100:0x110], b"\xa5" * 16)
+            prints = b"".join(x.data for x in by_type(recs, md.T_DMA_SNAP)
+                              if x.f["label"] == "GSPDMEM:print")
+            self.assertIn(b"rm_proxy: hello.", prints)
+            self.assertIn(b"rm_proxy: second.", prints)
+            # the decoder sees the same from the MMIO records
+            fq = md.falcon_scan(recs)[0x110000]
+            self.assertTrue(fq.init)
+            self.assertEqual([(e["kind"], e["seqnum"]) for e in fq.events],
+                             [("msg", 0), ("cmd", 1), ("msg", 1)])
+        finally:
+            run.cleanup()
+
     def test_follow_rpc_buffers(self):
         """Buffers named by GSP RPCs are captured: ALLOC_MEMORY pages, channel
         USERD (re-read on the usermode doorbell), display pushbuffer (logged

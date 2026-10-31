@@ -242,6 +242,18 @@ ring), `MaxFileMB` 4096, `HookCallbacks` 1, `HookVidPn` 1, `LogRegistry` 1,
 `BootStart` 0, `Mute` (multi-string of slot names), `MaxFails` 2,
 `HealthySeconds` 90.
 
+`install.cmd` writes one of two profiles (and resets `FailCount`):
+
+| Profile | Start | `RingKB` | `TotalRingMB` | `MaxFails` | `HealthySeconds` | For |
+|---|---|---|---|---|---|---|
+| `install.cmd` (normal) | system | 8192 | 256 | 2 | 90 | everyday use: two loads that do not reach 90 s of uptime disable nvddi |
+| `install.cmd boot` (capture) | boot | 32768 | 512 | 50 | 15 | unattended capture runs: no ring drops during bring-up (8 MB rings dropped records at boot), and quick reboot cycles do not trip the guard |
+
+The capture profile keeps the hard guard: a failing hooked
+`DxgkDdiStartDevice` still sets `FailCount` to `MaxFails` at once, and safe
+mode never loads nvddi. Running `install.cmd` without `boot` returns to the
+normal profile.
+
 `nvddictl`: `status | start | stop | flush | level N | mute NAME | unmute NAME |
 mark TEXT | reset | enable | disable`.
 

@@ -2,10 +2,16 @@
 # switch.sh vm   : stop the desktop (display manager), give the RTX 5090 to vfio-pci, boot nvcap (vm.sh).
 #                  Any failure before the VM is up restores the desktop on its own.
 # switch.sh host : shut nvcap down, give the 5090 back to the NVIDIA driver, start the display manager.
+#                  The monitor is then turned off on the login screen (DPMS), so an
+#                  unattended run leaves it dark; NVCAP_MONITOR_OFF=0 skips that.
 # Run as root. Log: /run/nvcap/switch.log
+# Env: NVCAP_HOST_USER (owner of the SSH key; default: owner of $N),
+#      NVCAP_GUEST_USER (default "Ole Algoritme")
 set -u
 GPU=0000:01:00.0 AUD=0000:01:00.1
-N=/steam/conduit-scratch/nvcap R=/run/nvcap
+N=${NVCAP_DIR:-/steam/conduit-scratch/nvcap} R=/run/nvcap
+HUSER=${NVCAP_HOST_USER:-$(stat -c %U "$N")}
+GUSER=${NVCAP_GUEST_USER:-Ole Algoritme}
 mkdir -p $R
 exec >>$R/switch.log 2>&1
 log() { echo "[$(date +%T)] $*"; }
@@ -15,7 +21,7 @@ nv_users() { fuser /dev/nvidia0 /dev/nvidiactl /dev/nvidia-modeset /dev/nvidia-u
 to_host() {
 	log "to host"
 	if pid=$(cat $R/qemu.pid 2>/dev/null) && kill -0 "$pid" 2>/dev/null; then
-		timeout 10 sudo -u xuw ssh -o BatchMode=yes -o ConnectTimeout=5 -p 2223 "Ole Algoritme@127.0.0.1" "shutdown /s /t 0" >/dev/null 2>&1 ||
+		timeout 10 sudo -u "$HUSER" ssh -o BatchMode=yes -o ConnectTimeout=5 -p 2223 "$GUSER@127.0.0.1" "shutdown /s /t 0" >/dev/null 2>&1 ||
 			echo '{"execute":"qmp_capabilities"}{"execute":"system_powerdown"}' | timeout 5 socat - UNIX-CONNECT:$R/qmp.sock >/dev/null 2>&1
 		for i in $(seq 120); do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
 		kill -0 "$pid" 2>/dev/null && { log "qemu still up after 120 s: quit"; kill "$pid"; sleep 3; kill -9 "$pid" 2>/dev/null; }
@@ -31,6 +37,23 @@ to_host() {
 	nvidia-smi -L || log "nvidia-smi failed"
 	systemctl start display-manager
 	log "display manager started"
+	[ "${NVCAP_MONITOR_OFF:-1}" = 1 ] && monitor_off
+}
+
+# DPMS off on the display manager's X server (SDDM greeter), at most 30 s of
+# waiting for its X authority; it stays off until the next input.
+monitor_off() {
+	local i a
+	for i in $(seq 15); do
+		sleep 2
+		for a in /var/run/sddm/* /run/sddm/*; do
+			[ -f "$a" ] || continue
+			if DISPLAY=:0 XAUTHORITY=$a timeout 5 xset dpms force off 2>/dev/null; then
+				log "monitor off (DPMS, $a)"; return 0
+			fi
+		done
+	done
+	log "monitor off: no X authority under /run/sddm after 30 s (not an X greeter?)"
 }
 
 to_vm() {
@@ -60,7 +83,7 @@ to_vm() {
 	if ! kill -0 "$(cat $R/qemu.pid)" 2>/dev/null; then log "FAIL: qemu exited: $(tail -5 $R/qemu.log)"; to_host; return 1; fi
 	log "qemu pid $(cat $R/qemu.pid) up"
 	for i in $(seq 60); do
-		timeout 8 sudo -u xuw ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=no -p 2223 "Ole Algoritme@127.0.0.1" "echo up" 2>/dev/null | grep -q up && { log "SSH up after $((i*5)) s"; return 0; }
+		timeout 8 sudo -u "$HUSER" ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=no -p 2223 "$GUSER@127.0.0.1" "echo up" 2>/dev/null | grep -q up && { log "SSH up after $((i*5)) s"; return 0; }
 		kill -0 "$(cat $R/qemu.pid)" 2>/dev/null || { log "FAIL: qemu died: $(tail -5 $R/qemu.log)"; to_host; return 1; }
 		sleep 5
 	done

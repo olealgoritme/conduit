@@ -1,0 +1,506 @@
+From c46abcc19fd78b3115de107d4e05589f6bc342ac Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Sat, 31 Oct 2026 23:14:27 +0100
+Subject: [PATCH] vfio: nvtrace - GSP RTOS DMEM queues (GSP without GSP-RM)
+
+The Windows driver boots the GSP through the FSP chain of trust without
+GSP-RM boot args: the GSP runs a falcon-style RTOS (GSP-RM-Proxy) and RM
+stays on the CPU. Detect that at COT, stop the futile queue RAM scans,
+mirror the DMEM port-0 accesses, follow the sysmem buffers named in RTOS
+commands (snapshot at submit, again at the reply when changed) and read
+the RTOS print buffer through DMEM port 1 (unused by the driver).
+---
+ hw/vfio/nvtrace.c | 395 +++++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 393 insertions(+), 2 deletions(-)
+
+diff --git a/hw/vfio/nvtrace.c b/hw/vfio/nvtrace.c
+index 439a65491..ff2ec7f7c 100644
+--- a/hw/vfio/nvtrace.c
++++ b/hw/vfio/nvtrace.c
+@@ -678,6 +678,20 @@ static bool nvt_is_ram(AddressSpace *as, uint64_t gpa)
+ #define NV_PGSP_FALCON_MAILBOX0   0x110040
+ #define NV_PGSP_FALCON_MAILBOX1   0x110044
+ #define NV_PGSP_QUEUE_HEAD0       0x110c00
++/* falcon RTOS (GSP without GSP-RM, e.g. the Windows GSP-RM-Proxy) */
++#define NV_PGSP_DMEMC0            0x1101c0   /* OFFS/BLK 23:2, AINCW 24, AINCR 25 */
++#define NV_PGSP_DMEMD0            0x1101c4
++#define NV_PGSP_DMEMC1            0x1101c8   /* port 1: never used by the driver */
++#define NV_PGSP_DMEMD1            0x1101cc
++#define NV_PGSP_MSGQ_HEAD0        0x110c80
++#define NV_PGSP_MSGQ_TAIL0        0x110c84
++#define NVT_DMEM_BYTES            (1u << 20)
++#define FLCN_PRINT_MAGIC          0xf007ba11u
++#define NVT_FQ_RUNS               4
++#define NVT_FQ_REFS               16
++#define NVT_FQ_SNAP_DEFAULT       (16 * 1024)
++#define NVT_FQ_SNAP_SYNC_MAX      (256 * 1024)
++#define NVT_FQ_PRINT_MAX          (64 * 1024)
+ #define NV_PFSP_EMEMC0            0x8f2ac0
+ #define NV_PFSP_EMEMD0            0x8f2ac4
+ #define NV_PFSP_QUEUE_HEAD0       0x8f2c00
+@@ -790,6 +804,10 @@ typedef struct NvtBarTrack {
+     uint64_t overflow, dropped, readfail, emitted, ticks;
+ } NvtBarTrack;
+ 
++typedef struct NvtRun {
++    uint32_t lo, hi;           /* DMEM byte range [lo, hi) */
++} NvtRun;
++
+ typedef struct NvtGsp {
+     QemuMutex lock;
+     bool known;
+@@ -844,6 +862,31 @@ typedef struct NvtGsp {
+     uint64_t watch_hot_ns, watch_all_ns;
+     NvtWatchCursor watch_cur;
+     NvtDispChn disp[NVT_DISP_CHN];
++
++    /*
++     * GSP without GSP-RM (COT without GSP-RM boot args): a falcon-style RTOS
++     * whose command/message queues live in GSP DMEM and are accessed through
++     * DMEMC/DMEMD(0). The mirror holds what the guest wrote or read there.
++     */
++    bool proxy;
++    uint32_t *dmem;
++    uint32_t dmemc;
++    bool dm_aincw, dm_aincr;
++    uint32_t qhead, mtail;
++    bool qhead_valid, mtail_valid;
++    NvtRun wrun[NVT_FQ_RUNS], rrun[NVT_FQ_RUNS];
++    int nwrun, nrrun;
++    struct {
++        uint8_t seqnum;
++        uint32_t cmd, len;
++        uint64_t gpa, hash;
++        int idx;
++    } fref[NVT_FQ_REFS];
++    int nfref;
++    uint32_t fq_cmds, fq_msgs;
++    bool print_known, print_off;
++    uint32_t print_hdr, print_put, print_size;
++    bool print_seen;
+ } NvtGsp;
+ 
+ struct NvTraceDev {
+@@ -868,6 +911,8 @@ struct NvTraceDev {
+     uint64_t bar1_size, fw_max;
+     bool bar0_trapped;
+     uint64_t fw_hash[8];
++    bool dmem_log;             /* NVTRACE_GSP_DMEM_LOG */
++    QEMUTimer *print_timer;
+ };
+ 
+ static uint8_t nvt_dev_index(NvTraceDev *d)
+@@ -3035,6 +3080,24 @@ static bool gsp_discover_from_fmc(NvTraceDev *d, uint64_t fmc_pa,
+     }
+     memcpy(&wpr, fmc + 16, 8);   /* bootGspRmParams.gspRmDescOffset */
+     memcpy(&libos, fmc + 48, 8); /* gspRmParams.bootArgsOffset */
++    if (!libos && source == 1) {
++        /*
++         * The FMC is booted without GSP-RM (the Windows driver keeps RM on
++         * the CPU): the GSP runs an RTOS driven through DMEM queues. Nothing
++         * to discover in sysmem; follow the DMEM queues instead.
++         */
++        nvt_snap(d, fmc_pa, NVT_PAGE, "GSP_FMC_BOOT_PARAMS");
++        if (!d->g.proxy) {
++            nvtrace_note(d, "gsp: 0x%" PRIx64 ": no GSP-RM boot args "
++                         "(bootArgsOffset 0): the GSP runs an RTOS "
++                         "(GSP-RM-Proxy), RM runs on the CPU; following its "
++                         "DMEM queues (no GSP RPCs, no GSP-RM log buffers; "
++                         "NVTRACE_VRAM has no RPC inputs)", fmc_pa);
++        }
++        d->g.proxy = true;
++        d->g.need_scan = false;
++        return false;
++    }
+     if (!libos || !nvt_is_ram(d->as, libos)) {
+         nvtrace_note(d, "gsp: 0x%" PRIx64 " does not look like "
+                      "GSP_FMC_BOOT_PARAMS (bootArgsOffset 0x%" PRIx64 ")",
+@@ -3396,11 +3459,327 @@ static void gsp_resolve_candidates(NvTraceDev *d)
+     }
+ }
+ 
++
++/* ---- GSP RTOS DMEM queues (GSP without GSP-RM) ---- */
++
++static void fq_run_add(NvtRun *runs, int *n, uint32_t addr)
++{
++    if (*n && runs[*n - 1].hi == addr) {
++        runs[*n - 1].hi = addr + 4;
++        return;
++    }
++    if (*n == NVT_FQ_RUNS) {
++        memmove(runs, runs + 1, (NVT_FQ_RUNS - 1) * sizeof(*runs));
++        (*n)--;
++    }
++    runs[*n].lo = addr;
++    runs[*n].hi = addr + 4;
++    (*n)++;
++}
++
++/*
++ * Sysmem buffers named in a command body: a 4 KiB aligned low word followed
++ * by a high word whose bits 23:8 are clear (7:0 = address 39:32, the top
++ * byte carries flags), optionally followed by a 4 KiB multiple <= 64 MiB as
++ * the size. Same heuristic as mmiodump.py flcn_dma_refs().
++ */
++static void fq_follow_cmd(NvTraceDev *d, const uint32_t *w, unsigned n,
++                          uint8_t seqnum)
++{
++    NvtGsp *g = &d->g;
++    unsigned i;
++    int found = 0;
++    uint64_t used = 0;          /* bit i: word i was a high word or a size */
++
++    for (i = 0; i + 1 < n && i < 61 && found < 4; i++) {
++        uint32_t lo = w[i], hi = w[i + 1], size = 0;
++        uint64_t gpa;
++        char label[24];
++
++        if ((used >> i & 1) || !lo || (lo & 0xfff) || (hi & 0x00ffff00)) {
++            continue;
++        }
++        gpa = ((uint64_t)(hi & 0xff) << 32) | lo;
++        if (gpa < 0x1000000 || !nvt_is_ram(d->as, gpa)) {
++            continue;
++        }
++        used |= 1ull << (i + 1);
++        if (i + 2 < n && w[i + 2] && !(w[i + 2] & 0xfff) &&
++            w[i + 2] <= (64u << 20)) {
++            size = w[i + 2];
++            used |= 1ull << (i + 2);
++        }
++        snprintf(label, sizeof(label), "fq:c%u.%d", g->fq_cmds, found);
++        if (size > NVT_FQ_SNAP_SYNC_MAX) {
++            fw_queue(d, gpa, size, label, false);    /* poller dumps it */
++        } else {
++            uint32_t len = size ? size : NVT_FQ_SNAP_DEFAULT;
++            g_autofree uint8_t *buf = g_malloc(len);
++            NvtSnap sn = { .gpa = gpa, .len = len };
++
++            pstrcpy(sn.label, sizeof(sn.label), label);
++            if (!nvt_gread(d->as, gpa, buf, len)) {
++                sn.flags = NVT_SNAP_F_NODATA;
++                nvt_emit(d, NVT_REC_DMA_SNAP, 0, &sn, sizeof(sn), NULL, 0);
++            } else {
++                nvt_emit(d, NVT_REC_DMA_SNAP, 0, &sn, sizeof(sn), buf, len);
++                if (g->nfref == NVT_FQ_REFS) {
++                    memmove(g->fref, g->fref + 1,
++                            (NVT_FQ_REFS - 1) * sizeof(g->fref[0]));
++                    g->nfref--;
++                }
++                g->fref[g->nfref].seqnum = seqnum;
++                g->fref[g->nfref].cmd = g->fq_cmds;
++                g->fref[g->nfref].idx = found;
++                g->fref[g->nfref].gpa = gpa;
++                g->fref[g->nfref].len = len;
++                g->fref[g->nfref].hash = nvt_hash(buf, len);
++                g->nfref++;
++            }
++        }
++        found++;
++    }
++}
++
++/* The reply to a command: re-read the buffers it named, log what changed. */
++static void fq_follow_msg(NvTraceDev *d, uint8_t seqnum)
++{
++    NvtGsp *g = &d->g;
++    int i = 0;
++
++    while (i < g->nfref) {
++        typeof(g->fref[0]) *f = &g->fref[i];
++        g_autofree uint8_t *buf = NULL;
++
++        if (f->seqnum != seqnum) {
++            i++;
++            continue;
++        }
++        buf = g_malloc(f->len);
++        if (nvt_gread(d->as, f->gpa, buf, f->len) &&
++            nvt_hash(buf, f->len) != f->hash) {
++            NvtSnap sn = { .gpa = f->gpa, .len = f->len,
++                           .flags = NVT_SNAP_F_CHANGED };
++
++            snprintf(sn.label, sizeof(sn.label), "fq:r%u.%d", f->cmd, f->idx);
++            nvt_emit(d, NVT_REC_DMA_SNAP, 0, &sn, sizeof(sn), buf, f->len);
++        }
++        memmove(f, f + 1, (g->nfref - i - 1) * sizeof(*f));
++        g->nfref--;
++    }
++}
++
++/*
++ * Walk RM_FLCN_QUEUE_HDR records (u8 unitId, size, ctrlFlags, seqNumId) in
++ * the runs that make up one queue update: the run that starts at the old
++ * pointer, and after a rewind (new < old) the run that ends at the new one.
++ */
++static void fq_walk(NvTraceDev *d, NvtRun *runs, int n, uint32_t old,
++                    bool old_valid, uint32_t new, bool cmd)
++{
++    NvtGsp *g = &d->g;
++    int k;
++
++    for (k = 0; k < n; k++) {
++        uint32_t a = runs[k].lo, end = runs[k].hi;
++
++        if (old_valid && a != old && !(new < old && end == new)) {
++            continue;
++        }
++        while (a + 4 <= end && a + 4 <= NVT_DMEM_BYTES) {
++            uint32_t h = g->dmem[a / 4];
++            uint8_t unit = h & 0xff, size = (h >> 8) & 0xff;
++
++            if (!unit || size < 4 || a + size > end) {
++                break;          /* rewind marker or incomplete */
++            }
++            if (cmd) {
++                g->fq_cmds++;
++                if (d->follow) {
++                    fq_follow_cmd(d, &g->dmem[a / 4 + 1], (size - 4) / 4,
++                                  h >> 24);
++                }
++            } else {
++                g->fq_msgs++;
++                fq_follow_msg(d, h >> 24);
++            }
++            a += (size + 3) & ~3u;
++        }
++    }
++}
++
++static void fq_dmemd(NvTraceDev *d, uint32_t val, bool write)
++{
++    NvtGsp *g = &d->g;
++    uint32_t a = g->dmemc;
++
++    if (g->dmem && a < NVT_DMEM_BYTES) {
++        g->dmem[a / 4] = val;
++        if (write) {
++            fq_run_add(g->wrun, &g->nwrun, a);
++        } else {
++            fq_run_add(g->rrun, &g->nrrun, a);
++        }
++        if (!write && val == FLCN_PRINT_MAGIC && !g->print_known &&
++            a >= 12) {
++            g->print_known = true;
++            g->print_hdr = a - 12;
++            nvtrace_note(d, "gsp: RTOS print buffer trailer at DMEM 0x%x",
++                         g->print_hdr);
++            if (d->print_timer && d->dmem_log && d->log_ms) {
++                timer_mod(d->print_timer,
++                          qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + d->log_ms);
++            }
++        }
++    }
++    if ((write && g->dm_aincw) || (!write && g->dm_aincr)) {
++        g->dmemc = (a + 4) & 0xfffffc;
++    }
++}
++
++/* Returns true when the access was a GSP RTOS queue register. */
++static bool fq_observe(NvTraceDev *d, uint32_t off, uint64_t val, bool write)
++{
++    NvtGsp *g = &d->g;
++
++    switch (off) {
++    case NV_PGSP_DMEMC0:
++        if (write) {
++            if (!g->dmem) {
++                g->dmem = g_try_malloc0(NVT_DMEM_BYTES);
++            }
++            g->dmemc = val & 0xfffffc;
++            g->dm_aincw = (val >> 24) & 1;
++            g->dm_aincr = (val >> 25) & 1;
++        }
++        return true;
++    case NV_PGSP_DMEMD0:
++        fq_dmemd(d, val, write);
++        return true;
++    case NV_PGSP_QUEUE_HEAD0:
++        if (write && g->proxy && g->dmem) {
++            fq_walk(d, g->wrun, g->nwrun, g->qhead, g->qhead_valid, val,
++                    true);
++            g->nwrun = 0;
++        }
++        g->qhead = val;
++        g->qhead_valid = true;
++        return !write;          /* writes also go to the GSP-RM path */
++    case NV_PGSP_MSGQ_TAIL0:
++        if (write && g->dmem && g->mtail_valid && val != g->mtail) {
++            fq_walk(d, g->rrun, g->nrrun, g->mtail, true, val, false);
++            g->nrrun = 0;
++        }
++        g->mtail = val;
++        g->mtail_valid = true;
++        return true;
++    }
++    return false;
++}
++
++/*
++ * The RTOS print buffer (DMEM ring with a trailer 0, put, size, magic):
++ * the driver reads it only now and then. A main-loop timer (BQL held: all
++ * of BAR0 traps, no vCPU touches BAR0 meanwhile) reads the new bytes
++ * through DMEM port 1, which the driver never uses, so its port-0
++ * auto-increment state is untouched. Logged as DMA_SNAP blobs
++ * "GSPDMEM:print" with gpa = DMEM address. Any PRI error turns it off.
++ */
++static bool fq_dmem_read1(NvTraceDev *d, uint32_t addr, uint32_t *buf,
++                          unsigned ndw)
++{
++    uint32_t saved, c = (addr & 0xfffffc) | (1u << 25), v;
++    unsigned i;
++    bool ok = true;
++
++    if (!d->bar0_rw(d->bar_opaque, NV_PGSP_DMEMC1, &saved, 4, false) ||
++        (saved >> 16) == 0xbadf ||
++        !d->bar0_rw(d->bar_opaque, NV_PGSP_DMEMC1, &c, 4, true)) {
++        return false;
++    }
++    for (i = 0; i < ndw && ok; i++) {
++        ok = d->bar0_rw(d->bar_opaque, NV_PGSP_DMEMD1, &v, 4, false) &&
++             (v >> 16) != 0xbadf;
++        buf[i] = v;
++    }
++    saved &= ~(3u << 24);       /* restore the address, no auto-increment */
++    d->bar0_rw(d->bar_opaque, NV_PGSP_DMEMC1, &saved, 4, true);
++    return ok;
++}
++
++static void fq_print_emit(NvTraceDev *d, uint32_t base, uint32_t from,
++                          uint32_t to)
++{
++    uint32_t n = (to - from + 3) / 4;
++    g_autofree uint32_t *buf = g_malloc(n * 4);
++    NvtSnap sn = { .gpa = base + from, .len = n * 4,
++                   .flags = NVT_SNAP_F_BLOB };
++
++    if (!fq_dmem_read1(d, base + from, buf, n)) {
++        d->g.print_off = true;
++        nvtrace_note(d, "gsp: DMEM port 1 read failed: RTOS print buffer "
++                     "capture off");
++        return;
++    }
++    pstrcpy(sn.label, sizeof(sn.label), "GSPDMEM:print");
++    nvt_emit(d, NVT_REC_DMA_SNAP, 0, &sn, sizeof(sn), buf, n * 4);
++}
++
++static void fq_print_tick(void *opaque)
++{
++    NvTraceDev *d = opaque;
++    NvtGsp *g = &d->g;
++    uint32_t t[4], base, put, size;
++    bool ok;
++
++    if (qatomic_read(&d->stop) || g->print_off || !d->bar0_rw ||
++        !d->bar0_trapped) {
++        return;
++    }
++    qemu_mutex_lock(&g->lock);
++    ok = g->print_known && g->proxy;
++    base = g->print_hdr;
++    qemu_mutex_unlock(&g->lock);
++    if (ok) {
++        if (!fq_dmem_read1(d, base, t, 4) || t[3] != FLCN_PRINT_MAGIC ||
++            !t[2] || t[2] > NVT_FQ_PRINT_MAX || t[2] > base || t[1] >= t[2]) {
++            g->print_off = true;
++            nvtrace_note(d, "gsp: RTOS print trailer at DMEM 0x%x not "
++                         "readable through port 1 (0x%x 0x%x 0x%x): print "
++                         "buffer capture off", base, t[1], t[2], t[3]);
++            return;
++        }
++        put = t[1];
++        size = t[2];
++        base -= size;
++        if (!g->print_seen || g->print_size != size) {
++            fq_print_emit(d, base, 0, size);       /* whole buffer once */
++        } else if (put > g->print_put) {
++            fq_print_emit(d, base, g->print_put & ~3u, put);
++        } else if (put < g->print_put) {          /* wrapped */
++            fq_print_emit(d, base, g->print_put & ~3u, size);
++            if (put && !g->print_off) {
++                fq_print_emit(d, base, 0, put);
++            }
++        }
++        g->print_seen = true;
++        g->print_put = put;
++        g->print_size = size;
++    }
++    if (!g->print_off) {
++        timer_mod(d->print_timer,
++                  qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + d->log_ms);
++    }
++}
++
+ static void gsp_observe(NvTraceDev *d, uint32_t off, unsigned size,
+                         uint64_t val, bool write)
+ {
+     NvtGsp *g = &d->g;
+ 
++    if (fq_observe(d, off, val, write)) {
++        return;
++    }
+     switch (off) {
+     case NV_PFSP_EMEMC0:
+         if (write) {
+@@ -3464,7 +3843,7 @@ static void gsp_observe(NvTraceDev *d, uint32_t off, unsigned size,
+         return;
+     }
+     if (off == NV_PGSP_QUEUE_HEAD0) {
+-        if (!g->known) {
++        if (!g->known && !g->proxy) {
+             if (g->ncand > 1) {
+                 gsp_resolve_candidates(d);
+             } else {
+@@ -3967,7 +4346,8 @@ void nvtrace_mmio(NvTraceDev *d, int bar, hwaddr off, unsigned size,
+      */
+     if (bar == 0 && d->gsp_on && origin == NVT_ORIGIN_DIRECT &&
+         (write || off == NV_PFSP_EMEMD0 || off == NV_PFSP_MSGQ_HEAD0 ||
+-         off == NV_PFSP_MSGQ_TAIL0)) {
++         off == NV_PFSP_MSGQ_TAIL0 || off == NV_PGSP_DMEMD0 ||
++         off == NV_PGSP_QUEUE_HEAD0 || off == NV_PGSP_MSGQ_TAIL0)) {
+         qemu_mutex_lock(&d->g.lock);
+         gsp_observe(d, off, size, val, write);
+         qemu_mutex_unlock(&d->g.lock);
+@@ -4055,6 +4435,10 @@ void nvtrace_reset(NvTraceDev *d, int kind)
+         g_byte_array_set_size(d->g.fsp_msg[1], 0);
+         g_byte_array_set_size(d->g.big, 0);
+         d->g.nfw = 0;
++        d->g.proxy = false;
++        d->g.qhead_valid = d->g.mtail_valid = false;
++        d->g.nwrun = d->g.nrrun = d->g.nfref = 0;
++        d->g.print_known = d->g.print_seen = false;
+         watch_clear(d);
+         qemu_mutex_unlock(&d->g.lock);
+     }
+@@ -4080,6 +4464,7 @@ void nvtrace_set_ids(NvTraceDev *d, uint16_t vendor, uint16_t device,
+     if (d->gsp_wanted && vendor == 0x10de &&
+         ((class_code >> 16) == 0x03) && !d->gsp_on) {
+         d->gsp_on = true;
++        d->print_timer = timer_new_ms(QEMU_CLOCK_REALTIME, fq_print_tick, d);
+         gpu_start(d);
+         d->poll_started = true;
+         qemu_thread_create(&d->poll_thread, "nvtrace-gsp", nvt_poll_thread,
+@@ -4202,6 +4587,8 @@ NvTraceDev *nvtrace_attach(const char *name, const char *file,
+     d->trap_mask = trap_mask;
+     d->poll_us = MAX(nvt_env_u64("NVTRACE_GSP_POLL_US", 100), 10);
+     d->log_ms = nvt_env_u64("NVTRACE_GSP_LOG_MS", 1000);
++    /* opt-in: on the RTX 5090 (610.74) DMEM port 1 reads back zeros */
++    d->dmem_log = nvt_env_u64("NVTRACE_GSP_DMEM_LOG", 0) != 0;
+     qemu_mutex_init(&d->g.lock);
+     d->g.fsp_msg[0] = g_byte_array_new();
+     d->g.fsp_msg[1] = g_byte_array_new();
+@@ -4229,6 +4616,10 @@ void nvtrace_detach(NvTraceDev *d)
+     }
+     nvtrace_note(d, "nvtrace: detach %s", d->name);
+     qatomic_set(&d->stop, true);
++    if (d->print_timer) {
++        timer_free(d->print_timer);     /* BQL held */
++        d->print_timer = NULL;
++    }
+     nvt_bt_stop(d, true);
+     gpu_stop(d);
+     if (d->poll_started) {
+-- 
+2.43.0
+

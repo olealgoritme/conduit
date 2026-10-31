@@ -13,6 +13,9 @@ Usage:
                                            control / free / memory) as a
                                            user-space RM client would issue it
   mmiodump.py fsp      TRACE...            FSP packets / messages (COT etc.)
+  mmiodump.py flcn     TRACE... [--hex]    falcon RTOS DMEM queues (GSP without
+                                           GSP-RM: the Windows driver's
+                                           GSP-RM-Proxy), INIT, print buffer
   mmiodump.py boot     TRACE... [--json FILE]
                                            what the device answered until GSP
                                            INIT_DONE: the emulator's fake table
@@ -555,9 +558,11 @@ def describe_fsp(msg):
                   f"frtsSysmem=0x{fsys:x}+0x{fsys_sz:x} "
                   f"frtsVidmemOffset(from end)=0x{fvid:x}+0x{fvid_sz:x} "
                   f"gspBootArgsSysmemOffset=0x{boot:x}")
-    elif t == 0x15 and len(p) >= 8:
-        cmd, err = struct.unpack_from("<II", p, 0)
-        extra += f" command=0x{cmd:x} ({NVDM_TYPES.get(cmd, '?')}) error=0x{err:x}"
+    elif t == 0x15 and len(p) >= 12:
+        # NVDM_PAYLOAD_COMMAND_RESPONSE: taskId, commandNvdmType, errorCode
+        task, cmd, err = struct.unpack_from("<III", p, 0)
+        extra += (f" task={task} command=0x{cmd:x} ({NVDM_TYPES.get(cmd, '?')})"
+                  f" error=0x{err:x}")
     return name, extra
 
 # -------------------------------------------------------------- printing --
@@ -698,8 +703,14 @@ def cmd_summary(a, names):
     lost = [0, 0]
     t0 = t1 = None
     n = 0
+    modeev = []
     for r in iter_records(a.trace):
         n += 1
+        if r.type in (T_GSP_MSG, T_NOTE) or (
+                r.type == T_MMIO and r.f["write"] and r.f["bar"] == 0 and
+                r.f["off"] == 0x110000 + FLCN_QHEAD0):
+            if r.type != T_GSP_MSG or len(modeev) < 4:
+                modeev.append(r)
         t0 = r.ts if t0 is None else t0
         t1 = r.ts
         types[r.name()] += 1
@@ -726,6 +737,7 @@ def cmd_summary(a, names):
     print(f"records: {n}  span: {span:.3f} s  tables: {names.source}")
     if lost[0]:
         print(f"LOST: {lost[0]} records ({lost[1]} bytes)")
+    print("GSP: %s (%s)" % gsp_mode(modeev))
     print("\ndevices:")
     for d, s in sorted(devs.items()):
         print(f"  d{d}: {s}")
@@ -955,8 +967,19 @@ def cmd_rmlog(a, names):
     objs = {}
     order = []
     jout = []
-    recs = (r for r in iter_records(a.trace) if r.type == T_GSP_MSG)
-    for c in rm_calls(names, recs):
+    seen = []
+
+    def recs_():
+        for r in iter_records(a.trace):
+            if r.type == T_GSP_MSG:
+                yield r
+            elif r.type == T_NOTE or (r.type == T_MMIO and r.f["write"] and
+                                      r.f["bar"] == 0 and
+                                      r.f["off"] == 0x110000 + FLCN_QHEAD0):
+                seen.append(r)
+    ncalls = 0
+    for c in rm_calls(names, recs_()):
+        ncalls += 1
         ts = f"{(c['ts'] - t0) / 1e9:12.6f}"
         st = "pending" if c["status"] is None else names.status_name(c["status"])
         lat = f" {c['latency_us']:.0f}us" if c["latency_us"] is not None else ""
@@ -1022,7 +1045,12 @@ def cmd_rmlog(a, names):
             if "out" in c:
                 j["out"] = c["out"].hex()
             jout.append(j)
-    if a.tree:
+    if not ncalls:
+        mode, detail = gsp_mode(seen)
+        print(f"no GSP-RM RPCs in this trace ({detail}).")
+        if mode == "gsp-rtos":
+            print(RM_ON_CPU_HINT)
+    if a.tree and ncalls:
         print("\nobject tree (* = freed):")
         kids = collections.defaultdict(list)
         for h in order:
@@ -1063,10 +1091,17 @@ def cmd_boot(a, names):
     first = None
     done = None
     t0 = None
+    gq = FalconQueues(0x110000, "GSP")
     for r in iter_records(a.trace):
         t0 = r.ts if t0 is None else t0
         if r.type == T_MMIO and r.f["bar"] == 0 and r.f["origin"] in (0, 1):
             off = r.f["off"]
+            if off & ~0xfff == 0x110000:
+                gq.feed(r)
+                if gq.init and not rpcs:
+                    # no GSP-RM: the GSP RTOS INIT message ends the boot
+                    done = r
+                    break
             if r.f["write"]:
                 writes[off] += 1
                 continue
@@ -1087,7 +1122,13 @@ def cmd_boot(a, names):
                     done = r
                     break
         first = first or r
-    print(f"BAR0 reads until {'GSP INIT_DONE at seq ' + str(done.seq) if done else 'end of trace (no INIT_DONE)'}:"
+    mode = "gsp-rtos" if gq.init else ("gsp-rm" if rpcs else "unknown")
+    what = ("GSP RTOS INIT (no GSP-RM: GSP-RM-Proxy DMEM queues)" if gq.init
+            else "GSP INIT_DONE")
+    if not done:
+        print("no GSP INIT_DONE and no GSP RTOS INIT message: the driver did "
+              "not finish booting the GSP in this trace")
+    print(f"BAR0 reads until {what + ' at seq ' + str(done.seq) if done else 'end of trace'}:"
           f" {sum(e['n'] for e in reads.values())} reads of {len(reads)} "
           f"registers, {sum(writes.values())} writes")
     print(f"{'offset':>9} {'register':48s} {'reads':>7}  values (value x count, in order)")
@@ -1102,12 +1143,29 @@ def cmd_boot(a, names):
         name, extra = describe_fsp(msg)
         print(f"  {frst.seq:10d} {'CPU->FSP' if d == 0 else 'FSP->CPU'} "
               f"{name} {extra}")
+    if gq.init:
+        i = gq.init
+        print(f"\nGSP RTOS INIT message (seq {i['seq']}): unit 0x{i['unit']:02x} "
+              f"msgType {i['msgType']}, osDebugEntryPoint 0x{i['osDebugEntryPoint']:x}")
+        for q in i["queues"]:
+            print(f"  queue log {q['log']} phy {q['phy']}: DMEM 0x{q['offset']:x}"
+                  f"+0x{q['size']:x}")
+        print("  falcon queue records until INIT:")
+        for ev in gq.events:
+            print("  " + flcn_line(names, ev, t0))
+        print("  (later GSP RTOS commands: mmiodump.py flcn)")
     print("\nGSP RPCs before INIT_DONE:")
     for r, rpc in rpcs:
         print(f"  {r.seq:10d} {'CMD ' if r.f['queue'] == 0 else 'STAT'} "
               f"{names.rpc_name(rpc['function'])} len={rpc['length']}")
     if a.json:
         out = {"init_done_seq": done.seq if done else None,
+               "mode": mode,
+               "rtos_init": ({k: (v.hex() if isinstance(v, bytes) else v)
+                              for k, v in gq.init.items()}
+                             if gq.init else None),
+               "flcn": [{k: (v.hex() if isinstance(v, bytes) else v)
+                         for k, v in ev.items()} for ev in gq.events],
                "reads": {f"0x{off:x}": {"name": names.reg(off), "n": e["n"],
                                         "values": [[f"0x{v:x}", n]
                                                    for v, n in e["vals"]]}
@@ -1120,6 +1178,285 @@ def cmd_boot(a, names):
                          "params": p["params"].hex()} for r, p in rpcs]}
         with open(a.json, "w") as f:
             json.dump(out, f, indent=1)
+
+# ------------------------------------------------------- falcon RTOS queues --
+#
+# Without GSP-RM (the Windows driver keeps RM on the CPU) the GSP runs a
+# falcon-style RTOS ("GSP-RM-Proxy") and RM talks to it the pre-GSP way:
+# commands and messages are RM_FLCN_QUEUE_HDR-framed records in the falcon's
+# DMEM, written/read through the DMEMC/DMEMD PRI ports, with
+# QUEUE_HEAD/TAIL(i) (command queues) and MSGQ_HEAD/TAIL (message queue) as
+# DMEM offsets. All of it is BAR0 traffic, so it is rebuilt from MMIO records.
+
+FALCON_BASES = {0x110000: "GSP", 0x840000: "SEC2", 0x10a000: "PMU"}
+FLCN_DMEMC0 = 0x1c0                 # DMEMC(i) = 0x1c0 + 8i, DMEMD(i) = +4
+FLCN_QHEAD0, FLCN_MSGQ_HEAD, FLCN_MSGQ_TAIL = 0xc00, 0xc80, 0xc84
+FLCN_PRINT_MAGIC = 0xf007ba11       # print buffer trailer: 0, put, size, magic
+FLCN_F_STATUS, FLCN_F_EVENT = 0x01, 0x04
+FLCN_UNIT_REWIND = 0x00
+
+
+def flcn_dma_refs(words):
+    """(index, address, size) of plausible sysmem buffer references in a
+    command body: a 4 KiB aligned low word followed by a high word whose bits
+    23:8 are clear (bits 7:0 = address 39:32, the top byte carries flags);
+    size = the next word if it is a 4 KiB multiple up to 64 MiB. The same
+    heuristic as the tracer's DMA follow (snapshots labelled fq:...)."""
+    out = []
+    used = set()
+    for i in range(len(words) - 1):
+        lo, hi = words[i], words[i + 1]
+        if i in used or lo & 0xfff or not lo or hi & 0x00ffff00:
+            continue
+        addr = (hi & 0xff) << 32 | lo
+        if addr < 0x1000000:
+            continue
+        size = 0
+        if i + 2 < len(words):
+            s = words[i + 2]
+            if s and not s & 0xfff and s <= 64 << 20:
+                size = s
+                used.add(i + 2)
+        used.add(i + 1)
+        out.append((i, addr, size))
+    return out
+
+
+class FalconQueues:
+    """Feed BAR0 MMIO records in order; collects commands, messages, the RTOS
+    INIT message (queue layout) and the DMEM print buffer."""
+
+    def __init__(self, base, name):
+        self.base, self.name = base, name
+        self.port = [[0, False, False] for _ in range(8)]  # addr, aincw, aincr
+        self.dmem = {}
+        self.qhead = {}                 # cmd queue i -> last head value seen
+        self.mtail = None               # last MSGQ_TAIL value seen
+        self.mhead = None
+        self.events = []                # dicts in order
+        self.init = None
+        self.print_hdr = None           # DMEM address of the print trailer
+        self.print_put = None
+        self.writes = 0
+
+    def _seg(self, start, end, qsize_hint):
+        if end >= start:
+            return [(start, end)]
+        q = self.init and next((q for q in self.init["queues"]
+                                if q["offset"] <= start < q["offset"] + q["size"]),
+                               None)
+        if q:
+            return [(start, q["offset"] + q["size"]), (q["offset"], end)]
+        hi = max((x for x in self.dmem if start <= x < start + qsize_hint),
+                 default=start)
+        lo = min((x for x in self.dmem if end - qsize_hint <= x < end),
+                 default=end)
+        return [(start, hi + 4), (lo, end)]
+
+    def _bytes(self, a, b):
+        return b"".join(struct.pack("<I", self.dmem.get(x, 0))
+                        for x in range(a & ~3, b, 4))
+
+    def _parse(self, r, kind, segs, qidx):
+        for a, b in segs:
+            buf = self._bytes(a, b)
+            pos = 0
+            while pos + 4 <= len(buf):
+                unit, size, fl, sq = buf[pos:pos + 4]
+                if unit == FLCN_UNIT_REWIND or size < 4:
+                    break
+                body = buf[pos + 4:pos + size]
+                ev = {"seq": r.seq, "ts": r.ts, "kind": kind, "queue": qidx,
+                      "dmem": a + pos, "unit": unit, "size": size,
+                      "flags": fl, "seqnum": sq, "body": body}
+                self.events.append(ev)
+                if kind == "msg" and self.init is None and fl & FLCN_F_EVENT:
+                    self._try_init(ev)
+                pos += (size + 3) & ~3
+
+    def _try_init(self, ev):
+        b = ev["body"]
+        if len(b) < 4:
+            return
+        mtype, nq, dbg = b[0], b[1], struct.unpack_from("<H", b, 2)[0]
+        if not 1 <= nq <= 8 or len(b) < 4 + 8 * nq:
+            return
+        qs = []
+        for i in range(nq):
+            off, size, phy, log = struct.unpack_from("<IHBB", b, 4 + 8 * i)
+            qs.append({"offset": off, "size": size, "phy": phy, "log": log})
+        if any(not q["size"] or q["offset"] > 0x1000000 for q in qs):
+            return
+        self.init = {"seq": ev["seq"], "ts": ev["ts"], "unit": ev["unit"],
+                     "msgType": mtype, "numQueues": nq,
+                     "osDebugEntryPoint": dbg, "queues": qs,
+                     "rest": b[4 + 8 * nq:]}
+
+    def feed(self, r):
+        rel = r.f["off"] - self.base
+        if not 0 <= rel < 0x1000:
+            return
+        w, v = r.f["write"], r.f["val"]
+        if FLCN_DMEMC0 <= rel < FLCN_DMEMC0 + 64:
+            p = self.port[(rel - FLCN_DMEMC0) >> 3]
+            if not rel & 4:                         # DMEMC
+                if w:
+                    p[0], p[1], p[2] = v & 0xfffffc, bool(v >> 24 & 1), \
+                        bool(v >> 25 & 1)
+                return
+            self.dmem[p[0]] = v                     # DMEMD
+            if not w and v == FLCN_PRINT_MAGIC and self.print_hdr is None:
+                self.print_hdr = p[0] - 12
+            if (w and p[1]) or (not w and p[2]):
+                p[0] = (p[0] + 4) & 0xfffffc
+            return
+        if FLCN_QHEAD0 <= rel < FLCN_QHEAD0 + 64 and not rel & 4:
+            qi = (rel - FLCN_QHEAD0) >> 3
+            if w:
+                self.writes += 1
+                old = self.qhead.get(qi)
+                if old is not None and old != v:
+                    self._parse(r, "cmd", self._seg(old, v, 0x400), qi)
+            elif qi == 7 and self.print_hdr is not None:
+                self.print_put = v
+            self.qhead[qi] = v
+        elif rel == FLCN_MSGQ_HEAD:
+            self.mhead = v
+        elif rel == FLCN_MSGQ_TAIL:
+            if w and self.mtail is not None and self.mtail != v:
+                self._parse(r, "msg", self._seg(self.mtail, v, 0x400), 0)
+            self.mtail = v
+
+    def print_text(self):
+        """Strings in the DMEM print buffer as far as the CPU read it."""
+        if self.print_hdr is None:
+            return []
+        size = self.dmem.get(self.print_hdr + 8, 0)
+        if not 0 < size <= 0x10000:
+            return []
+        start = self.print_hdr - size
+        raw = self._bytes(start, self.print_hdr)
+        known = sum(1 for x in range(start, self.print_hdr, 4) if x in self.dmem)
+        strs = [s.decode("ascii", "replace") for s in raw.split(b"\0")
+                if len(s) >= 3]
+        return [f"(print buffer DMEM 0x{start:x}+0x{size:x}, "
+                f"{known * 4} bytes read by the CPU)"] + strs
+
+
+def falcon_scan(records, bases=None, stop_at_init=False):
+    fq = {b: FalconQueues(b, n) for b, n in (bases or FALCON_BASES).items()}
+    for r in records:
+        if r.type != T_MMIO or r.f["bar"] != 0 or r.f["origin"] not in (0, 1):
+            continue
+        q = fq.get(r.f["off"] & ~0xfff)
+        if q:
+            q.feed(r)
+            if stop_at_init and q.init:
+                break
+    return fq
+
+
+def flcn_line(names, ev, t0, snaps=None):
+    fl = "".join(n for b, n in ((FLCN_F_STATUS, "S"), (FLCN_F_EVENT, "E"))
+                 if ev["flags"] & b) or "-"
+    b = ev["body"]
+    words = list(struct.unpack_from(f"<{len(b) // 4}I", b)) if len(b) >= 4 else []
+    first = f" w0=0x{words[0]:08x}" if words else ""
+    s = (f"{ev['seq']:10d} {(ev['ts'] - t0) / 1e9:12.6f} "
+         f"{'CMD' if ev['kind'] == 'cmd' else 'MSG'}{ev['queue']} "
+         f"dmem=0x{ev['dmem']:05x} unit=0x{ev['unit']:02x} size={ev['size']} "
+         f"flags={fl} seq={ev['seqnum']}{first}")
+    if ev["kind"] == "cmd":
+        refs = flcn_dma_refs(words)
+        if refs:
+            s += " dma=" + ",".join(
+                f"0x{a:x}" + (f"+0x{z:x}" if z else "") for _, a, z in refs)
+    return s
+
+
+def cmd_flcn(a, names):
+    t0 = first_ts(a.trace)
+    snaps = []
+    prints = []
+
+    def feed():
+        for r in iter_records(a.trace):
+            if r.type == T_DMA_SNAP and r.f["label"].startswith("fq:"):
+                snaps.append(r)
+            elif r.type == T_DMA_SNAP and r.f["label"] == "GSPDMEM:print":
+                prints.append(r)
+            yield r
+    fq = falcon_scan(feed())
+    any_ = False
+    for base, q in fq.items():
+        if not q.events and q.print_hdr is None:
+            continue
+        any_ = True
+        print(f"== {q.name} (BAR0 0x{base:x}): {sum(e['kind'] == 'cmd' for e in q.events)} "
+              f"commands, {sum(e['kind'] == 'msg' for e in q.events)} messages")
+        if q.init:
+            i = q.init
+            print(f"  RTOS INIT at seq {i['seq']} ({(i['ts'] - t0) / 1e9:.6f} s): "
+                  f"unit 0x{i['unit']:02x} msgType {i['msgType']} "
+                  f"{i['numQueues']} queues, osDebugEntryPoint 0x{i['osDebugEntryPoint']:x}")
+            for qq in i["queues"]:
+                print(f"    queue log {qq['log']} phy {qq['phy']}: DMEM "
+                      f"0x{qq['offset']:x}+0x{qq['size']:x}"
+                      f" ({'command' if qq['log'] == 0 else 'message'})")
+        for ev in q.events:
+            print(flcn_line(names, ev, t0))
+            if a.hex and ev["body"]:
+                print(hexdump(ev["body"], limit=a.hex_limit))
+        for line_ in q.print_text():
+            print(f"  print: {line_}")
+    if prints:
+        # read by the tracer through DMEM port 1 whenever the put pointer
+        # moved: the whole ring once, then the new bytes
+        print(f"\nGSP RTOS print buffer read by the tracer ({len(prints)} reads):")
+        for r in prints:
+            for t in r.data.split(b"\0"):
+                if len(t) >= 3:
+                    print(f"  {r.seq:10d} {(r.ts - t0) / 1e9:12.6f} "
+                          f"{t.decode('ascii', 'replace')}")
+    if snaps:
+        print("\nsysmem buffers named in falcon commands (DMA_SNAP fq:*):")
+        for r in snaps:
+            print(f"  {r.seq:10d} {r.f['label']:24s} gpa=0x{r.f['gpa']:x} "
+                  f"len=0x{r.f['len']:x}")
+    if not any_ and not prints:
+        print("no falcon RTOS queue traffic in this trace")
+
+
+def gsp_mode(records):
+    """('gsp-rm' | 'gsp-rtos' | 'unknown', detail) from a record stream."""
+    rpcs = cot = heads = 0
+    for r in records:
+        if r.type == T_GSP_MSG:
+            rpcs += 1
+        elif r.type == T_NOTE and b"no GSP-RM boot args" in r.data:
+            cot += 1
+        elif r.type == T_MMIO and r.f["write"] and r.f["bar"] == 0 and \
+                r.f["off"] == 0x110000 + FLCN_QHEAD0:
+            heads += 1
+    if rpcs:
+        return "gsp-rm", f"{rpcs} GSP-RM RPC records"
+    if heads or cot:
+        return "gsp-rtos", (f"no GSP-RM: {heads} GSP RTOS DMEM queue commands"
+                            " (GSP-RM-Proxy; RM runs on the CPU in the guest)")
+    return "unknown", "no GSP RPCs and no GSP queue writes"
+
+
+RM_ON_CPU_HINT = """\
+The driver in this trace does not run GSP-RM: the GSP runs a small RTOS
+(GSP-RM-Proxy) that RM drives through DMEM queues (`mmiodump.py flcn`), and
+RM itself runs inside nvlddmkm on the guest CPU. RM API calls therefore never
+cross the PCI bus as RPCs; they are visible as NVIDIA escapes / IOCTLs at
+level 1 (`ntrdump.py LOG --rm`, `--escapes`) and as DxgkDdiEscape calls at
+level 3 (`ndldump.py`). What level 2 has instead: every register the CPU-side
+RM programs (BAR0), VRAM it writes through PRAMIN (`pramin`), with
+NVTRACE_DIRTY=0x8 the BAR2 pages (page tables, instance blocks: `bars`),
+the GSP RTOS commands/messages and sysmem buffers they name (`flcn`)."""
+
 
 # ---------------------------------------------------------------- display --
 
@@ -1577,6 +1914,9 @@ def main(argv=None):
                    help="parameter fields per line")
     p.add_argument("--json", metavar="FILE",
                    help="write the call sequence as JSON (for replay/forward)")
+    p = add("flcn", cmd_flcn)
+    p.add_argument("--hex", action="store_true")
+    p.add_argument("--hex-limit", type=int, default=256)
     p = add("boot", cmd_boot)
     p.add_argument("--json", metavar="FILE")
     add("disp", cmd_disp)

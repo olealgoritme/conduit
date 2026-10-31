@@ -181,7 +181,8 @@ class DecoderTest(unittest.TestCase):
         part1, part2 = msg[:400], msg[400:]
         w.fsp(0, struct.pack("<I", 0x80000001) + part1)
         w.fsp(0, struct.pack("<I", 0x40000001) + part2)
-        resp = struct.pack("<III", 0x7e | (0x10de << 8) | (0x15 << 24), 0x14, 0)
+        resp = struct.pack("<IIII", 0x7e | (0x10de << 8) | (0x15 << 24), 1,
+                           0x14, 0)
         w.fsp(1, struct.pack("<I", 0xC0000001) + resp)
         p = self.path("f.nvt")
         w.save(p)
@@ -189,7 +190,7 @@ class DecoderTest(unittest.TestCase):
         self.assertIn("COT", out)
         self.assertIn("gspBootArgsSysmemOffset=0x1234000", out)
         self.assertIn("FSP_RESPONSE", out)
-        self.assertIn("command=0x14 (COT) error=0x0", out)
+        self.assertIn("task=1 command=0x14 (COT) error=0x0", out)
 
     def test_compressed(self):
         w = self.basic_trace()
@@ -488,6 +489,70 @@ class NewViewsTest(unittest.TestCase):
         self.assertEqual([(m, v, op) for _, _, m, v, op in out],
                          [(0, 0xcb97, "INC"), (0x100, 0, "INC"),
                           (0x200, 5, "IMMD"), (None, None, "END_PB_SEGMENT")])
+
+    def gsp_rtos_trace(self):
+        """GSP-RM-Proxy style traffic as the Windows driver does it."""
+        G = 0x110000
+        w = TraceWriter()
+        w.dev()
+        w.note("gsp: 0x47e7f1000: no GSP-RM boot args (bootArgsOffset 0): "
+               "GSP runs an RTOS")
+
+        def dmem_read(addr, words):
+            w.mmio(G + 0x1c0, 0x02000000 | addr)
+            for v in words:
+                w.mmio(G + 0x1c4, v, write=False)
+
+        # RTOS INIT event in the message queue (0x36f00), then tail moves
+        w.mmio(G + 0xc84, 0x36f00, write=False)
+        w.mmio(G + 0xc80, 0x36f20, write=False)
+        dmem_read(0x36f00, [0x00042002, 0x02000200, 0x00036f80, 0x00000080,
+                            0x00036f00, 0x01000080, 0xefffffff, 0xffff00b0])
+        w.mmio(G + 0xc84, 0x36f20)
+        # print buffer: trailer at 0x37ff0 (0, put, size 0x10, magic)
+        dmem_read(0x37ff0, [0, 0x9, 0x10, 0xf007ba11])
+        dmem_read(0x37fe0, [0x6c6c6568, 0x0000006f, 0, 0])   # "hello"
+        # one command with a sysmem buffer (lo, hi|flags, size)
+        w.mmio(G + 0xc00, 0x36f80, write=False)
+        w.mmio(G + 0x1c0, 0x01000000 | 0x36f80)
+        for v in [0x0101140f, 5, 0x77815000, 0x94000004, 0x001eb000]:
+            w.mmio(G + 0x1c4, v)
+        w.mmio(G + 0xc00, 0x36f94)
+        # the reply
+        w.mmio(G + 0xc80, 0x36f34, write=False)
+        dmem_read(0x36f20, [0x0100140f, 5, 0, 0, 0])
+        w.mmio(G + 0xc84, 0x36f34)
+        return w
+
+    def test_gsp_rtos(self):
+        p = self.path("rtos.nvt")
+        self.gsp_rtos_trace().save(p)
+        out = run(["flcn", p])
+        self.assertIn("RTOS INIT at seq", out)
+        self.assertIn("DMEM 0x36f80+0x80 (command)", out)
+        self.assertIn("DMEM 0x36f00+0x80 (message)", out)
+        self.assertIn("CMD0 dmem=0x36f80 unit=0x0f size=20 flags=S seq=1 "
+                      "w0=0x00000005 dma=0x477815000+0x1eb000", out)
+        self.assertIn("MSG0 dmem=0x36f20 unit=0x0f size=20 flags=- seq=1", out)
+        self.assertIn("print: hello", out)
+        out = run(["rmlog", "--tree", p])
+        self.assertIn("no GSP-RM RPCs", out)
+        self.assertIn("ntrdump.py LOG --rm", out)
+        j = self.path("boot.json")
+        out = run(["boot", p, "--json", j])
+        self.assertIn("GSP RTOS INIT", out)
+        with open(j) as f:
+            b = json.load(f)
+        self.assertEqual(b["mode"], "gsp-rtos")
+        self.assertEqual(b["rtos_init"]["numQueues"], 2)
+        out = run(["summary", p])
+        self.assertIn("GSP: gsp-rtos", out)
+
+    def test_falcon_register_names(self):
+        n = md.Names()
+        self.assertEqual(n.reg(0x1101c0), "NV_PGSP_FALCON_DMEMC(0)")
+        self.assertEqual(n.reg(0x1101c4), "NV_PGSP_FALCON_DMEMD(0)")
+        self.assertEqual(n.reg(0x110c84), "NV_PGSP_MSGQ_TAIL(0)")
 
     def test_struct_decoder_tables(self):
         n = md.Names()

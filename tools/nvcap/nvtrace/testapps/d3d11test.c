@@ -7,10 +7,15 @@
  *   2. compiles a cs_5_0 compute shader with D3DCompile, writes a UAV buffer,
  *      copies it to a staging buffer and checks it (skipped with a warning if
  *      d3dcompiler_47.dll is missing)
- *   3. presents 30 frames to a window through a flip-model swap chain, switches
- *      to fullscreen for 30 frames and back (a failed fullscreen switch is only
- *      a warning), then destroys everything
- * Options: --no-present  skip step 3
+ *   3. allocation sweep: DEFAULT buffers of 4 KiB .. 16 MiB created with a
+ *      pattern, copied to STAGING, mapped and checked, released
+ *   4. compute loop: --iters dispatches (default 200), checked every 50
+ *   5. presents --frames frames (default 300) to a window through a flip-model
+ *      swap chain, switches to fullscreen for half as many and back (a failed
+ *      fullscreen switch is only a warning), then destroys everything
+ * Options: --no-present  skip step 5
+ *          --frames N, --iters N   steady-state sizes
+ *          --quick       30 frames, 1 dispatch, no sweep (the old smoke test)
  * Every GPU wait uses an event query polled with a 5 s timeout.
  * Prints step-by-step progress and a final "PASS" or "FAIL: <reason>" line.
  */
@@ -22,7 +27,7 @@
 
 #define TEX_SIZE 256u
 #define CS_COUNT 4096u
-#define FRAMES 30
+static int frames = STEADY_FRAMES, iters = STEADY_ITERS, quick;
 
 typedef HRESULT(WINAPI *PFN_CreateDXGIFactory1)(REFIID, void **);
 
@@ -182,24 +187,36 @@ static int test_compute(void)
     bd.StructureByteStride = 0;
     HR_CHECK(ID3D11Device_CreateBuffer(dev, &bd, NULL, &staging));
 
-    logmsg("compute test: Dispatch(%u, 1, 1)", CS_COUNT / 64);
-    ID3D11DeviceContext_CSSetShader(ctx, cs, NULL, 0);
-    ID3D11DeviceContext_CSSetUnorderedAccessViews(ctx, 0, 1, &uav, NULL);
-    ID3D11DeviceContext_Dispatch(ctx, CS_COUNT / 64, 1, 1);
-    ID3D11DeviceContext_CSSetUnorderedAccessViews(ctx, 0, 1, &null_uav, NULL);
-    ID3D11DeviceContext_CSSetShader(ctx, NULL, NULL, 0);
-    ID3D11DeviceContext_CopyResource(ctx, (ID3D11Resource *)staging, (ID3D11Resource *)buf);
-    if (gpu_wait("dispatch+copy"))
-        return 1;
-    HR_CHECK(ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)staging, 0, D3D11_MAP_READ, 0, &map));
-    p = (const unsigned *)map.pData;
-    for (i = 0; i < CS_COUNT; i++)
-        if (p[i] != i * 3u + 7u) {
-            if (bad < 5)
-                logmsg("mismatch at %u: got %u want %u", i, p[i], i * 3u + 7u);
-            bad++;
+    logmsg("compute test: %d x Dispatch(%u, 1, 1), checked every 50", iters, CS_COUNT / 64);
+    {
+        int it;
+        double t0 = now_ms();
+        for (it = 0; it < iters && !bad; it++) {
+            ID3D11DeviceContext_CSSetShader(ctx, cs, NULL, 0);
+            ID3D11DeviceContext_CSSetUnorderedAccessViews(ctx, 0, 1, &uav, NULL);
+            ID3D11DeviceContext_Dispatch(ctx, CS_COUNT / 64, 1, 1);
+            ID3D11DeviceContext_CSSetUnorderedAccessViews(ctx, 0, 1, &null_uav, NULL);
+            ID3D11DeviceContext_CSSetShader(ctx, NULL, NULL, 0);
+            if ((it + 1) % 50 && it + 1 != iters) {
+                ID3D11DeviceContext_Flush(ctx);
+                continue;
+            }
+            ID3D11DeviceContext_CopyResource(ctx, (ID3D11Resource *)staging, (ID3D11Resource *)buf);
+            if (gpu_wait("dispatch+copy"))
+                return 1;
+            HR_CHECK(ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)staging, 0, D3D11_MAP_READ, 0, &map));
+            p = (const unsigned *)map.pData;
+            for (i = 0; i < CS_COUNT; i++)
+                if (p[i] != i * 3u + 7u) {
+                    if (bad < 5)
+                        logmsg("mismatch at %u after %d dispatches: got %u want %u", i, it + 1,
+                               p[i], i * 3u + 7u);
+                    bad++;
+                }
+            ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)staging, 0);
         }
-    ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)staging, 0);
+        logmsg("compute test: %d dispatches in %.1f ms", it, now_ms() - t0);
+    }
     ID3D11Buffer_Release(staging);
     ID3D11UnorderedAccessView_Release(uav);
     ID3D11Buffer_Release(buf);
@@ -207,6 +224,57 @@ static int test_compute(void)
     if (bad)
         return fail("compute test: %u of %u values wrong", bad, CS_COUNT);
     logmsg("compute test: all %u values correct", CS_COUNT);
+    return 0;
+}
+
+/* DEFAULT buffers of every sweep size: pattern in, STAGING copy out, checked. */
+static int test_alloc_sweep(void)
+{
+    unsigned s;
+    double t0 = now_ms();
+
+    for (s = 0; s < ALLOC_SWEEP_N; s++) {
+        unsigned size = alloc_sweep_sizes[s], n = size / 4, i, bad = 0;
+        unsigned *data = malloc(size);
+        D3D11_BUFFER_DESC bd;
+        D3D11_SUBRESOURCE_DATA init;
+        D3D11_MAPPED_SUBRESOURCE map;
+        ID3D11Buffer *buf, *staging;
+        const unsigned *p;
+
+        if (!data)
+            return fail("alloc sweep: out of host memory (%u bytes)", size);
+        for (i = 0; i < n; i++)
+            data[i] = sweep_word(s, i);
+        memset(&bd, 0, sizeof(bd));
+        bd.ByteWidth = size;
+        bd.Usage = D3D11_USAGE_DEFAULT;
+        bd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        init.pSysMem = data;
+        init.SysMemPitch = size;
+        init.SysMemSlicePitch = size;
+        HR_CHECK(ID3D11Device_CreateBuffer(dev, &bd, &init, &buf));
+        bd.Usage = D3D11_USAGE_STAGING;
+        bd.BindFlags = 0;
+        bd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        HR_CHECK(ID3D11Device_CreateBuffer(dev, &bd, NULL, &staging));
+        ID3D11DeviceContext_CopyResource(ctx, (ID3D11Resource *)staging, (ID3D11Resource *)buf);
+        if (gpu_wait("alloc sweep copy"))
+            return 1;
+        HR_CHECK(ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)staging, 0, D3D11_MAP_READ, 0, &map));
+        p = (const unsigned *)map.pData;
+        for (i = 0; i < n; i++)
+            if (p[i] != data[i])
+                bad++;
+        ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)staging, 0);
+        ID3D11Buffer_Release(staging);
+        ID3D11Buffer_Release(buf);
+        free(data);
+        if (bad)
+            return fail("alloc sweep: %u of %u words wrong in the %u-byte buffer", bad, n, size);
+        logmsg("alloc sweep: %u bytes ok", size);
+    }
+    logmsg("alloc sweep: %u sizes in %.1f ms", (unsigned)ALLOC_SWEEP_N, now_ms() - t0);
     return 0;
 }
 
@@ -225,11 +293,18 @@ static void pump_messages(void)
     }
 }
 
-static int present_frames(IDXGISwapChain1 *sc, int first, int count, const char *what)
+/* Presents up to count frames (PRESENT_BUDGET_MS at most). optional: a failed
+ * Present is a warning (returns 2) instead of a FAIL. */
+static int present_frames(IDXGISwapChain1 *sc, int first, int count, const char *what, int optional)
 {
     int f;
     double t0 = now_ms();
     for (f = first; f < first + count; f++) {
+        if (now_ms() - t0 > PRESENT_BUDGET_MS) {
+            logmsg("%s: time budget of %.0f ms reached after %d of %d frames", what,
+                   PRESENT_BUDGET_MS, f - first, count);
+            break;
+        }
         ID3D11Texture2D *bb;
         ID3D11RenderTargetView *rtv;
         float t = (float)(f % 60) / 59.0f;
@@ -248,6 +323,12 @@ static int present_frames(IDXGISwapChain1 *sc, int first, int count, const char 
         ID3D11RenderTargetView_Release(rtv);
         ID3D11Texture2D_Release(bb);
         hr = IDXGISwapChain1_Present(sc, 1, 0);
+        if (FAILED(hr) && optional) {
+            logmsg("WARNING: %s: Present frame %d failed hr 0x%08lx (device removed reason "
+                   "0x%08lx), leaving this phase", what, f, (unsigned long)hr,
+                   (unsigned long)ID3D11Device_GetDeviceRemovedReason(dev));
+            return ID3D11Device_GetDeviceRemovedReason(dev) == S_OK ? 2 : 1;
+        }
         if (FAILED(hr))
             return fail("%s: Present frame %d failed hr 0x%08lx (device removed reason 0x%08lx)", what,
                         f, (unsigned long)hr,
@@ -257,7 +338,7 @@ static int present_frames(IDXGISwapChain1 *sc, int first, int count, const char 
     }
     if (gpu_wait(what))
         return 1;
-    logmsg("%s: %d frames in %.1f ms", what, count, now_ms() - t0);
+    logmsg("%s: %d frames in %.1f ms", what, f - first, now_ms() - t0);
     return 0;
 }
 
@@ -324,7 +405,7 @@ static int test_present(IDXGIFactory1 *factory1)
     HR_CHECK(IDXGIFactory2_CreateSwapChainForHwnd(factory2, (IUnknown *)dev, hwnd, &scd, NULL, NULL, &sc));
     IDXGIFactory2_MakeWindowAssociation(factory2, hwnd, DXGI_MWA_NO_ALT_ENTER);
 
-    if (present_frames(sc, 0, FRAMES, "windowed"))
+    if (present_frames(sc, 0, frames, "windowed", 0))
         return 1;
 
     logmsg("present test: SetFullscreenState(TRUE)");
@@ -337,7 +418,7 @@ static int test_present(IDXGIFactory1 *factory1)
         resize_buffers(sc, "fullscreen");
         IDXGISwapChain1_GetFullscreenState(sc, &fs, NULL);
         logmsg("present test: fullscreen state now %d", (int)fs);
-        if (present_frames(sc, FRAMES, FRAMES, "fullscreen"))
+        if (present_frames(sc, frames, frames / 2, "fullscreen", 1) == 1)
             return 1;
         logmsg("present test: SetFullscreenState(FALSE)");
         hr = IDXGISwapChain1_SetFullscreenState(sc, FALSE, NULL);
@@ -345,7 +426,7 @@ static int test_present(IDXGIFactory1 *factory1)
             logmsg("WARNING: SetFullscreenState(FALSE) failed hr 0x%08lx", (unsigned long)hr);
         pump_messages();
         resize_buffers(sc, "windowed");
-        if (present_frames(sc, 2 * FRAMES, 5, "windowed again"))
+        if (present_frames(sc, frames + frames / 2, 5, "windowed again", 0))
             return 1;
     }
 
@@ -380,6 +461,10 @@ int main(int argc, char **argv)
     int no_present = has_arg(argc, argv, "--no-present");
 
     common_init("d3d11test");
+    quick = has_arg(argc, argv, "--quick");
+    frames = arg_int(argc, argv, "--frames", quick ? QUICK_FRAMES : STEADY_FRAMES, 1, 100000);
+    iters = arg_int(argc, argv, "--iters", quick ? QUICK_ITERS : STEADY_ITERS, 1, 1000000);
+    logmsg("workload: %d frames, %d dispatches%s", frames, iters, quick ? ", quick" : ", alloc sweep");
 
     logmsg("loading dxgi.dll and d3d11.dll");
     dxgi_lib = LoadLibraryA("dxgi.dll");
@@ -426,6 +511,8 @@ int main(int argc, char **argv)
     logmsg("device created, feature level 0x%x", (unsigned)got);
 
     if (test_clear())
+        return 1;
+    if (!quick && test_alloc_sweep())
         return 1;
     if (test_compute())
         return 1;

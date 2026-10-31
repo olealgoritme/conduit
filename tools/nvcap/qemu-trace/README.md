@@ -16,6 +16,7 @@ firmware access onwards. Purpose: the blueprint for emulating a 5090 later
 | `patches/0103-...` | Review fixes to 0101 (lock-free BAR0 read path, queue walker limits). |
 | `patches/0104-...` | VRAM aperture pages (KVM dirty log), trap windows, buffers followed from GSP RPCs (memory, channels, display pushbuffers, doorbells). |
 | `patches/0105-...` | GPU memory from the host side (VRAM via static BAR1 / PRAMIN, GMMU walks, GPFIFO + pushbuffers, VRAM sweep), large RPC reassembly, firmware images and GSP-RM areas from sysmem, PCI config dumps. |
+| `patches/0106-...` | GSP without GSP-RM (the Windows driver): GSP RTOS DMEM queues, buffers named in RTOS commands, RTOS print buffer through DMEM port 1. |
 | `vm-trace.sh` | `vm.sh` with this QEMU and tracing on (`/steam/conduit-scratch/nvcap/vm-trace.sh` links here). |
 | `tools/mmiodump.py` | Decoder (Python 3 stdlib). |
 | `tools/gen_tables.py` → `tools/nvtables.json.gz` | Register, RPC, class, control-command and status names, structure layouts (RPC, alloc and control parameters), display methods, from open-gpu-kernel-modules 610.57.04. `tools/cstructs.py` is its C layout parser. |
@@ -99,7 +100,8 @@ is still readable up to the cut.
 | `NVTRACE_LOSSY` | 0 | 1 = never wait, drop at once. |
 | `NVTRACE_MIN_FREE_GB` | 20 | Tracing stops (VM keeps running) when the trace file system has less free space. |
 | `NVTRACE_GSP_POLL_US` | 100 | GSP status/command queue poll period once the queues are known. |
-| `NVTRACE_GSP_LOG_MS` | 1000 | Snapshot period for GSP log buffers (only when their put pointer moved); 0 = only at boot/reset/exit. |
+| `NVTRACE_GSP_LOG_MS` | 1000 | Snapshot period for GSP log buffers (only when their put pointer moved); 0 = only at boot/reset/exit. Also the read period of the GSP RTOS print buffer. |
+| `NVTRACE_GSP_DMEM_LOG` | 0 | 1 = read the GSP RTOS print buffer through DMEM port 1 (see "GSP without GSP-RM"). Off by default: on the RTX 5090 with 610.74, port 1 reads back zeros. |
 | `NVTRACE_PAIR_BUDGET_MB` | 256 | Budget for the LO/HI register-pair snapshot heuristic. |
 | `NVTRACE_FOLLOW` | 1 | 0 = do not follow addresses in GSP RPCs (memory, channels, display). |
 | `NVTRACE_WATCH_MS` | 1000 | Re-read every followed buffer this often (in 256 KiB slices), log pages that changed; 0 = never. |
@@ -156,7 +158,10 @@ logs), `pair:<reg><<shift>` (register-pair heuristic), `EXPANSION_ROM`,
 `mem<hMemory>` (ALLOC_MEMORY pages), `ch<hChannel>.<inst|userd|ramfc|mthdbuf|errnotif|eccnotif>`
 (channel memory), `dispPB:<chn>` (display pushbuffer at registration),
 `dispPB:<chn>@<start>` (bytes between the old and new PUT), `w:<tag>`
-(re-read, content changed), `PCI_CONFIG` (whole config space, at start
+(re-read, content changed), `fq:c<n>.<i>` / `fq:r<n>.<i>` (sysmem buffer
+named in GSP RTOS command n, at submit / changed at the reply),
+`GSPDMEM:print` (GSP RTOS print ring bytes, gpa = DMEM address, flag 2),
+`PCI_CONFIG` (whole config space, at start
 and after resets), and images (flag 8: `gpa` = byte offset in the image,
 chunks of 1 MiB): `FW:GSP_RM_ELF` (the GSP-RM ELF the driver loaded,
 followed through its radix3 page lists), `FW:BOOTLOADER`, `FW:SIGNATURE`,
@@ -164,6 +169,67 @@ followed through its radix3 page lists), `FW:BOOTLOADER`, `FW:SIGNATURE`,
 libos region in sysmem), `ARGS:{profiler,sysmemHeap,rmStateMonitor,bindata}`
 (GSP_ARGUMENTS_CACHED areas; the first three are also watched). An image
 identical to the previous dump is not dumped again.
+
+## GSP without GSP-RM (the Windows 610.74 driver)
+
+The first real traces (Windows 610.74, RTX 5090) contain no GSP RPCs at all,
+and that is how the driver works, not a capture gap. nvlddmkm keeps RM on
+the CPU. It boots the GSP through the FSP chain of trust (CAPS_QUERY,
+CLOCK_BOOST, COT, all answered OK), but `GSP_FMC_BOOT_PARAMS` carries no
+GSP-RM boot args (`bootArgsOffset` 0). The FMC then starts a small
+falcon-style RTOS, NVIDIA's "GSP-RM-Proxy" (its print buffer reads
+"rm_proxy: GSP-RM-Proxy Loader ... Wire RPC ... running from FB"). RM drives
+it the pre-GSP way:
+
+- commands and messages are `RM_FLCN_QUEUE_HDR` records (u8 unitId, size,
+  ctrlFlags, seqNumId) in GSP **DMEM**, written/read through
+  `NV_PGSP_FALCON_DMEMC/DMEMD(0)` (0x1101c0/4; OFFS/BLK 23:2, AINCW 24,
+  AINCR 25);
+- `NV_PGSP_QUEUE_HEAD(0)` (0x110c00) / `QUEUE_TAIL(0)` are the command queue
+  pointers (DMEM offsets), `MSGQ_HEAD/TAIL(0)` (0x110c80/4) the message
+  queue's;
+- the first message is the RTOS INIT event (unit 0x02, flags EVENT): queue
+  layout, e.g. command queue DMEM 0x36f80+0x80, message queue 0x36f00+0x80;
+- a DMEM print ring ends in a trailer `0, put, size, 0xf007ba11` (seen at
+  DMEM 0x37ff0, 0xff0 bytes; `QUEUE_HEAD(7)` mirrors `put`);
+- commands name sysmem buffers as (lo, hi | flags << 24[, size]), e.g. the
+  2 MB image the proxy is loaded from.
+
+So the RM API (alloc/control/free) never crosses the bus: it is in the
+guest at level 1 (`ntrdump.py LOG --rm`, `--escapes`) and level 3
+(`ndldump.py`, DxgkDdiEscape). `rmlog` says so instead of printing nothing.
+Level 2 has the hardware side: every register CPU-RM programs, VRAM written
+through PRAMIN (`pramin`), the GSP RTOS traffic, FSP messages.
+
+What the tracer does in this mode (0106):
+
+- at the COT it snapshots the boot params page, notes "no GSP-RM boot args"
+  and stops the GSP-RM queue RAM scans (they cannot succeed);
+- it mirrors the guest's DMEM port-0 accesses; on each `QUEUE_HEAD(0)`
+  write it walks the new command records and snapshots the sysmem buffers
+  they name (`fq:c<n>.<i>`, default 16 KiB, the given size up to 256 KiB;
+  larger ones are dumped by the poller like firmware images), and on the
+  `MSGQ_TAIL` write that consumes the reply (same seqNumId) re-reads them
+  and logs what the GSP changed (`fq:r<n>.<i>`, flag 4);
+- with `NVTRACE_GSP_DMEM_LOG=1`, once the guest has read the print
+  trailer, a main-loop timer reads the print ring every
+  `NVTRACE_GSP_LOG_MS` through DMEM **port 1**, which the driver never uses
+  (its port-0 auto-increment state stays untouched; BAR0 traps, so no vCPU
+  touches BAR0 meanwhile), and logs new bytes as `GSPDMEM:print` blobs
+  (gpa = DMEM address). A PRI error or a missing trailer turns this off
+  with a NOTE. On the RTX 5090 (610.74) port 1 read back zeros (first
+  real run), hence off by default; the print text the driver itself reads
+  through port 0 is always in the trace (`flcn` prints it).
+- `NVTRACE_VRAM` has no inputs here (no WPR meta, no static info, no
+  channel RPCs) and stays idle; the guest's own PRAMIN accesses are in the
+  BAR0 trace, and `NVTRACE_DIRTY=0x8` adds the BAR2 pages CPU-RM writes
+  (page tables, instance blocks) [not yet tried on the 5090].
+
+Decoder: `mmiodump.py flcn TRACE [--hex]` rebuilds INIT, every command and
+message (with the buffers they name) and the print text from the MMIO
+records alone (it also works on traces made before 0106); `boot` ends the
+boot table at the RTOS INIT message (`"mode": "gsp-rtos"` in the JSON);
+`summary` prints the GSP mode.
 
 ## How the GSP queues are found and captured
 
@@ -282,6 +348,11 @@ page, which the GPU reports as a BAR1 fault to the driver. Start with BAR3
 only (`0x8`); BAR3 is RM's own fixed kernel window.
 
 ## What an emulated 5090 has to fake until GSP INIT_DONE
+
+(This is the Linux/GSP-RM path. The Windows 610.74 driver takes the same
+FSP steps up to the COT, then expects the GSP RTOS instead: the INIT event
+in the DMEM message queue, and replies to its DMEM commands; see "GSP
+without GSP-RM". `mmiodump.py boot` detects which one a trace shows.)
 
 From the 610.57.04 GB202 paths (FSP chain of trust; `bPartitionedFmc`, so no
 booter, no FWSEC, no CPU sequencer). `mmiodump.py boot TRACE --json F`
@@ -493,8 +564,9 @@ tools/mmiodump.py gsp      TRACE... [--decode [--all]] [--hex]
 tools/mmiodump.py rmlog    TRACE... [--out] [--tree] [--internal] [--json calls.json]
                                             # the RM API sequence: Alloc/Control/Free/AllocMemory
                                             # with handles, class/cmd names, decoded params, status
-tools/mmiodump.py boot     TRACE... [--json boot.json]   # registers + values until GSP INIT_DONE
+tools/mmiodump.py boot     TRACE... [--json boot.json]   # registers + values until GSP INIT_DONE / RTOS INIT
 tools/mmiodump.py fsp      TRACE...         # FSP messages (COT fields, responses)
+tools/mmiodump.py flcn     TRACE... [--hex] # GSP RTOS DMEM queues (no GSP-RM), INIT, print text
 tools/mmiodump.py disp     TRACE...         # display channels, PUT writes, decoded methods
 tools/mmiodump.py bars     TRACE... [--extract DIR]      # BAR_PAGE records, most rewritten pages
 tools/mmiodump.py pramin   TRACE...         # VRAM accesses through the BAR0 PRAMIN window

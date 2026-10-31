@@ -6,15 +6,20 @@
  * queue and one fence, then:
  *   1. direct queue: clears a committed render target, CopyTextureRegion into
  *      a readback buffer, maps and checks it
- *   2. copy queue: upload buffer -> default buffer -> readback buffer, checks it
+ *   2. copy queue: upload buffer -> default buffer -> readback buffer, checks it,
+ *      for every allocation sweep size (4 KiB .. 16 MiB; 1 MiB only with --quick)
  *   3. direct queue: cs_5_0 compute shader (D3DCompile) with a root UAV writes a
  *      buffer, copied to readback and checked (skipped with a warning if
  *      d3dcompiler_47.dll is missing)
- *   4. presents 30 frames to a window through a flip-model swap chain
- *      (IDXGISwapChain3, PRESENT <-> RENDER_TARGET barriers, fence per frame)
+ *      The recorded list is executed --iters times (default 200), checked at the end.
+ *   4. presents --frames frames (default 300) to a window through a flip-model
+ *      swap chain (IDXGISwapChain3, PRESENT <-> RENDER_TARGET barriers, fence
+ *      per frame)
  * Every fence wait uses SetEventOnCompletion + WaitForSingleObject(5 s).
  * Options: --no-present  skip step 4
  *          --debug       enable the D3D12 debug layer (needs Graphics Tools)
+ *          --frames N, --iters N   steady-state sizes
+ *          --quick       30 frames, 1 dispatch, one 1 MiB copy (the old smoke test)
  * Prints step-by-step progress and a final "PASS" or "FAIL: <reason>" line.
  *
  * Note on the C ABI: methods that return a struct (GetCPUDescriptorHandleForHeapStart,
@@ -33,7 +38,7 @@
 #define TEX_SIZE 256u
 #define COPY_BYTES (1u << 20)
 #define CS_COUNT 4096u
-#define FRAMES 30
+static int frames = STEADY_FRAMES, iters = STEADY_ITERS, quick;
 #define SC_BUFFERS 2
 
 typedef HRESULT(WINAPI *PFN_CreateDXGIFactory1)(REFIID, void **);
@@ -235,7 +240,7 @@ static int test_clear(void)
     return 0;
 }
 
-static int test_copy_queue(void)
+static int test_copy_queue(UINT64 bytes, unsigned seed)
 {
     ID3D12CommandAllocator *alloc;
     ID3D12GraphicsCommandList *cl;
@@ -243,17 +248,17 @@ static int test_copy_queue(void)
     D3D12_RANGE range = {0, 0};
     unsigned *p, i, bad = 0;
 
-    logmsg("copy queue test: upload -> default -> readback, %u bytes", COPY_BYTES);
-    if (create_buffer(D3D12_HEAP_TYPE_UPLOAD, COPY_BYTES, D3D12_RESOURCE_FLAG_NONE,
+    logmsg("copy queue test: upload -> default -> readback, %llu bytes", (unsigned long long)bytes);
+    if (create_buffer(D3D12_HEAP_TYPE_UPLOAD, bytes, D3D12_RESOURCE_FLAG_NONE,
                       D3D12_RESOURCE_STATE_GENERIC_READ, &up) ||
-        create_buffer(D3D12_HEAP_TYPE_DEFAULT, COPY_BYTES, D3D12_RESOURCE_FLAG_NONE,
+        create_buffer(D3D12_HEAP_TYPE_DEFAULT, bytes, D3D12_RESOURCE_FLAG_NONE,
                       D3D12_RESOURCE_STATE_COMMON, &mid) ||
-        create_buffer(D3D12_HEAP_TYPE_READBACK, COPY_BYTES, D3D12_RESOURCE_FLAG_NONE,
+        create_buffer(D3D12_HEAP_TYPE_READBACK, bytes, D3D12_RESOURCE_FLAG_NONE,
                       D3D12_RESOURCE_STATE_COPY_DEST, &rb))
         return 1;
     HR_CHECK(ID3D12Resource_Map(up, 0, &range, (void **)&p));
-    for (i = 0; i < COPY_BYTES / 4; i++)
-        p[i] = i * 2654435761u;
+    for (i = 0; i < bytes / 4; i++)
+        p[i] = sweep_word(seed, i);
     ID3D12Resource_Unmap(up, 0, NULL);
 
     HR_CHECK(ID3D12Device_CreateCommandAllocator(dev, D3D12_COMMAND_LIST_TYPE_COPY,
@@ -261,21 +266,21 @@ static int test_copy_queue(void)
     HR_CHECK(ID3D12Device_CreateCommandList(dev, 0, D3D12_COMMAND_LIST_TYPE_COPY, alloc, NULL,
                                             &IID_ID3D12GraphicsCommandList, (void **)&cl));
     transition(cl, mid, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
-    ID3D12GraphicsCommandList_CopyBufferRegion(cl, mid, 0, up, 0, COPY_BYTES);
+    ID3D12GraphicsCommandList_CopyBufferRegion(cl, mid, 0, up, 0, bytes);
     transition(cl, mid, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    ID3D12GraphicsCommandList_CopyBufferRegion(cl, rb, 0, mid, 0, COPY_BYTES);
+    ID3D12GraphicsCommandList_CopyBufferRegion(cl, rb, 0, mid, 0, bytes);
     transition(cl, mid, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
     HR_CHECK(ID3D12GraphicsCommandList_Close(cl));
     execute(cq, cl);
     if (signal_wait(cq, "copy queue"))
         return 1;
 
-    range.End = COPY_BYTES;
+    range.End = bytes;
     HR_CHECK(ID3D12Resource_Map(rb, 0, &range, (void **)&p));
-    for (i = 0; i < COPY_BYTES / 4; i++)
-        if (p[i] != i * 2654435761u) {
+    for (i = 0; i < bytes / 4; i++)
+        if (p[i] != sweep_word(seed, i)) {
             if (bad < 5)
-                logmsg("mismatch at %u: got 0x%08x want 0x%08x", i, p[i], i * 2654435761u);
+                logmsg("mismatch at %u: got 0x%08x want 0x%08x", i, p[i], sweep_word(seed, i));
             bad++;
         }
     range.End = 0;
@@ -286,8 +291,8 @@ static int test_copy_queue(void)
     ID3D12Resource_Release(mid);
     ID3D12Resource_Release(up);
     if (bad)
-        return fail("copy queue test: %u of %u words wrong", bad, COPY_BYTES / 4);
-    logmsg("copy queue test: all %u words correct", COPY_BYTES / 4);
+        return fail("copy queue test: %u of %u words wrong", bad, (unsigned)(bytes / 4));
+    logmsg("copy queue test: all %u words correct", (unsigned)(bytes / 4));
     return 0;
 }
 
@@ -379,9 +384,19 @@ static int test_compute(void)
     ID3D12GraphicsCommandList_CopyBufferRegion(dcl, rb, 0, buf, 0, CS_COUNT * 4);
     transition(dcl, buf, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
     HR_CHECK(ID3D12GraphicsCommandList_Close(dcl));
-    execute(dq, dcl);
-    if (signal_wait(dq, "dispatch+copy"))
-        return 1;
+    {
+        int it;
+        double t0 = now_ms();
+        for (it = 0; it < iters; it++) {
+            /* a closed direct list may be executed again once the previous
+             * execution completed */
+            execute(dq, dcl);
+            HR_CHECK(ID3D12CommandQueue_Signal(dq, fence, ++fence_val));
+            if (wait_value(fence_val, "dispatch+copy"))
+                return 1;
+        }
+        logmsg("compute test: %d executions in %.1f ms", iters, now_ms() - t0);
+    }
 
     range.Begin = 0;
     range.End = CS_COUNT * 4;
@@ -483,9 +498,14 @@ static int test_present(IDXGIFactory1 *factory1)
            (int)bd.Format);
 
     t0 = now_ms();
-    for (f = 0; f < FRAMES; f++) {
+    for (f = 0; f < frames; f++) {
         UINT idx = IDXGISwapChain3_GetCurrentBackBufferIndex(sc);
-        float t = (float)f / (float)(FRAMES - 1);
+        if (now_ms() - t0 > PRESENT_BUDGET_MS) {
+            logmsg("present test: time budget of %.0f ms reached after %d of %d frames",
+                   PRESENT_BUDGET_MS, f, frames);
+            break;
+        }
+        float t = (float)(f % 60) / 59.0f;
         float color[4];
         color[0] = t;
         color[1] = 1.0f - t;
@@ -514,7 +534,7 @@ static int test_present(IDXGIFactory1 *factory1)
     }
     if (signal_wait(dq, "present drain"))
         return 1;
-    logmsg("present test: %d frames in %.1f ms", FRAMES, now_ms() - t0);
+    logmsg("present test: %d frames in %.1f ms", f, now_ms() - t0);
 
     logmsg("present test: destroying swap chain and window");
     for (i = 0; i < SC_BUFFERS; i++) {
@@ -546,6 +566,10 @@ int main(int argc, char **argv)
     int no_present = has_arg(argc, argv, "--no-present");
 
     common_init("d3d12test");
+    quick = has_arg(argc, argv, "--quick");
+    frames = arg_int(argc, argv, "--frames", quick ? QUICK_FRAMES : STEADY_FRAMES, 1, 100000);
+    iters = arg_int(argc, argv, "--iters", quick ? QUICK_ITERS : STEADY_ITERS, 1, 1000000);
+    logmsg("workload: %d frames, %d dispatches%s", frames, iters, quick ? ", quick" : ", copy sweep");
 
     logmsg("loading dxgi.dll and d3d12.dll");
     dxgi_lib = LoadLibraryA("dxgi.dll");
@@ -628,8 +652,15 @@ int main(int argc, char **argv)
 
     if (test_clear())
         return 1;
-    if (test_copy_queue())
-        return 1;
+    if (quick) {
+        if (test_copy_queue(COPY_BYTES, 0))
+            return 1;
+    } else {
+        unsigned sw;
+        for (sw = 0; sw < ALLOC_SWEEP_N; sw++)
+            if (test_copy_queue(alloc_sweep_sizes[sw], sw))
+                return 1;
+    }
     if (test_compute())
         return 1;
     if (no_present)

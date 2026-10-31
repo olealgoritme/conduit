@@ -17,9 +17,10 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 
 #define NV_VENDOR_ID 0x10DEu
-#define WATCHDOG_MS 90000u
+#define WATCHDOG_MS 180000u
 #define WAIT_TIMEOUT_MS 5000u
 
 static const char *g_test_name = "test";
@@ -130,6 +131,49 @@ static inline int has_arg(int argc, char **argv, const char *flag)
         if (!strcmp(argv[i], flag))
             return 1;
     return 0;
+}
+
+/* "--name N" (decimal) or def; N is clamped to [lo, hi]. */
+static inline int arg_int(int argc, char **argv, const char *flag, int def, int lo, int hi)
+{
+    int i, v = def;
+    for (i = 1; i + 1 < argc; i++)
+        if (!strcmp(argv[i], flag))
+            v = atoi(argv[i + 1]);
+    return v < lo ? lo : v > hi ? hi : v;
+}
+
+/*
+ * Steady-state workload sizes shared by the tests. Defaults are chosen so
+ * that each test runs for several seconds (long enough to show the
+ * driver's steady state, not only its first-use paths) while staying small
+ * and deterministic; --quick restores the short smoke test.
+ *   --frames N   presented frames (windowed phase)
+ *   --iters N    compute dispatch / kernel launch iterations
+ */
+#define STEADY_FRAMES 300
+#define STEADY_ITERS 200
+#define QUICK_FRAMES 30
+/*
+ * Present phases also stop after this long: with the displays powered off
+ * (the capture runs keep the monitor dark) vsync-paced presents can drop to
+ * a few frames per second, and the frame count must not run into the
+ * watchdog.
+ */
+#define PRESENT_BUDGET_MS 30000.0
+#define QUICK_ITERS 1
+
+/* Allocation sizes swept by every test, in bytes (4 KiB .. 16 MiB; bigger
+ * ones only grow the level-1 logs, which snapshot mapped memory). */
+static const unsigned alloc_sweep_sizes[] = {
+    4096u, 65536u, 262144u, 1u << 20, 4u << 20, 16u << 20,
+};
+#define ALLOC_SWEEP_N (sizeof(alloc_sweep_sizes) / sizeof(alloc_sweep_sizes[0]))
+
+/* Deterministic fill pattern: word i of sweep buffer s. */
+static inline unsigned sweep_word(unsigned s, unsigned i)
+{
+    return (s + 1u) * 0x9e3779b9u ^ (i * 2654435761u);
 }
 
 #endif

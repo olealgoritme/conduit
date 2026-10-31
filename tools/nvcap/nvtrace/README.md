@@ -212,10 +212,17 @@ wait longer than a few seconds per step, run without nvtrace too.
 
 | program | does |
 |---|---|
-| `vktest.exe [--async-compute]` | Vulkan 1.2: buffers, compute dispatch, timeline semaphore wait |
-| `d3d11test.exe [--no-present]` | D3D11: clear, copy, map, compute, flip-model swapchain |
-| `d3d12test.exe [--no-present] [--debug]` | D3D12: direct and copy queues, fences, readback, compute, presents |
-| `cudatest.exe` | CUDA driver API: context, memory, vector add from PTX |
+| `vktest.exe [--async-compute] [--no-present]` | Vulkan 1.2: buffers, compute dispatch, timeline semaphore wait; then a compute loop (one reusable command buffer, `--iters` submits), the allocation sweep, and a Win32-surface FIFO swapchain present loop (`--frames`) |
+| `d3d11test.exe [--no-present]` | D3D11: clear, copy, map, allocation sweep, compute loop, flip-model swapchain (`--frames` windowed, half as many fullscreen) |
+| `d3d12test.exe [--no-present] [--debug]` | D3D12: direct and copy queues (copy round trip per sweep size), fences, readback, compute list executed `--iters` times, presents |
+| `cudatest.exe` | CUDA driver API: context, allocation sweep, vector add from PTX launched `--iters` times (c = a + iters·b) |
+
+Each program runs a steady-state phase by default so that a trace shows the
+driver's repeated paths, not only first use: `--iters 200` dispatches /
+launches, `--frames 300` presented frames, and an allocation sweep over
+4 KiB, 64 KiB, 256 KiB, 1 MiB, 4 MiB and 16 MiB with a fixed data pattern
+(every result is checked). That is several seconds per program. `--quick`
+gives the old one-shot smoke test (`--iters`/`--frames` still override).
 
 ## Decoder
 

@@ -5,6 +5,10 @@
  * the first device, creates a context, JIT-compiles an embedded PTX vector-add
  * kernel (c[i] = a[i] + b[i] over 1<<20 floats), launches it, waits with a
  * timeout, copies the result back and checks every element.
+ * Steady state (default): an allocation sweep (cuMemAlloc 4 KiB .. 16 MiB,
+ * pattern up and back, checked) and --iters launches (default 200):
+ * c = a + b, then c = c + b, so c ends as a + iters * b (exact in float).
+ * Options: --iters N, --quick (one launch, no sweep: the old smoke test).
  * Prints step-by-step progress and a final "PASS" or "FAIL: <reason>" line.
  */
 #include "common.h"
@@ -139,7 +143,41 @@ static const char *cu_err(CUresult r)
 
 static float *h_a, *h_b, *h_c;
 
-int main(void)
+static int alloc_sweep(PFN_cuMemAlloc_v2 alloc, PFN_cuMemFree_v2 release,
+                       PFN_cuMemcpyHtoD_v2 htod, PFN_cuMemcpyDtoH_v2 dtoh)
+{
+    unsigned s;
+    double t0 = now_ms();
+
+    for (s = 0; s < ALLOC_SWEEP_N; s++) {
+        unsigned size = alloc_sweep_sizes[s], n = size / 4, i, bad = 0;
+        unsigned *up = malloc(size), *down = malloc(size);
+        CUdeviceptr d;
+
+        if (!up || !down)
+            return fail("alloc sweep: host malloc of %u bytes failed", size);
+        for (i = 0; i < n; i++) {
+            up[i] = sweep_word(s, i);
+            down[i] = ~up[i];
+        }
+        CU_CHECK(alloc(&d, size));
+        CU_CHECK(htod(d, up, size));
+        CU_CHECK(dtoh(down, d, size));
+        CU_CHECK(release(d));
+        for (i = 0; i < n; i++)
+            if (down[i] != up[i])
+                bad++;
+        free(up);
+        free(down);
+        if (bad)
+            return fail("alloc sweep: %u of %u words wrong at %u bytes", bad, n, size);
+        logmsg("alloc sweep: %u bytes ok (device 0x%llx)", size, d);
+    }
+    logmsg("alloc sweep: %u sizes in %.1f ms", (unsigned)ALLOC_SWEEP_N, now_ms() - t0);
+    return 0;
+}
+
+int main(int argc, char **argv)
 {
     HMODULE lib;
     PFN_cuInit p_cuInit;
@@ -178,8 +216,12 @@ int main(void)
     void *args[4];
     double t0;
     size_t bytes = (size_t)N * sizeof(float);
+    int it, iters, quick;
 
     common_init("cudatest");
+    quick = has_arg(argc, argv, "--quick");
+    iters = arg_int(argc, argv, "--iters", quick ? QUICK_ITERS : STEADY_ITERS, 1, 4000);
+    logmsg("workload: %d launches%s", iters, quick ? ", quick" : ", alloc sweep");
 
     logmsg("loading nvcuda.dll");
     lib = LoadLibraryA("nvcuda.dll");
@@ -273,6 +315,8 @@ int main(void)
     if (r != CUDA_SUCCESS)
         return fail("cuModuleLoadDataEx failed for every PTX variant: %s", cu_err(r));
     CU_CHECK(p_cuModuleGetFunction(&fn, mod, "vadd"));
+    if (!quick && alloc_sweep(p_cuMemAlloc_v2, p_cuMemFree_v2, p_cuMemcpyHtoD_v2, p_cuMemcpyDtoH_v2))
+        return 1;
 
     logmsg("allocating 3 x %llu bytes host + device", (unsigned long long)bytes);
     h_a = (float *)malloc(bytes);
@@ -294,13 +338,18 @@ int main(void)
     CU_CHECK(p_cuMemcpyHtoD_v2(d_b, h_b, bytes));
     CU_CHECK(p_cuMemcpyHtoD_v2(d_c, h_c, bytes)); /* poison the output */
 
-    logmsg("cuLaunchKernel grid %u block %u", grid, BLOCK);
+    logmsg("cuLaunchKernel grid %u block %u, %d launches", grid, BLOCK, iters);
     args[0] = &d_a;
     args[1] = &d_b;
     args[2] = &d_c;
     args[3] = &n;
     t0 = now_ms();
-    CU_CHECK(p_cuLaunchKernel(fn, grid, 1, 1, BLOCK, 1, 1, 0, NULL, args, NULL));
+    for (it = 0; it < iters; it++) {
+        CU_CHECK(p_cuLaunchKernel(fn, grid, 1, 1, BLOCK, 1, 1, 0, NULL, args, NULL));
+        args[0] = &d_c; /* from the second launch on: c = c + b */
+        if (it % 50 == 49)
+            CU_CHECK(p_cuCtxSynchronize());
+    }
     for (;;) {
         r = p_cuStreamQuery(NULL);
         if (r == CUDA_SUCCESS)
@@ -316,7 +365,7 @@ int main(void)
 
     CU_CHECK(p_cuMemcpyDtoH_v2(h_c, d_c, bytes));
     for (i = 0; i < (int)N; i++) {
-        float want = h_a[i] + h_b[i];
+        float want = h_a[i] + (float)iters * h_b[i];
         if (h_c[i] != want) {
             if (bad < 5)
                 logmsg("mismatch at %d: got %f want %f", i, (double)h_c[i], (double)want);

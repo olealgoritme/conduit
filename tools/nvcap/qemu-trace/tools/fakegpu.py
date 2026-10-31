@@ -12,6 +12,8 @@ Device model:
           FSP EMEM channel 0 (EMEMC/EMEMD auto-increment), QUEUE_HEAD/TAIL,
           MSGQ_HEAD/TAIL: every CPU->FSP packet gets an NVDM FSP_RESPONSE.
           0xfff000: write N -> raise MSI-X vector N (or INTx if MSI-X off).
+          GSP DMEM (256 KiB) behind DMEMC/DMEMD(0..7) at 0x1101c0 + 8i
+          (OFFS/BLK 23:2, AINCW 24, AINCR 25), like a falcon's PRI ports.
           PRAMIN: 0x700000-0x7fffff reads/writes VRAM at
           (NV_XAL_EP_ZB_BAR0_WINDOW 0xd40 & 0x7fffff) << 16; VRAM page
           0x2200000 reads PRI error words (0xbad0ac01) through PRAMIN.
@@ -44,6 +46,7 @@ CFG_SIZE = 256
 EMEMC0, EMEMD0 = 0x8f2ac0, 0x8f2ac4
 QHEAD0, QTAIL0, MHEAD0, MTAIL0 = 0x8f2c00, 0x8f2c04, 0x8f2c80, 0x8f2c84
 TEST_IRQ = 0xfff000
+GSP_DMEMC0, GSP_DMEM_PORTS, GSP_DMEM_SIZE = 0x1101c0, 8, 256 * 1024
 BAR0_WINDOW, PRAMIN, PRAMIN_END = 0xd40, 0x700000, 0x800000
 PRI_BAD_PAGE = 0x2200000
 
@@ -76,6 +79,8 @@ class FakeGpu:
         struct.pack_into("<I", self.bar0, 0, 0x1b2000a1)
         self.emem = [0] * 1024
         self.emem_ptr = 0
+        self.dmem = [0] * (GSP_DMEM_SIZE // 4)
+        self.dport = [[0, False, False] for _ in range(GSP_DMEM_PORTS)]
         self.aincw = self.aincr = False
         self.qtail = 0
         self.irq_fds = {}
@@ -97,6 +102,14 @@ class FakeGpu:
                 return struct.pack("<I", 0xbad0ac01) * (n // 4) + b"\0" * (n % 4)
             self.stats["pramin"] = self.stats.get("pramin", 0) + 1
             return bytes(self.bar1[v:v + n])
+        if GSP_DMEMC0 <= off < GSP_DMEMC0 + 8 * GSP_DMEM_PORTS and n == 4:
+            p = self.dport[(off - GSP_DMEMC0) >> 3]
+            if not off & 4:
+                return struct.pack("<I", p[0] | p[1] << 24 | p[2] << 25)
+            v = self.dmem[p[0] // 4] if p[0] < GSP_DMEM_SIZE else 0xbadf5620
+            if p[2]:
+                p[0] += 4
+            return struct.pack("<I", v)
         if off == EMEMD0 and n == 4:
             v = self.emem[self.emem_ptr] if self.emem_ptr < 1024 else 0
             if self.aincr:
@@ -110,6 +123,17 @@ class FakeGpu:
         if PRAMIN <= off < PRAMIN_END:
             v = self.pramin(off, n)
             self.bar1[v:v + n] = data
+            return
+        if GSP_DMEMC0 <= off < GSP_DMEMC0 + 8 * GSP_DMEM_PORTS and n == 4:
+            p = self.dport[(off - GSP_DMEMC0) >> 3]
+            if not off & 4:
+                p[0], p[1], p[2] = val & 0xfffffc, bool(val >> 24 & 1), \
+                    bool(val >> 25 & 1)
+            else:
+                if p[0] < GSP_DMEM_SIZE:
+                    self.dmem[p[0] // 4] = val
+                if p[1]:
+                    p[0] += 4
             return
         if off == EMEMC0:
             self.emem_ptr = ((val >> 8) & 0xff) * 64 + ((val >> 2) & 0x3f)
@@ -126,7 +150,8 @@ class FakeGpu:
         elif off == QHEAD0:
             # FSP consumed the packet: answer with an FSP_RESPONSE
             cmd = self.emem[1] >> 24
-            resp = [0xC0000001, 0x7e | (0x10de << 8) | (0x15 << 24), cmd, 0]
+            # NVDM_PAYLOAD_COMMAND_RESPONSE: taskId, commandNvdmType, errorCode
+            resp = [0xC0000001, 0x7e | (0x10de << 8) | (0x15 << 24), 1, cmd, 0]
             for i, v in enumerate(resp):
                 self.emem[i] = v
             struct.pack_into("<II", self.bar0, MHEAD0, 0, len(resp) * 4 - 4)
