@@ -1,0 +1,197 @@
+From ccf82ac7fdedda527e2f93abca121ca1a7aa3920 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Sat, 31 Oct 2026 16:47:53 +0100
+Subject: [PATCH 103/104] vfio: nvtrace - review fixes
+
+- BAR0 reads no longer take the per-device GSP lock (only writes and the
+  FSP EMEM/MSGQ reads feed the GSP/FSP state machine).
+- LO/HI pair heuristic: hash lookup before the guest RAM lookup.
+- GSP queue walker: element limit from queueElementSizeMax (up to 64
+  elements), message size capped at 64 KiB in the header check, partial
+  multi-element reads are flagged TRUNC instead of logging stale bytes,
+  one reused drain buffer instead of an allocation per drain, a note when
+  a queue is first seen mid-stream.
+- Record truncation cannot underflow.
+---
+ hw/vfio/nvtrace.c | 59 ++++++++++++++++++++++++++++++++++++-----------
+ 1 file changed, 46 insertions(+), 13 deletions(-)
+
+diff --git a/hw/vfio/nvtrace.c b/hw/vfio/nvtrace.c
+index afb441eb2..60bf76468 100644
+--- a/hw/vfio/nvtrace.c
++++ b/hw/vfio/nvtrace.c
+@@ -318,6 +318,9 @@ static void nvt_emit(NvTraceDev *d, uint16_t type, uint8_t flags,
+         return;
+     }
+     if (sizeof(NvtRecHdr) + blen + dlen > w->size / 4) {
++        if (sizeof(NvtRecHdr) + blen > w->size / 4) {
++            return;                         /* cannot happen for our bodies */
++        }
+         dlen = w->size / 4 - sizeof(NvtRecHdr) - blen;
+         flags |= 0x80;                      /* record data truncated */
+     }
+@@ -632,7 +635,7 @@ static bool nvt_is_ram(AddressSpace *as, uint64_t gpa)
+ #define WPR_META_MAGIC            0xdc3aae21371a60b3ull
+ 
+ #define NVT_PAGE                  4096
+-#define NVT_MAX_ELEMS             16
++#define NVT_MAX_ELEMS             64   /* 256 KiB of 4 KiB elements */
+ #define NVT_EMEM_DWORDS           1024
+ #define NVT_MAX_LOGS              16
+ #define NVT_PAIR_HIST             16
+@@ -663,6 +666,9 @@ typedef struct NvtGsp {
+     uint32_t npte;
+     uint64_t *pte;
+     uint32_t elem_hdr;         /* queueElementHdrSize (0 = autodetect) */
++    uint32_t elem_max;         /* queueElementSizeMax (0 = 64 KiB) */
++    uint8_t *drain_buf;        /* NVT_MAX_ELEMS elements, reused */
++    size_t drain_cap;
+     NvtQueue q[2];
+     NvtQState qs;
+     bool qs_valid;
+@@ -784,7 +790,8 @@ static bool gsp_txhdr_ok(const MsgqTxHeader *h)
+ {
+     return h->version == 0 && h->size >= 2 * NVT_PAGE &&
+            (h->size % NVT_PAGE) == 0 && h->size <= 64 * 1024 * 1024 &&
+-           h->msg_size >= 16 && is_power_of_2(h->msg_size) &&
++           h->msg_size >= 16 && h->msg_size <= 65536 &&
++           is_power_of_2(h->msg_size) &&
+            h->entry_off < h->size && h->rxhdr_off >= sizeof(MsgqTxHeader) &&
+            h->rxhdr_off < h->entry_off &&
+            h->msg_count == (h->size - h->entry_off) / h->msg_size &&
+@@ -805,6 +812,11 @@ static bool gsp_q_header(NvTraceDev *d, NvtQueue *q, MsgqTxHeader *h)
+         q->last = 0;
+         q->seq_valid = false;
+         q->valid = true;
++        if (h->write_ptr) {
++            nvtrace_note(d, "gsp: queue at +0x%" PRIx64 " joined mid-stream "
++                         "(writePtr %u): slots before it are logged late "
++                         "and may be stale", q->off, h->write_ptr);
++        }
+     } else if (q->size != h->size || q->msg_size != h->msg_size ||
+                q->entry_off != h->entry_off) {
+         return false;
+@@ -850,7 +862,7 @@ static void gsp_drain(NvTraceDev *d, int qi)
+     NvtQueue *q = &g->q[qi];
+     MsgqTxHeader h;
+     uint32_t wp, rp, n = 0;
+-    g_autofree uint8_t *buf = NULL;
++    uint8_t *buf;
+ 
+     if (!g->known) {
+         return;
+@@ -869,7 +881,11 @@ static void gsp_drain(NvTraceDev *d, int qi)
+         return;
+     }
+     rp = gsp_q_readptr(d, qi);
+-    buf = g_malloc(NVT_MAX_ELEMS * q->msg_size);
++    if (g->drain_cap < NVT_MAX_ELEMS * q->msg_size) {
++        g->drain_cap = NVT_MAX_ELEMS * q->msg_size;
++        g->drain_buf = g_realloc(g->drain_buf, g->drain_cap);
++    }
++    buf = g->drain_buf;
+ 
+     while (q->last != wp && n < q->msg_count) {
+         uint32_t avail = (wp + q->msg_count - q->last) % q->msg_count;
+@@ -890,7 +906,8 @@ static void gsp_drain(NvTraceDev *d, int qi)
+             memcpy(&rlen, buf + roff + 8, 4);
+             len = roff + rlen;
+             nelem = DIV_ROUND_UP(len, q->msg_size);
+-            if (nelem > NVT_MAX_ELEMS || nelem > avail || nelem == 0) {
++            if (nelem > NVT_MAX_ELEMS || nelem > avail || nelem == 0 ||
++                (g->elem_max && len > g->elem_max)) {
+                 m.flags |= NVT_GSP_F_TRUNC;
+                 nelem = MAX(1, MIN(MIN(nelem, NVT_MAX_ELEMS), avail));
+                 len = MIN(len, nelem * q->msg_size);
+@@ -907,6 +924,9 @@ static void gsp_drain(NvTraceDev *d, int qi)
+             if (!gsp_shm_read(d, q->off + q->entry_off +
+                               (uint64_t)s * q->msg_size,
+                               buf + i * q->msg_size, q->msg_size)) {
++                /* log what was readable; the slots are still consumed */
++                m.flags |= NVT_GSP_F_TRUNC;
++                len = MIN(len, i * q->msg_size);
+                 break;
+             }
+         }
+@@ -963,7 +983,8 @@ static void gsp_drain_all(NvTraceDev *d)
+ /* Set up queue tracking from MESSAGE_QUEUE_INIT_ARGUMENTS-like values. */
+ static bool gsp_set_queues(NvTraceDev *d, uint64_t shared_pa, uint32_t npte,
+                            uint64_t cmd_off, uint64_t stat_off,
+-                           uint32_t elem_hdr, uint32_t source)
++                           uint32_t elem_hdr, uint64_t elem_max,
++                           uint32_t source)
+ {
+     NvtGsp *g = &d->g;
+     NvtQInfo qi = { 0 };
+@@ -1008,6 +1029,8 @@ static bool gsp_set_queues(NvTraceDev *d, uint64_t shared_pa, uint32_t npte,
+     g->q[0].off = cmd_off;
+     g->q[1].off = stat_off;
+     g->elem_hdr = elem_hdr <= 128 ? elem_hdr : 0;
++    g->elem_max = elem_max >= NVT_PAGE &&
++                  elem_max <= NVT_MAX_ELEMS * NVT_PAGE ? elem_max : 0;
+     g->known = true;
+     g->qs_valid = false;
+ 
+@@ -1185,7 +1208,7 @@ static bool gsp_discover_from_fmc(NvTraceDev *d, uint64_t fmc_pa,
+                      r[i].kind, r[i].loc);
+         if (!strcmp(id, "RMARGS")) {
+             uint8_t a[64];
+-            uint64_t shared, cmd, stat, hdr;
++            uint64_t shared, cmd, stat, hdr, emax;
+             uint32_t npte;
+ 
+             nvt_snap(d, r[i].pa, MIN(r[i].size, 64 * 1024),
+@@ -1199,7 +1222,9 @@ static bool gsp_discover_from_fmc(NvTraceDev *d, uint64_t fmc_pa,
+             memcpy(&cmd, a + 16, 8);
+             memcpy(&stat, a + 24, 8);
+             memcpy(&hdr, a + 32, 8);
+-            found = gsp_set_queues(d, shared, npte, cmd, stat, hdr, source);
++            memcpy(&emax, a + 48, 8);   /* queueElementSizeMax */
++            found = gsp_set_queues(d, shared, npte, cmd, stat, hdr, emax,
++                                   source);
+         } else if (g_str_has_prefix(id, "LOG") && r[i].loc == 1) {
+             gsp_add_log(d, id, r[i].pa, r[i].size);
+         }
+@@ -1294,13 +1319,14 @@ static void pair_candidate(NvTraceDev *d, uint32_t lo_off, uint64_t addr)
+         if (a < 0x100000 || (a & 0xff) || a >= (1ull << 52)) {
+             continue;
+         }
+-        if (!nvt_is_ram(d->as, a)) {
+-            continue;
+-        }
++        /* cheap checks first: this runs for every BAR0 register pair */
+         key = (a & ~0xfffull) ^ ((uint64_t)lo_off << 40);
+         if (g_hash_table_contains(g->snapped, &key)) {
+             continue;
+         }
++        if (!nvt_is_ram(d->as, a)) {
++            continue;
++        }
+         if (g->pair_budget < NVT_PAGE) {
+             return;
+         }
+@@ -1460,7 +1486,7 @@ static void gsp_pick_candidate(NvTraceDev *d, uint64_t pa)
+         !nvt_gread(d->as, pte, &ch, sizeof(ch))) {
+         return;
+     }
+-    gsp_set_queues(d, pa, npte, cmd_off, cmd_off + ch.size, 0, 3);
++    gsp_set_queues(d, pa, npte, cmd_off, cmd_off + ch.size, 0, 0, 3);
+ }
+ 
+ /* Called from the poller thread without g->lock held. */
+@@ -1642,7 +1668,14 @@ void nvtrace_mmio(NvTraceDev *d, int bar, hwaddr off, unsigned size,
+     };
+ 
+     nvt_emit(d, NVT_REC_MMIO, 0, &m, sizeof(m), NULL, 0);
+-    if (bar == 0 && d->gsp_on && origin == NVT_ORIGIN_DIRECT) {
++    /*
++     * Only writes and the FSP EMEM/MSGQ reads feed the GSP/FSP state; plain
++     * reads (the bulk of the traffic) skip the per-device lock, which the
++     * GSP poller may hold while it drains a queue.
++     */
++    if (bar == 0 && d->gsp_on && origin == NVT_ORIGIN_DIRECT &&
++        (write || off == NV_PFSP_EMEMD0 || off == NV_PFSP_MSGQ_HEAD0 ||
++         off == NV_PFSP_MSGQ_TAIL0)) {
+         qemu_mutex_lock(&d->g.lock);
+         gsp_observe(d, off, size, val, write);
+         qemu_mutex_unlock(&d->g.lock);

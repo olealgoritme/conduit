@@ -1,0 +1,1237 @@
+From d1bdbf5898ed680279bdad7d0d4ace0c80e6a843 Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Sat, 31 Oct 2026 16:47:54 +0100
+Subject: [PATCH 104/104] vfio: nvtrace - VRAM aperture pages, trap windows,
+ buffers from GSP RPCs
+
+New vfio-pci properties:
+  x-nvtrace-dirty-bars=MASK  log the pages of these mmapped BARs that the
+                             guest CPU writes: KVM dirty logging on the BAR
+                             memslots, collected every NVTRACE_DIRTY_MS on
+                             the main loop, re-read by a worker through
+                             pread() on the device fd (no SIGBUS), logged as
+                             BAR_PAGE records when the content changed
+                             (budget NVTRACE_DIRTY_BUDGET_MB/s, optional
+                             periodic re-read NVTRACE_DIRTY_RESCAN_MS). The
+                             first collection after a BAR is (re)mapped is
+                             dropped: new KVM slots start all dirty.
+  x-trap-windows=B:OFF+LEN,...  keep only these ranges un-mmapped so they
+                             trap and are traced; the rest stays mmapped.
+
+Buffers named in GSP command RPCs (610.57.04 layouts) are captured:
+ALLOC_MEMORY sysmem page lists, the sysmem memdescs of GPFIFO channel
+allocations (instance, USERD, RAMFC, method buffer, error notifiers) and
+display channel pushbuffers (NV2080_CTRL_CMD_INTERNAL_DISPLAY_CHANNEL_
+PUSHBUFFER). They are snapshotted, re-read on usermode doorbell writes,
+interrupts and periodically (changed pages only, in slices from the GSP
+poller), dropped on FREE; every display PUT write logs the new pushbuffer
+bytes.
+---
+ hw/vfio/nvtrace.c | 846 ++++++++++++++++++++++++++++++++++++++++++++++
+ hw/vfio/nvtrace.h |  14 +
+ hw/vfio/pci.c     | 129 +++++++
+ hw/vfio/pci.h     |   7 +
+ 4 files changed, 996 insertions(+)
+
+diff --git a/hw/vfio/nvtrace.c b/hw/vfio/nvtrace.c
+index 60bf76468..dca0591fa 100644
+--- a/hw/vfio/nvtrace.c
++++ b/hw/vfio/nvtrace.c
+@@ -35,6 +35,9 @@
+ #include "qemu/error-report.h"
+ #include "qemu/cutils.h"
+ #include "qemu/int128.h"
++#include "qemu/bswap.h"
++#include "qemu/timer.h"
++#include "qemu/main-loop.h"
+ #include "system/system.h"
+ #include "system/memory.h"
+ #include "system/address-spaces.h"
+@@ -68,6 +71,7 @@ enum {
+     NVT_REC_FSP_PKT    = 12,
+     NVT_REC_GSP_QINFO  = 13,
+     NVT_REC_DEV        = 14,
++    NVT_REC_BAR_PAGE   = 15,
+ };
+ 
+ typedef struct QEMU_PACKED {
+@@ -173,6 +177,21 @@ typedef struct QEMU_PACKED {
+     uint64_t rsvd;
+ } NvtDevRec;
+ 
++/* A 4 KiB page of a BAR (VRAM aperture) whose content changed. */
++typedef struct QEMU_PACKED {
++    uint8_t  bar;
++    uint8_t  reason;       /* 0 = guest CPU wrote it, 1 = periodic re-read */
++    uint16_t rsvd;
++    uint32_t len;
++    uint64_t off;          /* offset in the BAR */
++    uint64_t hash;
++} NvtBarPage;
++
++/* DMA_SNAP flags */
++#define NVT_SNAP_F_NODATA   0x01   /* not readable */
++#define NVT_SNAP_F_BLOB     0x02   /* not guest memory */
++#define NVT_SNAP_F_CHANGED  0x04   /* watched buffer re-read: content changed */
++
+ /* ------------------------------------------------------------------ */
+ /* Ring + writer                                                       */
+ 
+@@ -640,6 +659,21 @@ static bool nvt_is_ram(AddressSpace *as, uint64_t gpa)
+ #define NVT_MAX_LOGS              16
+ #define NVT_PAIR_HIST             16
+ 
++/* RPC-driven DMA capture (610.57.04 layouts, see README "follow") */
++#define RPC_FN_ALLOC_MEMORY       4
++#define RPC_FN_FREE               10
++#define RPC_FN_GSP_RM_CONTROL     76
++#define RPC_FN_GSP_RM_ALLOC       103
++#define NV01_MEMORY_LIST_SYSTEM   0x81
++#define NV01_MEMORY_LIST_FBMEM    0x82
++#define NV_CTRL_DISP_CHN_PB       0x20800a58 /* ..._INTERNAL_DISPLAY_CHANNEL_PUSHBUFFER */
++#define NV_ADDR_SYSMEM            1
++#define NV_ADDR_FBMEM             2
++#define NV_UDISP_CORE             0x680000   /* NV_UDISP_FE_CHN_ASSY_BASEADR_CORE */
++#define NV_UDISP_WIN0             0x690000   /* ..._WIN(0); PUT at +0 */
++#define NVT_DISP_CHN              33         /* core + 32 windows */
++#define NV_USERMODE_DOORBELL      (0xb80000 + 0x30090) /* VF FULL_PHYS + DOORBELL */
++
+ typedef struct NvtQueue {
+     uint64_t off;              /* offset of the queue in the shared memory */
+     uint32_t size, msg_size, msg_count, entry_off, rxhdr_off;
+@@ -659,6 +693,62 @@ typedef struct NvtScanCand {
+     uint32_t wp;
+ } NvtScanCand;
+ 
++/* A guest-memory buffer the GPU reads or writes, learned from an RPC. */
++typedef struct NvtWatch {
++    uint32_t hclient, hobject;
++    char tag[22];              /* "w:" + tag fits a DMA_SNAP label */
++    bool hot;                  /* re-read on doorbells and interrupts */
++    uint32_t npages;
++    uint64_t first, len;       /* byte offset into the first page; size */
++    uint64_t *pages;           /* page-aligned guest physical addresses */
++    uint64_t *hash;            /* last content hash per page */
++} NvtWatch;
++
++typedef struct NvtWatchCursor {
++    guint k;                   /* entry */
++    uint32_t i;                /* page in the entry */
++} NvtWatchCursor;
++
++#define NVT_WATCH_SLICE           (256 * 1024)  /* bytes per poll, all */
++#define NVT_WATCH_HOT_SLICE       (1024 * 1024) /* bytes per hot pass */
++
++typedef struct NvtDispChn {
++    bool valid, sysmem;
++    uint32_t hclass, inst;
++    uint64_t pa, size;
++    uint32_t put;
++} NvtDispChn;
++
++/* BAR pages written by the guest CPU (KVM dirty log on the BAR mmaps) */
++#define NVT_BT_MAPS               32
++#define NVT_BT_PENDING_MAX        65536
++
++typedef struct NvtBarTrack {
++    struct {
++        int bar;
++        MemoryRegion *mr;
++        uint64_t off, size;
++        int skip;              /* ticks to discard (fresh KVM slot) */
++    } map[NVT_BT_MAPS];
++    int nmaps;
++    MemoryListener ml;
++    bool ml_on;
++    uint64_t discarded;
++    NvtBarReadFn read;
++    void *opaque;
++    QEMUTimer *timer;
++    uint64_t period_ms, rescan_ms, budget;     /* budget: bytes/s */
++    QemuMutex lock;
++    QemuCond cond;
++    GArray *pending;                           /* uint64 keys */
++    GHashTable *pending_set;
++    GHashTable *hashes;                        /* worker thread only */
++    QemuThread thread;
++    bool started, stop;
++    int paused;
++    uint64_t overflow, dropped, readfail, emitted, ticks;
++} NvtBarTrack;
++
+ typedef struct NvtGsp {
+     QemuMutex lock;
+     bool known;
+@@ -696,6 +786,14 @@ typedef struct NvtGsp {
+     uint64_t last_scan_ns;
+     NvtScanCand cand[8];
+     int ncand;
++
++    /* RPC-driven capture */
++    GPtrArray *watch;          /* NvtWatch */
++    uint64_t watch_bytes;
++    bool watch_kick, watch_full_noted, watch_all_active;
++    uint64_t watch_hot_ns, watch_all_ns;
++    NvtWatchCursor watch_cur;
++    NvtDispChn disp[NVT_DISP_CHN];
+ } NvtGsp;
+ 
+ struct NvTraceDev {
+@@ -710,6 +808,9 @@ struct NvTraceDev {
+     QemuThread poll_thread;
+     bool poll_started, stop;
+     uint64_t poll_us, log_ms;
++    bool follow;
++    uint64_t watch_ms, watch_hot_us, watch_max, watch_obj_max;
++    NvtBarTrack *bt;
+ };
+ 
+ static uint8_t nvt_dev_index(NvTraceDev *d)
+@@ -781,6 +882,403 @@ static uint64_t gsp_shm_gpa(NvTraceDev *d, uint64_t off)
+     return pg < g->npte ? g->pte[pg] + (off % NVT_PAGE) : 0;
+ }
+ 
++/* ---- content hash for change detection (not cryptographic) ---- */
++
++static uint64_t nvt_hash(const void *p, size_t len)
++{
++    const uint8_t *b = p;
++    uint64_t h = 0x9e3779b97f4a7c15ull ^ len;
++    size_t i;
++
++    for (i = 0; i + 8 <= len; i += 8) {
++        uint64_t v;
++
++        memcpy(&v, b + i, 8);
++        h ^= v * 0xbf58476d1ce4e5b9ull;
++        h = ((h << 27) | (h >> 37)) * 0x94d049bb133111ebull;
++    }
++    for (; i < len; i++) {
++        h = (h ^ b[i]) * 0x100000001b3ull;
++    }
++    return h ^ (h >> 31);
++}
++
++/* ---- watched guest buffers (learned from GSP RPCs) ---- */
++
++static void watch_free(gpointer p)
++{
++    NvtWatch *w = p;
++
++    g_free(w->pages);
++    g_free(w->hash);
++    g_free(w);
++}
++
++/* Byte range of page i of a watch entry: [*start, *start + *n) in the page */
++static void watch_page_range(const NvtWatch *w, uint32_t i, uint64_t *start,
++                             uint64_t *n)
++{
++    uint64_t lo = i ? 0 : w->first;
++    uint64_t end = w->first + w->len - (uint64_t)i * NVT_PAGE;
++
++    *start = lo;
++    *n = MIN(end, NVT_PAGE) - lo;
++}
++
++/* Read page i, return true and its hash when the content changed. */
++static bool watch_page_check(NvTraceDev *d, NvtWatch *w, uint32_t i,
++                             uint8_t *buf, uint64_t *start, uint64_t *n)
++{
++    uint64_t h;
++
++    watch_page_range(w, i, start, n);
++    if (!nvt_gread(d->as, w->pages[i] + *start, buf, *n)) {
++        return false;
++    }
++    h = nvt_hash(buf, *n) | 1;
++    if (h == w->hash[i]) {
++        return false;
++    }
++    w->hash[i] = h;
++    return true;
++}
++
++/* Called with g->lock held. */
++static void watch_add(NvTraceDev *d, uint32_t hclient, uint32_t hobject,
++                      const char *tag, bool hot, const uint64_t *pages,
++                      uint32_t npages, uint64_t first, uint64_t len)
++{
++    NvtGsp *g = &d->g;
++    NvtWatch *w;
++    uint8_t buf[NVT_PAGE];
++    uint32_t i;
++
++    len = MIN(len, d->watch_obj_max);
++    if (!len || !npages) {
++        return;
++    }
++    npages = MIN(npages, DIV_ROUND_UP(first + len, NVT_PAGE));
++    len = MIN(len, (uint64_t)npages * NVT_PAGE - first);
++    if (g->watch_bytes + len > d->watch_max) {
++        if (!g->watch_full_noted) {
++            nvtrace_note(d, "follow: watch budget (%" PRIu64 " MB) full, "
++                         "%s and later buffers not watched",
++                         d->watch_max >> 20, tag);
++            g->watch_full_noted = true;
++        }
++        return;
++    }
++    w = g_new0(NvtWatch, 1);
++    w->hclient = hclient;
++    w->hobject = hobject;
++    pstrcpy(w->tag, sizeof(w->tag), tag);
++    w->hot = hot;
++    w->npages = npages;
++    w->first = first;
++    w->len = len;
++    w->pages = g_memdup2(pages, npages * sizeof(uint64_t));
++    w->hash = g_new0(uint64_t, npages);
++    g_ptr_array_add(g->watch, w);
++    g->watch_bytes += len;
++
++    for (i = 0; i < npages; i++) {
++        uint64_t start, n;
++
++        watch_page_range(w, i, &start, &n);
++        if (!nvt_gread(d->as, pages[i] + start, buf, n)) {
++            NvtSnap sn = { .gpa = pages[i] + start, .len = n,
++                           .flags = NVT_SNAP_F_NODATA };
++
++            pstrcpy(sn.label, sizeof(sn.label), tag);
++            nvt_emit(d, NVT_REC_DMA_SNAP, 0, &sn, sizeof(sn), NULL, 0);
++            continue;
++        }
++        w->hash[i] = nvt_hash(buf, n) | 1;
++        {
++            NvtSnap sn = { .gpa = pages[i] + start, .len = n };
++
++            pstrcpy(sn.label, sizeof(sn.label), tag);
++            nvt_emit(d, NVT_REC_DMA_SNAP, 0, &sn, sizeof(sn), buf, n);
++        }
++    }
++}
++
++static void watch_add_contig(NvTraceDev *d, uint32_t hclient,
++                             uint32_t hobject, const char *tag, bool hot,
++                             uint64_t pa, uint64_t len)
++{
++    uint64_t first = pa & (NVT_PAGE - 1);
++    uint32_t i, n;
++    g_autofree uint64_t *pages = NULL;
++
++    len = MIN(len, d->watch_obj_max);
++    n = DIV_ROUND_UP(first + len, NVT_PAGE);
++    pages = g_new(uint64_t, n);
++    for (i = 0; i < n; i++) {
++        pages[i] = (pa & ~(uint64_t)(NVT_PAGE - 1)) + (uint64_t)i * NVT_PAGE;
++    }
++    watch_add(d, hclient, hobject, tag, hot, pages, n, first, len);
++}
++
++static void watch_remove(NvTraceDev *d, uint32_t hclient, uint32_t hobject)
++{
++    NvtGsp *g = &d->g;
++    guint i = 0;
++
++    while (i < g->watch->len) {
++        NvtWatch *w = g_ptr_array_index(g->watch, i);
++
++        if (w->hobject == hobject && (w->hclient == hclient || !hclient)) {
++            g->watch_bytes -= w->len;
++            g_ptr_array_remove_index_fast(g->watch, i);
++        } else {
++            i++;
++        }
++    }
++}
++
++/*
++ * Re-read watched buffers from *c on, at most 'budget' bytes (bounds the
++ * time g->lock is held); log the pages whose content changed. Returns true
++ * when the pass is complete (and resets the cursor).
++ */
++static bool watch_scan(NvTraceDev *d, bool hot_only, NvtWatchCursor *c,
++                       uint64_t budget)
++{
++    NvtGsp *g = &d->g;
++    uint8_t buf[NVT_PAGE];
++
++    for (; c->k < g->watch->len; c->k++, c->i = 0) {
++        NvtWatch *w = g_ptr_array_index(g->watch, c->k);
++
++        if (hot_only && !w->hot) {
++            continue;
++        }
++        for (; c->i < w->npages; c->i++) {
++            uint64_t start, n;
++            NvtSnap sn = { .flags = NVT_SNAP_F_CHANGED };
++
++            if (budget < NVT_PAGE) {
++                return false;
++            }
++            budget -= NVT_PAGE;
++            if (!watch_page_check(d, w, c->i, buf, &start, &n)) {
++                continue;
++            }
++            sn.gpa = w->pages[c->i] + start;
++            sn.len = n;
++            snprintf(sn.label, sizeof(sn.label), "w:%s", w->tag);
++            nvt_emit(d, NVT_REC_DMA_SNAP, 0, &sn, sizeof(sn), buf, n);
++        }
++    }
++    c->k = 0;
++    c->i = 0;
++    return true;
++}
++
++static void watch_clear(NvTraceDev *d)
++{
++    NvtGsp *g = &d->g;
++
++    g_ptr_array_set_size(g->watch, 0);
++    g->watch_bytes = 0;
++    g->watch_full_noted = false;
++    g->watch_all_active = false;
++    memset(&g->watch_cur, 0, sizeof(g->watch_cur));
++    memset(g->disp, 0, sizeof(g->disp));
++}
++
++/* ---- following addresses in GSP RPCs ---- */
++
++/* ALLOC_MEMORY (rpc_alloc_memory_v13_01): memory registered with GSP-RM */
++static void follow_alloc_memory(NvTraceDev *d, const uint8_t *p, uint32_t n)
++{
++    uint32_t hclient, hmem, cls, adj, count, i;
++    uint64_t length;
++    g_autofree uint64_t *pages = NULL;
++    g_autofree char *tag = NULL;
++
++    if (n < 56) {
++        return;
++    }
++    hclient = ldl_le_p(p);
++    hmem = ldl_le_p(p + 8);
++    cls = ldl_le_p(p + 12);
++    adj = ldl_le_p(p + 20);
++    length = ldq_le_p(p + 32);
++    count = MIN(ldl_le_p(p + 40), (n - 56) / 8);  /* pteDesc.pte_pde[] */
++    if (cls != NV01_MEMORY_LIST_SYSTEM || !count || !length) {
++        return;                     /* FBMEM: physical VRAM pages, no data */
++    }
++    tag = g_strdup_printf("mem%08x", hmem);
++    if (count == 1) {               /* contiguous: one PTE */
++        watch_add_contig(d, hclient, hmem, tag, false,
++                         (ldq_le_p(p + 56) << 12) + (adj & 0xfff), length);
++        return;
++    }
++    pages = g_new(uint64_t, count);
++    for (i = 0; i < count; i++) {
++        pages[i] = ldq_le_p(p + 56 + 8 * i) << 12;
++    }
++    watch_add(d, hclient, hmem, tag, false, pages, count, adj & 0xfff,
++              length);
++}
++
++/* GSP_RM_ALLOC of a GPFIFO channel: NV_CHANNEL_ALLOC_PARAMS memdescs */
++static void follow_channel(NvTraceDev *d, uint32_t hclient, uint32_t hobj,
++                           const uint8_t *a, uint32_t n)
++{
++    static const struct {
++        uint32_t off;
++        const char *name;
++        bool hot;
++    } md[] = {
++        { 152, "inst", false }, { 176, "userd", true },
++        { 200, "ramfc", false }, { 224, "mthdbuf", false },
++        { 256, "errnotif", true }, { 280, "eccnotif", false },
++    };
++    int i;
++
++    for (i = 0; i < ARRAY_SIZE(md); i++) {
++        uint64_t base, size;
++        uint32_t as;
++        g_autofree char *tag = NULL;
++
++        if (md[i].off + 24 > n) {
++            break;
++        }
++        base = ldq_le_p(a + md[i].off);
++        size = ldq_le_p(a + md[i].off + 8);
++        as = ldl_le_p(a + md[i].off + 16);
++        if (as != NV_ADDR_SYSMEM || !base || !size || size > (16 << 20)) {
++            continue;
++        }
++        tag = g_strdup_printf("ch%08x.%s", hobj, md[i].name);
++        watch_add_contig(d, hclient, hobj, tag, md[i].hot, base, size);
++    }
++}
++
++/* NV2080_CTRL_CMD_INTERNAL_DISPLAY_CHANNEL_PUSHBUFFER: display channel PB */
++static void follow_disp_pb(NvTraceDev *d, const uint8_t *c, uint32_t n)
++{
++    NvtGsp *g = &d->g;
++    uint32_t as, hclass, inst;
++    uint64_t pa, limit;
++    int chn;
++    NvtDispChn *dc;
++
++    if (n < 52) {
++        return;
++    }
++    as = ldl_le_p(c);
++    pa = ldq_le_p(c + 8);
++    limit = ldq_le_p(c + 16);
++    hclass = ldl_le_p(c + 28);
++    inst = ldl_le_p(c + 32);
++    if (!c[36]) {
++        return;                     /* PIO channel: no pushbuffer */
++    }
++    if ((hclass & 0xff) == 0x7d) {
++        chn = 0;
++    } else if ((hclass & 0xff) == 0x7e && inst < NVT_DISP_CHN - 1) {
++        chn = 1 + inst;
++    } else {
++        return;
++    }
++    if (limit >= (1ull << 32)) {
++        return;                     /* implausible; also avoids size 0 */
++    }
++    dc = &g->disp[chn];
++    dc->valid = true;
++    dc->sysmem = as == NV_ADDR_SYSMEM;
++    dc->hclass = hclass;
++    dc->inst = inst;
++    dc->pa = pa;
++    dc->size = MIN(limit + 1, 1 << 20);
++    dc->put = 0;
++    nvtrace_note(d, "disp: channel %d (class 0x%04x inst %u) pushbuffer %s "
++                 "0x%" PRIx64 " size 0x%" PRIx64, chn, hclass, inst,
++                 dc->sysmem ? "sysmem" : as == NV_ADDR_FBMEM ? "vidmem" : "?",
++                 pa, dc->size);
++    if (dc->sysmem) {
++        g_autofree char *label = g_strdup_printf("dispPB:%d", chn);
++
++        nvt_snap(d, pa, dc->size, label);
++    }
++}
++
++/* Guest wrote a display channel PUT: log the new pushbuffer bytes. */
++static void disp_put(NvTraceDev *d, int chn, uint32_t put)
++{
++    NvtDispChn *dc = &d->g.disp[chn];
++    g_autofree char *label = NULL;
++    uint32_t start = dc->put;
++
++    if (!dc->valid) {
++        return;
++    }
++    put %= dc->size;
++    dc->put = put;
++    if (!dc->sysmem || put == start) {
++        return;
++    }
++    label = g_strdup_printf("dispPB:%d@%x", chn, start);
++    if (put > start) {
++        nvt_snap(d, dc->pa + start, put - start, label);
++    } else {                        /* wrapped (JUMP back to 0) */
++        nvt_snap(d, dc->pa + start, dc->size - start, label);
++        if (put) {
++            g_free(label);
++            label = g_strdup_printf("dispPB:%d@0", chn);
++            nvt_snap(d, dc->pa, put, label);
++        }
++    }
++}
++
++/* Called with g->lock held for each logged command-queue RPC. */
++static void gsp_follow(NvTraceDev *d, const uint8_t *rpc, uint32_t len)
++{
++    uint32_t fn, rlen, n;
++    const uint8_t *p = rpc + 32;
++
++    if (!d->follow || len < 32) {
++        return;
++    }
++    rlen = ldl_le_p(rpc + 8);
++    fn = ldl_le_p(rpc + 12);
++    if (rlen < 32) {
++        return;
++    }
++    n = MIN(rlen, len) - 32;
++
++    switch (fn) {
++    case RPC_FN_ALLOC_MEMORY:
++        follow_alloc_memory(d, p, n);
++        break;
++    case RPC_FN_GSP_RM_ALLOC:
++        if (n >= 32) {
++            uint32_t cls = ldl_le_p(p + 12);
++            uint32_t psz = MIN(ldl_le_p(p + 20), n - 32);
++
++            /* Volta+ *_CHANNEL_GPFIFO_* */
++            if ((cls & 0xff) == 0x6f && cls >= 0xc36f && cls <= 0xcfff) {
++                follow_channel(d, ldl_le_p(p), ldl_le_p(p + 8), p + 32, psz);
++            }
++        }
++        break;
++    case RPC_FN_GSP_RM_CONTROL:
++        if (n >= 40 && ldl_le_p(p + 8) == NV_CTRL_DISP_CHN_PB) {
++            follow_disp_pb(d, p + 40, MIN(ldl_le_p(p + 16), n - 40));
++        }
++        break;
++    case RPC_FN_FREE:               /* NVOS00_PARAMETERS: hRoot, hParent, h */
++        if (n >= 12) {
++            watch_remove(d, ldl_le_p(p), ldl_le_p(p + 8));
++        }
++        break;
++    }
++}
++
+ typedef struct QEMU_PACKED {
+     uint32_t version, size, msg_size, msg_count, write_ptr, flags;
+     uint32_t rxhdr_off, entry_off;
+@@ -944,6 +1442,9 @@ static void gsp_drain(NvTraceDev *d, int qi)
+         m.nelem = nelem;
+         m.len = len;
+         nvt_emit(d, NVT_REC_GSP_MSG, 0, &m, sizeof(m), buf, len);
++        if (qi == 0 && roff >= 0) {
++            gsp_follow(d, buf + roff, len - roff);
++        }
+         q->last = (q->last + nelem) % q->msg_count;
+         n += nelem;
+     }
+@@ -1581,6 +2082,20 @@ static void gsp_observe(NvTraceDev *d, uint32_t off, unsigned size,
+     if (!write) {
+         return;
+     }
++    if (off == NV_USERMODE_DOORBELL) {
++        /* work submission (also from guest user mode): re-read hot buffers */
++        g->watch_kick = true;
++        return;
++    }
++    if (off >= NV_UDISP_CORE && off < NV_UDISP_WIN0 + 32 * 0x1000 &&
++        !(off & 0xfff) && size == 4) {
++        if (off == NV_UDISP_CORE) {
++            disp_put(d, 0, val);
++        } else if (off >= NV_UDISP_WIN0) {
++            disp_put(d, 1 + (off - NV_UDISP_WIN0) / 0x1000, val);
++        }
++        return;
++    }
+     if (off == NV_PGSP_QUEUE_HEAD0) {
+         if (!g->known) {
+             if (g->ncand > 1) {
+@@ -1631,6 +2146,28 @@ static void *nvt_poll_thread(void *opaque)
+         if (g->known) {
+             gsp_drain_all(d);
+         }
++        if (g->watch->len) {
++            uint64_t now = nvt_now();
++
++            if (g->watch_kick &&
++                now - g->watch_hot_ns >= d->watch_hot_us * 1000) {
++                NvtWatchCursor c = { 0 };
++
++                watch_scan(d, true, &c, NVT_WATCH_HOT_SLICE);
++                g->watch_hot_ns = now;
++                g->watch_kick = false;
++            }
++            if (!g->watch_all_active && d->watch_ms &&
++                now - g->watch_all_ns >= d->watch_ms * 1000000) {
++                g->watch_all_active = true;
++                g->watch_all_ns = now;
++                memset(&g->watch_cur, 0, sizeof(g->watch_cur));
++            }
++            if (g->watch_all_active &&
++                watch_scan(d, false, &g->watch_cur, NVT_WATCH_SLICE)) {
++                g->watch_all_active = false;
++            }
++        }
+         qemu_mutex_unlock(&g->lock);
+         if (d->log_ms) {
+             gsp_snap_logs_impl(d, false, true);
+@@ -1645,6 +2182,300 @@ static void *nvt_poll_thread(void *opaque)
+     return NULL;
+ }
+ 
++/* ------------------------------------------------------------------ */
++/* BAR pages written by the guest CPU (VRAM apertures)                 */
++/*
++ * The mmapped BAR ranges stay mmapped (no exits); QEMU turns on KVM dirty
++ * logging for them (DIRTY_MEMORY_VGA client). A timer on the main loop
++ * (BQL) collects the dirty pages every NVTRACE_DIRTY_MS; a worker thread
++ * re-reads each one through the device fd (pread: no SIGBUS while memory
++ * decode is off, -EIO instead), hashes it and logs it (BAR_PAGE) when the
++ * content differs from the last time. KVM write-protects the pages again
++ * after each collection, so each tracked page costs one write fault per
++ * period, not one per write.
++ */
++
++#define NVT_BT_CHUNK    (2 * 1024 * 1024)
++
++static void nvt_bt_queue(NvtBarTrack *t, const uint64_t *keys, size_t n)
++{
++    size_t i;
++
++    qemu_mutex_lock(&t->lock);
++    for (i = 0; i < n; i++) {
++        if (t->pending->len >= NVT_BT_PENDING_MAX) {
++            t->overflow += n - i;
++            break;
++        }
++        if (g_hash_table_add(t->pending_set, GSIZE_TO_POINTER(keys[i] + 1))) {
++            g_array_append_val(t->pending, keys[i]);
++        }
++    }
++    qemu_cond_signal(&t->cond);
++    qemu_mutex_unlock(&t->lock);
++}
++
++/*
++ * A new KVM memslot with dirty logging starts with every page dirty
++ * (KVM_DIRTY_LOG_INITIALLY_SET), and so does a new RAMBlock. Reading all
++ * of them would hit BAR1 pages the GPU has not mapped, so the first
++ * collection after the BAR range is (re)mapped is thrown away.
++ */
++static void nvt_bt_section(MemoryListener *l, MemoryRegionSection *sec)
++{
++    NvtBarTrack *t = container_of(l, NvtBarTrack, ml);
++    int m;
++
++    for (m = 0; m < t->nmaps; m++) {
++        if (sec->mr == t->map[m].mr) {
++            t->map[m].skip = 1;
++        }
++    }
++}
++
++static void nvt_bt_log_start(MemoryListener *l, MemoryRegionSection *sec,
++                             int old, int new)
++{
++    nvt_bt_section(l, sec);
++}
++
++static void nvt_bt_tick(void *opaque)
++{
++    NvTraceDev *d = opaque;
++    NvtBarTrack *t = d->bt;
++    g_autoptr(GArray) keys = g_array_new(false, false, sizeof(uint64_t));
++    int m;
++
++    t->ticks++;
++    for (m = 0; m < t->nmaps; m++) {
++        MemoryRegion *mr = t->map[m].mr;
++        uint64_t size = t->map[m].size, o, p;
++        guint before = keys->len;
++        DirtyBitmapSnapshot *snap;
++
++        snap = memory_region_snapshot_and_clear_dirty(mr, 0, size,
++                                                      DIRTY_MEMORY_VGA);
++        if (t->map[m].skip) {
++            t->map[m].skip--;
++            t->discarded++;
++            g_free(snap);
++            continue;
++        }
++        for (o = 0; o < size; o += NVT_BT_CHUNK) {
++            uint64_t l = MIN(NVT_BT_CHUNK, size - o);
++
++            if (!memory_region_snapshot_get_dirty(mr, snap, o, l)) {
++                continue;
++            }
++            for (p = o; p < o + l; p += NVT_PAGE) {
++                if (memory_region_snapshot_get_dirty(mr, snap, p, NVT_PAGE)) {
++                    uint64_t key = ((uint64_t)t->map[m].bar << 56) |
++                                   (t->map[m].off + p);
++
++                    g_array_append_val(keys, key);
++                }
++            }
++        }
++        g_free(snap);
++        /* everything dirty in a large range: not guest writes, drop it */
++        if (size >= (256 << 20) &&
++            (uint64_t)(keys->len - before) * NVT_PAGE > size / 2) {
++            g_array_set_size(keys, before);
++            t->discarded++;
++        }
++    }
++    if (keys->len) {
++        nvt_bt_queue(t, (uint64_t *)keys->data, keys->len);
++    }
++    timer_mod(t->timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) +
++              t->period_ms);
++}
++
++static void *nvt_bt_thread(void *opaque)
++{
++    NvTraceDev *d = opaque;
++    NvtBarTrack *t = d->bt;
++    uint8_t *buf = g_malloc(NVT_PAGE);
++    uint64_t tokens = t->budget, last = nvt_now(), last_rescan = nvt_now();
++    uint64_t last_note = nvt_now(), noted = 0;
++
++    for (;;) {
++        g_autoptr(GArray) work = NULL;
++        uint64_t now;
++        guint i;
++        bool rescan;
++
++        qemu_mutex_lock(&t->lock);
++        while (!t->pending->len && !t->stop) {
++            qemu_cond_timedwait(&t->cond, &t->lock, 200);
++            if (t->rescan_ms &&
++                nvt_now() - last_rescan >= t->rescan_ms * 1000000) {
++                break;
++            }
++        }
++        if (t->stop) {
++            qemu_mutex_unlock(&t->lock);
++            break;
++        }
++        work = t->pending;
++        t->pending = g_array_new(false, false, sizeof(uint64_t));
++        g_hash_table_remove_all(t->pending_set);
++        qemu_mutex_unlock(&t->lock);
++
++        now = nvt_now();
++        rescan = t->rescan_ms && now - last_rescan >= t->rescan_ms * 1000000;
++        if (rescan) {
++            GHashTableIter it;
++            gpointer k, v;
++
++            last_rescan = now;
++            g_hash_table_iter_init(&it, t->hashes);
++            while (g_hash_table_iter_next(&it, &k, &v)) {
++                uint64_t key = GPOINTER_TO_SIZE(k) - 1;
++
++                key |= 1ull << 55;          /* marks "rescan" for reason */
++                g_array_append_val(work, key);
++            }
++        }
++
++        for (i = 0; i < work->len; i++) {
++            uint64_t key = g_array_index(work, uint64_t, i);
++            uint8_t reason = (key >> 55) & 1;
++            uint64_t h, hk;
++            int bar;
++            uint64_t off;
++            gpointer old;
++
++            key &= ~(1ull << 55);
++            bar = key >> 56;
++            off = key & ((1ull << 55) - 1);
++            hk = key + 1;
++            now = nvt_now();
++            tokens = MIN(t->budget, tokens + (now - last) * t->budget /
++                         1000000000ull);
++            last = now;
++            if (qatomic_read(&t->paused) || qatomic_read(&t->stop) ||
++                tokens < NVT_PAGE) {
++                t->dropped++;
++                continue;
++            }
++            tokens -= NVT_PAGE;
++            if (!t->read(t->opaque, bar, off, buf, NVT_PAGE)) {
++                t->readfail++;
++                continue;
++            }
++            h = nvt_hash(buf, NVT_PAGE) | 1;
++            old = g_hash_table_lookup(t->hashes, GSIZE_TO_POINTER(hk));
++            if (old && GPOINTER_TO_SIZE(old) == h) {
++                continue;
++            }
++            g_hash_table_insert(t->hashes, GSIZE_TO_POINTER(hk),
++                                GSIZE_TO_POINTER(h));
++            {
++                NvtBarPage bp = { .bar = bar, .reason = reason,
++                                  .len = NVT_PAGE, .off = off, .hash = h };
++
++                nvt_emit(d, NVT_REC_BAR_PAGE, 0, &bp, sizeof(bp), buf,
++                         NVT_PAGE);
++            }
++            t->emitted++;
++        }
++
++        now = nvt_now();
++        if (now - last_note > 5000000000ull &&
++            t->dropped + t->overflow + t->readfail != noted) {
++            noted = t->dropped + t->overflow + t->readfail;
++            last_note = now;
++            nvtrace_note(d, "bar pages: %" PRIu64 " logged, %" PRIu64
++                         " skipped (budget/reset), %" PRIu64 " overflow, %"
++                         PRIu64 " unreadable, %u known, %" PRIu64
++                         " collections discarded (remap)",
++                         t->emitted, t->dropped, t->overflow, t->readfail,
++                         g_hash_table_size(t->hashes), t->discarded);
++        }
++    }
++    g_free(buf);
++    return NULL;
++}
++
++void nvtrace_bar_track(NvTraceDev *d, int bar, MemoryRegion *mr,
++                       uint64_t bar_off, uint64_t size, NvtBarReadFn read,
++                       void *opaque)
++{
++    NvtBarTrack *t = d->bt;
++
++    if (!t) {
++        t = d->bt = g_new0(NvtBarTrack, 1);
++        t->read = read;
++        t->opaque = opaque;
++        t->period_ms = MAX(nvt_env_u64("NVTRACE_DIRTY_MS", 250), 10);
++        t->rescan_ms = nvt_env_u64("NVTRACE_DIRTY_RESCAN_MS", 0);
++        t->budget = MAX(nvt_env_u64("NVTRACE_DIRTY_BUDGET_MB", 16), 1) << 20;
++        qemu_mutex_init(&t->lock);
++        qemu_cond_init(&t->cond);
++        t->pending = g_array_new(false, false, sizeof(uint64_t));
++        t->pending_set = g_hash_table_new(NULL, NULL);
++        t->hashes = g_hash_table_new(NULL, NULL);
++        t->ml.name = "nvtrace-bar";
++        t->ml.region_add = nvt_bt_section;
++        t->ml.log_start = nvt_bt_log_start;
++        t->timer = timer_new_ms(QEMU_CLOCK_REALTIME, nvt_bt_tick, d);
++        timer_mod(t->timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) +
++                  t->period_ms);
++        t->started = true;
++        qemu_thread_create(&t->thread, "nvtrace-bar", nvt_bt_thread, d,
++                           QEMU_THREAD_JOINABLE);
++        nvtrace_note(d, "bar pages: period %" PRIu64 " ms, budget %" PRIu64
++                     " MB/s, rescan %" PRIu64 " ms", t->period_ms,
++                     t->budget >> 20, t->rescan_ms);
++    }
++    if (t->nmaps == NVT_BT_MAPS || !size) {
++        return;
++    }
++    t->map[t->nmaps].bar = bar;
++    t->map[t->nmaps].mr = mr;
++    t->map[t->nmaps].off = bar_off;
++    t->map[t->nmaps].size = size;
++    t->map[t->nmaps].skip = 1;          /* RAMBlocks start all dirty */
++    t->nmaps++;
++    memory_region_set_log(mr, true, DIRTY_MEMORY_VGA);
++    if (!t->ml_on) {
++        memory_listener_register(&t->ml, &address_space_memory);
++        t->ml_on = true;
++    }
++    nvtrace_note(d, "bar pages: BAR%d +0x%" PRIx64 " size 0x%" PRIx64
++                 " dirty-tracked", bar, bar_off, size);
++}
++
++/* Stop the worker (any thread); the timer is removed with the BQL held. */
++static void nvt_bt_stop(NvTraceDev *d, bool bql)
++{
++    NvtBarTrack *t = d->bt;
++    int m;
++
++    if (!t || !t->started) {
++        return;
++    }
++    qemu_mutex_lock(&t->lock);
++    t->stop = true;
++    qemu_cond_signal(&t->cond);
++    qemu_mutex_unlock(&t->lock);
++    qemu_thread_join(&t->thread);
++    t->started = false;
++    if (bql) {
++        if (t->ml_on) {
++            memory_listener_unregister(&t->ml);
++            t->ml_on = false;
++        }
++        timer_free(t->timer);
++        t->timer = NULL;
++        for (m = 0; m < t->nmaps; m++) {
++            memory_region_set_log(t->map[m].mr, false, DIRTY_MEMORY_VGA);
++        }
++        t->nmaps = 0;
++    }
++}
++
+ /* ------------------------------------------------------------------ */
+ /* Public hooks                                                        */
+ 
+@@ -1709,6 +2540,7 @@ void nvtrace_irq(NvTraceDev *d, int kind, int vector, uint64_t addr,
+     if (d->gsp_on) {
+         qemu_mutex_lock(&d->g.lock);
+         gsp_drain_all(d);
++        d->g.watch_kick = true;     /* notifiers / semaphores may have moved */
+         qemu_mutex_unlock(&d->g.lock);
+     }
+ }
+@@ -1727,6 +2559,11 @@ void nvtrace_reset(NvTraceDev *d, int kind)
+     uint32_t body[2] = { kind, 0 };
+ 
+     nvt_emit(d, NVT_REC_RESET, 0, body, sizeof(body), NULL, 0);
++    if (d->bt && kind == NVT_RESET_BEGIN) {
++        qatomic_set(&d->bt->paused, 1);  /* no BAR reads while in reset */
++    } else if (d->bt && kind == NVT_RESET_END) {
++        qatomic_set(&d->bt->paused, 0);
++    }
+     if (d->gsp_on && (kind == NVT_RESET_BEGIN || kind == NVT_RESET_FLR_CFG)) {
+         qemu_mutex_lock(&d->g.lock);
+         gsp_drain_all(d);
+@@ -1736,6 +2573,7 @@ void nvtrace_reset(NvTraceDev *d, int kind)
+         memset(d->g.q, 0, sizeof(d->g.q));
+         g_byte_array_set_size(d->g.fsp_msg[0], 0);
+         g_byte_array_set_size(d->g.fsp_msg[1], 0);
++        watch_clear(d);
+         qemu_mutex_unlock(&d->g.lock);
+     }
+ }
+@@ -1777,6 +2615,7 @@ static void nvt_shutdown(Notifier *n, void *data)
+     }
+     QLIST_FOREACH(d, &w->devs, next) {
+         qatomic_set(&d->stop, true);
++        nvt_bt_stop(d, false);
+         if (d->poll_started) {
+             qemu_thread_join(&d->poll_thread);
+             d->poll_started = false;
+@@ -1885,6 +2724,12 @@ NvTraceDev *nvtrace_attach(const char *name, const char *file,
+     d->g.snapped = g_hash_table_new_full(g_int64_hash, g_int64_equal,
+                                          g_free, NULL);
+     d->g.pair_budget = nvt_env_u64("NVTRACE_PAIR_BUDGET_MB", 256) << 20;
++    d->g.watch = g_ptr_array_new_with_free_func(watch_free);
++    d->follow = nvt_env_u64("NVTRACE_FOLLOW", 1) != 0;
++    d->watch_ms = nvt_env_u64("NVTRACE_WATCH_MS", 1000);
++    d->watch_hot_us = nvt_env_u64("NVTRACE_WATCH_HOT_US", 1000);
++    d->watch_max = nvt_env_u64("NVTRACE_WATCH_MAX_MB", 64) << 20;
++    d->watch_obj_max = MAX(nvt_env_u64("NVTRACE_WATCH_OBJ_KB", 256), 4) << 10;
+     QLIST_INSERT_HEAD(&w->devs, d, next);
+     nvtrace_note(d, "nvtrace: attached %s as dev %d trap_mask=0x%x gsp=%d",
+                  name, d->index, trap_mask, gsp);
+@@ -1898,6 +2743,7 @@ void nvtrace_detach(NvTraceDev *d)
+     }
+     nvtrace_note(d, "nvtrace: detach %s", d->name);
+     qatomic_set(&d->stop, true);
++    nvt_bt_stop(d, true);
+     if (d->poll_started) {
+         qemu_thread_join(&d->poll_thread);
+         d->poll_started = false;
+diff --git a/hw/vfio/nvtrace.h b/hw/vfio/nvtrace.h
+index 1e1cfb98d..c132d5b9a 100644
+--- a/hw/vfio/nvtrace.h
++++ b/hw/vfio/nvtrace.h
+@@ -11,6 +11,11 @@
+ 
+ typedef struct NvTraceDev NvTraceDev;
+ typedef struct AddressSpace AddressSpace;
++typedef struct MemoryRegion MemoryRegion;
++
++/* Read len bytes at off of BAR bar without side effects or SIGBUS. */
++typedef bool (*NvtBarReadFn)(void *opaque, int bar, uint64_t off, void *buf,
++                             size_t len);
+ 
+ /* Where an MMIO record came from (the "origin" byte of a MMIO record). */
+ enum {
+@@ -68,4 +73,13 @@ void G_GNUC_PRINTF(2, 3) nvtrace_note(NvTraceDev *d, const char *fmt, ...);
+ void nvtrace_blob(NvTraceDev *d, const char *label, const void *data,
+                   size_t len);
+ 
++/*
++ * Capture guest CPU writes to an mmapped BAR range (KVM dirty log): every
++ * dirty 4 KiB page is re-read through 'read' and logged when its content
++ * changed. Call with the BQL held after the range is mmapped.
++ */
++void nvtrace_bar_track(NvTraceDev *d, int bar, MemoryRegion *mr,
++                       uint64_t bar_off, uint64_t size, NvtBarReadFn read,
++                       void *opaque);
++
+ #endif
+diff --git a/hw/vfio/pci.c b/hw/vfio/pci.c
+index c7eb73aab..e7a71a0e3 100644
+--- a/hw/vfio/pci.c
++++ b/hw/vfio/pci.c
+@@ -49,6 +49,7 @@
+ #include "system/iommufd.h"
+ #include "vfio-migration-internal.h"
+ #include "vfio-helpers.h"
++#include "qemu/cutils.h"
+ #include "nvtrace.h"
+ 
+ /* Protected by BQL */
+@@ -2064,6 +2065,88 @@ static void vfio_bars_prepare(VFIOPCIDevice *vdev)
+     }
+ }
+ 
++/*
++ * x-trap-windows: remove [off, off+len) of BAR nr from its mmaps, so guest
++ * accesses there exit to QEMU (and are traced) while the rest of the BAR
++ * stays mmapped. Called before the BAR is mmapped.
++ */
++static void vfio_nvtrace_carve(VFIOPCIDevice *vdev, int nr)
++{
++    VFIORegion *r = &vdev->bars[nr].region;
++    int w, i;
++
++    for (w = 0; w < vdev->ntrapwin; w++) {
++        uint64_t ws, we;
++        GArray *out;
++
++        if (vdev->trapwin[w].bar != nr || !r->nr_mmaps) {
++            continue;
++        }
++        ws = vdev->trapwin[w].off & qemu_real_host_page_mask();
++        we = REAL_HOST_PAGE_ALIGN(vdev->trapwin[w].off + vdev->trapwin[w].len);
++        out = g_array_new(false, true, sizeof(VFIOMmap));
++        for (i = 0; i < r->nr_mmaps; i++) {
++            uint64_t ms = r->mmaps[i].offset, me = ms + r->mmaps[i].size;
++            VFIOMmap m = { 0 };
++
++            if (we <= ms || ws >= me) {
++                m.offset = ms;
++                m.size = me - ms;
++                g_array_append_val(out, m);
++                continue;
++            }
++            if (ws > ms) {
++                m.offset = ms;
++                m.size = ws - ms;
++                g_array_append_val(out, m);
++            }
++            if (we < me) {
++                m.offset = we;
++                m.size = me - we;
++                g_array_append_val(out, m);
++            }
++        }
++        g_free(r->mmaps);
++        r->nr_mmaps = out->len;
++        r->mmaps = (VFIOMmap *)g_array_free(out, false);
++        if (!r->nr_mmaps) {
++            g_free(r->mmaps);
++            r->mmaps = NULL;
++        }
++        if (vdev->vbasedev.nvtrace) {
++            nvtrace_note(vdev->vbasedev.nvtrace, "BAR%d window 0x%" PRIx64
++                         "+0x%" PRIx64 " trapped (%d mmaps left)", nr, ws,
++                         we - ws, r->nr_mmaps);
++        }
++    }
++}
++
++/* Side-effect free BAR read for the dirty page logger (any thread). */
++static bool vfio_nvtrace_bar_read(void *opaque, int bar, uint64_t off,
++                                  void *buf, size_t len)
++{
++    VFIOPCIDevice *vdev = opaque;
++    VFIORegion *r = &vdev->bars[bar].region;
++    int i;
++
++    if (!vdev->vbasedev.proxy) {
++        /* kernel vfio: -EIO instead of SIGBUS when memory decode is off */
++        int fd = vfio_device_get_region_fd(&vdev->vbasedev, r->nr);
++
++        return pread(fd, buf, len, r->fd_offset + off) == (ssize_t)len;
++    }
++    /* vfio-user: the server's memory is ordinary shared memory */
++    for (i = 0; i < r->nr_mmaps; i++) {
++        if (r->mmaps[i].mmap && off >= r->mmaps[i].offset &&
++            off + len <= r->mmaps[i].offset + r->mmaps[i].size) {
++            memcpy(buf, (uint8_t *)r->mmaps[i].mmap +
++                   (off - r->mmaps[i].offset), len);
++            return true;
++        }
++    }
++    return false;
++}
++
+ static void vfio_bar_register(VFIOPCIDevice *vdev, int nr)
+ {
+     PCIDevice *pdev = PCI_DEVICE(vdev);
+@@ -2082,9 +2165,23 @@ static void vfio_bar_register(VFIOPCIDevice *vdev, int nr)
+     if (bar->region.size) {
+         memory_region_add_subregion(bar->mr, 0, bar->region.mem);
+ 
++        vfio_nvtrace_carve(vdev, nr);
+         if (vfio_region_mmap(&bar->region)) {
+             error_report("Failed to mmap %s BAR %d. Performance may be slow",
+                          vdev->vbasedev.name, nr);
++        } else if (vdev->vbasedev.nvtrace &&
++                   (vdev->nvtrace_dirty_bars & (1u << nr))) {
++            int i;
++
++            for (i = 0; i < bar->region.nr_mmaps; i++) {
++                if (bar->region.mmaps[i].mmap) {
++                    nvtrace_bar_track(vdev->vbasedev.nvtrace, nr,
++                                      &bar->region.mmaps[i].mem,
++                                      bar->region.mmaps[i].offset,
++                                      bar->region.mmaps[i].size,
++                                      vfio_nvtrace_bar_read, vdev);
++                }
++            }
+         }
+     }
+ 
+@@ -3266,6 +3363,29 @@ bool vfio_pci_populate_device(VFIOPCIDevice *vdev, Error **errp)
+     if (vdev->trap_bars == UINT32_MAX) {
+         vdev->trap_bars = vdev->nvtrace ? 0x1 : 0;
+     }
++    if (vdev->trap_windows && *vdev->trap_windows && !vdev->trapwin) {
++        g_auto(GStrv) parts = g_strsplit(vdev->trap_windows, ",", -1);
++        int n;
++
++        vdev->trapwin = g_new0(struct VFIONvtWindow, g_strv_length(parts));
++        for (n = 0; parts[n]; n++) {
++            const char *p = parts[n], *e;
++            uint64_t bar, off, len;
++
++            if (qemu_strtou64(p, &e, 0, &bar) < 0 || *e != ':' ||
++                bar >= PCI_ROM_SLOT ||
++                qemu_strtou64(e + 1, &e, 0, &off) < 0 || *e != '+' ||
++                qemu_strtou64(e + 1, &e, 0, &len) < 0 || *e || !len) {
++                error_setg(errp, "x-trap-windows: bad entry '%s' "
++                           "(want BAR:OFFSET+LENGTH)", p);
++                return false;
++            }
++            vdev->trapwin[vdev->ntrapwin].bar = bar;
++            vdev->trapwin[vdev->ntrapwin].off = off;
++            vdev->trapwin[vdev->ntrapwin].len = len;
++            vdev->ntrapwin++;
++        }
++    }
+     if (vdev->nvtrace && !vbasedev->nvtrace) {
+         vbasedev->nvtrace = nvtrace_attach(vbasedev->name, vdev->nvtrace_file,
+                                            pci_device_iommu_address_space(pdev),
+@@ -3982,6 +4102,9 @@ static const Property vfio_pci_nvtrace_properties[] = {
+     DEFINE_PROP_STRING("x-nvtrace-file", VFIOPCIDevice, nvtrace_file),
+     DEFINE_PROP_BOOL("x-nvtrace-irq", VFIOPCIDevice, nvtrace_irq, true),
+     DEFINE_PROP_BOOL("x-nvtrace-gsp", VFIOPCIDevice, nvtrace_gsp, true),
++    DEFINE_PROP_UINT32("x-nvtrace-dirty-bars", VFIOPCIDevice,
++                       nvtrace_dirty_bars, 0),
++    DEFINE_PROP_STRING("x-trap-windows", VFIOPCIDevice, trap_windows),
+ };
+ 
+ static void vfio_pci_device_class_init(ObjectClass *klass, const void *data)
+@@ -4001,6 +4124,12 @@ static void vfio_pci_device_class_init(ObjectClass *klass, const void *data)
+         "With x-nvtrace: route interrupts and ioeventfds through QEMU");
+     object_class_property_set_description(klass, "x-nvtrace-gsp",
+         "With x-nvtrace on an NVIDIA GPU: capture FSP/GSP messages");
++    object_class_property_set_description(klass, "x-nvtrace-dirty-bars",
++        "With x-nvtrace: bitmask of mmapped BARs whose guest-written pages "
++        "are logged (KVM dirty log; e.g. 0xa = BAR1+BAR3)");
++    object_class_property_set_description(klass, "x-trap-windows",
++        "BAR:OFFSET+LENGTH[,...] ranges kept un-mmapped so accesses trap "
++        "(and are traced) while the rest of the BAR stays mmapped");
+     dc->desc = "VFIO PCI base device";
+     set_bit(DEVICE_CATEGORY_MISC, dc->categories);
+     pdc->exit = vfio_exitfn;
+diff --git a/hw/vfio/pci.h b/hw/vfio/pci.h
+index 8ee24cb76..853604778 100644
+--- a/hw/vfio/pci.h
++++ b/hw/vfio/pci.h
+@@ -195,6 +195,13 @@ struct VFIOPCIDevice {
+     char *nvtrace_file;        /* trace file (else $NVTRACE_MMIO) */
+     bool nvtrace_irq;          /* route interrupts through QEMU to log them */
+     bool nvtrace_gsp;          /* NVIDIA GSP/FSP capture */
++    uint32_t nvtrace_dirty_bars; /* BARs whose dirty pages are logged */
++    char *trap_windows;        /* "BAR:OFF+LEN,..." kept un-mmapped */
++    struct VFIONvtWindow {
++        int bar;
++        uint64_t off, len;
++    } *trapwin;
++    int ntrapwin;
+     VFIODisplay *dpy;
+     Notifier irqchip_change_notifier;
+     VFIOPCICPR cpr;

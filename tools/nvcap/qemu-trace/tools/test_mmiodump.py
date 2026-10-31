@@ -6,6 +6,7 @@ Run: python3 -m unittest -v test_mmiodump   (from tools/)
 import contextlib
 import gzip
 import io
+import json
 import os
 import shutil
 import struct
@@ -65,6 +66,10 @@ class TraceWriter:
     def snap(self, gpa, label, data):
         self.rec(md.T_DMA_SNAP, md.BODY[md.T_DMA_SNAP][0].pack(
             gpa, len(data), 0, label.encode()), data)
+
+    def barpage(self, bar, off, data, reason=0):
+        self.rec(md.T_BAR_PAGE, md.BODY[md.T_BAR_PAGE][0].pack(
+            bar, reason, 0, len(data), off, 0x1234), data, vcpu=-1)
 
     def dev(self, name="vfio-test", vendor=0x10de, device=0x2b85):
         self.rec(md.T_DEV, md.BODY[md.T_DEV][0].pack(vendor, device, 0x030000,
@@ -238,6 +243,206 @@ class DecoderTest(unittest.TestCase):
         out = run(["json", p])
         self.assertIn('"rpc": "GSP_RM_ALLOC"', out)
         self.assertIn('"reg": "NV_PGSP_QUEUE_HEAD(0)"', out)
+
+
+def channel_alloc_params(userd_pa):
+    """NV_CHANNEL_ALLOC_PARAMS (376 bytes, 610.57.04) with a sysmem USERD."""
+    a = bytearray(376)
+    struct.pack_into("<IIQI", a, 0, 0xcafe0001, 0, 0x7f0000000, 1024)
+    struct.pack_into("<I", a, 136, 1)                     # engineType GR0
+    struct.pack_into("<QQII", a, 176, userd_pa, 512, 1, 0)  # userdMem sysmem
+    struct.pack_into("<QQII", a, 152, 0x4000000, 0x1000, 2, 0)  # inst vidmem
+    return bytes(a)
+
+
+class NewViewsTest(unittest.TestCase):
+    """rmlog, gsp --decode, continuation records, boot, disp, bars, pramin."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="mmiodump-test2-")
+
+    def tearDown(self):
+        shutil.rmtree(self.dir)
+
+    def path(self, name):
+        return os.path.join(self.dir, name)
+
+    def rm_trace(self):
+        w = TraceWriter()
+        w.dev()
+        w.mmio(0x0, 0x1b2000a1, write=False)
+        w.mmio(0xad00bc, 0xff, write=False)
+        w.mmio(0xad00bc, 0xff, write=False)
+        w.mmio(0x88a828, 0x0, write=False)
+        hc = 0xc1d00001
+        dev = struct.pack("<IIIIIII4x", hc, hc, 0xde000001, 0x80, 0, 56, 0) + \
+            struct.pack("<I", 0) + b"\0" * 52            # NV0080_ALLOC_PARAMETERS
+        chan = channel_alloc_params(0x3000000)
+        ch = struct.pack("<IIIIIII4x", hc, 0xde000001, 0xc4a00001, 0xc96f, 0,
+                         len(chan), 0) + chan
+        # NV2080_CTRL_GPU_GET_INFO_V2_PARAMS: 580 bytes in 610.57.04
+        gi = struct.pack("<III", 1, 0x7, 0).ljust(580, b"\0")
+        go = struct.pack("<III", 1, 0x7, 0x1b2).ljust(580, b"\0")
+        ctrl_in = struct.pack("<IIIIIIIIQ", hc, 0xde000001, 0x20800102, 0,
+                              580, 0, 0, 0, 0) + gi
+        ctrl_out = struct.pack("<IIIIIIIIQ", hc, 0xde000001, 0x20800102, 0,
+                               580, 0, 0, 0, 0) + go
+        mem = struct.pack("<7I4xQI4xI4x", hc, 0xde000001, 0x3e000001, 0x81, 0,
+                          0, 0, 0x2000, 2, 0) + struct.pack("<QQ", 0x5000, 0x5003)
+        free = struct.pack("<IIII", hc, 0xde000001, 0xc4a00001, 0)
+        w.gsp(0, 0, FN_ALLOC, dev, rpc_seq=1, qseq=0)
+        w.gsp(1, 0, FN_ALLOC, dev, rpc_seq=1, qseq=0)
+        w.gsp(0, 1, FN_ALLOC, ch, rpc_seq=2, qseq=1)
+        w.gsp(1, 1, FN_ALLOC, ch, rpc_seq=2, qseq=1)
+        w.gsp(0, 2, FN_CONTROL, ctrl_in, rpc_seq=3, qseq=2)
+        w.gsp(1, 2, FN_CONTROL, ctrl_out, rpc_seq=3, qseq=2)
+        w.gsp(0, 3, 4, mem, rpc_seq=4, qseq=3)              # ALLOC_MEMORY
+        w.gsp(0, 4, 73, b"\x01" * 100, rpc_seq=5, qseq=4)  # SET_REGISTRY
+        w.gsp(1, 3, EV_INIT_DONE, b"\0", rpc_seq=0, qseq=3)
+        w.gsp(0, 5, FN_FREE, free, rpc_seq=6, qseq=5)
+        w.gsp(1, 4, FN_FREE, free, rpc_seq=6, qseq=4)
+        w.mmio(0x0, 0x1b2000a1, write=False)                # after INIT_DONE
+        return w
+
+    def test_rmlog(self):
+        p = self.path("r.nvt")
+        self.rm_trace().save(p)
+        j = self.path("calls.json")
+        out = run(["rmlog", p, "--out", "--tree", "--json", j])
+        self.assertIn("Alloc   hClient=0xc1d00001 hParent=0xc1d00001 "
+                      "hObject=0xde000001 NV01_DEVICE_0", out)
+        self.assertIn("BLACKWELL_CHANNEL_GPFIFO_A", out)
+        self.assertIn("userdMem.base=0x3000000", out)
+        self.assertIn("userdMem.addressSpace=0x1", out)
+        self.assertIn("NV2080_CTRL_CMD_GPU_GET_INFO_V2", out)
+        self.assertIn("-> NV_OK", out)
+        self.assertIn("out {gpuInfoListSize=0x1 gpuInfoList[0].index=0x7 "
+                      "gpuInfoList[0].data=0x1b2}", out)
+        self.assertIn("NV01_MEMORY_LIST_SYSTEM", out)
+        self.assertIn("AllocMemory", out)
+        self.assertIn("pages=[0x5000000,0x5003000]", out)
+        self.assertIn("Free    hClient=0xc1d00001", out)
+        self.assertNotIn("SET_REGISTRY", out)              # internal: hidden
+        self.assertIn("object tree", out)
+        self.assertIn("BLACKWELL_CHANNEL_GPFIFO_A *", out)  # freed
+        with open(j) as f:
+            calls = json.load(f)
+        self.assertEqual([c["op"] for c in calls],
+                         ["alloc", "alloc", "control", "memory", "free"])
+        self.assertEqual(calls[1]["hClass"], 0xc96f)
+        self.assertEqual(calls[2]["status"], 0)
+        out = run(["rmlog", p, "--internal"])
+        self.assertIn("GSP-internal SET_REGISTRY", out)
+
+    def test_gsp_decode_params(self):
+        p = self.path("r.nvt")
+        self.rm_trace().save(p)
+        out = run(["gsp", p, "--decode"])
+        self.assertIn("NV_CHANNEL_ALLOC_PARAMS (376 bytes)", out)
+        self.assertIn("gpFifoEntries = 0x400", out)
+        self.assertIn("NV2080_CTRL_GPU_GET_INFO_V2_PARAMS", out)
+        self.assertNotIn("LAYOUT MISMATCH", out)
+        self.assertIn("rpc_alloc_memory_v13_01", out)
+
+    def test_layout_mismatch_flagged(self):
+        w = TraceWriter()
+        hc = 0xc1d00001
+        chan = channel_alloc_params(0x3000000)[:300]       # wrong size
+        w.gsp(0, 0, FN_ALLOC, struct.pack("<IIIIIII4x", hc, 1, 2, 0xc96f, 0,
+                                          len(chan), 0) + chan, rpc_seq=1)
+        p = self.path("m.nvt")
+        w.save(p)
+        self.assertIn("LAYOUT MISMATCH", run(["gsp", p, "--decode"]))
+
+    def test_continuation_records(self):
+        w = TraceWriter()
+        big = bytes(range(256)) * 300                      # 76800 bytes
+        first, rest = big[:65488], big[65488:]
+        w.gsp(0, 0, 73, first, rpc_seq=10, qseq=0)
+        w.gsp(0, 16, 71, rest, rpc_seq=11, qseq=1)         # CONTINUATION
+        w.gsp(0, 20, FN_FREE, b"\0" * 16, rpc_seq=12, qseq=2)
+        p = self.path("c.nvt")
+        w.save(p)
+        recs = list(md.iter_records([p]))
+        stream = md.rpc_stream(recs)
+        self.assertEqual([x[1]["function"] for x in stream], [73, FN_FREE])
+        self.assertEqual(stream[0][1]["params"], big)
+        self.assertIn("+1 continuation records", run(["gsp", p]))
+
+    def test_boot_table(self):
+        p = self.path("r.nvt")
+        self.rm_trace().save(p)
+        j = self.path("boot.json")
+        out = run(["boot", p, "--json", j])
+        self.assertIn("GSP INIT_DONE at seq", out)
+        self.assertIn("0x0ad00bc", out)
+        self.assertIn("0xffx2", out)
+        with open(j) as f:
+            b = json.load(f)
+        self.assertEqual(b["reads"]["0xad00bc"]["values"], [["0xff", 2]])
+        self.assertEqual(b["reads"]["0x0"]["n"], 1)         # stops at INIT_DONE
+        self.assertTrue(any(r["function"] == "GSP_RM_ALLOC" for r in b["rpcs"]))
+
+    def test_disp(self):
+        w = TraceWriter()
+        w.note("disp: channel 0 (class 0xca7d inst 0) pushbuffer sysmem "
+               "0x7000000 size 0x1000")
+        pb = struct.pack("<IIIII",
+                         (2 << 18) | 0x2064, 0x04380780, 0x00000001,  # 2 methods
+                         (1 << 18) | 0x0200, 0x1)                     # UPDATE
+        w.mmio(0x680000, len(pb))
+        w.snap(0x7000000, "dispPB:0@0", pb)
+        p = self.path("d.nvt")
+        w.save(p)
+        out = run(["disp", p])
+        self.assertIn("<disp core PUT 0x14>", out)
+        self.assertIn("NVCA7D_HEAD_SET_RASTER_SIZE(0) = 0x04380780", out)
+        self.assertIn("NVCA7D_UPDATE = 0x00000001", out)
+
+    def test_bars_and_pramin(self):
+        w = TraceWriter()
+        w.note("bar pages: BAR1 +0x0 size 0x4000000 dirty-tracked")
+        w.barpage(1, 0x3000, b"\x11" * 4096)
+        w.barpage(1, 0x3000, b"\x22" * 4096, reason=1)
+        w.barpage(3, 0x0, b"\x33" * 4096)
+        w.mmio(0xd40, 0x12)                     # window at VRAM 0x120000
+        w.mmio(0x700010, 0xabcd)
+        w.mmio(0x700010, 0xabcd, write=False)
+        p = self.path("b.nvt")
+        w.save(p)
+        d = self.path("pages")
+        out = run(["bars", p, "--extract", d])
+        self.assertIn("2 distinct pages, 3 versions", out)
+        self.assertIn("rescan", out)
+        self.assertEqual(len(os.listdir(d)), 3)
+        out = run(["pramin", p])
+        self.assertIn("W4 VRAM 0x0000120010 = 0xabcd", out)
+        self.assertIn("R4 VRAM 0x0000120010", out)
+        out = run(["timeline", p, "--types", "mmio"])
+        self.assertIn("<PRAMIN -> VRAM 0x120000>", out)
+
+    def test_struct_decoder_tables(self):
+        n = md.Names()
+        st = n.struct("NV_CHANNEL_ALLOC_PARAMS")
+        self.assertEqual(st["s"], 376)
+        offs = {f[0]: f[1] for f in st["f"]}
+        # offsets hw/vfio/nvtrace.c relies on (follow_channel)
+        self.assertEqual([offs[k] for k in ("instanceMem", "userdMem",
+                                            "ramfcMem", "mthdbufMem",
+                                            "errorNotifierMem",
+                                            "eccErrorNotifierMem")],
+                         [152, 176, 200, 224, 256, 280])
+        pb = n.struct("NV2080_CTRL_INTERNAL_DISPLAY_CHANNEL_PUSHBUFFER_PARAMS")
+        offs = {f[0]: f[1] for f in pb["f"]}
+        self.assertEqual((offs["physicalAddr"], offs["limit"], offs["hclass"],
+                          offs["channelInstance"], offs["valid"]),
+                         (8, 16, 28, 32, 36))
+        am = n.struct("rpc_alloc_memory_v13_01")
+        self.assertEqual({f[0]: f[1] for f in am["f"]}["pteDesc"], 48)
+        self.assertEqual(n.ctrl_params[0x20800a58],
+                         "NV2080_CTRL_INTERNAL_DISPLAY_CHANNEL_PUSHBUFFER_PARAMS")
+        self.assertEqual(n.status_name(0), "NV_OK")
+        self.assertEqual(n.alloc_params[0xc96f], "NV_CHANNEL_ALLOC_PARAMS")
 
 
 if __name__ == "__main__":

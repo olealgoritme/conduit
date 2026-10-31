@@ -12,8 +12,14 @@
 #   NVTRACE_FILE   trace path (default $N/traces/<date>/nvtrace.nvt.zst)
 #   NVTRACE_AUDIO  1 = also trace the HDA function 01:00.1 (default 0)
 #   NVTRACE_TRAP   x-trap-bars mask (default 0x1 = BAR0 only)
+#   NVTRACE_DIRTY  x-nvtrace-dirty-bars mask: log guest-written pages of the
+#                  mmapped VRAM apertures (0x8 = BAR3, 0xa = BAR1+BAR3;
+#                  default off)
+#   NVTRACE_WINDOWS x-trap-windows list BAR:OFF+LEN[,...] (commas are
+#                  escaped for -device here)
 #   NVTRACE_BUF_MB, NVTRACE_ROTATE_MB, NVTRACE_MIN_FREE_GB, NVTRACE_LOSSY,
-#   NVTRACE_GSP_POLL_US, NVTRACE_GSP_LOG_MS, NVTRACE_PAIR_BUDGET_MB:
+#   NVTRACE_GSP_POLL_US, NVTRACE_GSP_LOG_MS, NVTRACE_PAIR_BUDGET_MB,
+#   NVTRACE_FOLLOW, NVTRACE_WATCH_*, NVTRACE_DIRTY_*:
 #                  passed to QEMU (see qemu-trace/README.md)
 set -eu
 N=/steam/conduit-scratch/nvcap
@@ -32,6 +38,14 @@ export NVTRACE_MIN_FREE_GB=${NVTRACE_MIN_FREE_GB:-20}
 
 GPU_OLD='-device vfio-pci,host=0000:01:00.0,'
 GPU_PROPS="x-nvtrace=on,x-nvtrace-file=$TRACE,x-trap-bars=$TRAP"
+if [ -n "${NVTRACE_DIRTY:-}" ]; then
+	GPU_PROPS="$GPU_PROPS,x-nvtrace-dirty-bars=$NVTRACE_DIRTY"
+fi
+if [ -n "${NVTRACE_WINDOWS:-}" ]; then
+	case "$NVTRACE_WINDOWS" in *[!0-9a-fA-Fx:+,]*)
+		echo "NVTRACE_WINDOWS: only BAR:OFF+LEN[,...]" >&2; exit 1;; esac
+	GPU_PROPS="$GPU_PROPS,x-trap-windows=${NVTRACE_WINDOWS//,/,,}"
+fi
 AUD_OLD='-device vfio-pci,host=0000:01:00.1,'
 
 gen=$(sed \

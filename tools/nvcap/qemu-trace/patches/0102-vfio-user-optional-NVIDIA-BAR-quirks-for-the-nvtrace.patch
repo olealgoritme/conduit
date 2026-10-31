@@ -1,7 +1,7 @@
-From 28c1baa45219c5b7cd6291e765f7a1cce42596cf Mon Sep 17 00:00:00 2001
+From 46c1f6c9413c19d782768234224ea60c9921ffde Mon Sep 17 00:00:00 2001
 From: Ole Algoritme <olealgoritme@gmail.com>
 Date: Sat, 31 Oct 2026 15:53:44 +0100
-Subject: [PATCH 102/102] vfio-user: optional NVIDIA BAR quirks for the nvtrace
+Subject: [PATCH 102/104] vfio-user: optional NVIDIA BAR quirks for the nvtrace
  test
 
 vfio-user-pci sets up no device quirks. With NVTRACE_TEST_QUIRKS=1 in the

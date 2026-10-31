@@ -5,8 +5,21 @@ Usage:
   mmiodump.py summary  TRACE...            counts per record type, BAR, block,
                                            register, IRQ vector, RPC function
   mmiodump.py timeline TRACE... [filters]  one line per record, in order
-  mmiodump.py gsp      TRACE... [--hex]    GSP RPCs (command + status queue)
+  mmiodump.py gsp      TRACE... [--decode] [--hex]
+                                           GSP RPCs (command + status queue);
+                                           --decode: every parameter field
+  mmiodump.py rmlog    TRACE... [--out] [--tree] [--json FILE]
+                                           the RM API call sequence (alloc /
+                                           control / free / memory) as a
+                                           user-space RM client would issue it
   mmiodump.py fsp      TRACE...            FSP packets / messages (COT etc.)
+  mmiodump.py boot     TRACE... [--json FILE]
+                                           what the device answered until GSP
+                                           INIT_DONE: the emulator's fake table
+  mmiodump.py disp     TRACE...            display channel pushbuffers, decoded
+  mmiodump.py bars     TRACE... [--extract DIR]   BAR (VRAM aperture) pages
+  mmiodump.py pramin   TRACE...            VRAM accesses through the BAR0
+                                           PRAMIN window
   mmiodump.py snaps    TRACE... [--extract DIR]   DMA snapshots
   mmiodump.py regs     TRACE... [--top N]  per-register read/write counts
   mmiodump.py json     TRACE...            records as JSON lines
@@ -37,13 +50,14 @@ FILE_HDR = struct.Struct("<8sIIQQII24s")          # 64 bytes
 REC_HDR = struct.Struct("<HBBIQQhHI")             # 32 bytes
 
 T_MMIO, T_CFG, T_IRQ, T_VEC, T_RESET, T_BAR, T_GSP_MSG, T_DMA_SNAP, \
-    T_NOTE, T_GSP_QSTATE, T_LOST, T_FSP_PKT, T_GSP_QINFO, T_DEV = range(1, 15)
+    T_NOTE, T_GSP_QSTATE, T_LOST, T_FSP_PKT, T_GSP_QINFO, T_DEV, \
+    T_BAR_PAGE = range(1, 16)
 
 TYPE_NAMES = {
     T_MMIO: "MMIO", T_CFG: "CFG", T_IRQ: "IRQ", T_VEC: "VEC", T_RESET: "RESET",
     T_BAR: "BAR", T_GSP_MSG: "GSP_MSG", T_DMA_SNAP: "DMA_SNAP", T_NOTE: "NOTE",
     T_GSP_QSTATE: "GSP_QSTATE", T_LOST: "LOST", T_FSP_PKT: "FSP_PKT",
-    T_GSP_QINFO: "GSP_QINFO", T_DEV: "DEV",
+    T_GSP_QINFO: "GSP_QINFO", T_DEV: "DEV", T_BAR_PAGE: "BAR_PAGE",
 }
 
 BODY = {
@@ -68,7 +82,10 @@ BODY = {
                    "cmd_size", "stat_size", "source", "_r")),
     T_DEV: (struct.Struct("<HHIIIQ"),
             ("vendor", "device", "class_code", "trap_mask", "dflags", "_r")),
+    T_BAR_PAGE: (struct.Struct("<BBHIQQ"),
+                 ("bar", "reason", "_r", "len", "off", "hash")),
 }
+SNAP_NODATA, SNAP_BLOB, SNAP_CHANGED = 1, 2, 4
 
 ORIGINS = {0: "", 1: "mirror", 2: "quirk-int", 3: "window", 4: "ioeventfd",
            5: "msix-table", 6: "msix-pba", 7: "rom"}
@@ -185,7 +202,7 @@ def iter_records(paths, warn=True):
                         "ascii", "replace")
                     r.data = r.data[:r.f["len"]] if not r.f["sflags"] & 1 \
                         else b""
-                elif typ == T_FSP_PKT:
+                elif typ in (T_FSP_PKT, T_BAR_PAGE):
                     r.data = r.data[:r.f["len"]]
                 elif typ in (T_NOTE,):
                     r.data = r.data.rstrip(b"\0")
@@ -215,6 +232,15 @@ class Names:
         self.rpc = {int(k): v for k, v in t.get("rpc", {}).items()}
         self.classes = {int(k, 16): v for k, v in t.get("classes", {}).items()}
         self.ctrls = {int(k, 16): v for k, v in t.get("ctrls", {}).items()}
+        self.structs = t.get("structs", {})
+        self.rpc_params = {int(k): v for k, v in t.get("rpc_params", {}).items()}
+        self.ctrl_params = {int(k, 16): v
+                            for k, v in t.get("ctrl_params", {}).items()}
+        self.alloc_params = {int(k, 16): v
+                             for k, v in t.get("alloc_params", {}).items()}
+        self.disp = {int(c, 16): {int(k, 16): n for k, n in m.items()}
+                     for c, m in t.get("disp_methods", {}).items()}
+        self.status = {int(k, 16): v for k, v in t.get("status", {}).items()}
         self.source = t.get("source", "no tables")
 
     def block(self, off):
@@ -238,6 +264,17 @@ class Names:
 
     def class_name(self, c):
         return self.classes.get(c, f"class_{c:04x}")
+
+    def status_name(self, st):
+        return self.status.get(st, f"0x{st:x}")
+
+    def struct(self, name):
+        for _ in range(8):
+            st = self.structs.get(name)
+            if not st or "alias" not in st:
+                return st
+            name = st["alias"]
+        return None
 
     def ctrl_name(self, cmd):
         n = self.ctrls.get(cmd)
@@ -272,6 +309,11 @@ def parse_rpc(r):
     return out
 
 
+FN_ALLOC_MEMORY, FN_FREE, FN_CONTINUATION, FN_CONTROL, FN_ALLOC = \
+    4, 10, 71, 76, 103
+EV_INIT_DONE = 0x1001
+
+
 def describe_rpc(names, rpc):
     fn = rpc["function"]
     name = names.rpc_name(fn)
@@ -281,17 +323,162 @@ def describe_rpc(names, rpc):
         hc, hp, ho, cls, st, psz, fl = ALLOC.unpack_from(p, 0)
         extra = (f"hClient=0x{hc:08x} hParent=0x{hp:08x} hObject=0x{ho:08x} "
                  f"hClass=0x{cls:04x}({names.class_name(cls)}) "
-                 f"status=0x{st:x} paramsSize={psz} flags=0x{fl:x}")
+                 f"status={names.status_name(st)} paramsSize={psz} "
+                 f"flags=0x{fl:x}")
     elif name == "GSP_RM_CONTROL" and len(p) >= CONTROL.size:
         hc, ho, cmd, st, psz, rf, cf, acc, _ = CONTROL.unpack_from(p, 0)
         extra = (f"hClient=0x{hc:08x} hObject=0x{ho:08x} "
-                 f"cmd=0x{cmd:08x}({names.ctrl_name(cmd)}) status=0x{st:x} "
+                 f"cmd=0x{cmd:08x}({names.ctrl_name(cmd)}) "
+                 f"status={names.status_name(st)} "
                  f"paramsSize={psz} flags=0x{rf:x}/0x{cf:x}")
     elif name == "FREE" and len(p) >= FREE.size:
         hr, hp, ho, st = FREE.unpack_from(p, 0)
         extra = (f"hRoot=0x{hr:08x} hParent=0x{hp:08x} hObject=0x{ho:08x} "
-                 f"status=0x{st:x}")
+                 f"status={names.status_name(st)}")
+    elif fn in names.rpc_params:
+        extra = " ".join(f"{k}={v}" for k, v in
+                         decode_struct(names, names.rpc_params[fn], p,
+                                       limit=8))
+    if rpc.get("continuations"):
+        extra += f" (+{rpc['continuations']} continuation records)"
     return name, extra
+
+# ------------------------------------------------------- structure decode --
+
+
+def _fmt_val(kind, size, v):
+    if kind == "i":
+        return str(v)
+    if kind == "b":
+        return "true" if v else "false"
+    return f"0x{v:x}"
+
+
+def decode_struct(names, sname, data, base=0, prefix="", compact=True,
+                  limit=200, maxarr=16, depth=0, out=None):
+    """Return [(path, value-string)] for structure 'sname' at data[base:].
+
+    compact: leave out zero fields. Layouts come from the 610.57.04 headers
+    (gen_tables.py); fields beyond the data are left out."""
+    out = [] if out is None else out
+    st = names.struct(sname)
+    if st is None or depth > 6:
+        return out
+    for name, off, kind, esz, count, sub, boff, bits in st["f"]:
+        if len(out) >= limit:
+            break
+        o = base + off
+        if o >= len(data):
+            break
+        path = prefix + name
+        if count == 0:                      # flexible array member
+            count = max(0, (len(data) - o) // max(esz, 1))
+            if kind != "c":
+                count = min(count, maxarr)
+        if kind == "S":
+            n = min(count, maxarr)
+            for i in range(n):
+                p = f"{path}[{i}]." if count > 1 else path + "."
+                before = len(out)
+                decode_struct(names, sub, data, o + i * esz, p, compact,
+                              limit, maxarr, depth + 1, out)
+                if compact and len(out) == before:
+                    continue
+            continue
+        if kind == "c":
+            raw = data[o:o + count]
+            txt = raw.split(b"\0", 1)[0].decode("latin-1")
+            if txt or not compact:
+                out.append((path, repr(txt)))
+            continue
+        if esz not in (1, 2, 4, 8):
+            continue
+        fmt = {1: "B", 2: "H", 4: "I", 8: "Q"}[esz]
+        if kind == "i":
+            fmt = fmt.lower()
+        n = min(count, (len(data) - o) // esz)
+        if n <= 0:
+            continue
+        vals = struct.unpack_from(f"<{n}{fmt}", data, o)
+        if bits is not None:
+            v = (vals[0] >> boff) & ((1 << bits) - 1)
+            if v or not compact:
+                out.append((path, _fmt_val(kind, esz, v)))
+            continue
+        if count == 1:
+            if vals[0] or not compact:
+                out.append((path, _fmt_val(kind, esz, vals[0])))
+            continue
+        if kind == "u" and esz == 1 and count > 16:
+            nz = bytes(vals).rstrip(b"\0")
+            if nz or not compact:
+                out.append((path, nz[:64].hex() + ("..." if len(nz) > 64
+                                                   else "")))
+            continue
+        shown = [(i, v) for i, v in enumerate(vals) if v or not compact]
+        if shown:
+            items = ",".join(f"{i}:{_fmt_val(kind, esz, v)}"
+                             for i, v in shown[:maxarr])
+            more = "..." if len(shown) > maxarr else ""
+            out.append((path, f"[{items}{more}]"))
+    return out
+
+
+def params_struct(names, rpc, reply=False):
+    """(struct name, data, header text) for the payload of an RPC."""
+    fn = rpc["function"]
+    p = rpc["params"]
+    if fn == FN_ALLOC and len(p) >= ALLOC.size:
+        cls = ALLOC.unpack_from(p, 0)[3]
+        psz = ALLOC.unpack_from(p, 0)[5]
+        return names.alloc_params.get(cls), p[ALLOC.size:ALLOC.size + psz], psz
+    if fn == FN_CONTROL and len(p) >= CONTROL.size:
+        cmd, psz = CONTROL.unpack_from(p, 0)[2], CONTROL.unpack_from(p, 0)[4]
+        return names.ctrl_params.get(cmd), \
+            p[CONTROL.size:CONTROL.size + psz], psz
+    return names.rpc_params.get(fn), p, len(p)
+
+
+def format_params(names, rpc, indent="      ", compact=True, limit=200):
+    sname, data, psz = params_struct(names, rpc)
+    if not sname:
+        return ""
+    st = names.struct(sname)
+    if st is None:
+        return ""
+    lines = []
+    head = f"{indent}{sname} ({psz} bytes"
+    if rpc["function"] in (FN_ALLOC, FN_CONTROL) and st["s"] != psz:
+        head += f"; 610.57.04 size {st['s']}: LAYOUT MISMATCH"
+    lines.append(head + ")")
+    for k, v in decode_struct(names, sname, data, compact=compact,
+                              limit=limit):
+        lines.append(f"{indent}  {k} = {v}")
+    return "\n".join(lines)
+
+
+def rpc_stream(records):
+    """[(record, rpc)] for all GSP_MSG records in order; CONTINUATION_RECORDs
+    (large RPCs, vgpu/rpc.c) are merged into the message they continue."""
+    out = []
+    last = {}
+    for r in records:
+        if r.type == T_GSP_QINFO:
+            last.clear()
+            continue
+        if r.type != T_GSP_MSG:
+            continue
+        rpc = parse_rpc(r)
+        q = r.f["queue"]
+        if rpc and rpc["function"] == FN_CONTINUATION and q in last:
+            prev = last[q][1]
+            prev["params"] += rpc["params"]
+            prev["continuations"] = prev.get("continuations", 0) + 1
+            continue
+        out.append((r, rpc))
+        if rpc:
+            last[q] = (r, rpc)
+    return out
 
 
 def hexdump(b, width=16, limit=None, indent="    "):
@@ -353,7 +540,30 @@ def fmt_ts(r, t0):
     return f"{(r.ts - t0) / 1e9:12.6f}"
 
 
-def line(names, r, t0):
+NV_DOORBELL = 0xb80000 + 0x30090
+NV_PRAMIN_LO, NV_PRAMIN_HI = 0x700000, 0x800000
+NV_BAR0_WINDOW = 0xd40          # NV_XAL_EP_ZB_BAR0_WINDOW (BASE << 16)
+DISP_CORE, DISP_WIN0 = 0x680000, 0x690000
+
+
+def mmio_note(f):
+    """Short decode of a few BAR0 writes worth explaining inline."""
+    off, v = f["off"], f["val"]
+    if not f["write"] or f["bar"] != 0:
+        return ""
+    if off == NV_DOORBELL:
+        return (f"  <doorbell chid={v & 0xfff} runlist={(v >> 16) & 0x7f}"
+                f"{' rl' if v >> 30 & 1 else ''}>")
+    if off == DISP_CORE:
+        return f"  <disp core PUT 0x{v:x}>"
+    if DISP_WIN0 <= off < DISP_WIN0 + 32 * 0x1000 and not off & 0xfff:
+        return f"  <disp window {(off - DISP_WIN0) >> 12} PUT 0x{v:x}>"
+    if off == NV_BAR0_WINDOW:
+        return f"  <PRAMIN -> VRAM 0x{(v & 0xffffff) << 16:x}>"
+    return ""
+
+
+def line(names, r, t0, rpc=None):
     who = f"v{r.vcpu}" if r.vcpu >= 0 else f"t{r.tid}"
     head = f"{r.seq:10d} {fmt_ts(r, t0)} d{r.dev if r.dev != 255 else '-'} {who:>8} "
     f = r.f
@@ -364,7 +574,8 @@ def line(names, r, t0):
         reg = names.reg(f["off"]) if f["bar"] == 0 else \
             ("ROM" if f["bar"] == 6 else f"BAR{f['bar']}")
         return (head + f"MMIO {rw}{f['size']} bar{f['bar']}+0x{f['off']:07x} = "
-                f"0x{f['val']:0{f['size'] * 2}x}  {reg}" + (f" [{o}]" if o else ""))
+                f"0x{f['val']:0{f['size'] * 2}x}  {reg}" + (f" [{o}]" if o else "")
+                + mmio_note(f))
     if t == T_CFG:
         rw = "W" if f["write"] else "R"
         return head + f"CFG  {rw}{f['len']} 0x{f['off']:03x} = 0x{f['val']:x}"
@@ -382,7 +593,7 @@ def line(names, r, t0):
                 f"size 0x{f['size']:x}")
     if t == T_GSP_MSG:
         q = "CMD " if f["queue"] == 0 else "STAT"
-        rpc = parse_rpc(r)
+        rpc = rpc or parse_rpc(r)
         fl = "".join(n for b, n in ((GSP_F_TRUNC, " TRUNC"), (GSP_F_NOSIG, " NOSIG"),
                                     (GSP_F_SEQGAP, " SEQGAP")) if f["gflags"] & b)
         if rpc:
@@ -394,7 +605,8 @@ def line(names, r, t0):
     if t == T_DMA_SNAP:
         where = "blob" if f["sflags"] & 2 else f"gpa=0x{f['gpa']:x}"
         return (head + f"SNAP {f['label']} {where} len=0x{f['len']:x}"
-                + (" (not RAM)" if f["sflags"] & 1 else ""))
+                + (" (not RAM)" if f["sflags"] & 1 else "")
+                + (" (changed)" if f["sflags"] & SNAP_CHANGED else ""))
     if t == T_NOTE:
         return head + "NOTE " + r.data.decode("utf-8", "replace")
     if t == T_GSP_QSTATE:
@@ -418,6 +630,10 @@ def line(names, r, t0):
         return (head + f"DEV  {r.data.decode()} {f['vendor']:04x}:{f['device']:04x} "
                 f"class {f['class_code']:06x} trap_mask=0x{f['trap_mask']:x} "
                 f"gsp={f['dflags'] & 1}")
+    if t == T_BAR_PAGE:
+        return (head + f"BARPAGE bar{f['bar']}+0x{f['off']:09x} "
+                f"{'rescan' if f['reason'] else 'cpu-write'} "
+                f"hash={f['hash']:016x}")
     return head + r.name()
 
 
@@ -528,17 +744,15 @@ def cmd_timeline(a, names):
 
 
 def cmd_gsp(a, names):
-    t0 = None
+    t0 = first_ts(a.trace)
     pending = {}
-    for r in iter_records(a.trace):
-        t0 = r.ts if t0 is None else t0
-        if r.type == T_GSP_QINFO:
-            print(line(names, r, t0))
-            continue
-        if r.type != T_GSP_MSG:
-            continue
-        rpc = parse_rpc(r)
-        print(line(names, r, t0))
+    recs = (r for r in iter_records(a.trace)
+            if r.type in (T_GSP_MSG, T_GSP_QINFO))
+    qinfo = []
+    for r, rpc in rpc_stream(_tee_qinfo(recs, qinfo)):
+        while qinfo and qinfo[0].seq < r.seq:
+            print(line(names, qinfo.pop(0), t0))
+        print(line(names, r, t0, rpc))
         if rpc:
             key = (rpc["function"], rpc["rpc_seq"])
             if r.f["queue"] == 0:
@@ -547,10 +761,23 @@ def cmd_gsp(a, names):
                 req = pending.pop(key)
                 print(f"{'':>34}reply to seq {req.seq} after "
                       f"{(r.ts - req.ts) / 1e3:.1f} us")
+            if a.decode:
+                txt = format_params(names, rpc, compact=not a.all)
+                if txt:
+                    print(txt)
             if a.hex:
                 print(hexdump(rpc["params"], limit=a.hex_limit))
         elif a.hex:
             print(hexdump(r.data, limit=a.hex_limit))
+    for q in qinfo:
+        print(line(names, q, t0))
+
+
+def _tee_qinfo(recs, sink):
+    for r in recs:
+        if r.type == T_GSP_QINFO:
+            sink.append(r)
+        yield r
 
 
 def cmd_fsp(a, names):
@@ -614,6 +841,367 @@ def cmd_json(a, names):
         print(json.dumps(o))
 
 
+# ------------------------------------------------------------ RM API log --
+
+RMAPI_FN = {FN_ALLOC: "Alloc", FN_CONTROL: "Control", FN_FREE: "Free",
+            FN_ALLOC_MEMORY: "AllocMemory"}
+
+
+def _kv(items, limit=12):
+    s = " ".join(f"{k}={v}" for k, v in items[:limit])
+    return s + (" ..." if len(items) > limit else "")
+
+
+def rm_calls(names, records):
+    """The RM API sequence from the GSP command queue, matched with replies.
+
+    Yields dicts: op (alloc/control/free/memory/internal), handles, class or
+    cmd, raw params (bytes), status, reply params, timing."""
+    stream = rpc_stream(records)
+    replies = {}
+    for r, rpc in stream:
+        if rpc and r.f["queue"] == 1:
+            replies.setdefault((rpc["function"], rpc["rpc_seq"]), (r, rpc))
+    for r, rpc in stream:
+        if not rpc or r.f["queue"] != 0:
+            continue
+        fn, p = rpc["function"], rpc["params"]
+        rep = replies.get((fn, rpc["rpc_seq"]))
+        c = {"seq": r.seq, "ts": r.ts, "rpc_seq": rpc["rpc_seq"],
+             "function": names.rpc_name(fn), "rpc": rpc,
+             "reply": rep[1] if rep else None,
+             "latency_us": (rep[0].ts - r.ts) / 1e3 if rep else None}
+        status = None
+        if fn == FN_ALLOC and len(p) >= ALLOC.size:
+            hc, hp, ho, cls, _, psz, fl = ALLOC.unpack_from(p, 0)
+            c.update(op="alloc", hClient=hc, hParent=hp, hObject=ho,
+                     hClass=cls, params=p[ALLOC.size:ALLOC.size + psz],
+                     flags=fl)
+            if rep and len(rep[1]["params"]) >= ALLOC.size:
+                status = ALLOC.unpack_from(rep[1]["params"], 0)[4]
+        elif fn == FN_CONTROL and len(p) >= CONTROL.size:
+            hc, ho, cmd, _, psz, rf, cf, acc, _ = CONTROL.unpack_from(p, 0)
+            c.update(op="control", hClient=hc, hObject=ho, cmd=cmd,
+                     params=p[CONTROL.size:CONTROL.size + psz], flags=cf)
+            if rep and len(rep[1]["params"]) >= CONTROL.size:
+                rp = rep[1]["params"]
+                status = CONTROL.unpack_from(rp, 0)[3]
+                c["out"] = rp[CONTROL.size:CONTROL.size + psz]
+        elif fn == FN_FREE and len(p) >= FREE.size:
+            hr, hp, ho, _ = FREE.unpack_from(p, 0)
+            c.update(op="free", hClient=hr, hParent=hp, hObject=ho)
+            if rep and len(rep[1]["params"]) >= FREE.size:
+                status = FREE.unpack_from(rep[1]["params"], 0)[3]
+        elif fn == FN_ALLOC_MEMORY and len(p) >= 56:
+            hc, hd, hm, cls, fl, adj, fmt = struct.unpack_from("<7I", p, 0)
+            length, count = struct.unpack_from("<QI", p, 32)
+            ptes = [struct.unpack_from("<Q", p, 56 + 8 * i)[0] << 12
+                    for i in range(min(count, (len(p) - 56) // 8))]
+            c.update(op="memory", hClient=hc, hParent=hd, hObject=hm,
+                     hClass=cls, flags=fl, length=length, pteAdjust=adj,
+                     pages=ptes, params=p)
+        else:
+            c.update(op="internal", params=p)
+        if status is None and rep:
+            status = rep[1]["result"]
+        c["status"] = status
+        yield c
+
+
+def cmd_rmlog(a, names):
+    t0 = first_ts(a.trace)
+    objs = {}
+    order = []
+    jout = []
+    recs = (r for r in iter_records(a.trace) if r.type == T_GSP_MSG)
+    for c in rm_calls(names, recs):
+        ts = f"{(c['ts'] - t0) / 1e9:12.6f}"
+        st = "pending" if c["status"] is None else names.status_name(c["status"])
+        lat = f" {c['latency_us']:.0f}us" if c["latency_us"] is not None else ""
+        op = c["op"]
+        if op == "internal" and not a.internal:
+            continue
+        if op == "alloc":
+            sname = names.alloc_params.get(c["hClass"])
+            prm = decode_struct(names, sname, c["params"]) if sname and \
+                sname != "NvHandle" else []
+            print(f"{c['seq']:10d} {ts} Alloc   hClient=0x{c['hClient']:08x} "
+                  f"hParent=0x{c['hParent']:08x} hObject=0x{c['hObject']:08x} "
+                  f"{names.class_name(c['hClass'])} ({len(c['params'])} B) "
+                  f"-> {st}{lat}")
+            if prm:
+                print(f"{'':>24}{{{_kv(prm, a.fields)}}}")
+            if c["status"] in (0, None):
+                if c["hObject"] not in objs:
+                    order.append(c["hObject"])
+                objs[c["hObject"]] = [c["hParent"], c["hClass"], c["hClient"],
+                                      True]
+        elif op == "control":
+            sname = names.ctrl_params.get(c["cmd"])
+            prm = decode_struct(names, sname, c["params"]) if sname else []
+            print(f"{c['seq']:10d} {ts} Control hClient=0x{c['hClient']:08x} "
+                  f"hObject=0x{c['hObject']:08x} {names.ctrl_name(c['cmd'])} "
+                  f"({len(c['params'])} B) -> {st}{lat}")
+            if prm:
+                print(f"{'':>24}in  {{{_kv(prm, a.fields)}}}")
+            if a.out and sname and c.get("out"):
+                o = decode_struct(names, sname, c["out"])
+                if o:
+                    print(f"{'':>24}out {{{_kv(o, a.fields)}}}")
+        elif op == "free":
+            print(f"{c['seq']:10d} {ts} Free    hClient=0x{c['hClient']:08x} "
+                  f"hParent=0x{c['hParent']:08x} hObject=0x{c['hObject']:08x} "
+                  f"-> {st}{lat}")
+            if c["hObject"] in objs:
+                objs[c["hObject"]][3] = False
+        elif op == "memory":
+            pg = ",".join(f"0x{x:x}" for x in c["pages"][:4])
+            more = "..." if len(c["pages"]) > 4 else ""
+            print(f"{c['seq']:10d} {ts} AllocMemory hClient=0x{c['hClient']:08x} "
+                  f"hParent=0x{c['hParent']:08x} hMemory=0x{c['hObject']:08x} "
+                  f"{names.class_name(c['hClass'])} length=0x{c['length']:x} "
+                  f"pages=[{pg}{more}] -> {st}{lat}")
+            if c["hObject"] not in objs:
+                order.append(c["hObject"])
+            objs[c["hObject"]] = [c["hParent"], c["hClass"], c["hClient"], True]
+        else:
+            print(f"{c['seq']:10d} {ts} # GSP-internal {c['function']} "
+                  f"({len(c['params'])} B) -> {st}{lat}")
+        if a.json:
+            j = {k: c[k] for k in ("seq", "ts", "op", "function", "status",
+                                   "latency_us") if k in c}
+            for k in ("hClient", "hParent", "hObject", "hClass", "cmd",
+                      "flags", "length", "pteAdjust"):
+                if k in c:
+                    j[k] = c[k]
+            if "pages" in c:
+                j["pages"] = c["pages"]
+            j["params"] = c.get("params", b"").hex()
+            if "out" in c:
+                j["out"] = c["out"].hex()
+            jout.append(j)
+    if a.tree:
+        print("\nobject tree (* = freed):")
+        kids = collections.defaultdict(list)
+        for h in order:
+            kids[objs[h][0]].append(h)
+        roots = [h for h in order if objs[h][0] not in objs]
+        roots += [h for h in set(objs[h][0] for h in order)
+                  if h not in objs and h not in roots]
+
+        def walk(h, depth, seen):
+            if h in seen:
+                return
+            seen.add(h)
+            if h in objs:
+                par, cls, cl, live = objs[h]
+                print(f"  {'  ' * depth}0x{h:08x} {names.class_name(cls)}"
+                      f"{'' if live else ' *'}")
+            else:
+                print(f"  {'  ' * depth}0x{h:08x}")
+            for k in kids.get(h, []):
+                walk(k, depth + 1, seen)
+        seen = set()
+        for h in sorted(set(r for r in roots if r not in objs)) + \
+                [r for r in roots if r in objs]:
+            walk(h, 0, seen)
+    if a.json:
+        with open(a.json, "w") as f:
+            json.dump(jout, f, indent=1)
+
+# ------------------------------------------------------------- boot table --
+
+
+def cmd_boot(a, names):
+    """BAR0 values the device returned before GSP INIT_DONE."""
+    reads = collections.OrderedDict()
+    writes = collections.Counter()
+    fsp = []
+    rpcs = []
+    first = None
+    done = None
+    t0 = None
+    for r in iter_records(a.trace):
+        t0 = r.ts if t0 is None else t0
+        if r.type == T_MMIO and r.f["bar"] == 0 and r.f["origin"] in (0, 1):
+            off = r.f["off"]
+            if r.f["write"]:
+                writes[off] += 1
+                continue
+            e = reads.setdefault(off, {"first": r.seq, "n": 0, "vals": []})
+            e["n"] += 1
+            v = r.f["val"]
+            if e["vals"] and e["vals"][-1][0] == v:
+                e["vals"][-1][1] += 1
+            elif len(e["vals"]) < 64:
+                e["vals"].append([v, 1])
+        elif r.type == T_FSP_PKT:
+            fsp.append(r)
+        elif r.type == T_GSP_MSG:
+            rpc = parse_rpc(r)
+            if rpc:
+                rpcs.append((r, rpc))
+                if r.f["queue"] == 1 and rpc["function"] == EV_INIT_DONE:
+                    done = r
+                    break
+        first = first or r
+    print(f"BAR0 reads until {'GSP INIT_DONE at seq ' + str(done.seq) if done else 'end of trace (no INIT_DONE)'}:"
+          f" {sum(e['n'] for e in reads.values())} reads of {len(reads)} "
+          f"registers, {sum(writes.values())} writes")
+    print(f"{'offset':>9} {'register':48s} {'reads':>7}  values (value x count, in order)")
+    for off, e in sorted(reads.items(), key=lambda x: x[1]["first"]):
+        vals = " ".join(f"0x{v:x}" + (f"x{n}" if n > 1 else "")
+                        for v, n in e["vals"][:8])
+        if len(e["vals"]) > 8:
+            vals += f" ... ({len(e['vals'])} runs)"
+        print(f"0x{off:07x} {names.reg(off):48.48s} {e['n']:7d}  {vals}")
+    print("\nFSP messages:")
+    for d, frst, msg in fsp_messages(fsp):
+        name, extra = describe_fsp(msg)
+        print(f"  {frst.seq:10d} {'CPU->FSP' if d == 0 else 'FSP->CPU'} "
+              f"{name} {extra}")
+    print("\nGSP RPCs before INIT_DONE:")
+    for r, rpc in rpcs:
+        print(f"  {r.seq:10d} {'CMD ' if r.f['queue'] == 0 else 'STAT'} "
+              f"{names.rpc_name(rpc['function'])} len={rpc['length']}")
+    if a.json:
+        out = {"init_done_seq": done.seq if done else None,
+               "reads": {f"0x{off:x}": {"name": names.reg(off), "n": e["n"],
+                                        "values": [[f"0x{v:x}", n]
+                                                   for v, n in e["vals"]]}
+                         for off, e in reads.items()},
+               "writes": {f"0x{off:x}": n for off, n in writes.items()},
+               "fsp": [{"dir": d, "seq": f.seq, "msg": m.hex()}
+                       for d, f, m in fsp_messages(fsp)],
+               "rpcs": [{"seq": r.seq, "queue": r.f["queue"],
+                         "function": names.rpc_name(p["function"]),
+                         "params": p["params"].hex()} for r, p in rpcs]}
+        with open(a.json, "w") as f:
+            json.dump(out, f, indent=1)
+
+# ---------------------------------------------------------------- display --
+
+DISP_OPS = {0: "METHOD", 1: "JUMP", 2: "NONINC", 3: "SET_SUBDEVICE_MASK"}
+
+
+def decode_disp_methods(names, cls, data):
+    """Decode an NVDisplay pushbuffer fragment (clc37d.h DMA format)."""
+    meth = names.disp.get(cls, {})
+    out = []
+    words = struct.unpack_from(f"<{len(data) // 4}I", data)
+    i = 0
+    while i < len(words):
+        w = words[i]
+        op, cnt, mth = w >> 29, (w >> 18) & 0x3ff, w & 0xfffc
+        i += 1
+        if w == 0:
+            continue
+        if op == 1:
+            out.append(f"JUMP 0x{w & 0xfffc:x}")
+            continue
+        if op == 3:
+            out.append(f"SET_SUBDEVICE_MASK 0x{w & 0xfff:x}")
+            continue
+        if op not in (0, 2):
+            out.append(f"? 0x{w:08x}")
+            continue
+        for k in range(cnt):
+            if i >= len(words):
+                out.append("(truncated)")
+                break
+            m = mth if op == 2 else mth + 4 * k
+            out.append(f"{meth.get(m, f'method_0x{m:04x}')} = 0x{words[i]:08x}")
+            i += 1
+    return out
+
+
+def cmd_disp(a, names):
+    t0 = None
+    chan_cls = {}
+    rx = re.compile(r"disp: channel (\d+) \(class 0x([0-9a-f]+) inst (\d+)\) "
+                    r"pushbuffer (\w+) 0x([0-9a-f]+) size 0x([0-9a-f]+)")
+    for r in iter_records(a.trace):
+        t0 = r.ts if t0 is None else t0
+        if r.type == T_NOTE:
+            m = rx.search(r.data.decode("utf-8", "replace"))
+            if m:
+                chan_cls[int(m.group(1))] = int(m.group(2), 16)
+                print(line(names, r, t0))
+        elif r.type == T_MMIO and r.f["write"] and r.f["bar"] == 0 and \
+                mmio_note(r.f).startswith("  <disp"):
+            print(line(names, r, t0))
+        elif r.type == T_DMA_SNAP and r.f["label"].startswith("dispPB:"):
+            lab = r.f["label"][7:]
+            chn = int(lab.split("@")[0])
+            if "@" not in lab:          # whole pushbuffer at registration
+                print(line(names, r, t0))
+                continue
+            cls = chan_cls.get(chn, 0)
+            print(line(names, r, t0) + f"  {names.class_name(cls)}")
+            for m in decode_disp_methods(names, cls, r.data):
+                print(f"{'':>24}{m}")
+
+# ------------------------------------------------------------- BAR pages --
+
+
+def cmd_bars(a, names):
+    t0 = None
+    per = collections.Counter()
+    if a.extract:
+        os.makedirs(a.extract, exist_ok=True)
+    for r in iter_records(a.trace):
+        t0 = r.ts if t0 is None else t0
+        if r.type == T_NOTE and r.data.startswith(b"bar pages"):
+            print(line(names, r, t0))
+        if r.type != T_BAR_PAGE:
+            continue
+        per[(r.f["bar"], r.f["off"])] += 1
+        if not a.quiet:
+            print(line(names, r, t0))
+        if a.extract:
+            fn = os.path.join(a.extract, f"{r.seq:010d}_bar{r.f['bar']}_"
+                              f"{r.f['off']:09x}.bin")
+            with open(fn, "wb") as f:
+                f.write(r.data)
+    print(f"\n{len(per)} distinct pages, {sum(per.values())} versions; "
+          f"most rewritten:")
+    for (bar, off), n in per.most_common(a.top):
+        print(f"  bar{bar}+0x{off:09x} {n}")
+
+# ---------------------------------------------------------------- PRAMIN --
+
+
+def cmd_pramin(a, names):
+    """VRAM accesses through the BAR0 PRAMIN window (0x700000, 1 MiB),
+    positioned by NV_XAL_EP_ZB_BAR0_WINDOW (BASE in 64 KiB units)."""
+    t0 = None
+    base = None
+    per = collections.Counter()
+    for r in iter_records(a.trace):
+        t0 = r.ts if t0 is None else t0
+        if r.type != T_MMIO or r.f["bar"] != 0 or r.f["origin"] not in (0, 1):
+            continue
+        off = r.f["off"]
+        if off == NV_BAR0_WINDOW:
+            base = (r.f["val"] & 0xffffff) << 16 if r.f["write"] or \
+                base is None else base
+            if r.f["write"] and not a.quiet:
+                print(line(names, r, t0))
+            continue
+        if not NV_PRAMIN_LO <= off < NV_PRAMIN_HI:
+            continue
+        va = None if base is None else base + off - NV_PRAMIN_LO
+        per[(va or 0) & ~0xfff, "W" if r.f["write"] else "R"] += 1
+        if not a.quiet:
+            vs = "VRAM ?" if va is None else f"VRAM 0x{va:010x}"
+            print(f"{r.seq:10d} {(r.ts - t0) / 1e9:12.6f} "
+                  f"{'W' if r.f['write'] else 'R'}{r.f['size']} {vs} = "
+                  f"0x{r.f['val']:x}")
+    print(f"\nVRAM pages touched through PRAMIN: {len(set(k[0] for k in per))}")
+    for (pg, rw), n in sorted(per.items())[:a.top]:
+        print(f"  0x{pg:010x} {rw} {n}")
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -639,6 +1227,30 @@ def main(argv=None):
     p = add("gsp", cmd_gsp)
     p.add_argument("--hex", action="store_true")
     p.add_argument("--hex-limit", type=int, default=512)
+    p.add_argument("--decode", action="store_true",
+                   help="decode the parameters (610.57.04 layouts)")
+    p.add_argument("--all", action="store_true",
+                   help="with --decode: also zero fields")
+    p = add("rmlog", cmd_rmlog)
+    p.add_argument("--out", action="store_true",
+                   help="also decode control reply (output) parameters")
+    p.add_argument("--tree", action="store_true", help="print the object tree")
+    p.add_argument("--internal", action="store_true",
+                   help="also list GSP-internal RPCs (registry, system info..)")
+    p.add_argument("--fields", type=int, default=12,
+                   help="parameter fields per line")
+    p.add_argument("--json", metavar="FILE",
+                   help="write the call sequence as JSON (for replay/forward)")
+    p = add("boot", cmd_boot)
+    p.add_argument("--json", metavar="FILE")
+    add("disp", cmd_disp)
+    p = add("bars", cmd_bars)
+    p.add_argument("--extract", metavar="DIR")
+    p.add_argument("--quiet", action="store_true")
+    p.add_argument("--top", type=int, default=20)
+    p = add("pramin", cmd_pramin)
+    p.add_argument("--quiet", action="store_true")
+    p.add_argument("--top", type=int, default=40)
     p = add("fsp", cmd_fsp)
     p.add_argument("--hex", action="store_true")
     p.add_argument("--hex-limit", type=int, default=1024)

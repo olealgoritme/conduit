@@ -44,6 +44,7 @@ LOGINIT_PA, LOGRM_PA = 0x1010000, 0x1020000
 PTE_PA, PAGES_PA = 0x2000000, 0x2100000
 QSIZE, NPTE = 0x40000, 129
 CMDQ, STATQ = 0x1000, 0x41000
+FN_ALLOC_MEMORY = 4
 FN = {"FREE": 10, "GSP_RM_CONTROL": 76, "GSP_RM_ALLOC": 103,
       "SET_REGISTRY": 73, "GSP_SET_SYSTEM_INFO": 72, "INIT_DONE": 0x1001,
       "RUN_CPU_SEQUENCER": 0x1002}
@@ -236,7 +237,8 @@ class Guest:
 
 
 class Run:
-    def __init__(self, name, devopts, env=None, trace_name="trace.nvt.zst"):
+    def __init__(self, name, devopts, env=None, trace_name="trace.nvt.zst",
+                 accel="qtest", extra=()):
         self.dir = tempfile.mkdtemp(prefix=f"nvtrace-{name}-",
                                     dir=os.environ.get("NVTRACE_TEST_TMP"))
         # UNIX socket paths are limited to 107 bytes: keep them short.
@@ -259,11 +261,11 @@ class Run:
                   "NVTRACE_TEST_QUIRKS": "1"})
         e.update(env or {})
         self.errf = None
-        self.q = Qtest([QEMU, "-machine", "q35", "-accel", "qtest", "-m", "256M",
+        self.q = Qtest([QEMU, "-machine", "q35", "-accel", accel, "-m", "256M",
                         "-nodefaults", "-display", "none", "-qtest", "stdio",
                         "-qtest-log", "/dev/null",
                         "-qmp", f"unix:{self.qmp},server=on,wait=off",
-                        "-device", json.dumps(dev)], e, self.dir)
+                        "-device", json.dumps(dev)] + list(extra), e, self.dir)
         self.g = Guest(self.q)
 
     def finish(self, reset=False):
@@ -285,6 +287,55 @@ class Run:
             shutil.rmtree(self.dir, ignore_errors=True)
         else:
             print(f"kept {self.dir}", file=sys.stderr)
+
+
+# KVM test firmware (nasm source below): enters flat 32-bit mode, then on
+# request (mailbox at 0x7000: go=0x600d, dst, dwords, pattern) runs
+# "rep stosd" and answers done=0xd0e. The guest's own stores are what KVM
+# dirty-logs; qtest writes do not go through KVM.
+#   cli; o32 lgdt [cs:gdt_desc]; cr0.PE=1; jmp dword 0x08:pm
+#   pm: ds=es=ss=0x10
+#   .wait: pause; cmp dword [0x7000],0x600d; jne .wait
+#          mov dword [0x7000],0; edi=[0x7004]; ecx=[0x7008]; eax=[0x700c]
+#          cld; rep stosd; mov dword [0x7000],0xd0e; jmp .wait
+#   gdt: null, code 0x00CF9B000000FFFF, data 0x00CF93000000FFFF (accessed
+#        bit preset: the GDT is in ROM and KVM would loop emulating the
+#        accessed-bit write)
+#   reset vector (0xfff0): jmp start
+KVM_FW = bytes.fromhex(
+    "fa2e660f011678000f20c00c010f22c066ea1800ffff080066b810008ed88ec08ed0f3"
+    "90813d007000000d60000075f2c70500700000000000008b3d047000008b0d087000"
+    "00a10c700000fcf3abc705007000000e0d0000ebc890909090909000000000000000"
+    "00ffff0000009bcf00ffff00000093cf0017006000ffff")
+
+
+def kvm_firmware(path):
+    img = bytearray(0x10000)
+    img[:len(KVM_FW)] = KVM_FW
+    img[0xfff0:0xfff3] = bytes.fromhex("e90d00")          # jmp start
+    with open(path, "wb") as f:
+        f.write(img)
+    return path
+
+
+def kvm_usable():
+    if not os.access("/dev/kvm", os.R_OK | os.W_OK):
+        return False
+    try:
+        fd = os.open("/dev/kvm", os.O_RDWR)
+        os.close(fd)
+        return True
+    except OSError:
+        return False
+
+
+def channel_alloc_params(userd_pa):
+    """NV_CHANNEL_ALLOC_PARAMS (376 bytes, 610.57.04), USERD in sysmem."""
+    a = bytearray(376)
+    struct.pack_into("<IIQI", a, 0, 0, 0, 0x7f0000000, 1024)
+    struct.pack_into("<QQII", a, 176, userd_pa, 512, 1, 0)       # userdMem
+    struct.pack_into("<QQII", a, 152, 0x4000000, 0x1000, 2, 0)   # inst: vidmem
+    return bytes(a)
 
 
 def by_type(recs, t):
@@ -491,6 +542,157 @@ class EndToEnd(unittest.TestCase):
                               for r in msgs],
                              [(0, FN["GSP_RM_CONTROL"]), (0, FN["FREE"]),
                               (1, FN["INIT_DONE"])])
+        finally:
+            run.cleanup()
+
+    def test_follow_rpc_buffers(self):
+        """Buffers named by GSP RPCs are captured: ALLOC_MEMORY pages, channel
+        USERD (re-read on the usermode doorbell), display pushbuffer (logged
+        on PUT writes); FREE stops watching."""
+        run = Run("follow", {"x-nvtrace": True, "x-nvtrace-file": "@TRACE"},
+                  env={"NVTRACE_WATCH_MS": "0", "NVTRACE_WATCH_HOT_US": "0"})
+        g, q = run.g, run.q
+        hc, hdev, hch, hmem = 0xc1d00001, 0xde000001, 0xc4a00001, 0x3e000001
+        USERD, PB = 0x1110000, 0x1120000
+        m1 = struct.pack("<III", (2 << 18) | 0x2064, 0x04380780, 1)
+        m2 = struct.pack("<II", (1 << 18) | 0x0200, 1)
+        try:
+            g.setup_pci()
+            g.setup_boot_structs()
+            g.fsp_cot()
+            q.mem(0x1100000, b"MEMPAGE0" * 512)
+            q.mem(0x1102000, b"MEMPAGE1" * 512)
+            mem = struct.pack("<7I4xQI4xI4x", hc, hdev, hmem, 0x81, 0, 0, 0,
+                              0x2000, 2, 0) + struct.pack("<QQ", 0x1100, 0x1102)
+            g.send(FN_ALLOC_MEMORY, mem)
+            q.mem(USERD, b"U" * 512)
+            chan = channel_alloc_params(USERD)
+            g.send(FN["GSP_RM_ALLOC"], struct.pack(
+                "<IIIIIII4x", hc, hdev, hch, 0xc96f, 0, len(chan), 0) + chan)
+            pbp = struct.pack("<I4xQQIIIB3xIII4x", 1, PB, 0xfff, 0, 0xca7d, 0,
+                              1, 0, 0, 0)
+            g.send(FN["GSP_RM_CONTROL"], struct.pack(
+                "<IIIIIIIIQ", hc, 0xcafe0002, 0x20800a58, 0, len(pbp), 0, 0, 0,
+                0) + pbp)
+            q.mem(PB, m1)
+            q.writel(BAR0 + 0x680000, len(m1))               # core PUT
+            q.mem(PB + len(m1), m2)
+            q.writel(BAR0 + 0x680000, len(m1) + len(m2))
+            q.mem(USERD + 0x8c, struct.pack("<I", 0x40))      # GP_PUT moves
+            q.writel(BAR0 + 0xbb0090, 0x40000005)             # doorbell
+            time.sleep(0.3)
+            g.send(FN["FREE"], struct.pack("<IIII", hc, hdev, hch, 0))
+            q.mem(USERD + 0x8c, struct.pack("<I", 0x80))
+            q.writel(BAR0 + 0xbb0090, 0x40000005)
+            time.sleep(0.3)
+        finally:
+            run.finish()
+        try:
+            recs = run.records()
+            snaps = by_type(recs, md.T_DMA_SNAP)
+            lab = {}
+            for r in snaps:
+                lab.setdefault(r.f["label"], []).append(r)
+            self.assertEqual([r.data[:8] for r in lab["mem3e000001"]],
+                             [b"MEMPAGE0", b"MEMPAGE1"])
+            self.assertEqual(lab["chc4a00001.userd"][0].data, b"U" * 512)
+            self.assertTrue(any("pushbuffer sysmem 0x1120000 size 0x1000" in n
+                                for n in notes(recs)), notes(recs))
+            self.assertEqual(lab["dispPB:0@0"][0].data, m1)
+            self.assertEqual(lab[f"dispPB:0@{len(m1):x}"][0].data, m2)
+            w = lab["w:chc4a00001.userd"]
+            self.assertEqual(len(w), 1, "USERD re-read once (FREE stops it)")
+            self.assertEqual(struct.unpack_from("<I", w[0].data, 0x8c)[0], 0x40)
+            self.assertTrue(w[0].f["sflags"] & md.SNAP_CHANGED)
+            out = subprocess.run([sys.executable, os.path.join(HERE, "mmiodump.py"),
+                                  "disp", run.trace], capture_output=True,
+                                 text=True, check=True).stdout
+            self.assertIn("NVCA7D_HEAD_SET_RASTER_SIZE(0) = 0x04380780", out)
+            self.assertIn("NVCA7D_UPDATE = 0x00000001", out)
+            out = subprocess.run([sys.executable, os.path.join(HERE, "mmiodump.py"),
+                                  "rmlog", run.trace, "--tree"],
+                                 capture_output=True, text=True,
+                                 check=True).stdout
+            self.assertIn("BLACKWELL_CHANNEL_GPFIFO_A", out)
+            self.assertIn("NV2080_CTRL_CMD_INTERNAL_DISPLAY_CHANNEL_PUSHBUFFER",
+                          out)
+        finally:
+            run.cleanup()
+
+    def test_trap_windows(self):
+        """x-trap-bars=0 + x-trap-windows: only the windows trap and trace."""
+        run = Run("win", {"x-nvtrace": True, "x-nvtrace-file": "@TRACE",
+                          "x-trap-bars": 0,
+                          "x-trap-windows": "0:0x110000+0x1000,1:0x10000+0x1000"},
+                  trace_name="trace.nvt")
+        g, q = run.g, run.q
+        try:
+            g.setup_pci()
+            q.writel(BAR0 + 0x110c00, 0x11)
+            q.writel(BAR0 + 0x200, 0x22)
+            q.writel(BAR1 + 0x10010, 0x33)
+            q.writel(BAR1 + 0x20000, 0x44)
+            self.assertEqual(q.readl(BAR0 + 0x200), 0x22)
+            self.assertEqual(q.readl(BAR1 + 0x10010), 0x33)
+            self.assertEqual(q.readl(BAR1 + 0x20000), 0x44)
+        finally:
+            run.finish()
+        try:
+            recs = run.records()
+            mm = {(r.f["bar"], r.f["off"]) for r in by_type(recs, md.T_MMIO)
+                  if r.f["origin"] == 0}
+            self.assertIn((0, 0x110c00), mm)
+            self.assertIn((1, 0x10010), mm)
+            self.assertNotIn((0, 0x200), mm)
+            self.assertNotIn((1, 0x20000), mm)
+            nt = notes(recs)
+            self.assertTrue(any("BAR0 window 0x110000+0x1000 trapped" in n
+                                for n in nt), nt)
+            self.assertTrue(any("BAR1 window 0x10000+0x1000 trapped" in n
+                                for n in nt), nt)
+        finally:
+            run.cleanup()
+
+    @unittest.skipUnless(kvm_usable(), "needs /dev/kvm")
+    def test_dirty_bar_pages_kvm(self):
+        """KVM dirty log on mmapped BAR1: guest CPU stores become BAR_PAGE
+        records, unchanged rewrites are not logged again."""
+        fwdir = tempfile.mkdtemp(prefix="nvt-fw-")
+        fw = kvm_firmware(os.path.join(fwdir, "fw.bin"))
+        run = Run("dirty", {"x-nvtrace": True, "x-nvtrace-file": "@TRACE",
+                            "x-nvtrace-dirty-bars": 2},
+                  env={"NVTRACE_DIRTY_MS": "50"}, accel="kvm",
+                  extra=["-bios", fw, "-smp", "1"])
+        g, q = run.g, run.q
+
+        def fill(off, dwords, pattern):
+            q.writel(0x7004, BAR1 + off)
+            q.writel(0x7008, dwords)
+            q.writel(0x700c, pattern)
+            q.writel(0x7000, 0x600d)
+            for _ in range(500):
+                if q.readl(0x7000) == 0xd0e:
+                    break
+                time.sleep(0.01)
+            self.assertEqual(q.readl(0x7000), 0xd0e, "guest did not run")
+            time.sleep(0.4)                     # > 2 dirty collections
+
+        try:
+            g.setup_pci()
+            time.sleep(0.3)                     # first (discarded) collection
+            fill(0x5000, 2048, 0xa5a5a5a5)      # two pages
+            fill(0x5000, 2048, 0xa5a5a5a5)      # same content again
+            fill(0x6000, 1024, 0x5a5a5a5a)      # one page changes
+        finally:
+            run.finish()
+            shutil.rmtree(fwdir, ignore_errors=True)
+        try:
+            recs = run.records()
+            pages = [(r.f["off"], r.data[:4]) for r in by_type(recs, md.T_BAR_PAGE)]
+            self.assertEqual(pages, [(0x5000, b"\xa5" * 4), (0x6000, b"\xa5" * 4),
+                                     (0x6000, b"\x5a" * 4)], notes(recs))
+            self.assertTrue(all(r.f["bar"] == 1 for r in by_type(recs, md.T_BAR_PAGE)))
+            self.assertTrue(any("dirty-tracked" in n for n in notes(recs)))
         finally:
             run.cleanup()
 

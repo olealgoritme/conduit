@@ -44,7 +44,37 @@ SWREF = "src/common/inc/swref/published"
 RPC_ENUMS = "src/nvidia/inc/kernel/vgpu/rpc_global_enums.h"
 CLASS_DIR = "src/common/sdk/nvidia/inc/class"
 CTRL_DIR = "src/common/sdk/nvidia/inc/ctrl"
-NEEDED = [SWREF, RPC_ENUMS, CLASS_DIR, CTRL_DIR]
+SDK_INC = "src/common/sdk/nvidia/inc"
+RPC_C = "src/nvidia/src/kernel/vgpu/rpc.c"
+RES_LIST = "src/nvidia/src/kernel/rmapi/resource_list.h"
+STATUS_H = "src/common/sdk/nvidia/inc/nvstatuscodes.h"
+# Headers with structures (parsed in this order; the first definition wins)
+STRUCT_DIRS = [SDK_INC]
+STRUCT_FILES = [
+    "src/nvidia/inc/kernel/vgpu/sdk-structures.h",
+    "src/nvidia/inc/kernel/vgpu/rpc_headers.h",
+    "src/nvidia/generated/g_sdk-structures.h",
+    "src/nvidia/generated/g_rpc-structures.h",
+    "src/nvidia/inc/kernel/gpu/gsp/gsp_static_config.h",
+    "src/nvidia/inc/kernel/gpu/gpu_acpi_data.h",
+    "src/nvidia/inc/kernel/platform/chipset/chipset.h",
+    "src/nvidia/inc/kernel/gpu/nvbitmask.h",
+    "src/nvidia/inc/kernel/gpu/gpu_engine_type.h",
+    "src/nvidia/inc/kernel/gpu/gsp/gsp_init_args.h",
+    "src/nvidia/arch/nvalloc/common/inc/gsp/gspifpub.h",
+    "src/nvidia/generated/g_chipset_nvoc.h",
+    "src/nvidia/generated/g_os_nvoc.h",
+]
+NEEDED = [SWREF, RPC_ENUMS, SDK_INC, RPC_C, RES_LIST] + STRUCT_FILES
+# Display classes whose methods are decoded (GB20x: NVCA7x; older as fallback)
+DISP_CLASSES = ["ca7d", "ca7e", "ca7b", "ca7a", "cb7d", "cb7e", "cb7b", "cb7a",
+                "c97d", "c97e", "c67d", "c67e", "c57d", "c57e", "c37d", "c37e"]
+# RPCs whose parameters are not an rpc_<name>_v structure
+RPC_PARAM_OVERRIDE = {
+    "GSP_SET_SYSTEM_INFO": "GspSystemInfo",
+    "GET_GSP_STATIC_INFO": "GspStaticConfigInfo",
+    "SET_REGISTRY": "PACKED_REGISTRY_TABLE",
+}
 
 RE_REG = re.compile(
     r"^#define\s+(NV_\w+)\s+(0x[0-9a-fA-F]+)\s*/\*\s*([RW-][W-][-A-Z][1248][RA])\s*\*/")
@@ -61,12 +91,16 @@ RE_DEF_HEX = re.compile(r"^#define\s+(\w+)\s+\(?(0x[0-9a-fA-F]+)U?\)?(\s|$)")
 
 
 class Tree:
-    """Read files either from a directory or from a git tag."""
+    """Read files from a git tag (preferred) or from an extracted directory.
+
+    The extracted ref/ tree may be partial, so the git tag is used whenever
+    the repository is there; --src only serves as the fallback.
+    """
 
     def __init__(self, src, git, tag):
-        self.src = src if src and os.path.isdir(src) else None
+        self.src = None
         self.files = {}
-        if not self.src:
+        if git and os.path.isdir(git):
             data = subprocess.run(
                 ["git", "-C", git, "archive", "--format=tar", tag] + NEEDED,
                 check=True, capture_output=True).stdout
@@ -75,6 +109,10 @@ class Tree:
                     if m.isfile():
                         self.files[m.name] = tf.extractfile(m).read().decode(
                             "utf-8", "replace")
+        elif src and os.path.isdir(src):
+            self.src = src
+        else:
+            sys.exit(f"no source: neither {git} nor {src}")
 
     def list(self, prefix):
         if self.src:
@@ -92,6 +130,11 @@ class Tree:
                       errors="replace") as f:
                 return f.read()
         return self.files[path]
+
+    def exists(self, path):
+        if self.src:
+            return os.path.isfile(os.path.join(self.src, path))
+        return path in self.files
 
 
 # Headers whose offsets are relative to an engine/structure, not BAR0.
@@ -223,7 +266,14 @@ def parse_rpc(tree):
 
 
 def parse_classes(tree):
+    """Class id -> name: the define matching the header's number, then the
+    other external class names RM's resource_list.h knows (aliases such as
+    NV01_MEMORY_LIST_SYSTEM in cl84a0.h)."""
     classes = {}
+    ext = set()
+    if tree.exists(RES_LIST):
+        ext = set(re.findall(r"External Class\s*\*/\s*(\w+),",
+                             tree.read(RES_LIST)))
     for path in tree.list(CLASS_DIR):
         m = re.match(r".*/cl([0-9a-fA-F]{4})\.h$", path)
         if not m:
@@ -235,6 +285,11 @@ def parse_classes(tree):
                     not d.group(1).endswith(("_MESSAGE_ID", "_TYPEDEF")) and \
                     "_CTRL_" not in d.group(1):
                 classes.setdefault(want, d.group(1))
+    for path in tree.list(CLASS_DIR):
+        for line in tree.read(path).splitlines():
+            d = RE_DEF_HEX.match(line)
+            if d and d.group(1) in ext:
+                classes.setdefault(int(d.group(2), 16), d.group(1))
     return classes
 
 
@@ -252,6 +307,121 @@ def parse_ctrls(tree):
     return ctrls
 
 
+def parse_structs(tree):
+    """Structure layouts + constants from the SDK, vGPU/RPC and GSP headers."""
+    sys.path.insert(0, HERE)
+    import cstructs
+    consts = cstructs.Consts()
+    files = []
+    for d in STRUCT_DIRS:
+        files += [f for f in tree.list(d) if f.endswith(".h")]
+    files += [f for f in STRUCT_FILES if tree.exists(f)]
+    texts = [tree.read(f) for f in files]
+    for t in texts:
+        consts.add_text(t)
+    p = cstructs.Parser(consts)
+    for t in texts:
+        p.add_text(t)
+    return p.layout_all(), consts
+
+
+def parse_rpc_params(tree, rpc, structs):
+    """RPC function id -> parameter structure name."""
+    out = {}
+    pairs = {}
+    if tree.exists(RPC_C):
+        for fn, st in re.findall(r"NV_VGPU_MSG_FUNCTION_(\w+),\s*sizeof\((\w+)\)",
+                                 tree.read(RPC_C)):
+            if st in structs and not st.endswith("_v"):
+                pairs.setdefault(fn, st)
+    for fid, name in rpc.items():
+        base = name[6:] if name.startswith("EVENT_") else name
+        cand = [RPC_PARAM_OVERRIDE.get(base), pairs.get(base),
+                f"rpc_{base.lower()}_v"]
+        for c in cand:
+            if c and c in structs:
+                out[fid] = c
+                break
+    return out
+
+
+def parse_ctrl_params(tree, structs):
+    """RM control cmd -> parameter structure (from the finn comments)."""
+    out = {}
+    rx = re.compile(r"#define\s+(\w+_CTRL_CMD_\w+)\s+\((0x[0-9a-fA-F]+)U?\)\s*"
+                    r"/\*\s*finn: Evaluated from \"[^\"]*?(\w+)_MESSAGE_ID\)?\"")
+    for path in tree.list(CTRL_DIR):
+        if not path.endswith(".h"):
+            continue
+        for name, val, st in rx.findall(tree.read(path)):
+            if st in structs:
+                out[int(val, 16)] = st
+    return out
+
+
+def parse_alloc_params(tree, classes, structs):
+    """Class id -> allocation parameter structure (RM's resource_list.h)."""
+    out = {}
+    if not tree.exists(RES_LIST):
+        return out
+    by_name = {v: k for k, v in classes.items()}
+    for path in tree.list(CLASS_DIR):     # every name, also aliases
+        for line in tree.read(path).splitlines():
+            d = RE_DEF_HEX.match(line)
+            if d and "_CTRL_" not in d.group(1):
+                by_name.setdefault(d.group(1), int(d.group(2), 16))
+    text = tree.read(RES_LIST)
+    for cls, info in re.findall(
+            r"External Class\s*\*/\s*(\w+),.*?Alloc Param Info\s*\*/\s*([^,]+?\)|RS_NONE)",
+            text, re.S):
+        m = re.match(r"RS_(?:REQUIRED|OPTIONAL)\((\w+)\)", info)
+        if not m or cls not in by_name:
+            continue
+        st = m.group(1)
+        if st in structs or st == "NvHandle":
+            out.setdefault(by_name[cls], st)
+    return out
+
+
+def parse_disp_methods(tree):
+    """Display class -> {method offset: name} from the class headers."""
+    out = {}
+    rx = re.compile(r"^#define\s+(NV[0-9A-F]{4}_\w+?)(\(([a-z])\))?\s+"
+                    r"\((0x[0-9A-Fa-f]+)(?:\s*\+\s*\(\3\)\s*\*\s*(0x[0-9A-Fa-f]+))?\)",
+                    re.M)
+    rfield = re.compile(r"^#define\s+(NV[0-9A-F]{4}_\w+?)(\([a-z]\))?\s+\d+:\d+", re.M)
+    for c in DISP_CLASSES:
+        path = f"{CLASS_DIR}/cl{c}.h"
+        if not tree.exists(path):
+            continue
+        text = tree.read(path)
+        fields = set(m.group(1) for m in rfield.finditer(text))
+        meth = {}
+        for m in rx.finditer(text):
+            name, idx, base, stride = m.group(1), m.group(3), \
+                int(m.group(4), 16), m.group(5)
+            if base % 4 or not any(f.startswith(name + "_") for f in fields):
+                continue
+            if idx and stride:
+                cnt = 32 if "WINDOW" in name else 8
+                for k in range(cnt):
+                    meth.setdefault(base + k * int(stride, 16), f"{name}({k})")
+            else:
+                meth.setdefault(base, name)
+        if meth:
+            out[int(c, 16)] = {f"{k:x}": v for k, v in sorted(meth.items())}
+    return out
+
+
+def parse_status(tree):
+    out = {}
+    if tree.exists(STATUS_H):
+        for name, val in re.findall(r"NV_STATUS_CODE\((\w+),\s*(0x[0-9a-fA-F]+)",
+                                    tree.read(STATUS_H)):
+            out[int(val, 16)] = name
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -263,20 +433,51 @@ def main():
 
     tree = Tree(a.src, a.git, a.tag)
     regs, ranges = parse_regs(tree)
+    rpc = parse_rpc(tree)
+    classes = parse_classes(tree)
+    structs, _ = parse_structs(tree)
+    rpc_params = parse_rpc_params(tree, rpc, structs)
+    ctrl_params = parse_ctrl_params(tree, structs)
+    alloc_params = parse_alloc_params(tree, classes, structs)
+    # keep only the structures reachable from the maps (smaller tables)
+    keep = set()
+    todo = list(rpc_params.values()) + list(ctrl_params.values()) + \
+        list(alloc_params.values())
+    while todo:
+        n = todo.pop()
+        if n in keep or n not in structs:
+            continue
+        keep.add(n)
+        st = structs[n]
+        if "alias" in st:
+            todo.append(st["alias"])
+            continue
+        todo += [f[5] for f in st["f"] if f[5]]
     tables = {
         "source": f"open-gpu-kernel-modules {a.tag}",
         "regs": {f"{k:x}": v for k, v in sorted(regs.items())},
         "ranges": ranges,
         "pages": {f"{k:x}": v for k, v in sorted(page_prefixes(regs).items())},
-        "rpc": {str(k): v for k, v in sorted(parse_rpc(tree).items())},
-        "classes": {f"{k:x}": v for k, v in sorted(parse_classes(tree).items())},
+        "rpc": {str(k): v for k, v in sorted(rpc.items())},
+        "classes": {f"{k:x}": v for k, v in sorted(classes.items())},
         "ctrls": {f"{k:x}": v for k, v in sorted(parse_ctrls(tree).items())},
+        "structs": {k: structs[k] for k in sorted(keep)},
+        "rpc_params": {str(k): v for k, v in sorted(rpc_params.items())},
+        "ctrl_params": {f"{k:x}": v for k, v in sorted(ctrl_params.items())},
+        "alloc_params": {f"{k:x}": v for k, v in sorted(alloc_params.items())},
+        "disp_methods": {f"{k:x}": v for k, v in
+                         sorted(parse_disp_methods(tree).items())},
+        "status": {f"{k:x}": v for k, v in sorted(parse_status(tree).items())},
     }
     with gzip.open(a.out, "wt", encoding="utf-8") as f:
         json.dump(tables, f, separators=(",", ":"), sort_keys=True)
     print(f"{a.out}: {len(tables['regs'])} regs, {len(ranges)} ranges, "
-          f"{len(tables['rpc'])} rpc ids, {len(tables['classes'])} classes, "
-          f"{len(tables['ctrls'])} ctrl cmds", file=sys.stderr)
+          f"{len(tables['rpc'])} rpc ids ({len(rpc_params)} with params), "
+          f"{len(tables['classes'])} classes ({len(alloc_params)} with alloc "
+          f"params), {len(tables['ctrls'])} ctrl cmds ({len(ctrl_params)} "
+          f"with params), {len(keep)} structs of {len(structs)}, "
+          f"{len(tables['disp_methods'])} display classes, "
+          f"{len(tables['status'])} status codes", file=sys.stderr)
 
 
 if __name__ == "__main__":
