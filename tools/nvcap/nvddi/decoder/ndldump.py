@@ -41,13 +41,27 @@ TABLE = struct.Struct("<IIQQII")
 DROP = struct.Struct("<QQII")
 END = struct.Struct("<QQQ")
 REGISTRY = struct.Struct("<IIIIIHHIIHH")
+IMPORT = struct.Struct("<IIQQQQQ")
 
-T_PAD, T_SCHEMA, T_EVENT, T_IRP, T_REGISTER, T_TABLE, T_CALL, T_RET, T_BLOB, T_DROP, T_END, T_REGISTRY = range(12)
-TNAMES = ["PAD", "SCHEMA", "EVENT", "IRP", "REGISTER", "TABLE", "CALL", "RET", "BLOB", "DROP", "END", "REGISTRY"]
+(T_PAD, T_SCHEMA, T_EVENT, T_IRP, T_REGISTER, T_TABLE, T_CALL, T_RET, T_BLOB, T_DROP, T_END, T_REGISTRY,
+ T_IMPORT) = range(13)
+TNAMES = ["PAD", "SCHEMA", "EVENT", "IRP", "REGISTER", "TABLE", "CALL", "RET", "BLOB", "DROP", "END",
+          "REGISTRY", "IMPORT"]
+IMP = {1: "MmMapIoSpaceEx", 2: "MmMapIoSpace", 3: "MmUnmapIoSpace",
+       4: "MmAllocateContiguousMemorySpecifyCache", 5: "MmAllocateContiguousMemory", 6: "MmFreeContiguousMemory",
+       7: "MmAllocatePagesForMdlEx", 8: "MmMapLockedPagesSpecifyCache", 9: "IoAllocateMdl",
+       10: "MmProbeAndLockPages", 11: "KeInsertQueueDpc", 12: "IoConnectInterrupt", 13: "IoConnectInterruptEx",
+       14: "ExAllocatePool2", 15: "ExAllocatePoolWithTag", 16: "MmGetPhysicalAddress", 17: "ZwOpenKey",
+       18: "ZwQueryValueKey", 19: "ZwCreateFile"}
+IMP_ARGS = {1: ("phys", "len", "prot"), 2: ("phys", "len", "cache"), 3: ("va", "len"),
+            4: ("bytes", "lowest", "highest", "cache"), 5: ("bytes", "highest"), 6: ("va",),
+            7: ("lowAddr", "highAddr", "bytes", "flags"), 9: ("va", "len"), 11: ("dpc", "arg1", "arg2"),
+            13: ("params",), 14: ("flags", "bytes", "tag"), 15: ("pooltype", "bytes", "tag"),
+            16: ("va",)}
 REG_OPS = {1: "SetValue", 2: "DeleteValue", 21: "EnumerateValue", 23: "QueryValue", 27: "CreateKey",
            29: "OpenKey"}   # REG_NOTIFY_CLASS
 REG_TYPES = {0: "NONE", 1: "SZ", 2: "EXPAND_SZ", 3: "BINARY", 4: "DWORD", 7: "MULTI_SZ", 11: "QWORD"}
-B_ARG, B_NEST, B_ELEM, B_LENBUF, B_TABLE, B_INIT = 1, 2, 3, 4, 5, 6
+B_ARG, B_NEST, B_ELEM, B_LENBUF, B_TABLE, B_INIT, B_CMDBUF = 1, 2, 3, 4, 5, 6, 7
 BF = [(1, "post"), (2, "trunc"), (4, "partial"), (8, "failed"), (0x10, "irql"), (0x20, "direct"), (0x40, "user")]
 EV = {1: "LOAD", 2: "ATTACH", 3: "ATTACH_FAIL", 4: "REGISTER_IOCTL", 5: "HOOK_SKIP", 6: "TABLE_SKIP",
       7: "START_FAIL", 8: "LEVEL", 9: "FILE", 10: "HEALTHY", 11: "INFO"}
@@ -354,6 +368,7 @@ class Log:
         self.order = []           # all Call in seq order
         self.events, self.irps, self.registers, self.tables, self.drops = [], [], [], [], []
         self.registry = []
+        self.imports = []
         self.end = None
         self.bad = None
         self.ret_only = 0
@@ -423,6 +438,13 @@ class Log:
                 self.drops.append((seq, qpc, DROP.unpack_from(mm, p)))
             elif typ == T_END:
                 self.end = END.unpack_from(mm, p)
+            elif typ == T_IMPORT:
+                im = IMPORT.unpack_from(mm, p)
+                q = p + IMPORT.size
+                blob = None
+                if off + size - q >= BLOB.size:
+                    blob, _ = read_blob(self, q)
+                self.imports.append((seq, qpc, pid, tid, im, blob))
             elif typ == T_REGISTRY:
                 r = REGISTRY.unpack_from(mm, p)
                 q = p + REGISTRY.size
@@ -553,6 +575,12 @@ def blob_lines(log, L, c, verbose, indent="      "):
                     if v != 0 and sv != "0":
                         out.append("%s    %s = %s" % (indent, p, sv))
         for b in nested:
+            if b.kind == B_CMDBUF:
+                out.append("%s[%s] command buffer run %d GPUVA %#x seg %d %d/%d bytes %s" % (
+                    indent, phase, b.elem, b.addr, b.rule, b.len, b.orig, b.fl()))
+                if verbose and b.len:
+                    out.extend(nv_methods(b.data(), 400))
+                continue
             r = log.schema.rules.get(b.rule, {"owner": "?", "path": "?", "elem": None, "kind": "?"})
             el = "" if b.elem == 0xFFFFFFFF else "[%d]" % b.elem
             what = "%s.%s%s" % (r["owner"], r["path"], el) if b.kind == B_NEST else "%s.%s -> elem%s" % (
@@ -703,6 +731,10 @@ def view_summary(log, L, a, out):
     for (seq, qpc, t, b) in log.tables:
         tn = log.schema.tables.get(t[0], {}).get("name", t[0])
         out.append("table     %-40s %3d slots wrapped  src %#x  version %d" % (tn, t[1], t[2], t[5]))
+    out.append("")
+    if log.imports:
+        out.append("")
+        out.append("non-DDI imports logged: %d" % len(log.imports))
     out.append("")
     view_stats(log, L, a, out)
 
@@ -973,6 +1005,50 @@ def view_registry(log, L, a, out):
             break
 
 
+def view_imports(log, L, a, out):
+    n = 0
+    counts = collections.Counter()
+    for (seq, qpc, pid, tid, im, blob) in log.imports:
+        fn, a0, b0, c0, d0, ret = im[0], im[2], im[3], im[4], im[5], im[6]
+        counts[IMP.get(fn, fn)] += 1
+        names = IMP_ARGS.get(fn, ())
+        vals = [a0, b0, c0, d0]
+        parts = " ".join("%s=%#x" % (names[i], vals[i]) for i in range(len(names)) if vals[i])
+        extra = ""
+        if blob and blob.len:
+            extra = " name=%r" % blob.data().decode("utf-16-le", "replace").rstrip("\0")
+        out.append("%8d %10.3f %5d/%-5d %-40s %s ret=%#x%s" % (
+            seq, log.ms(qpc), pid, tid, IMP.get(fn, "imp%d" % fn), parts, ret, extra))
+        n += 1
+        if a.limit and n >= a.limit:
+            break
+    out.append("")
+    for k, v in counts.most_common():
+        out.append("  %-44s %d" % (k, v))
+
+
+def view_cmdbuf(log, L, a, out):
+    n = 0
+    for c in log.order:
+        nm = log.name(c)
+        if "SubmitCommand" not in nm:
+            continue
+        runs = [b for b in (c.nested + c.post_nested) if b.kind == B_CMDBUF]
+        if not runs and not a.verbose:
+            continue
+        total = sum(b.len for b in runs)
+        out.append("%8d %10.3f %s -> %s  %d bytes in %d runs" % (
+            c.seq, log.ms(c.qpc), nm, ret_text(log, c), total, len(runs)))
+        for b in runs:
+            tag = "unmapped" if (b.flags & 8) else "seg %d" % b.rule
+            out.append("  run %d GPUVA %#x %s %d bytes %s" % (b.elem, b.addr, tag, b.len, b.fl()))
+            if b.len:
+                out.extend(nv_methods(b.data(), 400 if a.verbose else 32))
+        n += 1
+        if a.limit and n >= a.limit:
+            break
+
+
 def view_schema(log, L, a, out):
     s = log.schema
     for tid, t in sorted(s.tables.items()):
@@ -1012,7 +1088,8 @@ def dump_blobs(log, a):
 def main(argv=None):
     ap = argparse.ArgumentParser(description="decode nvddi .ndl logs")
     ap.add_argument("log")
-    for v in ("summary", "timeline", "calls", "paging", "escapes", "vidpn", "events", "stats", "schema", "registry"):
+    for v in ("summary", "timeline", "calls", "paging", "escapes", "vidpn", "events", "stats", "schema",
+              "registry", "imports", "cmdbuf"):
         ap.add_argument("--" + v, action="store_true")
     ap.add_argument("--dump-blobs", metavar="DIR")
     ap.add_argument("-v", "--verbose", action="store_true")
@@ -1044,6 +1121,10 @@ def main(argv=None):
         view_stats(log, L, a, out)
     elif a.registry:
         view_registry(log, L, a, out)
+    elif a.imports:
+        view_imports(log, L, a, out)
+    elif a.cmdbuf:
+        view_cmdbuf(log, L, a, out)
     elif a.schema:
         view_schema(log, L, a, out)
     else:

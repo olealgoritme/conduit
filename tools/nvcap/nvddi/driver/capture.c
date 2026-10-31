@@ -401,6 +401,76 @@ static void record_call(NVDDI_CALL *c, ULONG_PTR *av, UCHAR phase, ULONG64 ret)
     ring_commit(rec);
 }
 
+/* read up to 8 bytes from a kernel structure already validated by the callee */
+static ULONG64 rd(ULONG_PTR p, ULONG size, KIRQL irql)
+{
+    ULONG64 v = 0;
+    USHORT f = 0;
+    if (!p)
+        return 0;
+    safe_copy(&v, p, size > 8 ? 8 : size, irql, FALSE, &f);
+    return (f & (NDL_BF_FAILED | NDL_BF_IRQL)) ? 0 : v;
+}
+
+/* GPU-VA map feeding and command-buffer capture, driven by (table, slot). */
+static void post_special(NVDDI_CALL *c, ULONG_PTR *av, ULONG64 ret)
+{
+    const NVDDI_SLOT *s = c->s;
+    KIRQL irql = KeGetCurrentIrql();
+    ULONG_PTR arg;
+    if (s->table != NVDDI_T_DRIVER_INITIALIZATION_DATA || !g.resolve_gpuva)
+        return;
+    arg = av[1];
+    if (!arg)
+        return;
+    if (s->index == NVDDI_S_0_DxgkDdiQueryAdapterInfo && (LONG)ret >= 0) {
+        if ((ULONG)rd(arg + NVDDI_OFF_QAI_TYPE, 4, irql) != NVDDI_QAI_QUERYSEGMENT)
+            return;
+        ULONG_PTR out = (ULONG_PTR)rd(arg + NVDDI_OFF_QAI_OUT, 8, irql);
+        if (!out)
+            return;
+        ULONG nb = (ULONG)rd(out + NVDDI_OFF_QSO_NB, 4, irql);
+        ULONG_PTR desc = (ULONG_PTR)rd(out + NVDDI_OFF_QSO_DESC, 8, irql);
+        ULONG i;
+        if (nb > 64)
+            nb = 64;
+        for (i = 0; i < nb && desc; i++) {
+            ULONG_PTR d = desc + (ULONG_PTR)i * NVDDI_SZ_SEGDESC;
+            gpuva_note_segment(i + 1,                 /* segment ids are 1-based in PTEs */
+                               (ULONG)rd(d + NVDDI_OFF_SEG_FLAGS, 4, irql),
+                               rd(d + NVDDI_OFF_SEG_BASE, 8, irql),
+                               rd(d + NVDDI_OFF_SEG_CPUXLATE, 8, irql),
+                               rd(d + NVDDI_OFF_SEG_SIZE, 8, irql));
+        }
+        return;
+    }
+    if (s->index == NVDDI_S_0_DxgkDdiBuildPagingBuffer) {
+        if ((ULONG)rd(arg + NVDDI_OFF_BPB_OP, 4, irql) != 11)   /* UPDATE_PAGE_TABLE */
+            return;
+        if ((ULONG)rd(arg + NVDDI_OFF_BPB_PTE_LEVEL, 4, irql) != 0)   /* leaf only */
+            return;
+        ULONG_PTR pte = (ULONG_PTR)rd(arg + NVDDI_OFF_BPB_PTE_PTR, 8, irql);
+        ULONG n = (ULONG)rd(arg + NVDDI_OFF_BPB_PTE_NUM, 4, irql);
+        ULONG64 va = rd(arg + NVDDI_OFF_BPB_PTE_VA, 8, irql);
+        ULONG i;
+        if (n > 0x40000)
+            n = 0x40000;
+        for (i = 0; i < n && pte; i++) {
+            ULONG_PTR e = pte + (ULONG_PTR)i * NVDDI_SZ_PTE;
+            gpuva_note_pte(va + (ULONG64)i * 4096, rd(e, 8, irql), rd(e + 8, 8, irql));
+        }
+        return;
+    }
+    if (c->active && s->index == NVDDI_S_0_DxgkDdiSubmitCommandVirtual && (LONG)ret >= 0) {
+        gpuva_capture(c->seq, rd(arg + NVDDI_OFF_SCV_VA, 8, irql),
+                      (ULONG)rd(arg + NVDDI_OFF_SCV_SIZE, 4, irql),
+                      (ULONG)rd(arg + NVDDI_OFF_SCV_ENGINE, 4, irql));
+    } else if (c->active && s->index == NVDDI_S_0_DxgkDdiSubmitCommandToHwQueue && (LONG)ret >= 0) {
+        gpuva_capture(c->seq, rd(arg + NVDDI_OFF_SCH_VA, 8, irql),
+                      (ULONG)rd(arg + NVDDI_OFF_SCH_SIZE, 4, irql), 0);
+    }
+}
+
 BOOLEAN slot_muted(const NVDDI_SLOT *s)
 {
     if (s->table >= NVDDI_NTABLES || s->index >= 256)
@@ -442,6 +512,8 @@ void nvddi_post(NVDDI_CALL *c, ULONG_PTR *av, ULONG64 ret)
 
     if (c->active)
         record_call(c, av, 1, ret);
+
+    post_special(c, av, ret);
 
     /* out-parameters that return dxgkrnl function tables (VidPN, monitor) */
     if (KeGetCurrentIrql() <= APC_LEVEL && (s->retkind == 0 || (LONG)ret >= 0)) {

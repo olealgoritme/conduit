@@ -19,6 +19,7 @@
  *   NDL_T_DROP      records lost since the last DROP (ring full / file cap)
  *   NDL_T_END       written when the log is closed
  *   NDL_T_REGISTRY  registry access made from the hooked miniport's code
+ *   NDL_T_IMPORT    a logged ntoskrnl/hal import call made from the miniport
  */
 #pragma once
 
@@ -38,6 +39,7 @@
 #define NDL_T_DROP      9
 #define NDL_T_END       10
 #define NDL_T_REGISTRY  11
+#define NDL_T_IMPORT    12
 
 /* NDL_REC.flags */
 #define NDL_RF_HIGHIRQL  0x0001   /* recorded above DISPATCH_LEVEL: no nested capture */
@@ -98,6 +100,7 @@ typedef struct NDL_CALL {
 #define NDL_B_LENBUF  4   /* void* argument with a length argument */
 #define NDL_B_TABLE   5   /* raw function table copy */
 #define NDL_B_INIT    6   /* DRIVER_INITIALIZATION_DATA as passed by the miniport */
+#define NDL_B_CMDBUF  7   /* command bytes at a submitted GPU VA (arg=engine, rule=segment, elem=run) */
 
 /* blob flags */
 #define NDL_BF_POST     0x0001  /* captured after the call */
@@ -183,6 +186,34 @@ typedef struct NDL_DROP {
     unsigned int       cpu;
     unsigned int       reason;            /* 1 ring full, 2 file size cap reached (rest of the capture dropped) */
 } NDL_DROP;
+
+typedef struct NDL_IMPORT {
+    unsigned int       fn;                /* NDL_IMP_* */
+    unsigned int       rsv;
+    unsigned long long a, b, c, d;        /* call arguments (meaning per fn, see the decoder) */
+    unsigned long long ret;               /* return value / out handle */
+    /* optional trailing NDL_BLOB (e.g. value name for a Zw registry call) */
+} NDL_IMPORT;
+
+#define NDL_IMP_MmMapIoSpaceEx            1   /* a=phys b=len c=prot ret=va */
+#define NDL_IMP_MmMapIoSpace              2
+#define NDL_IMP_MmUnmapIoSpace            3   /* a=va b=len */
+#define NDL_IMP_MmAllocateContiguousMemorySpecifyCache 4 /* a=bytes b=lowest c=highest ret=va */
+#define NDL_IMP_MmAllocateContiguousMemory 5  /* a=bytes b=highest ret=va */
+#define NDL_IMP_MmFreeContiguousMemory    6   /* a=va */
+#define NDL_IMP_MmAllocatePagesForMdlEx   7   /* a=low b=high c=bytes ret=mdl */
+#define NDL_IMP_MmMapLockedPagesSpecifyCache 8 /* a=mdl ret=va */
+#define NDL_IMP_IoAllocateMdl             9   /* a=va b=len ret=mdl */
+#define NDL_IMP_MmProbeAndLockPages       10  /* a=mdl */
+#define NDL_IMP_KeInsertQueueDpc          11  /* a=dpc b=arg1 c=arg2 ret=inserted */
+#define NDL_IMP_IoConnectInterrupt        12  /* a=service-routine b=context ret=status */
+#define NDL_IMP_IoConnectInterruptEx      13  /* a=params ret=status */
+#define NDL_IMP_ExAllocatePool2           14  /* a=flags b=bytes c=tag ret=ptr */
+#define NDL_IMP_ExAllocatePoolWithTag     15  /* a=type b=bytes c=tag ret=ptr */
+#define NDL_IMP_MmGetPhysicalAddress      16  /* a=va ret=phys */
+#define NDL_IMP_ZwOpenKey                 17  /* blob=key name; ret=status */
+#define NDL_IMP_ZwQueryValueKey           18  /* blob=value name; a=class ret=status */
+#define NDL_IMP_ZwCreateFile              19  /* blob=object name; ret=status */
 
 typedef struct NDL_REGISTRY {
     unsigned int       op;                /* REG_NOTIFY_CLASS (RegNtPostQueryValueKey, ...) */

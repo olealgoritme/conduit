@@ -23,6 +23,7 @@ typedef struct _NVDDI_MM_COPY_ADDRESS {
 NTKERNELAPI NTSTATUS NTAPI MmCopyMemory(PVOID TargetAddress, MM_COPY_ADDRESS SourceAddress, SIZE_T NumberOfBytes,
                                         ULONG Flags, PSIZE_T NumberOfBytesTransferred);
 NTKERNELAPI BOOLEAN NTAPI SeTokenIsAdmin(PACCESS_TOKEN Token);
+NTKERNELAPI PVOID NTAPI MmMapIoSpaceEx(PHYSICAL_ADDRESS PhysicalAddress, SIZE_T NumberOfBytes, ULONG Protect);
 NTKERNELAPI PDEVICE_OBJECT NTAPI IoGetDeviceAttachmentBaseRef(PDEVICE_OBJECT DeviceObject);
 NTSYSAPI NTSTATUS NTAPI ZwFlushBuffersFile(HANDLE FileHandle, PIO_STATUS_BLOCK IoStatusBlock);
 #ifndef SeQuerySubjectContextToken
@@ -201,7 +202,8 @@ typedef struct NVDDI_GLOBALS {
     /* configuration (Parameters key) */
     ULONG            enabled, cfg_level, ring_kb, total_ring_mb, max_blob, max_file_mb;
     ULONG            max_fails, fail_count, boot_count, healthy_seconds;
-    ULONG            hook_callbacks, hook_vidpn, log_registry;
+    ULONG            hook_callbacks, hook_vidpn, log_registry, resolve_gpuva, hook_imports, gpuva_entries;
+    ULONG            boot_start;        /* wrap nvlddmkm's first start (load order gate) */
     WCHAR            logdir[128];
     WCHAR            target[64];
 
@@ -256,11 +258,23 @@ ULONG    mute_by_name(const char *name, ULONG mute);
 
 /* filter.c */
 NTSTATUS filter_attach(void);
+VOID filter_reinit(PDRIVER_OBJECT drv, PVOID ctx, ULONG count);
 NTSTATUS filter_dispatch(PDEVICE_OBJECT dev, PIRP irp);
 void    *wrap_table(ULONG tid, void *src);
 
 /* registry.c */
 NTSTATUS registry_init(void);
+
+/* gpuva.c: GPU VA -> command bytes */
+NTSTATUS gpuva_init(void);
+void gpuva_note_segment(ULONG id, ULONG flags, ULONG64 base, ULONG64 cpu_translated, ULONG64 size);
+void gpuva_note_pte(ULONG64 va, ULONG64 pte_flags, ULONG64 pte_pageaddr);
+ULONG gpuva_capture(ULONG64 owner_seq, ULONG64 va, ULONG size, ULONG engine);
+ULONG gpuva_pte_count(void);
+
+/* imports.c: non-DDI kernel imports of the miniport */
+NTSTATUS imports_wrap(PDRIVER_OBJECT drv);
+void imports_unwrap(void);
 
 /* writer.c */
 NTSTATUS writer_start(void);

@@ -347,6 +347,10 @@ static NTSTATUS nvddi_dpi_initialize(PDRIVER_OBJECT drv, PUNICODE_STRING reg, PD
     log_register(drv, reg, init, 1, 0, sizeof(DRIVER_INITIALIZATION_DATA));
     log_table(NVDDI_T_DRIVER_INITIALIZATION_DATA, init, copy, sizeof(DRIVER_INITIALIZATION_DATA), wrapped,
               init->Version);
+    if (g.hook_imports) {
+        NTSTATUS iw = imports_wrap(drv);
+        log_event(NDL_EV_INFO, iw, 0, 0, "import IAT wrap %s", NT_SUCCESS(iw) ? "done" : "skipped/failed");
+    }
     st = real(drv, reg, (PDRIVER_INITIALIZATION_DATA)copy);
     if (NT_SUCCESS(st))
         InterlockedIncrement(&g.hooked);
@@ -406,6 +410,17 @@ static NTSTATUS load_dxgkrnl(void)
     UNICODE_STRING svc;
     RtlInitUnicodeString(&svc, L"\\Registry\\Machine\\System\\CurrentControlSet\\Services\\DXGKrnl");
     return ZwLoadDriver(&svc);
+}
+
+VOID filter_reinit(PDRIVER_OBJECT drv, PVOID ctx, ULONG count)
+{
+    UNREFERENCED_PARAMETER(ctx);
+    if (g.attached)
+        return;
+    if (NT_SUCCESS(filter_attach()))
+        return;
+    if (count < 8)   /* PnP start of the GPU may be later; keep retrying */
+        IoRegisterDriverReinitialization(drv, filter_reinit, NULL);
 }
 
 NTSTATUS filter_attach(void)

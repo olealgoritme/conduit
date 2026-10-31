@@ -31,7 +31,7 @@ LDFLAGS := -nostdlib -Wl,--subsystem,native -Wl,--entry,DriverEntry \
            -Wl,--disable-runtime-pseudo-reloc -Wl,--disable-auto-import -Wl,--no-insert-timestamp
 
 SRCS := driver/main.c driver/filter.c driver/capture.c driver/ring.c driver/writer.c driver/util.c \
-        driver/registry.c
+        driver/registry.c driver/gpuva.c driver/imports.c
 OBJS := $(patsubst driver/%.c,$(B)/obj/%.o,$(SRCS)) $(B)/obj/nvddi_gen.o
 
 all: $(B)/nvddi.sys $(B)/nvddictl.exe

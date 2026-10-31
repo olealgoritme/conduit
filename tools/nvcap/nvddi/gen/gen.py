@@ -828,6 +828,48 @@ class Gen:
             h.append("#define NVDDI_N_%s %d" % (t["cname"], len(t["slots"])))
             for s in t["slots"]:
                 h.append("#define NVDDI_S_%d_%s %d" % (t["id"], s["field"], s["index"]))
+        # offsets the driver reads directly (GPU-VA resolution, segment/PTE feeding)
+        def O(tag, path):
+            rec = self.recs[tag]
+            stack = []
+            for (o, depth, name, typ, size, bits) in [(f["off"], f["depth"], f["name"], f["type"], f.get("bits"), None) for f in rec["fields"]]:
+                pass
+            # walk with the parser's own field list
+            st = []
+            for f in rec["fields"]:
+                d = f["depth"]
+                while st and st[-1][0] >= d:
+                    st.pop()
+                st.append((d, f["name"]))
+                if [n for (_, n) in st if n] == path.split("."):
+                    return f["off"]
+            raise SystemExit("offset %s.%s not found" % (tag, path))
+        off = [
+            ("SCV_VA", "_DXGKARG_SUBMITCOMMANDVIRTUAL", "DmaBufferVirtualAddress"),
+            ("SCV_SIZE", "_DXGKARG_SUBMITCOMMANDVIRTUAL", "DmaBufferSize"),
+            ("SCV_ENGINE", "_DXGKARG_SUBMITCOMMANDVIRTUAL", "EngineOrdinal"),
+            ("SCH_VA", "_DXGKARG_SUBMITCOMMANDTOHWQUEUE", "DmaBufferVirtualAddress"),
+            ("SCH_SIZE", "_DXGKARG_SUBMITCOMMANDTOHWQUEUE", "DmaBufferSize"),
+            ("BPB_OP", "_DXGKARG_BUILDPAGINGBUFFER", "Operation"),
+            ("BPB_PTE_PTR", "_DXGKARG_BUILDPAGINGBUFFER", "UpdatePageTable.pPageTableEntries"),
+            ("BPB_PTE_NUM", "_DXGKARG_BUILDPAGINGBUFFER", "UpdatePageTable.NumPageTableEntries"),
+            ("BPB_PTE_VA", "_DXGKARG_BUILDPAGINGBUFFER", "UpdatePageTable.FirstPteVirtualAddress"),
+            ("BPB_PTE_LEVEL", "_DXGKARG_BUILDPAGINGBUFFER", "UpdatePageTable.PageTableLevel"),
+            ("QAI_TYPE", "_DXGKARG_QUERYADAPTERINFO", "Type"),
+            ("QAI_OUT", "_DXGKARG_QUERYADAPTERINFO", "pOutputData"),
+            ("QAI_OUTSIZE", "_DXGKARG_QUERYADAPTERINFO", "OutputDataSize"),
+            ("QSO_NB", "_DXGK_QUERYSEGMENTOUT", "NbSegment"),
+            ("QSO_DESC", "_DXGK_QUERYSEGMENTOUT", "pSegmentDescriptor"),
+            ("SEG_BASE", "_DXGK_SEGMENTDESCRIPTOR", "BaseAddress"),
+            ("SEG_CPUXLATE", "_DXGK_SEGMENTDESCRIPTOR", "CpuTranslatedAddress"),
+            ("SEG_SIZE", "_DXGK_SEGMENTDESCRIPTOR", "Size"),
+            ("SEG_FLAGS", "_DXGK_SEGMENTDESCRIPTOR", "Flags"),
+        ]
+        for nm, tag, path in off:
+            h.append("#define NVDDI_OFF_%s %d" % (nm, O(tag, path)))
+        h.append("#define NVDDI_SZ_SEGDESC %d" % self.recs["_DXGK_SEGMENTDESCRIPTOR"]["size"])
+        h.append("#define NVDDI_SZ_PTE %d" % self.recs["_DXGK_PTE"]["size"])
+        h.append("#define NVDDI_QAI_QUERYSEGMENT 2")
         open(os.path.join(self.out, "nvddi_gen.h"), "w").write("\n".join(h) + "\n")
 
     def emit_wrapper(self, w, t, s):
@@ -949,6 +991,29 @@ class Gen:
             chk.append("sizeof(%s)" % t["cname"])
             for s in t["slots"]:
                 chk.append("__builtin_offsetof(%s, %s)" % (t["cname"], s["field"]))
+        # GPU-VA direct-read offsets the driver uses by #define
+        for tag, path in [
+            ("_DXGKARG_SUBMITCOMMANDVIRTUAL", "DmaBufferVirtualAddress"),
+            ("_DXGKARG_SUBMITCOMMANDVIRTUAL", "DmaBufferSize"),
+            ("_DXGKARG_SUBMITCOMMANDVIRTUAL", "EngineOrdinal"),
+            ("_DXGKARG_SUBMITCOMMANDTOHWQUEUE", "DmaBufferVirtualAddress"),
+            ("_DXGKARG_SUBMITCOMMANDTOHWQUEUE", "DmaBufferSize"),
+            ("_DXGKARG_BUILDPAGINGBUFFER", "Operation"),
+            ("_DXGKARG_BUILDPAGINGBUFFER", "UpdatePageTable.pPageTableEntries"),
+            ("_DXGKARG_BUILDPAGINGBUFFER", "UpdatePageTable.NumPageTableEntries"),
+            ("_DXGKARG_BUILDPAGINGBUFFER", "UpdatePageTable.FirstPteVirtualAddress"),
+            ("_DXGKARG_BUILDPAGINGBUFFER", "UpdatePageTable.PageTableLevel"),
+            ("_DXGKARG_QUERYADAPTERINFO", "Type"),
+            ("_DXGKARG_QUERYADAPTERINFO", "pOutputData"),
+            ("_DXGK_QUERYSEGMENTOUT", "NbSegment"),
+            ("_DXGK_QUERYSEGMENTOUT", "pSegmentDescriptor"),
+            ("_DXGK_SEGMENTDESCRIPTOR", "BaseAddress"),
+            ("_DXGK_SEGMENTDESCRIPTOR", "CpuTranslatedAddress"),
+            ("_DXGK_SEGMENTDESCRIPTOR", "Flags"),
+        ]:
+            chk.append("__builtin_offsetof(%s %s, %s)" % (self.recs[tag]["kw"], tag, path))
+        chk.append("sizeof(struct _DXGK_SEGMENTDESCRIPTOR)")
+        chk.append("sizeof(struct _DXGK_PTE)")
         with open(os.path.join(self.out, "layoutcheck.txt"), "w") as f:
             f.write("\n".join(chk) + "\n")
 

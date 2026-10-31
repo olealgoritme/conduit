@@ -52,6 +52,10 @@ CmCallbackGetKeyObjectIDEx
 CmCallbackReleaseKeyObjectIDEx
 RtlCaptureStackBackTrace
 ExGetPreviousMode
+IoRegisterDriverReinitialization
+MmMapIoSpaceEx
+MmGetPhysicalAddress
+MmUnmapIoSpace
 memcpy
 memmove
 memset

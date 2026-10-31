@@ -126,6 +126,20 @@ def build(schema_text, L):
     w.ret("DxgkCbNotifyInterrupt", c5, 0, [0x10, 0x30], thread=0xffff800000002000)
     w.ret("DxgkDdiInterruptRoutine", c4, 1, [0x1, 0x0], thread=0xffff800000002000)
 
+    # non-DDI import: MmMapIoSpaceEx + a ZwOpenKey with a name blob
+    w.rec(N.T_IMPORT, N.IMPORT.pack(1, 0, 0xf0000000, 0x1000, 0x4, 0, 0xffffd00000000000))
+    keyn = "\\REGISTRY\\MACHINE\\...\\nvlddmkm".encode("utf-16-le")
+    w.rec(N.T_IMPORT, N.IMPORT.pack(17, 0, 0x20019, 0, 0, 0, 0) + W.blob(keyn, N.B_ARG, 0))
+
+    # SubmitCommandVirtual with a resolved command-buffer run (NV push buffer)
+    sv = bytearray(L.size("DXGKARG_SUBMITCOMMANDVIRTUAL") or 64)
+    struct.pack_into("<QI", sv, 8, 0x1000000000, 0x40)
+    c6 = w.call("DxgkDdiSubmitCommandVirtual", [0x11, 0x44], [W.blob(bytes(sv), N.B_ARG, 1)])
+    r6 = w.ret("DxgkDdiSubmitCommandVirtual", c6, 0, [0x11, 0x44], [W.blob(bytes(sv), N.B_ARG, 1, flags=1)])
+    push = struct.pack("<IIII", 0x20018000 | (0x300 >> 2), 0x00000182, 0x2001c000, 0x12345678)
+    cb = N.BLOB.pack(len(push), len(push), N.B_CMDBUF, 0, 7, 1, 0, 0xFFFF, 0, 0x1000000000) + push
+    w.rec(N.T_BLOB, struct.pack("<Q", c6) + cb)
+
     w.rec(N.T_DROP, N.DROP.pack(3, 300, 1, 1))
     w.rec(N.T_END, N.END.pack(20, len(w.b), 0))
     return bytes(w.b)
@@ -154,6 +168,8 @@ def main():
         "--stats": ["DxgkDdiBuildPagingBuffer"],
         "--schema": ["DxgkDdiCreateAllocation"],
         "--registry": ["RmTest", "DWORD 0x2a"],
+        "--imports": ["MmMapIoSpaceEx", "ZwOpenKey", "nvlddmkm"],
+        "--cmdbuf": ["SubmitCommandVirtual", "GPUVA 0x1000000000", "LAUNCH_DMA"],
     }
     bad = 0
     for view, needles in expect.items():

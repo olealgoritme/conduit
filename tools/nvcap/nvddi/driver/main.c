@@ -15,6 +15,11 @@
  *   HookCallbacks  1     wrap DXGKRNL_INTERFACE (DxgkCb*)
  *   HookVidPn      1     wrap VidPN / monitor interfaces
  *   LogRegistry    1     record registry accesses made from the hooked miniport's code
+ *   ResolveGpuVa   1     reconstruct GpuMmu mappings and copy command bytes at submit
+ *   GpuVaEntries   0     VA map entries (0 = 1M = 32 MB nonpaged); power of two
+ *   HookImports    0     wrap nvlddmkm's ntoskrnl/hal imports via IAT (HVCI must be OFF)
+ *   BootStart      0     driver was set to boot/system start to wrap the first bring-up;
+ *                        retry attaching to \Device\DxgKrnl via driver reinit if not ready
  *   Mute           (REG_MULTI_SZ) slot names not to record
  *   MaxFails       2     load attempts that may end without "healthy"
  *   FailCount      -     incremented at every load, cleared after
@@ -349,6 +354,10 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING regpath)
     g.hook_callbacks = cfg_dword(h, L"HookCallbacks", 1);
     g.hook_vidpn = cfg_dword(h, L"HookVidPn", 1);
     g.log_registry = cfg_dword(h, L"LogRegistry", 1);
+    g.resolve_gpuva = cfg_dword(h, L"ResolveGpuVa", 1);
+    g.gpuva_entries = cfg_dword(h, L"GpuVaEntries", 0);
+    g.hook_imports = cfg_dword(h, L"HookImports", 0);
+    g.boot_start = cfg_dword(h, L"BootStart", 0);
     g.max_fails = cfg_dword(h, L"MaxFails", 2);
     g.fail_count = cfg_dword(h, L"FailCount", 0);
     g.boot_count = cfg_dword(h, L"BootCount", 0) + 1;
@@ -387,6 +396,10 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING regpath)
     st = ring_init(ring);
     if (!NT_SUCCESS(st))
         return st;
+    if (g.resolve_gpuva && !NT_SUCCESS(gpuva_init())) {
+        g.resolve_gpuva = 0;
+        InterlockedExchange(&g.last_error, STATUS_INSUFFICIENT_RESOURCES);
+    }
     InterlockedExchange(&g.level, (LONG)g.cfg_level);
     InterlockedExchange(&g.state, ST_PENDING);
 
@@ -415,8 +428,11 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING regpath)
     if (!NT_SUCCESS(st))
         log_event(NDL_EV_INFO, st, 0, 0, "writer thread not started");
     st = filter_attach();
-    if (!NT_SUCCESS(st))
+    if (!NT_SUCCESS(st)) {
         InterlockedExchange(&g.last_error, st);
+        /* boot/system start: \Device\DxgKrnl may not be up yet; retry via reinit */
+        IoRegisterDriverReinitialization(drv, filter_reinit, NULL);
+    }
     st = registry_init();
     if (!NT_SUCCESS(st))
         log_event(NDL_EV_INFO, st, 0, 0, "registry callback not registered");

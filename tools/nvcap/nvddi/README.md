@@ -82,6 +82,21 @@ call and (non-const) after it; 3 (default) + nested buffers.
   `DxgkCbRead/WriteDeviceSpace`, ACPI buffers, power runtime buffers.
 - `DxgkCbMapMemory` (physical address, length, cache type, returned VA) and
   every other device-space call.
+- **Command buffers at submitted GPU VAs** (`ResolveGpuVa`, default on): nvddi
+  reconstructs the GpuMmu mapping from the segment descriptors it saw in
+  QueryAdapterInfo (QUERYSEGMENT) and the leaf page-table entries it saw in
+  BuildPagingBuffer UPDATE_PAGE_TABLE, then at `SubmitCommandVirtual` /
+  `SubmitCommandToHwQueue` resolves `DmaBufferVirtualAddress` to physical pages
+  and copies the command bytes (MmCopyMemory physical for system/aperture
+  segments, MmMapIoSpaceEx for CPU-visible local memory). Decoder: `--cmdbuf`.
+  Unmapped pages become zero-length markers; nothing is invented.
+- **Non-DDI kernel imports** (`HookImports`, **off by default**, needs HVCI
+  off): the miniport's import address table is rewritten in memory so calls to
+  MmMapIoSpace(Ex)/MmUnmapIoSpace, MmAllocateContiguousMemory*,
+  MmAllocatePagesForMdlEx, IoAllocateMdl, MmGetPhysicalAddress,
+  KeInsertQueueDpc, IoConnectInterruptEx, ExAllocatePool2/WithTag, ZwOpenKey
+  and ZwQueryValueKey are logged with arguments and results. Decoder:
+  `--imports`.
 - Registration (driver object, image base/size, registry path, raw
   `DRIVER_INITIALIZATION_DATA`); each wrapped table with its raw original
   pointers (the decoder prints nvlddmkm's DDI entry points as image offsets).
@@ -111,6 +126,35 @@ marker and the END record carries the count.
   and the table version is one the headers cover; otherwise passed through and
   logged (`TABLE_SKIP`).
 
+## GPU-VA resolution and import logging
+
+`ResolveGpuVa` (default on) keeps a nonpaged GPU-VA → physical map
+(`GpuVaEntries`, default 1M entries = 32 MB) fed only from logged DDI traffic
+(QUERYSEGMENT descriptors, UPDATE_PAGE_TABLE leaf PTEs). It changes nothing in
+the driver. Resolution runs inline at `SubmitCommandVirtual` (PASSIVE); at
+`SubmitCommandToHwQueue` (<= DISPATCH) local-memory reads that need
+MmMapIoSpaceEx are skipped with an `irql` marker (raise `status` after the run
+to catch them, or it resolves when the buffer is in a system/aperture segment).
+
+`HookImports` is the one technique that touches another image: it overwrites
+pointers in nvlddmkm's IAT (data, not code) with wrappers in nvddi's image.
+Implications, why it is off by default, and why it needs **Memory Integrity
+(HVCI) off**:
+
+- The IAT pages are made read-only by the loader. nvddi writes them by mapping
+  their physical page through a fresh writable alias (MmMapIoSpaceEx). With HVCI
+  on, the physical page is read-only in the hypervisor's second-level
+  translation, so the write faults; nvddi detects the failed map and leaves the
+  slot alone (logs `import IAT write refused`).
+- The miniport has Kernel-CFG metadata (28k guarded call targets). Indirect
+  calls through the IAT are kCFG-checked. The wrappers are valid function
+  starts in nvddi's own image, which the loader publishes to the global kCFG
+  bitmap, so the check passes — again only in the target configuration (test
+  signing, HVCI off). With HVCI/kCFG enforced this is not safe and nvddi does
+  not attempt it.
+- No code bytes are patched anywhere; only IAT pointer slots change, and they
+  are restored on unload.
+
 ## Log file (`.ndl`, version 1)
 
 `<LogDir>\nvddi-YYYYMMDD-HHMMSS-b<boot>-<n>.ndl` (default `C:\nvddi`; falls
@@ -137,6 +181,10 @@ PASSIVE_LEVEL thread every 25 ms, flushed to disk every 2 s. Definitions:
 | 9 | DROP | records/bytes lost, CPU, reason (1 ring full, 2 file cap) |
 | 10 | END | totals |
 | 11 | REGISTRY | REG_NOTIFY_CLASS, status, type, info class, key, value, data |
+| 12 | IMPORT | logged ntoskrnl/hal import call: fn, args a-d, return, optional name blob |
+
+Blob kind 7 (CMDBUF) carries command bytes resolved from a submitted GPU VA
+(`arg` = engine, `rule` = segment id, `elem` = run index, `addr` = GPU VA).
 
 Blob header (32 bytes): len, orig_len, kind (arg, nested rule, ptrarray
 element, length-buffer, table, init), argument index, rule id, flags (post,
@@ -179,11 +227,20 @@ Prerequisites: Secure Boot off, Memory Integrity (HVCI) off,
    for nvlddmkm depends on PnP order (`status` tells). If not, run
    `restart-gpu.ps1` again after logon.
 
+**First-bring-up capture without a GPU restart:** install with
+`install.cmd boot`. nvddi is then a boot-start driver that attaches to
+`\Device\DxgKrnl` (loading the DXGKrnl service itself if needed) before the
+PnP manager starts nvlddmkm, so `DxgkInitialize` is wrapped on the very first
+start. If `\Device\DxgKrnl` is not ready when nvddi loads, it retries through
+driver reinitialization callbacks. `restart-gpu.ps1` remains the fallback.
+
 Registry (`HKLM\SYSTEM\CurrentControlSet\Services\nvddi\Parameters`):
 `Enabled` 1, `Level` 3, `Target` nvlddmkm, `LogDir` `\??\C:\nvddi`,
 `RingKB` 8192, `TotalRingMB` 256, `MaxBlobKB` 2048 (capped at a quarter
 ring), `MaxFileMB` 4096, `HookCallbacks` 1, `HookVidPn` 1, `LogRegistry` 1,
-`Mute` (multi-string of slot names), `MaxFails` 2, `HealthySeconds` 90.
+`ResolveGpuVa` 1, `GpuVaEntries` 0 (=1M), `HookImports` 0 (HVCI off only),
+`BootStart` 0, `Mute` (multi-string of slot names), `MaxFails` 2,
+`HealthySeconds` 90.
 
 `nvddictl`: `status | start | stop | flush | level N | mute NAME | unmute NAME |
 mark TEXT | reset | enable | disable`.
@@ -203,12 +260,19 @@ mark TEXT | reset | enable | disable`.
    `cudatest.exe` (nvtrace/dist): `nvddictl mark <name>`, run it, then
    `nvddictl flush`. Expect CreateDevice/CreateContext/CreateHwQueue,
    CreateAllocation with private data, Escape (NVDA RM calls; `--escapes`),
-   SubmitCommandVirtual/ToHwQueue, paging operations (`--paging`),
+   SubmitCommandVirtual/ToHwQueue, paging operations (`--paging`), and the
+   command bytes behind each submit (`--cmdbuf`: segment-resolved runs decoded
+   as NVIDIA push-buffer methods). With `HookImports` on (HVCI off),
+   `--imports` shows the miniport's BAR maps, contiguous allocations and
+   direct registry reads.
    DestroyAllocation/DestroyContext at exit.
 4. `nvddictl stop` closes the file; copy `C:\nvddi\*.ndl` to the host and run
    `decoder/ndldump.py` (`--summary`, `--timeline`, `--paging`, `--escapes`,
    `--vidpn`, `--events -v`, `--registry`, `--dump-blobs DIR`).
-5. Watch `status`: `dropped` should stay 0 at level 3; if not, raise
+5. To record the whole bring-up with no restart, reinstall with
+   `install.cmd boot` and reboot; the first StartDevice/QueryAdapterInfo/
+   CommitVidPn sequence then appears at the top of the log.
+6. Watch `status`: `dropped` should stay 0 at level 3; if not, raise
    `RingKB`/`TotalRingMB` or mute high-rate slots
    (`nvddictl mute DxgkDdiInterruptRoutine`).
 
@@ -231,15 +295,18 @@ mark TEXT | reset | enable | disable`.
 
 ## Known gaps and risks
 
-- GPU-VA submissions (`SubmitCommandVirtual`, `SubmitCommandToHwQueue`, HAGS)
-  carry only GPU virtual addresses of the command buffers; the CPU contents
-  are not reachable from the KMD interface (their private data is recorded).
-  The user-mode side is covered by nvtrace.
-- Kernel imports nvlddmkm calls directly (`MmMapIoSpace`, `IoAllocateMdl`, its
-  own PCI config access, ...) are not DDIs and are not recorded; only registry
-  access is (registry callback). BAR mappings through `DxgkCbMapMemory` are.
-- `SubmitCommand` and anything else running above DISPATCH_LEVEL gets argument
-  records only, no nested buffers.
+- GPU-VA command buffers resolve only through mappings nvddi has already seen
+  (QUERYSEGMENT + UPDATE_PAGE_TABLE). A VA mapped by a path nvddi did not
+  observe (or before its page table was logged) resolves to an unmapped marker.
+  The map is 1-based on segment id, matching the QUERYSEGMENT order; if the GPU
+  numbers PTE segments differently, lookups miss (markers, no wrong data). The
+  user-mode command stream is also covered by nvtrace.
+- Import logging (`HookImports`) is off by default and works only with HVCI
+  off (see above); PCI config access the miniport does through HAL interfaces
+  it queried (not a named import) is still not seen.
+- `SubmitCommandToHwQueue` and anything else above DISPATCH_LEVEL gets argument
+  records and, for the command buffer, only system/aperture-backed runs; a
+  local-memory run is marked `irql` rather than read at raised IRQL.
 - With HVCI/kernel CFG on, a mingw-built driver without CFG metadata may not
   load; run with Memory Integrity off.
 - `DpiInitialize`/`DxgkInitialize` internals are undocumented; the IOCTL codes,
