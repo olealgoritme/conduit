@@ -1,0 +1,7 @@
+src/
+build/
+install/
+ref/
+*.log
+__pycache__/
+traces/
