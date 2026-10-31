@@ -1,0 +1,17 @@
+// Compute shader for vktest: out[i] = in[i] * 2 + 1 for i < count.
+// Regenerate vktest_comp.h with: make -C testapps shaders
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer InBuf { uint data[]; } inb;
+layout(std430, set = 0, binding = 1) writeonly buffer OutBuf { uint data[]; } outb;
+
+layout(push_constant) uniform Push { uint count; } pc;
+
+void main()
+{
+    uint i = gl_GlobalInvocationID.x;
+    if (i < pc.count)
+        outb.data[i] = inb.data[i] * 2u + 1u;
+}

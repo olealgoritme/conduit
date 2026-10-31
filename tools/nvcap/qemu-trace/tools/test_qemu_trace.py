@@ -1,0 +1,523 @@
+#!/usr/bin/env python3
+"""End-to-end test of the nvtrace QEMU without the real GPU.
+
+QEMU runs with the qtest accelerator (no guest code, no KVM): this script
+plays the guest driver. The device is fakegpu.py, a vfio-user server that
+presents itself as 10de:2b85, so QEMU's real hw/vfio/pci.c + region.c +
+NVIDIA quirk code is used, including x-trap-bars and the nvtrace hooks.
+
+The script builds, in guest RAM, the structures NVIDIA's RM builds at boot
+(GSP_FMC_BOOT_PARAMS, WPR meta, libos init args, GSP_ARGUMENTS_CACHED, the
+PTE-mapped command/status queues) at 610.57.04 layouts, sends the FSP COT
+boot command through the FSP EMEM registers, then exchanges GSP RPCs via the
+queues and the NV_PGSP_QUEUE_HEAD(0) doorbell, and finally decodes the trace
+with mmiodump.py and checks what was captured.
+
+Run: python3 test_qemu_trace.py [-v] [--qemu PATH] [--keep]
+"""
+import argparse
+import base64
+import json
+import os
+import shutil
+import socket
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+import mmiodump as md                                   # noqa: E402
+
+QEMU = os.path.join(HERE, "..", "install", "bin", "qemu-system-x86_64")
+KEEP = False
+
+BAR0, BAR1 = 0xC0000000, 0xC4000000
+DEVFN = (4 << 3)
+MSI_ADDR, MSI_DATA = 0x3000000, 0x4021
+
+FMC_PA, WPR_PA, LIBOS_PA, RMARGS_PA = 0x1000000, 0x1001000, 0x1002000, 0x1003000
+LOGINIT_PA, LOGRM_PA = 0x1010000, 0x1020000
+PTE_PA, PAGES_PA = 0x2000000, 0x2100000
+QSIZE, NPTE = 0x40000, 129
+CMDQ, STATQ = 0x1000, 0x41000
+FN = {"FREE": 10, "GSP_RM_CONTROL": 76, "GSP_RM_ALLOC": 103,
+      "SET_REGISTRY": 73, "GSP_SET_SYSTEM_INFO": 72, "INIT_DONE": 0x1001,
+      "RUN_CPU_SEQUENCER": 0x1002}
+
+
+class Qtest:
+    def __init__(self, args, env, cwd):
+        self.p = subprocess.Popen(args, stdin=subprocess.PIPE,
+                                  stdout=subprocess.PIPE,
+                                  stderr=open(os.path.join(cwd, "qemu.err"), "w"),
+                                  env=env, cwd=cwd, text=True, bufsize=1)
+
+    def cmd(self, s):
+        self.p.stdin.write(s + "\n")
+        self.p.stdin.flush()
+        while True:
+            line = self.p.stdout.readline()
+            if not line:
+                raise RuntimeError(f"qemu died during: {s}")
+            line = line.strip()
+            if line.startswith("OK"):
+                return line[3:].strip()
+            if line.startswith("FAIL") or line.startswith("ERR"):
+                raise RuntimeError(f"{s}: {line}")
+
+    def readl(self, a):
+        return int(self.cmd(f"readl 0x{a:x}"), 16)
+
+    def writel(self, a, v):
+        self.cmd(f"writel 0x{a:x} 0x{v:x}")
+
+    def writeq(self, a, v):
+        self.cmd(f"writeq 0x{a:x} 0x{v:x}")
+
+    def mem(self, a, data):
+        if data:
+            self.cmd(f"b64write 0x{a:x} 0x{len(data):x} "
+                     f"{base64.b64encode(data).decode()}")
+
+    def cfg_addr(self, off):
+        self.cmd(f"outl 0xcf8 0x{0x80000000 | (DEVFN << 8) | (off & 0xfc):x}")
+
+    def cfg_read(self, off):
+        self.cfg_addr(off)
+        return int(self.cmd("inl 0xcfc"), 16)
+
+    def cfg_write(self, off, v):
+        self.cfg_addr(off)
+        self.cmd(f"outl 0xcfc 0x{v:x}")
+
+
+def qmp(path, *cmds):
+    s = socket.socket(socket.AF_UNIX)
+    for _ in range(100):
+        try:
+            s.connect(path)
+            break
+        except OSError:
+            time.sleep(0.05)
+    f = s.makefile("rw")
+    f.readline()
+    for c in ("qmp_capabilities",) + cmds:
+        f.write(json.dumps({"execute": c}) + "\n")
+        f.flush()
+        while True:
+            line = f.readline()
+            if not line or '"return"' in line or '"error"' in line:
+                break
+    s.close()
+
+
+def page_gpa(i):
+    return PTE_PA if i == 0 else PAGES_PA + (((i - 1) * 37) % 128) * 0x1000
+
+
+def rpc_elem(fn, params, rpc_seq, qseq):
+    rpc = struct.pack("<IIIIIIII", 0x03000000, md.VRPC, 32 + len(params), fn,
+                      0, 0, rpc_seq, 0) + params
+    return struct.pack("<IIII", 0xC0000001, 0x7e | (0x10de << 8) | (0x25 << 24),
+                       0, qseq) + rpc
+
+
+class Guest:
+    """Plays NVIDIA's RM on top of a Qtest connection."""
+
+    def __init__(self, q):
+        self.q = q
+        self.cmd_wp = 0
+        self.cmd_seq = 0
+        self.stat_wp = 0
+        self.stat_seq = 0
+        self.sent = []          # (function, rpc_seq)
+        self.replied = []
+
+    def shm_write(self, off, data):
+        while data:
+            pg, po = divmod(off, 0x1000)
+            n = min(len(data), 0x1000 - po)
+            self.q.mem(page_gpa(pg) + po, data[:n])
+            off += n
+            data = data[n:]
+
+    def setup_pci(self):
+        q = self.q
+        assert q.cfg_read(0) == 0x2b8510de, hex(q.cfg_read(0))
+        q.cfg_write(0x10, BAR0)
+        q.cfg_write(0x14, BAR1 | 0xc)
+        q.cfg_write(0x18, 0)
+        q.cfg_write(0x04, 0x0006)                   # MEM + bus master
+
+    def setup_msix(self):
+        q = self.q
+        q.writel(BAR0 + 0xff0000, MSI_ADDR)
+        q.writel(BAR0 + 0xff0004, 0)
+        q.writel(BAR0 + 0xff0008, MSI_DATA)
+        q.writel(BAR0 + 0xff000c, 0)                # unmasked
+        ctrl = q.cfg_read(0x40)
+        q.cfg_write(0x40, ctrl | (0x8000 << 16))     # MSI-X enable
+
+    def setup_boot_structs(self):
+        q = self.q
+        fmc = struct.pack("<I4xIIQQIBB2xI4xQ", 0, 1, 256, WPR_PA, 0, 0, 1, 0,
+                          1, LIBOS_PA)
+        fmc += b"\0" * (88 - len(fmc))
+        q.mem(FMC_PA, fmc)
+        q.mem(WPR_PA, struct.pack("<QQQQ", 0xdc3aae21371a60b3, 1, 0x7000000,
+                                  0x900000) + b"\0" * 224)
+
+        def region(name, pa, size):
+            id8 = 0
+            for c in name.encode():
+                id8 = (id8 << 8) | c
+            return struct.pack("<QQQBB6x", id8, pa, size, 1, 1)
+        q.mem(LIBOS_PA, region("LOGINIT", LOGINIT_PA, 0x10000) +
+              region("LOGRM", LOGRM_PA, 0x10000) +
+              region("RMARGS", RMARGS_PA, 0x1000) + b"\0" * 32)
+        q.mem(RMARGS_PA, struct.pack("<QI4xQQQQQII", PTE_PA, NPTE, CMDQ, STATQ,
+                                     16, 0x1000, 0x10000, 4, 12))
+        q.mem(LOGINIT_PA, struct.pack("<QQ", 0, LOGINIT_PA) + b"\x11" * 64)
+        q.mem(LOGRM_PA, struct.pack("<QQ", 0, LOGRM_PA))
+        ptes = b"".join(struct.pack("<Q", page_gpa(i)) for i in range(NPTE))
+        q.mem(PTE_PA, ptes)
+        hdr = struct.pack("<IIIIIIII", 0, QSIZE, 0x1000, 63, 0, 1, 0x20, 0x1000)
+        self.shm_write(CMDQ, hdr)
+        self.shm_write(STATQ, hdr)
+
+    def fsp_cot(self):
+        q = self.q
+        cot = struct.pack("<HHQQIQI", 2, 860, 0x5000000, 0x6000000, 0x100000,
+                          0x2000000, 0x100000)
+        cot += b"\0" * (852 - len(cot)) + struct.pack("<Q", FMC_PA)
+        pkt = struct.pack("<II", 0xC0000001,
+                          0x7e | (0x10de << 8) | (0x14 << 24)) + cot
+        pkt += b"\0" * (-len(pkt) % 4)
+        q.writel(BAR0 + 0x8f2ac0, 1 << 24)            # EMEMC: offset 0, AINCW
+        for i in range(0, len(pkt), 4):
+            q.writel(BAR0 + 0x8f2ac4, struct.unpack_from("<I", pkt, i)[0])
+        q.writel(BAR0 + 0x8f2c04, len(pkt) - 4)       # QUEUE_TAIL
+        q.writel(BAR0 + 0x8f2c00, 0)                  # QUEUE_HEAD: go
+        # read the response like kfspReadPacket_GH100
+        head = q.readl(BAR0 + 0x8f2c80)
+        tail = q.readl(BAR0 + 0x8f2c84)
+        q.writel(BAR0 + 0x8f2ac0, 1 << 25)            # EMEMC: AINCR
+        resp = [q.readl(BAR0 + 0x8f2ac4) for _ in range((tail - head) // 4 + 1)]
+        q.writel(BAR0 + 0x8f2c84, head)
+        q.writel(BAR0 + 0x8f2c80, head)
+        return resp
+
+    def send(self, fn, params, doorbell=True):
+        elem = rpc_elem(fn, params, self.cmd_seq + 100, self.cmd_seq)
+        nelem = (len(elem) + 0xfff) // 0x1000
+        for i in range(nelem):
+            slot = (self.cmd_wp + i) % 63
+            self.shm_write(CMDQ + 0x1000 + slot * 0x1000,
+                           elem[i * 0x1000:(i + 1) * 0x1000])
+        self.sent.append((fn, self.cmd_seq + 100, nelem))
+        self.cmd_seq += 1
+        self.cmd_wp = (self.cmd_wp + nelem) % 63
+        self.shm_write(CMDQ + 16, struct.pack("<I", self.cmd_wp))
+        if doorbell:
+            self.q.writel(BAR0 + 0x110c00, 0)
+
+    def gsp_reply(self, fn, params, rpc_seq):
+        elem = rpc_elem(fn, params, rpc_seq, self.stat_seq)
+        self.shm_write(STATQ + 0x1000 + self.stat_wp * 0x1000, elem)
+        self.replied.append((fn, rpc_seq))
+        self.stat_seq += 1
+        self.stat_wp = (self.stat_wp + 1) % 63
+        self.shm_write(STATQ + 16, struct.pack("<I", self.stat_wp))
+
+
+class Run:
+    def __init__(self, name, devopts, env=None, trace_name="trace.nvt.zst"):
+        self.dir = tempfile.mkdtemp(prefix=f"nvtrace-{name}-",
+                                    dir=os.environ.get("NVTRACE_TEST_TMP"))
+        # UNIX socket paths are limited to 107 bytes: keep them short.
+        self.sockdir = tempfile.mkdtemp(prefix="nvt", dir="/tmp")
+        self.sock = os.path.join(self.sockdir, "gpu")
+        self.qmp = os.path.join(self.sockdir, "qmp")
+        self.trace = os.path.join(self.dir, trace_name)
+        self.srv = subprocess.Popen([sys.executable, os.path.join(HERE, "fakegpu.py"),
+                                     self.sock], stderr=subprocess.PIPE, text=True)
+        assert "listening" in self.srv.stderr.readline()
+        dev = {"driver": "vfio-user-pci", "socket": {"path": self.sock,
+                                                      "type": "unix"},
+               "addr": "04.0"}
+        dev.update(devopts)
+        for k, v in list(dev.items()):
+            if v == "@TRACE":
+                dev[k] = self.trace
+        e = dict(os.environ)
+        e.update({"NVTRACE_GSP_POLL_US": "200", "NVTRACE_GSP_LOG_MS": "20",
+                  "NVTRACE_TEST_QUIRKS": "1"})
+        e.update(env or {})
+        self.errf = None
+        self.q = Qtest([QEMU, "-machine", "q35", "-accel", "qtest", "-m", "256M",
+                        "-nodefaults", "-display", "none", "-qtest", "stdio",
+                        "-qtest-log", "/dev/null",
+                        "-qmp", f"unix:{self.qmp},server=on,wait=off",
+                        "-device", json.dumps(dev)], e, self.dir)
+        self.g = Guest(self.q)
+
+    def finish(self, reset=False):
+        if reset:
+            qmp(self.qmp, "system_reset")
+        qmp(self.qmp, "quit")
+        self.q.p.wait(timeout=30)
+        self.srv.wait(timeout=10)
+        self.srv_log = self.srv.stderr.read()
+
+    def records(self, pattern=None):
+        files = sorted(f for f in os.listdir(self.dir)
+                       if f.startswith("trace") and (pattern is None or pattern in f))
+        return list(md.iter_records([os.path.join(self.dir, f) for f in files]))
+
+    def cleanup(self):
+        shutil.rmtree(self.sockdir, ignore_errors=True)
+        if not KEEP:
+            shutil.rmtree(self.dir, ignore_errors=True)
+        else:
+            print(f"kept {self.dir}", file=sys.stderr)
+
+
+def by_type(recs, t):
+    return [r for r in recs if r.type == t]
+
+
+def notes(recs):
+    return [r.data.decode() for r in recs if r.type == md.T_NOTE]
+
+
+class EndToEnd(unittest.TestCase):
+
+    def test_full_capture(self):
+        """Default trap mask (BAR0), FSP COT discovery, GSP RPCs, IRQs, reset."""
+        run = Run("full", {"x-nvtrace": True, "x-nvtrace-file": "@TRACE"})
+        g, q = run.g, run.q
+        try:
+            g.setup_pci()
+            self.assertEqual(q.readl(BAR0), 0x1b2000a1)
+            self.assertEqual(q.readl(BAR0 + 0x88000), 0x2b8510de)  # mirror
+            q.writel(BAR1 + 0x100, 0xdeadbeef)                     # mmapped
+            self.assertEqual(q.readl(BAR1 + 0x100), 0xdeadbeef)
+            g.setup_msix()
+            g.setup_boot_structs()
+            resp = g.fsp_cot()
+            self.assertEqual(resp[1] >> 24, 0x15)                  # FSP_RESPONSE
+            # GSP RPCs: small, then a 3-element one, then enough to wrap
+            alloc = struct.pack("<IIIIIII4x", 0xc1d00001, 0xc1d00001,
+                                0x5c000002, 0x2080, 0, 0, 0)
+            ctrl = struct.pack("<IIIIIIIIQ", 0xc1d00001, 0x5c000002, 0x20800102,
+                               0, 8, 0, 0, 0, 0) + b"\x01" * 8
+            g.send(FN["GSP_SET_SYSTEM_INFO"], b"\x22" * 200)
+            g.send(FN["SET_REGISTRY"], b"\x33" * 9000)              # 3 elements
+            g.send(FN["GSP_RM_ALLOC"], alloc)
+            g.send(FN["GSP_RM_CONTROL"], ctrl)
+            for i in range(70):                                    # wraps 63
+                g.send(FN["FREE"], struct.pack("<IIII", 1, 2, 0x100 + i, 0),
+                       doorbell=(i % 5 == 4))
+            q.writel(BAR0 + 0x110c00, 0)
+            # GSP side: events + replies, then an interrupt
+            g.gsp_reply(FN["INIT_DONE"], b"", 0)
+            g.gsp_reply(FN["GSP_RM_ALLOC"], alloc, 102)
+            g.gsp_reply(FN["RUN_CPU_SEQUENCER"], b"\x44" * 64, 0)
+            q.writel(BAR0 + 0xfff000, 0)                           # MSI-X 0
+            for _ in range(200):
+                if q.readl(MSI_ADDR) == MSI_DATA:
+                    break
+                time.sleep(0.01)
+            self.assertEqual(q.readl(MSI_ADDR), MSI_DATA, "MSI not delivered")
+            # log buffer put pointer moves -> snapshot
+            q.mem(LOGRM_PA, struct.pack("<Q", 5))
+            # LO/HI register pair pointing at guest RAM -> pair snapshot
+            q.mem(0x1050000, b"PAIRDATA" * 8)
+            q.writel(BAR0 + 0x100e40, 0x01050000)
+            q.writel(BAR0 + 0x100e44, 0)
+            time.sleep(0.3)
+        finally:
+            run.finish(reset=True)
+        try:
+            recs = run.records()
+            self.check_full(run, recs, g)
+        finally:
+            run.cleanup()
+
+    def check_full(self, run, recs, g):
+        nt = notes(recs)
+        self.assertFalse(by_type(recs, md.T_LOST), "lost records")
+        dev = by_type(recs, md.T_DEV)
+        self.assertEqual((dev[0].f["vendor"], dev[0].f["device"]), (0x10de, 0x2b85))
+        self.assertEqual(dev[0].f["trap_mask"], 1)
+        self.assertTrue(any("BAR0" in n and "trapped" in n for n in nt), nt)
+        self.assertFalse(any("BAR1" in n and "trapped" in n for n in nt))
+        bars = {}
+        for r in by_type(recs, md.T_BAR):
+            if r.f["new"] != (1 << 64) - 1:
+                bars.setdefault(r.f["bar"], r.f["new"])
+        self.assertTrue(any(r.f["new"] == (1 << 64) - 1
+                            for r in by_type(recs, md.T_BAR)), "reset unmap")
+        self.assertEqual(bars.get(0), BAR0)
+        self.assertEqual(bars.get(1), BAR1)
+        self.assertTrue(by_type(recs, md.T_CFG))
+        mmio = by_type(recs, md.T_MMIO)
+        self.assertTrue(any(r.f["bar"] == 0 and r.f["off"] == 0 and
+                            r.f["val"] == 0x1b2000a1 and r.f["origin"] == 0
+                            for r in mmio))
+        self.assertTrue(any(r.f["off"] == 0x88000 and r.f["origin"] == 1 and
+                            r.f["val"] == 0x2b8510de for r in mmio))
+        self.assertTrue(any(r.f["off"] == 0x88000 and r.f["origin"] == 2
+                            for r in mmio))
+        self.assertTrue(any(r.f["origin"] == 5 and r.f["write"] for r in mmio))
+        self.assertFalse(any(r.f["bar"] == 1 for r in mmio), "BAR1 was trapped")
+        # doorbells and FSP register writes are all there
+        bells = [r for r in mmio if r.f["off"] == 0x110c00 and r.f["write"]]
+        self.assertEqual(len(bells), 4 + 14 + 1)
+        # interrupts
+        irqs = by_type(recs, md.T_IRQ)
+        self.assertTrue(any(r.f["kind"] == 2 and r.f["vector"] == 0 and
+                            r.f["data"] == MSI_DATA for r in irqs))
+        self.assertTrue(any(r.f["event"] == 0 for r in by_type(recs, md.T_VEC)))
+        # FSP
+        fsp = list(md.fsp_messages(by_type(recs, md.T_FSP_PKT)))
+        self.assertEqual([d for d, _, _ in fsp], [0, 1])
+        self.assertEqual(md.describe_fsp(fsp[0][2])[0], "COT")
+        self.assertEqual(md.describe_fsp(fsp[1][2])[0], "FSP_RESPONSE")
+        self.assertTrue(any("gspBootArgsSysmemOffset=0x1000000" in n for n in nt))
+        # discovery + snapshots
+        qi = by_type(recs, md.T_GSP_QINFO)
+        self.assertEqual(qi[0].f["shared_pa"], PTE_PA)
+        self.assertEqual(qi[0].f["source"], 1)
+        self.assertEqual((qi[0].f["cmd_size"], qi[0].f["stat_size"]), (QSIZE, QSIZE))
+        labels = {r.f["label"]: r for r in by_type(recs, md.T_DMA_SNAP)}
+        for lab in ("GSP_FMC_BOOT_PARAMS", "GSP_WPR_META", "LIBOS_INIT_ARGS",
+                    "GSP_ARGUMENTS_CACHED", "GSP_QUEUE_PTES", "GSPLOG:LOGINIT",
+                    "GSPLOG:LOGRM"):
+            self.assertIn(lab, labels)
+        self.assertEqual(struct.unpack_from("<Q", labels["GSP_WPR_META"].data)[0],
+                         0xdc3aae21371a60b3)
+        self.assertEqual(len([r for r in by_type(recs, md.T_DMA_SNAP)
+                              if r.f["label"] == "GSPLOG:LOGRM"]), 2)
+        pair = [r for r in by_type(recs, md.T_DMA_SNAP)
+                if r.f["label"].startswith("pair:100e40")]
+        self.assertTrue(pair and pair[0].data.startswith(b"PAIRDATA"), labels.keys())
+        # GSP messages: every command exactly once, in order, decoded
+        msgs = by_type(recs, md.T_GSP_MSG)
+        cmds = [md.parse_rpc(r) for r in msgs if r.f["queue"] == 0]
+        self.assertEqual([(c["function"], c["rpc_seq"]) for c in cmds],
+                         [(f, s) for f, s, _ in g.sent])
+        big = [r for r in msgs if r.f["queue"] == 0 and r.f["nelem"] == 3]
+        self.assertEqual(len(big), 1)
+        self.assertEqual(md.parse_rpc(big[0])["params"], b"\x33" * 9000)
+        self.assertFalse(any(r.f["gflags"] for r in msgs), "flags set")
+        stats = [md.parse_rpc(r) for r in msgs if r.f["queue"] == 1]
+        self.assertEqual([(s["function"], s["rpc_seq"]) for s in stats], g.replied)
+        names = md.Names()
+        descs = [md.describe_rpc(names, c) for c in cmds]
+        self.assertIn(("GSP_RM_ALLOC", ), [(d[0],) for d in descs])
+        self.assertTrue(any("NV20_SUBDEVICE_0" in d[1] for d in descs))
+        self.assertTrue(any("NV2080_CTRL_CMD_GPU_GET_INFO_V2" in d[1] for d in descs))
+        # status messages are logged before the IRQ that announced them? No:
+        # IRQ first, then the drain it triggers (or earlier via the poller).
+        self.assertTrue(by_type(recs, md.T_GSP_QSTATE))
+        resets = [r.f["kind"] for r in by_type(recs, md.T_RESET)]
+        self.assertIn(0, resets)
+        self.assertIn(1, resets)
+        self.assertTrue(any("shutdown" in n for n in nt))
+        # the decoder runs over the whole file
+        out = subprocess.run([sys.executable, os.path.join(HERE, "mmiodump.py"),
+                              "summary", run.trace], capture_output=True,
+                             text=True, check=True).stdout
+        self.assertIn("NV_PGSP_QUEUE_HEAD(0)", out)
+        self.assertIn("GSP_RM_CONTROL", out)
+
+    def test_trap_bar1_and_rotation(self):
+        """x-trap-bars=0x3 traps BAR1 too; NVTRACE_ROTATE_MB splits files."""
+        run = Run("bar1", {"x-nvtrace": True, "x-nvtrace-file": "@TRACE",
+                           "x-trap-bars": 3}, env={"NVTRACE_ROTATE_MB": "1"},
+                  trace_name="trace.nvt")
+        g, q = run.g, run.q
+        try:
+            g.setup_pci()
+            for i in range(24000):
+                q.writel(BAR1 + 0x1000 + 4 * (i % 1024), i)
+            self.assertEqual(q.readl(BAR1 + 0x1000 + 4 * 1023), 23551)
+        finally:
+            run.finish()
+        try:
+            files = [f for f in os.listdir(run.dir) if f.startswith("trace.")]
+            self.assertGreaterEqual(len(files), 1)
+            recs = run.records()
+            self.assertTrue(len(files) >= 1)
+            self.assertIn("trace.nvt.000", files)
+            self.assertIn("trace.nvt.001", files)
+            seqs = [r.seq for r in recs]
+            self.assertEqual(seqs, list(range(seqs[0], seqs[0] + len(seqs))))
+            bar1 = [r for r in by_type(recs, md.T_MMIO) if r.f["bar"] == 1]
+            self.assertEqual(len([r for r in bar1 if r.f["write"]]), 24000)
+            self.assertTrue(any("BAR1" in n and "trapped" in n for n in notes(recs)))
+        finally:
+            run.cleanup()
+
+    def test_ram_scan_fallback(self):
+        """No FSP COT: the first doorbell triggers a guest RAM scan."""
+        run = Run("scan", {"x-nvtrace": True, "x-nvtrace-file": "@TRACE"},
+                  trace_name="trace.nvt.gz")
+        g, q = run.g, run.q
+        try:
+            g.setup_pci()
+            g.setup_boot_structs()
+            g.send(FN["GSP_RM_CONTROL"], b"\0" * 48)
+            time.sleep(0.5)
+            g.send(FN["FREE"], b"\0" * 16)
+            g.gsp_reply(FN["INIT_DONE"], b"", 0)
+            time.sleep(0.3)
+        finally:
+            run.finish()
+        try:
+            recs = run.records()
+            qi = by_type(recs, md.T_GSP_QINFO)
+            self.assertTrue(qi, notes(recs))
+            self.assertEqual(qi[0].f["source"], 3)
+            self.assertEqual(qi[0].f["shared_pa"], PTE_PA)
+            msgs = by_type(recs, md.T_GSP_MSG)
+            self.assertEqual([(r.f["queue"], md.parse_rpc(r)["function"])
+                              for r in msgs],
+                             [(0, FN["GSP_RM_CONTROL"]), (0, FN["FREE"]),
+                              (1, FN["INIT_DONE"])])
+        finally:
+            run.cleanup()
+
+    def test_no_trace_unchanged(self):
+        """Without x-nvtrace the device works and nothing is written."""
+        run = Run("off", {})
+        g, q = run.g, run.q
+        try:
+            g.setup_pci()
+            self.assertEqual(q.readl(BAR0), 0x1b2000a1)
+            q.writel(BAR0 + 0x200, 0x1234)
+            self.assertEqual(q.readl(BAR0 + 0x200), 0x1234)
+        finally:
+            run.finish()
+        try:
+            self.assertFalse([f for f in os.listdir(run.dir) if f.startswith("trace")])
+            # BAR0 was mmapped: the server saw no BAR0 region accesses
+            self.assertIn("'read': ", run.srv_log)
+        finally:
+            run.cleanup()
+
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--qemu", default=QEMU)
+    ap.add_argument("--keep", action="store_true")
+    a, rest = ap.parse_known_args()
+    QEMU = a.qemu
+    KEEP = a.keep
+    unittest.main(argv=[sys.argv[0]] + rest)
