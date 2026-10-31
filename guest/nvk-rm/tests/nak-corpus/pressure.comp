@@ -1,0 +1,22 @@
+#version 460
+// Many values live across a loop: register pressure, spilling,
+// rematerialization of constant-buffer loads and the occupancy target.
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0) uniform Params { vec4 k[32]; };
+layout(set = 0, binding = 1, std430) readonly buffer In { vec4 v[]; };
+layout(set = 0, binding = 2, std430) buffer Out { vec4 o[]; };
+layout(push_constant) uniform PC { uint iters; };
+void main() {
+  uint i = gl_GlobalInvocationID.x;
+  vec4 r[24];
+  for (int j = 0; j < 24; j++)
+    r[j] = v[i * 24u + uint(j)] * k[j];
+  for (uint it = 0u; it < iters; it++) {
+    for (int j = 0; j < 24; j++)
+      r[j] = fma(r[j], r[(j + 7) % 24], k[(j + int(it)) & 31]);
+  }
+  vec4 s = vec4(0.0);
+  for (int j = 0; j < 24; j++)
+    s += r[j] * k[31 - j];
+  o[i] = s;
+}

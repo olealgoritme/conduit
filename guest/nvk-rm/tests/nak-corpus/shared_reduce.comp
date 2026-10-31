@@ -1,0 +1,24 @@
+#version 460
+// Shared-memory tree reduction with barriers and subgroup operations.
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0, std430) readonly buffer In { float v[]; };
+layout(set = 0, binding = 1, std430) buffer Out { float sums[]; };
+shared float partial[256];
+void main() {
+  uint l = gl_LocalInvocationIndex;
+  float x = v[gl_GlobalInvocationID.x];
+  x += subgroupShuffleXor(x, 1u);
+  partial[l] = x;
+  barrier();
+  for (uint s = 128u; s > 0u; s >>= 1) {
+    if (l < s)
+      partial[l] += partial[l + s];
+    barrier();
+  }
+  float m = subgroupMax(x);
+  if (l == 0u)
+    sums[gl_WorkGroupID.x] = partial[0] + m;
+}

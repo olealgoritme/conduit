@@ -1,0 +1,19 @@
+#version 460
+// Lanes that leave early while the rest keep running, then a barrier-free
+// tail of work.
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0, std430) readonly buffer In { vec4 v[]; };
+layout(set = 0, binding = 1, std430) buffer Out { vec4 o[]; };
+layout(push_constant) uniform PC { uint n; float threshold; };
+void main() {
+  uint i = gl_GlobalInvocationID.x;
+  if (i >= n)
+    return;
+  vec4 x = v[i];
+  if (dot(x, x) < threshold)
+    return;
+  for (int k = 0; k < 8; k++)
+    x = normalize(x * mat4(x.x, x.y, x.z, x.w, x.y, x.z, x.w, x.x,
+                           x.z, x.w, x.x, x.y, x.w, x.x, x.y, x.z));
+  o[i] = x;
+}

@@ -1,0 +1,16 @@
+#version 460
+// f16 arithmetic and conversions to and from f32 and integers.
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0, std430) readonly buffer In { f16vec4 h[]; };
+layout(set = 0, binding = 1, std430) buffer Out { vec4 f[]; };
+layout(set = 0, binding = 2, std430) buffer Packed { f16vec2 p[]; };
+void main() {
+  uint i = gl_GlobalInvocationID.x;
+  f16vec4 a = h[i];
+  f16vec4 b = a * float16_t(0.5) + h[i + 1u];
+  vec4 w = vec4(b) * 3.0;
+  f[i] = w + vec4(ivec4(a));
+  p[i] = f16vec2(w.xy) * f16vec2(b.zw);
+}
