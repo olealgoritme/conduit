@@ -1,0 +1,38 @@
+From 46c1f6c9413c19d782768234224ea60c9921ffde Mon Sep 17 00:00:00 2001
+From: Ole Algoritme <olealgoritme@gmail.com>
+Date: Sat, 31 Oct 2026 15:53:44 +0100
+Subject: [PATCH 102/105] vfio-user: optional NVIDIA BAR quirks for the nvtrace
+ test
+
+vfio-user-pci sets up no device quirks. With NVTRACE_TEST_QUIRKS=1 in the
+environment it runs vfio_bar_quirk_setup() like vfio-pci does, so the
+nvtrace end-to-end test (a fake 10de:2b85 vfio-user server) also covers
+the NVIDIA config-mirror quirk paths. No effect without the variable.
+---
+ hw/vfio-user/pci.c | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/hw/vfio-user/pci.c b/hw/vfio-user/pci.c
+index e7573d4a9..84122d78c 100644
+--- a/hw/vfio-user/pci.c
++++ b/hw/vfio-user/pci.c
+@@ -339,6 +339,19 @@ static void vfio_user_pci_realize(PCIDevice *pdev, Error **errp)
+         vfio_user_msix_setup(vdev);
+     }
+ 
++    /*
++     * nvtrace test hook: vfio-user normally sets up no device quirks. The
++     * nvtrace end-to-end test (a fake 10de:2b85 vfio-user server) sets
++     * NVTRACE_TEST_QUIRKS=1 so the NVIDIA BAR quirks of vfio-pci run too.
++     */
++    if (getenv("NVTRACE_TEST_QUIRKS")) {
++        int i;
++
++        for (i = 0; i < PCI_ROM_SLOT; i++) {
++            vfio_bar_quirk_setup(vdev, i);
++        }
++    }
++
+     if (!vfio_pci_interrupt_setup(vdev, errp)) {
+         goto out_teardown;
+     }
