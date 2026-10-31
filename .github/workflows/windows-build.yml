@@ -73,10 +73,22 @@ jobs:
         with:
           submodules: false
           fetch-depth: 1
+      - name: Runner image
+        id: image
+        run: echo "image=$ImageOS-$ImageVersion" >> "$GITHUB_OUTPUT"
+      # The .debs (MinGW-w64 and LLVM, several hundred MB) between runs, so a
+      # slow Ubuntu mirror costs only the index update
+      - name: Restore the apt packages
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/apt-archives
+          key: apt-nvk-cross-${{ steps.image.outputs.image }}-${{ hashFiles('.github/workflows/windows-build.yml') }}
+          restore-keys: apt-nvk-cross-${{ steps.image.outputs.image }}-
       - name: Install the cross toolchain and Mesa's build dependencies
+        env:
+          APT_ARCHIVES: ${{ runner.temp }}/apt-archives
         run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-mingw-w64-x86-64 gcc-mingw-w64-i686 g++-mingw-w64-x86-64 g++-mingw-w64-i686 \
+          .github/scripts/apt-install.sh gcc-mingw-w64-x86-64 gcc-mingw-w64-i686 g++-mingw-w64-x86-64 g++-mingw-w64-i686 \
             bison flex glslang-tools python3-mako python3-yaml python3-packaging \
             llvm-20-dev clang-20 libclang-20-dev libclang-cpp20-dev libpolly-20-dev \
             libllvmspirvlib-20-dev llvm-spirv-20 libclc-20-dev
