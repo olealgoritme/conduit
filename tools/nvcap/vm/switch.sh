@@ -70,12 +70,18 @@ to_vm() {
 	if ! timeout 60 modprobe -r nvidia_uvm nvidia_drm nvidia_modeset nvidia; then
 		log "FAIL: NVIDIA modules would not unload"; to_host; return 1
 	fi
+	# A user sound server (wireplumber) holding the GPU's HDMI audio makes the
+	# snd_hda_intel unbind block forever: stop it while the devices move.
+	U=${NVCAP_USER:-$(stat -c %U $N)}
+	WP="sudo -u $U XDG_RUNTIME_DIR=/run/user/$(id -u $U) systemctl --user"
+	timeout 15 $WP stop wireplumber 2>/dev/null
 	modprobe vfio-pci
 	for d in $GPU $AUD; do
 		echo vfio-pci > /sys/bus/pci/devices/$d/driver_override
 		[ -e /sys/bus/pci/devices/$d/driver ] && echo $d > /sys/bus/pci/devices/$d/driver/unbind
 		echo $d > /sys/bus/pci/drivers_probe
 	done
+	timeout 15 $WP start wireplumber 2>/dev/null
 	log "5090: $(lspci -k -s 01:00.0 | grep 'in use')"
 	if ! lspci -k -s 01:00.0 | grep -q 'in use: vfio-pci'; then log "FAIL: not on vfio-pci"; to_host; return 1; fi
 	setsid bash $N/vm.sh >$R/qemu.log 2>&1 < /dev/null & echo $! > $R/qemu.pid
