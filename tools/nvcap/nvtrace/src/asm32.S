@@ -41,3 +41,29 @@ _nvt_call_orig:
         pop     esi
         pop     ebp
         ret
+
+/* int __stdcall nvt_selftest_target{,2,3}(int x): x + 0x1234 / 0x2234 /
+ * 0x3234, shaped like win32u stubs (mov eax, imm32 ... ret 4). They start
+ * 8-aligned, at 2 mod 8 and at 5 mod 8 (8-byte compare-exchange twice,
+ * then the suspended-threads path). */
+        .p2align 4
+        .globl  _nvt_selftest_target@4
+_nvt_selftest_target@4:
+        mov     eax, 0x1234
+        add     eax, [esp+4]
+        ret     4
+        .p2align 4
+        .byte   0x90, 0x90
+        .globl  _nvt_selftest_target2@4
+_nvt_selftest_target2@4:
+        mov     eax, 0x2234
+        add     eax, [esp+4]
+        ret     4
+        .p2align 4
+        .byte   0x90, 0x90, 0x90, 0x90, 0x90
+        .globl  _nvt_selftest_target3@4
+_nvt_selftest_target3@4:
+        mov     eax, 0x3234
+        add     eax, [esp+4]
+        ret     4
+        .p2align 4

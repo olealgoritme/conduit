@@ -109,6 +109,17 @@ static void test_stubs(void)
     CHECK(c == 8 && olen == 8 && !memcmp(out, stub64, 8), "x64 stub 5-byte patch relocation c=%d", c);
     c = x86_relocate(stub32, 0x77001000, 5, out, 0x10000000, 0, &olen);
     CHECK(c == 5 && olen == 5 && !memcmp(out, stub32, 5), "x86 stub relocation c=%d", c);
+    x86_relocmap map;
+    c = x86_relocate_map(stub64, 0x7FFA00001000ull, 5, out, 0x7FFA10000000ull, 1, &olen, &map);
+    CHECK(c == 8 && map.n == 2 && x86_relocmap_lookup(&map, 0) == 0 &&
+              x86_relocmap_lookup(&map, 3) == 3 && x86_relocmap_lookup(&map, 1) == -1,
+          "x64 stub boundary map n=%d", map.n);
+    /* jcc rel8 grows to 16 bytes: the instruction after it moves */
+    static const uint8_t jshort[] = {0x74, 0x10, 0x90, 0x90, 0x48, 0x89, 0xC8, 0xC3};
+    c = x86_relocate_map(jshort, 0x1000, 5, out, 0x2000, 1, &olen, &map);
+    CHECK(c == 7 && map.n == 4 && x86_relocmap_lookup(&map, 2) == 16 &&
+              x86_relocmap_lookup(&map, 4) == 18,
+          "x64 jcc boundary map c=%d n=%d", c, map.n);
     uint32_t ab = 99;
     CHECK(x86_stub_argbytes(stub32, 0, &ab) == 0 && ab == 4, "x86 argbytes %u", ab);
     static const uint8_t stub32b[] = {0xB8, 1, 0, 0, 0, 0x64, 0xFF, 0x15, 0xC0, 0, 0, 0, 0xC2, 0x2C, 0x00};

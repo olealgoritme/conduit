@@ -68,10 +68,12 @@ class Ptr:
     wstr=   NUL-terminated UTF-16 string
     mode=   'in' (copy before the call only), 'out' (after only), 'inout'
     chase=  scan the copied bytes for further user pointers and copy those
+    count_add= added to the count field (count + 1 for "BroadcastContextCount + 1")
     """
 
     def __init__(self, size=None, count=None, elem=None, target=None, wstr=False,
-                 mode="inout", chase=False, mult=1):
+                 mode="inout", chase=False, mult=1, count_add=0):
+        self.count_add = count_add
         self.size_spec = size
         self.count = count
         self.elem = elem
@@ -501,16 +503,14 @@ SETVIDPNSOURCEOWNER = S("D3DKMT_SETVIDPNSOURCEOWNER", [
     ("pVidPnSourceId", Ptr(count="VidPnSourceCount", elem=U32, mode="in")),
     ("VidPnSourceCount", U32)])
 SETVIDPNSOURCEOWNER1 = S("D3DKMT_SETVIDPNSOURCEOWNER1", [
-    ("hDevice", H),
-    ("pType", Ptr(count="VidPnSourceCount", elem=U32, mode="in")),
-    ("pVidPnSourceId", Ptr(count="VidPnSourceCount", elem=U32, mode="in")),
-    ("VidPnSourceCount", U32), ("Flags", U32)])
+    (None, SETVIDPNSOURCEOWNER), ("Flags", U32)])
 GETSCANLINE = S("D3DKMT_GETSCANLINE", [
     ("hAdapter", H), ("VidPnSourceId", U32), ("InVerticalBlank", BOOL), ("ScanLine", U32)])
 WAITFORVERTICALBLANKEVENT = S("D3DKMT_WAITFORVERTICALBLANKEVENT", [
     ("hAdapter", H), ("hDevice", H), ("VidPnSourceId", U32)])
 WAITFORVERTICALBLANKEVENT2 = S("D3DKMT_WAITFORVERTICALBLANKEVENT2", [
-    ("hAdapter", H), ("hDevice", H), ("ObjectCount", U32), ("ObjectHandleArray", Arr(H, 8))])
+    ("hAdapter", H), ("hDevice", H), ("VidPnSourceId", U32), ("NumObjects", U32),
+    ("ObjectHandleArray", Arr(HANDLE, 8))])
 GETSHAREDRESOURCEADAPTERLUID = S("D3DKMT_GETSHAREDRESOURCEADAPTERLUID", [
     ("hGlobalShare", H), ("hNtHandle", HANDLE), ("AdapterLuid", LUID)])
 
@@ -601,12 +601,12 @@ RELEASEKEYEDMUTEX2 = S("D3DKMT_RELEASEKEYEDMUTEX2", [
     ("pPrivateRuntimeData", Ptr(size="PrivateRuntimeDataSize", mode="in")),
     ("PrivateRuntimeDataSize", U32)])
 
-CONTEXTPRIORITY = S("D3DKMT_CONTEXTSCHEDULINGPRIORITY", [("hContext", H), ("Priority", I32)])
+CONTEXTPRIORITY = S("D3DKMT_GETCONTEXTSCHEDULINGPRIORITY", [("hContext", H), ("Priority", I32)])
 GETPROCESSDEVICEREMOVALSUPPORT = S("D3DKMT_GETPROCESSDEVICEREMOVALSUPPORT", [
     ("hProcess", HANDLE), ("AdapterLuid", LUID), ("Support", BOOL)])
-CHECKOCCLUSION = S("D3DKMT_CHECKOCCLUSION", [("hWnd", HANDLE)])
-ADAPTERSOURCE = S("D3DKMT_ADAPTER_VIDPNSOURCE", [("hAdapter", H), ("VidPnSourceId", U32)])
-GETRESOURCEPRESENTPRIVATEDRIVERDATA = S("D3DKMT_GETRESOURCEPRESENTPRIVATEDRIVERDATA", [
+CHECKOCCLUSION = S("D3DKMT_CHECKOCCLUSION", [("hWindow", HANDLE)])
+ADAPTERSOURCE = S("D3DKMT_CHECKVIDPNEXCLUSIVEOWNERSHIP", [("hAdapter", H), ("VidPnSourceId", U32)])
+GETRESOURCEPRESENTPRIVATEDRIVERDATA = S("D3DDDI_GETRESOURCEPRESENTPRIVATEDRIVERDATA", [
     ("hResource", H), ("PrivateDriverDataSize", U32),
     ("pPrivateDriverData", Ptr(size="PrivateDriverDataSize", mode="out"))])
 CREATEDCFROMMEMORY = S("D3DKMT_CREATEDCFROMMEMORY", [
@@ -622,7 +622,153 @@ ISFEATUREENABLED = S("D3DKMT_ISFEATUREENABLED", [
     ("hAdapter", H), ("FeatureId", U32), ("ResultVersion", U16), ("ResultValue", U16)])
 GETSHAREDPRIMARYHANDLE = S("D3DKMT_GETSHAREDPRIMARYHANDLE", [
     ("hAdapter", H), ("VidPnSourceId", U32), ("hSharedPrimary", H)])
-POLLDISPLAYCHILDREN = S("D3DKMT_POLLDISPLAYCHILDREN", [("hAdapter", H), ("Flags", U32)])
+POLLDISPLAYCHILDREN = S("D3DKMT_POLLDISPLAYCHILDREN", [("hAdapter", H), ("Bits", U32)])
+
+
+# ---- present path
+
+RECT = S("RECT", [("left", I32), ("top", I32), ("right", I32), ("bottom", I32)])
+MOVE_RECT = S("D3DKMT_MOVE_RECT", [("SourceX", I32), ("SourceY", I32), ("DestRect", RECT)])
+PRESENT_RGNS = S("D3DKMT_PRESENT_RGNS", [
+    ("DirtyRectCount", U32),
+    ("pDirtyRects", Ptr(count="DirtyRectCount", elem=RECT, mode="in")),
+    ("MoveRectCount", U32),
+    ("pMoveRects", Ptr(count="MoveRectCount", elem=MOVE_RECT, mode="in"))])
+# D3DKMT_PRESENTHISTORYTOKEN: Model, TokenSize, CompositionBindingId, union of
+# the per-model tokens (1064 bytes). Kept opaque.
+PRESENTHISTORYTOKEN = S("D3DKMT_PRESENTHISTORYTOKEN", [
+    ("Model", U32), ("TokenSize", U32), ("CompositionBindingId", U64),
+    ("Token", Arr(U64, 1064 // 8))])
+PRESENT = S("D3DKMT_PRESENT", [
+    Union(("hDevice", H), ("hContext", H)),
+    ("hWindow", HANDLE), ("VidPnSourceId", U32), ("hSource", H), ("hDestination", H),
+    ("Color", U32), ("DstRect", RECT), ("SrcRect", RECT), ("SubRectCnt", U32),
+    ("pSrcSubRects", Ptr(count="SubRectCnt", elem=RECT, mode="in")),
+    ("PresentCount", U32), ("FlipInterval", U32), ("Flags", U32),
+    ("BroadcastContextCount", U32), ("BroadcastContext", Arr(H, 64)),
+    ("PresentLimitSemaphore", HANDLE), ("PresentHistoryToken", PRESENTHISTORYTOKEN),
+    ("pPresentRegions", Ptr(target=PRESENT_RGNS, mode="in")),
+    Union(("hAdapter", H), ("hIndirectContext", H)),
+    ("Duration", U32),
+    ("BroadcastSrcAllocation", Ptr(count="BroadcastContextCount", elem=H, mode="in")),
+    ("BroadcastDstAllocation", Ptr(count="BroadcastContextCount", elem=H, mode="in")),
+    ("PrivateDriverDataSize", U32),
+    ("pPrivateDriverData", Ptr(size="PrivateDriverDataSize", mode="in", chase=True)),
+    ("bOptimizeForComposition", U8)])
+SUBMITPRESENTBLTTOHWQUEUE = S("D3DKMT_SUBMITPRESENTBLTTOHWQUEUE", [
+    ("hHwQueue", H), ("HwQueueProgressFenceId", U64), (None, PRESENT)])
+SUBMITPRESENTTOHWQUEUE = S("D3DKMT_SUBMITPRESENTTOHWQUEUE", [
+    ("hHwQueues", Ptr(count="BroadcastContextCount", count_add=1, elem=H, mode="in")),
+    (None, PRESENT)])
+PRESENT_REDIRECTED = S("D3DKMT_PRESENT_REDIRECTED", [
+    ("hSyncObj", H), ("hDevice", H), ("WaitedFenceValue", U64),
+    ("PresentHistoryToken", PRESENTHISTORYTOKEN), ("Flags", U32), ("hSource", H),
+    ("PrivateDriverDataSize", U32),
+    ("pPrivateDriverData", Ptr(size="PrivateDriverDataSize", mode="in", chase=True))])
+OUTPUTDUPLPRESENTTOHWQUEUE = S("D3DKMT_OUTPUTDUPLPRESENTTOHWQUEUE", [
+    ("hSource", H), ("VidPnSourceId", U32), ("BroadcastHwQueueCount", U32),
+    ("hHwQueues", Ptr(count="BroadcastHwQueueCount", elem=H, mode="in")),
+    ("PresentRegions", PRESENT_RGNS), ("Flags", U32), ("hIndirectHwQueue", H)])
+
+MPO_ATTRIBUTES = S("D3DKMT_MULTIPLANE_OVERLAY_ATTRIBUTES", [
+    ("Flags", U32), ("SrcRect", RECT), ("DstRect", RECT), ("ClipRect", RECT),
+    ("Rotation", U32), ("Blend", U32), ("DirtyRectCount", U32),
+    ("pDirtyRects", Ptr(count="DirtyRectCount", elem=RECT, mode="in")),
+    ("VideoFrameFormat", U32), ("YCbCrFlags", U32), ("StereoFormat", U32),
+    ("StereoLeftViewFrame0", BOOL), ("StereoBaseViewFrame0", BOOL), ("StereoFlipMode", U32),
+    ("StretchQuality", U32)])
+MPO_ATTRIBUTES2 = S("D3DKMT_MULTIPLANE_OVERLAY_ATTRIBUTES2", [
+    ("Flags", U32), ("SrcRect", RECT), ("DstRect", RECT), ("ClipRect", RECT),
+    ("Rotation", U32), ("Blend", U32), ("DirtyRectCount", U32),
+    ("pDirtyRects", Ptr(count="DirtyRectCount", elem=RECT, mode="in")),
+    ("VideoFrameFormat", U32), ("ColorSpace", U32), ("StereoFormat", U32),
+    ("StereoLeftViewFrame0", BOOL), ("StereoBaseViewFrame0", BOOL), ("StereoFlipMode", U32),
+    ("StretchQuality", U32), ("Reserved1", U32)])
+MPO_ATTRIBUTES3 = S("D3DKMT_MULTIPLANE_OVERLAY_ATTRIBUTES3", [
+    ("Flags", U32), ("SrcRect", RECT), ("DstRect", RECT), ("ClipRect", RECT),
+    ("Rotation", U32), ("Blend", U32), ("DirtyRectCount", U32),
+    ("pDirtyRects", Ptr(count="DirtyRectCount", elem=RECT, mode="in")),
+    ("ColorSpace", U32), ("StretchQuality", U32), ("SDRWhiteLevel", U32)])
+MPO_PLANE = S("D3DKMT_MULTIPLANE_OVERLAY", [
+    ("LayerIndex", U32), ("Enabled", BOOL), ("hAllocation", H), (None, MPO_ATTRIBUTES)])
+MPO_PLANE2 = S("D3DKMT_MULTIPLANE_OVERLAY2", [
+    ("LayerIndex", U32), ("Enabled", BOOL), ("hAllocation", H), (None, MPO_ATTRIBUTES2)])
+MPO_PLANE3 = S("D3DKMT_MULTIPLANE_OVERLAY3", [
+    ("LayerIndex", U32), ("InputFlags", U32), ("FlipInterval", U32),
+    ("MaxImmediateFlipLine", U32), ("AllocationCount", U32),
+    ("pAllocationList", Ptr(count="AllocationCount", elem=H, mode="in")),
+    ("DriverPrivateDataSize", U32),
+    ("pDriverPrivateData", Ptr(size="DriverPrivateDataSize", mode="in", chase=True)),
+    ("pPlaneAttributes", Ptr(target=MPO_ATTRIBUTES3, mode="in")),
+    ("hFlipToFence", H), ("hFlipAwayFence", H), ("FlipToFenceValue", U64),
+    ("FlipAwayFenceValue", U64)])
+MPO_POST_COMPOSITION = S("D3DKMT_MULTIPLANE_OVERLAY_POST_COMPOSITION", [
+    ("Flags", U32), ("SrcRect", RECT), ("DstRect", RECT), ("Rotation", U32)])
+PRESENT_MPO = S("D3DKMT_PRESENT_MULTIPLANE_OVERLAY", [
+    Union(("hDevice", H), ("hContext", H)),
+    ("BroadcastContextCount", U32), ("BroadcastContext", Arr(H, 64)),
+    ("VidPnSourceId", U32), ("PresentCount", U32), ("FlipInterval", U32), ("Flags", U32),
+    ("PresentPlaneCount", U32),
+    ("pPresentPlanes", Ptr(count="PresentPlaneCount", elem=MPO_PLANE, mode="in")),
+    ("Duration", U32)])
+PRESENT_MPO2 = S("D3DKMT_PRESENT_MULTIPLANE_OVERLAY2", [
+    ("hAdapter", H), Union(("hDevice", H), ("hContext", H)),
+    ("BroadcastContextCount", U32), ("BroadcastContext", Arr(H, 64)),
+    ("VidPnSourceId", U32), ("PresentCount", U32), ("FlipInterval", U32), ("Flags", U32),
+    ("PresentPlaneCount", U32),
+    ("pPresentPlanes", Ptr(count="PresentPlaneCount", elem=MPO_PLANE2, mode="in")),
+    ("Duration", U32)])
+PLANE3PTR = S("PLANE3PTR", [("p", Ptr(target=MPO_PLANE3, mode="in"))])
+PRESENT_MPO3 = S("D3DKMT_PRESENT_MULTIPLANE_OVERLAY3", [
+    ("hAdapter", H), ("ContextCount", U32),
+    ("pContextList", Ptr(count="ContextCount", elem=H, mode="in")),
+    ("VidPnSourceId", U32), ("PresentCount", U32), ("Flags", U32),
+    ("PresentPlaneCount", U32),
+    ("ppPresentPlanes", Ptr(count="PresentPlaneCount", elem=PLANE3PTR, mode="in")),
+    ("pPostComposition", Ptr(target=MPO_POST_COMPOSITION, mode="in")),
+    ("Duration", U32), ("HDRMetaDataType", U32), ("HDRMetaDataSize", U32),
+    ("pHDRMetaData", Ptr(size="HDRMetaDataSize", mode="in")),
+    ("BoostRefreshRateMultiplier", U32)])
+CANCEL_PRESENTS = S("D3DKMT_CANCEL_PRESENTS", [
+    ("cbSize", U32), ("hDevice", H), ("Flags", U32), ("Operation", U32),
+    ("CancelFromPresentId", U64), ("CompSurfaceLuid", LUID), ("BindId", U64),
+    ("hFlipManagerProcessedEvent", HANDLE)])
+
+# ---- HW contexts, doorbells (WDDM 3.1 user-mode submission), native fences
+
+CREATEHWCONTEXT = S("D3DKMT_CREATEHWCONTEXT", [
+    ("hDevice", H), ("NodeOrdinal", U32), ("EngineAffinity", U32), ("Flags", U32),
+    ("PrivateDriverDataSize", U32),
+    ("pPrivateDriverData", Ptr(size="PrivateDriverDataSize", chase=True)),
+    ("hHwContext", H)])
+DESTROYHWCONTEXT = S("D3DKMT_DESTROYHWCONTEXT", [("hHwContext", H)])
+# The doorbell and status CPU addresses are device or special mappings: they
+# are recorded (REGION records), never read.
+CREATE_DOORBELL = S("D3DKMT_CREATE_DOORBELL", [
+    ("hHwQueue", H), ("hRingBuffer", H), ("hRingBufferControl", H), ("Flags", U32),
+    ("PrivateDriverDataSize", U32),
+    ("PrivateDriverData", Ptr(size="PrivateDriverDataSize", chase=True)),
+    ("DoorbellCPUVirtualAddress", PTR), ("DoorbellSecondaryCPUVirtualAddress", PTR),
+    ("DoorbellStatusCPUVirtualAddress", PTR),
+    ("HwQueueProgressFenceLastQueuedValueCPUVirtualAddress", PTR),
+    ("hDoorbell", H)])
+CONNECT_DOORBELL = S("D3DKMT_CONNECT_DOORBELL", [("hDoorbell", H), ("Flags", U32)])
+DESTROY_DOORBELL = S("D3DKMT_DESTROY_DOORBELL", [("hDoorbell", H)])
+NOTIFY_WORK_SUBMISSION = S("D3DKMT_NOTIFY_WORK_SUBMISSION", [("hDoorbell", H), ("Flags", U32)])
+NATIVEFENCEMAPPING = S("D3DDDI_NATIVEFENCEMAPPING", [
+    ("CurrentValueCpuVa", Ptr(size=8, mode="out")), ("CurrentValueGpuVa", GPUVA),
+    ("MonitoredValueGpuVa", GPUVA), ("MappingReserved", Arr(U8, 32))])
+OPENNATIVEFENCEFROMNTHANDLE = S("D3DKMT_OPENNATIVEFENCEFROMNTHANDLE", [
+    ("hNtHandle", HANDLE), ("hDevice", H), ("EngineAffinity", U32), ("Flags", U32),
+    ("hSyncObject", H), (None, NATIVEFENCEMAPPING), ("PrivateDriverData", Arr(U8, 64)),
+    ("Reserved", Arr(U8, 32))])
+GETNATIVEFENCELOGDETAIL = S("D3DKMT_GETNATIVEFENCELOGDETAIL", [
+    ("hHwQueue", H), ("Flags", U32), ("WaitLogNumberOfEntries", U32),
+    ("SignalLogNumberOfEntries", U32), ("WaitLogGpuBaseAddress", GPUVA),
+    ("SignalLogGpuBaseAddress", GPUVA), ("Reserved", Arr(U8, 64))])
+GETPRESENTHISTORY = S("D3DKMT_GETPRESENTHISTORY", [
+    ("hAdapter", H), ("ProvidedSize", U32), ("WrittenSize", U32),
+    ("pTokens", Ptr(size="ProvidedSize", mode="out")), ("NumTokens", U32)])
 
 
 class Raw:
@@ -680,15 +826,16 @@ FUNCS = [
     kmt("CreateContext", CREATECONTEXT, extra_flags=("NVT_FN_CTXTRACK",)),
     kmt("CreateContextVirtual", CREATECONTEXTVIRTUAL),
     kmt("DestroyContext", DESTROYCONTEXT),
-    kmt("CreateHwContext", Raw("D3DKMT_CREATEHWCONTEXT", 0x40, 0x30)),
-    kmt("DestroyHwContext", Raw("D3DKMT_DESTROYHWCONTEXT", 4)),
+    kmt("CreateHwContext", CREATEHWCONTEXT),
+    kmt("DestroyHwContext", DESTROYHWCONTEXT),
     kmt("CreateHwQueue", CREATEHWQUEUE),
     kmt("DestroyHwQueue", DESTROYHWQUEUE),
     kmt("SubmitCommandToHwQueue", SUBMITCOMMANDTOHWQUEUE),
     kmt("SubmitWaitForSyncObjectsToHwQueue", SUBMITWAITFORSYNCOBJECTSTOHWQUEUE),
     kmt("SubmitSignalSyncObjectsToHwQueue", SUBMITSIGNALSYNCOBJECTSTOHWQUEUE),
-    kmt("SubmitPresentToHwQueue", Raw("D3DKMT_SUBMITPRESENTTOHWQUEUE", 0x400)),
-    kmt("SubmitPresentBltToHwQueue", Raw("D3DKMT_SUBMITPRESENTBLTTOHWQUEUE", 0x400)),
+    kmt("SubmitPresentToHwQueue", SUBMITPRESENTTOHWQUEUE),
+    kmt("SubmitPresentBltToHwQueue", SUBMITPRESENTBLTTOHWQUEUE),
+    kmt("OutputDuplPresentToHwQueue", OUTPUTDUPLPRESENTTOHWQUEUE),
     kmt("CreatePagingQueue", CREATEPAGINGQUEUE),
     kmt("DestroyPagingQueue", DESTROYPAGINGQUEUE),
     kmt("MakeResident", MAKERESIDENT),
@@ -729,13 +876,21 @@ FUNCS = [
     kmt("SignalSynchronizationObjectFromGpu", SIGNALFROMGPU),
     kmt("SignalSynchronizationObjectFromGpu2", SIGNALFROMGPU2),
     kmt("CreateNativeFence", CREATENATIVEFENCE),
-    kmt("OpenNativeFenceFromNtHandle", Raw("D3DKMT_OPENNATIVEFENCEFROMNTHANDLE", 0xA8)),
+    kmt("OpenNativeFenceFromNtHandle", OPENNATIVEFENCEFROMNTHANDLE),
+    kmt("GetNativeFenceLogDetail", GETNATIVEFENCELOGDETAIL),
+    kmt("CreateDoorbell", CREATE_DOORBELL),
+    kmt("ConnectDoorbell", CONNECT_DOORBELL),
+    kmt("DestroyDoorbell", DESTROY_DOORBELL),
+    kmt("NotifyWorkSubmission", NOTIFY_WORK_SUBMISSION),
+    kmt("CancelPresents", CANCEL_PRESENTS),
     kmt("SubmitCommand", SUBMITCOMMAND),
     kmt("Render", RENDER, extra_flags=("NVT_FN_RENDER",)),
-    kmt("Present", Raw("D3DKMT_PRESENT", 0x400)),
-    kmt("PresentMultiPlaneOverlay", Raw("D3DKMT_PRESENT_MULTIPLANE_OVERLAY", 0x200)),
-    kmt("PresentMultiPlaneOverlay2", Raw("D3DKMT_PRESENT_MULTIPLANE_OVERLAY2", 0x200)),
-    kmt("PresentMultiPlaneOverlay3", Raw("D3DKMT_PRESENT_MULTIPLANE_OVERLAY3", 0x200)),
+    kmt("Present", PRESENT),
+    kmt("PresentMultiPlaneOverlay", PRESENT_MPO),
+    kmt("PresentMultiPlaneOverlay2", PRESENT_MPO2),
+    kmt("PresentMultiPlaneOverlay3", PRESENT_MPO3),
+    kmt("PresentRedirected", PRESENT_REDIRECTED),
+    kmt("GetPresentHistory", GETPRESENTHISTORY),
     kmt("GetDeviceState", GETDEVICESTATE),
     kmt("QueryStatistics", QUERYSTATISTICS),
     kmt("QueryClockCalibration", QUERYCLOCKCALIBRATION),
@@ -822,6 +977,60 @@ FUNCS = [
         ("InputBufferLength", U32),
         ("OutputBuffer", Ptr(size="OutputBufferLength", chase=True)),
         ("OutputBufferLength", U32)], ("NVT_FN_DEVHANDLE",)),
+    Fn("ntdll.dll", "NtReadFile", [
+        ("FileHandle", HANDLE), ("Event", HANDLE), ("ApcRoutine", PTR), ("ApcContext", PTR),
+        ("IoStatusBlock", Ptr(target=IO_STATUS_BLOCK, mode="out")),
+        ("Buffer", Ptr(size="Length", mode="out")), ("Length", U32),
+        ("ByteOffset", Ptr(size=8, mode="in")), ("Key", Ptr(size=4, mode="in"))],
+       ("NVT_FN_DEVHANDLE",)),
+    Fn("ntdll.dll", "NtWriteFile", [
+        ("FileHandle", HANDLE), ("Event", HANDLE), ("ApcRoutine", PTR), ("ApcContext", PTR),
+        ("IoStatusBlock", Ptr(target=IO_STATUS_BLOCK, mode="out")),
+        ("Buffer", Ptr(size="Length", mode="in")), ("Length", U32),
+        ("ByteOffset", Ptr(size=8, mode="in")), ("Key", Ptr(size=4, mode="in"))],
+       ("NVT_FN_DEVHANDLE",)),
+    # registry: opens are logged when the key's full name matches NVTRACE_REG
+    # (NVIDIA/display keys by default), reads and writes for those key handles
+    Fn("ntdll.dll", "NtOpenKey", [
+        ("KeyHandle", Ptr(size="P", mode="out")), ("DesiredAccess", U32),
+        ("ObjectAttributes", Ptr(target=OBJECT_ATTRIBUTES, mode="in"))], ("NVT_FN_REGOPEN",)),
+    Fn("ntdll.dll", "NtOpenKeyEx", [
+        ("KeyHandle", Ptr(size="P", mode="out")), ("DesiredAccess", U32),
+        ("ObjectAttributes", Ptr(target=OBJECT_ATTRIBUTES, mode="in")), ("OpenOptions", U32)],
+       ("NVT_FN_REGOPEN",)),
+    Fn("ntdll.dll", "NtCreateKey", [
+        ("KeyHandle", Ptr(size="P", mode="out")), ("DesiredAccess", U32),
+        ("ObjectAttributes", Ptr(target=OBJECT_ATTRIBUTES, mode="in")), ("TitleIndex", U32),
+        ("Class", Ptr(target=UNICODE_STRING, mode="in")), ("CreateOptions", U32),
+        ("Disposition", Ptr(size=4, mode="out"))], ("NVT_FN_REGOPEN",)),
+    Fn("ntdll.dll", "NtQueryValueKey", [
+        ("KeyHandle", HANDLE), ("ValueName", Ptr(target=UNICODE_STRING, mode="in")),
+        ("KeyValueInformationClass", U32),
+        ("KeyValueInformation", Ptr(size="Length", mode="out")), ("Length", U32),
+        ("ResultLength", Ptr(size=4, mode="out"))], ("NVT_FN_REGKEY",)),
+    Fn("ntdll.dll", "NtEnumerateValueKey", [
+        ("KeyHandle", HANDLE), ("Index", U32), ("KeyValueInformationClass", U32),
+        ("KeyValueInformation", Ptr(size="Length", mode="out")), ("Length", U32),
+        ("ResultLength", Ptr(size=4, mode="out"))], ("NVT_FN_REGKEY",)),
+    Fn("ntdll.dll", "NtEnumerateKey", [
+        ("KeyHandle", HANDLE), ("Index", U32), ("KeyInformationClass", U32),
+        ("KeyInformation", Ptr(size="Length", mode="out")), ("Length", U32),
+        ("ResultLength", Ptr(size=4, mode="out"))], ("NVT_FN_REGKEY",)),
+    Fn("ntdll.dll", "NtQueryKey", [
+        ("KeyHandle", HANDLE), ("KeyInformationClass", U32),
+        ("KeyInformation", Ptr(size="Length", mode="out")), ("Length", U32),
+        ("ResultLength", Ptr(size=4, mode="out"))], ("NVT_FN_REGKEY",)),
+    Fn("ntdll.dll", "NtSetValueKey", [
+        ("KeyHandle", HANDLE), ("ValueName", Ptr(target=UNICODE_STRING, mode="in")),
+        ("TitleIndex", U32), ("Type", U32), ("Data", Ptr(size="DataSize", mode="in")),
+        ("DataSize", U32)], ("NVT_FN_REGKEY",)),
+    Fn("ntdll.dll", "NtDeleteValueKey", [
+        ("KeyHandle", HANDLE), ("ValueName", Ptr(target=UNICODE_STRING, mode="in"))],
+       ("NVT_FN_REGKEY",)),
+    Fn("ntdll.dll", "NtNotifyChangeKey", [
+        ("KeyHandle", HANDLE), ("Event", HANDLE), ("ApcRoutine", PTR), ("ApcContext", PTR),
+        ("IoStatusBlock", PTR), ("CompletionFilter", U32), ("WatchTree", U32), ("Buffer", PTR),
+        ("BufferSize", U32), ("Asynchronous", U32)], ("NVT_FN_REGKEY",)),
     Fn("ntdll.dll", "NtClose", [("Handle", HANDLE)], ("NVT_FN_CLOSE",)),
     Fn("ntdll.dll", "NtTerminateProcess", [("ProcessHandle", HANDLE), ("ExitStatus", U32)],
        ("NVT_FN_TERMINATE",)),
@@ -844,6 +1053,22 @@ FUNCS = [
 ]
 
 FUNC_BY_NAME = {f.name: f for f in FUNCS}
+# Newer builds export some thunks as NtDxgk<X> instead of NtGdiDdDDI<X>
+# (CreateNativeFence, SubmitPresentToHwQueue, CreateDoorbell, ...). Both
+# names share one layout.
+for _f in FUNCS:
+    if _f.name.startswith("NtGdiDdDDI"):
+        FUNC_BY_NAME.setdefault("NtDxgk" + _f.name[10:], _f)
+
+THUNK_PREFIXES = ("NtGdiDdDDI", "NtDxgk")
+
+
+def kmt_name(name):
+    """Function name without the NtGdiDdDDI / NtDxgk prefix."""
+    for p in THUNK_PREFIXES:
+        if name.startswith(p):
+            return name[len(p):]
+    return name
 
 
 def arg0_struct(fn):

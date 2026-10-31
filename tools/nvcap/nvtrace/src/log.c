@@ -1,127 +1,222 @@
-/* Log writer: producers append finished records to in-memory chunks under a
- * critical section; one writer thread writes them to the file. */
+/* Log writer. Records are copied straight into a writable mapped view of the
+ * log file. A mapped file's dirty pages belong to the file, not to the
+ * process, so everything written survives the process being killed
+ * (TerminateProcess from outside, a crash, nvinject -t); no writer thread and
+ * no in-process queue exist that could be lost.
+ *
+ * The file grows in segments (64 MiB on x64, 16 MiB on x86): each segment is
+ * its own mapping object and view. A record never spans segments; the unused
+ * tail of a segment is filled with a PAD record. Space is reserved under a
+ * short lock, the copy happens outside it.
+ *
+ * Crash consistency: a record is written with type PAD first, then its body,
+ * then the real type (one aligned 4-byte store). A reader therefore sees a
+ * finished record, a PAD it skips, or zeros (end of data). On a clean exit
+ * the file is truncated to its used length; after a kill it keeps a zero
+ * tail that readers stop at.
+ */
 #include "nvtrace.h"
 #include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
 
-typedef struct chunk {
-    struct chunk *next;
-    size_t len;
-    size_t cap;
-    uint8_t data[];
-} chunk;
+#ifdef _WIN64
+#define SEG_SIZE ((uint64_t)64 << 20)
+#else
+#define SEG_SIZE ((uint64_t)16 << 20)
+#endif
+#define GRAN 65536u
 
-#define CHUNK_SIZE (4u << 20)
-#define QUEUE_LIMIT ((LONG64)512 << 20)
+typedef struct segment {
+    struct segment *next;   /* retired list */
+    HANDLE map;
+    uint8_t *view;
+    uint64_t file_off;      /* file offset of view[0] */
+    uint64_t len;
+    uint64_t used;
+    LONG refs;              /* writers copying into this view */
+    int retired;
+} segment;
 
 static HANDLE log_file = INVALID_HANDLE_VALUE;
-static HANDLE log_event;
-static HANDLE log_thread;
-static CRITICAL_SECTION log_lock;
-static chunk *cur;
-static chunk *full_head, *full_tail;
-static volatile LONG64 queued;
-static volatile LONG stop_writer;
+static SRWLOCK log_lock = SRWLOCK_INIT;
+static segment *cur;
+static segment *retired;        /* retired but still referenced */
 static volatile LONG seq;
-static volatile LONG final_mode;
-/* chunk list the writer is working on, and bytes of its head already written:
- * if the writer is killed at process exit, the final flush resumes there so
- * no record is torn (at worst one chunk is written twice; readers drop
- * records with a repeated sequence number). */
-static chunk *volatile inflight;
-static volatile size_t inflight_done;
-static DWORD writer_tid;
+static volatile LONG log_closed;
+static volatile LONG log_full;   /* size cap reached or disk full */
+static volatile LONG exit_mode;  /* other threads were killed: try-lock only */
+static uint64_t file_end;       /* end of the last segment */
+static uint64_t max_bytes;
 
 volatile LONG64 nvt_stat_records, nvt_stat_calls, nvt_stat_dropped, nvt_stat_bytes;
+
+/* At process exit a thread may have been killed holding log_lock; then the
+ * lock is only tried for a short while and the record dropped. */
+volatile DWORD nvt_log_owner;   /* thread holding log_lock (hooks pass through) */
+
+static int lock_log(void)
+{
+    if (!exit_mode) {
+        AcquireSRWLockExclusive(&log_lock);
+        nvt_log_owner = GetCurrentThreadId();
+        return 1;
+    }
+    static volatile LONG lock_lost;
+    if (lock_lost)
+        return 0;
+    for (int i = 0; i < 200; i++) {
+        if (TryAcquireSRWLockExclusive(&log_lock)) {
+            nvt_log_owner = GetCurrentThreadId();
+            return 1;
+        }
+        Sleep(1);
+    }
+    InterlockedExchange(&lock_lost, 1);   /* held by a killed thread: give up */
+    return 0;
+}
+
+static void unlock_log(void)
+{
+    nvt_log_owner = 0;
+    ReleaseSRWLockExclusive(&log_lock);
+}
+
+void nvt_log_exit_mode(void)
+{
+    InterlockedExchange(&exit_mode, 1);
+}
 
 uint32_t nvt_next_seq(void)
 {
     return (uint32_t)InterlockedIncrement(&seq);
 }
 
-static chunk *chunk_alloc(size_t need)
+static void seg_free(segment *s)
 {
-    size_t cap = need > CHUNK_SIZE ? need : CHUNK_SIZE;
-    chunk *c = VirtualAlloc(NULL, sizeof(chunk) + cap, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-    if (!c)
+    if (s->view)
+        UnmapViewOfFile(s->view);
+    if (s->map)
+        CloseHandle(s->map);
+    VirtualFree(s, 0, MEM_RELEASE);
+}
+
+/* New segment covering [file_end, file_end + len). Called with the lock. */
+static segment *seg_new(uint64_t need)
+{
+    uint64_t len = need > SEG_SIZE ? (need + GRAN - 1) / GRAN * GRAN : SEG_SIZE;
+    uint64_t off = file_end;
+    if (max_bytes && off + len > max_bytes)
         return NULL;
-    c->next = NULL;
-    c->len = 0;
-    c->cap = cap;
-    return c;
-}
-
-static void write_all(const void *p, size_t n, volatile size_t *progress)
-{
-    const uint8_t *b = p;
-    while (n) {
-        DWORD w = 0;
-        DWORD part = n > (1u << 30) ? (1u << 30) : (DWORD)n;
-        if (!WriteFile(log_file, b, part, &w, NULL) || w == 0)
-            return;
-        if (progress)
-            *progress += w;
-        b += w;
-        n -= w;
-        InterlockedAdd64(&nvt_stat_bytes, w);
+    segment *s = VirtualAlloc(NULL, sizeof(segment), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (!s)
+        return NULL;
+    memset(s, 0, sizeof(*s));
+    uint64_t end = off + len;
+    /* the mapping object extends the file to `end` (allocating its
+     * clusters: a full disk fails here, never later in a page fault) */
+    s->map = CreateFileMappingW(log_file, NULL, PAGE_READWRITE, (DWORD)(end >> 32), (DWORD)end, NULL);
+    if (!s->map) {
+        VirtualFree(s, 0, MEM_RELEASE);
+        return NULL;
     }
-}
-
-/* write and free the inflight list */
-static void drain_inflight(void)
-{
-    while (inflight) {
-        chunk *c = inflight;
-        size_t done = inflight_done;
-        if (done < c->len)
-            write_all(c->data + done, c->len - done, &inflight_done);
-        InterlockedAdd64(&queued, -(LONG64)c->len);
-        /* reset progress first: a kill between the two lines then repeats
-         * this whole chunk (dropped by readers) instead of tearing the next */
-        inflight_done = 0;
-        inflight = c->next;
-        VirtualFree(c, 0, MEM_RELEASE);
+    s->view = MapViewOfFile(s->map, FILE_MAP_WRITE, (DWORD)(off >> 32), (DWORD)off, (SIZE_T)len);
+    if (!s->view) {
+        CloseHandle(s->map);
+        VirtualFree(s, 0, MEM_RELEASE);
+        return NULL;
     }
+    s->file_off = off;
+    s->len = len;
+    file_end = end;
+    return s;
 }
 
-static DWORD WINAPI writer_main(LPVOID arg)
+static void put_pad(uint8_t *p, uint64_t n)
 {
-    (void)arg;
-    TlsSetValue(nvt_tls, (void *)1);   /* marks this thread: hooks pass through */
-    for (;;) {
-        WaitForSingleObject(log_event, 50);
-        EnterCriticalSection(&log_lock);
-        if (cur && cur->len) {
-            if (full_tail)
-                full_tail->next = cur;
-            else
-                full_head = cur;
-            full_tail = cur;
-            cur = NULL;
+    /* PAD: u32 type 0, u32 size; readers skip `size` bytes (>= 8) */
+    uint32_t h[2] = {NTR_REC_PAD, (uint32_t)n};
+    memcpy(p, h, 8);
+}
+
+/* Reserve `len` bytes; returns the destination and the segment to release. */
+static uint8_t *reserve(size_t len, segment **segp)
+{
+    uint8_t *dst = NULL;
+    if (!lock_log())
+        return NULL;
+    if (!cur || log_closed || log_full) {
+        unlock_log();
+        return NULL;
+    }
+    if (cur->len - cur->used < len) {
+        segment *s = seg_new(len);
+        if (!s) {
+            /* stop for good only at the size cap or a full disk; an
+             * oversized record whose view cannot be mapped (x86 address
+             * space) is dropped alone */
+            DWORD le = GetLastError();
+            if ((max_bytes && file_end + len > max_bytes) || le == ERROR_DISK_FULL ||
+                le == ERROR_HANDLE_DISK_FULL || len <= SEG_SIZE)
+                InterlockedExchange(&log_full, 1);
+            unlock_log();
+            return NULL;
         }
-        inflight_done = 0;
-        inflight = full_head;
-        full_head = full_tail = NULL;
-        LeaveCriticalSection(&log_lock);
-        drain_inflight();
-        if (stop_writer)
-            break;
+        uint64_t rest = cur->len - cur->used;
+        if (rest)
+            put_pad(cur->view + cur->used, rest);
+        cur->used = cur->len;
+        cur->retired = 1;
+        if (cur->refs == 0) {
+            seg_free(cur);
+        } else {
+            cur->next = retired;
+            retired = cur;
+        }
+        cur = s;
     }
-    return 0;
+    dst = cur->view + cur->used;
+    /* PAD header under the lock: a writer killed before its copy leaves a
+     * skippable PAD, never a zero hole that would end the readable data */
+    put_pad(dst, len);
+    cur->used += len;
+    cur->refs++;
+    *segp = cur;
+    unlock_log();
+    return dst;
 }
 
-static HANDLE buf_heap;
-
-int nvt_log_open(const wchar_t *path, uint32_t ptr_size)
+static void release(segment *s)
 {
-    InitializeCriticalSection(&log_lock);
-    if (!buf_heap)
-        buf_heap = HeapCreate(0, 0, 0);
-    log_file = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_NEW,
+    if (!lock_log())
+        return;
+    if (--s->refs == 0 && s->retired) {
+        segment **pp = &retired;
+        while (*pp && *pp != s)
+            pp = &(*pp)->next;
+        if (*pp)
+            *pp = s->next;
+        seg_free(s);
+    }
+    unlock_log();
+}
+
+int nvt_log_open(const wchar_t *path, uint32_t ptr_size, uint64_t maxlog)
+{
+    max_bytes = maxlog;
+    log_file = CreateFileW(path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_NEW,
                            FILE_ATTRIBUTE_NORMAL, NULL);
     if (log_file == INVALID_HANDLE_VALUE)
         return -1;
+    file_end = 0;
+    cur = seg_new(SEG_SIZE);
+    if (!cur) {
+        DWORD le = GetLastError();
+        CloseHandle(log_file);
+        log_file = INVALID_HANDLE_VALUE;
+        SetLastError(le ? le : ERROR_DISK_FULL);
+        return -1;
+    }
     ntr_file_header h;
     memset(&h, 0, sizeof(h));
     memcpy(h.magic, NTR_MAGIC, 8);
@@ -130,107 +225,88 @@ int nvt_log_open(const wchar_t *path, uint32_t ptr_size)
     h.ptr_size = ptr_size;
     h.pid = GetCurrentProcessId();
     h.qpc_freq = (uint64_t)nvt_qpc_freq.QuadPart;
-    write_all(&h, sizeof(h), NULL);
-    log_event = CreateEventW(NULL, FALSE, FALSE, NULL);
-    log_thread = CreateThread(NULL, 0, writer_main, NULL, 0, &writer_tid);
+    memcpy(cur->view, &h, sizeof(h));
+    cur->used = sizeof(h);
     return 0;
+}
+
+int nvt_log_is_open(void)
+{
+    return log_file != INVALID_HANDLE_VALUE && !log_closed;
 }
 
 void nvt_log_submit(const void *rec, size_t len)
 {
-    if (log_file == INVALID_HANDLE_VALUE)
+    segment *s;
+    if (log_file == INVALID_HANDLE_VALUE || len < 8 || (len & 7)) {
+        InterlockedIncrement64(&nvt_stat_dropped);
         return;
+    }
+    uint8_t *dst = reserve(len, &s);
+    if (!dst) {
+        InterlockedIncrement64(&nvt_stat_dropped);
+        return;
+    }
+    memcpy(dst + 8, (const uint8_t *)rec + 8, len - 8);
+    MemoryBarrier();
+    InterlockedExchange((volatile LONG *)dst, (LONG) * (const uint32_t *)rec);
+    release(s);
     InterlockedIncrement64(&nvt_stat_records);
-    if (final_mode) {
-        write_all(rec, len, NULL);
-        return;
-    }
-    /* back-pressure: let the writer catch up rather than eat all memory */
-    if (queued > QUEUE_LIMIT && GetCurrentThreadId() != writer_tid && !stop_writer) {
-        ULONGLONG deadline = GetTickCount64() + 2000;
-        while (queued > QUEUE_LIMIT && GetTickCount64() < deadline) {
-            SetEvent(log_event);
-            Sleep(1);
-        }
-    }
-    EnterCriticalSection(&log_lock);
-    if (!cur || cur->cap - cur->len < len) {
-        if (cur) {
-            if (full_tail)
-                full_tail->next = cur;
-            else
-                full_head = cur;
-            full_tail = cur;
-        }
-        cur = chunk_alloc(len);
-        if (!cur) {
-            LeaveCriticalSection(&log_lock);
-            InterlockedIncrement64(&nvt_stat_dropped);
-            return;
-        }
-    }
-    memcpy(cur->data + cur->len, rec, len);
-    cur->len += len;
-    LeaveCriticalSection(&log_lock);
-    if (InterlockedAdd64(&queued, (LONG64)len) > (LONG64)CHUNK_SIZE)
-        SetEvent(log_event);
+    InterlockedAdd64(&nvt_stat_bytes, (LONG64)len);
 }
 
-/* Process exit. Either the other threads are gone (ExitProcess; the writer
- * may have died holding the lock) or they still run (TerminateProcess on
- * ourselves). Stop the writer first so only this thread drains; afterwards
- * every record is written directly (final mode). */
-void nvt_log_flush_final(void)
+/* Process exit, every other thread gone (DLL_PROCESS_DETACH at exit):
+ * unmap and cut the file to its used length. With `truncate` 0 (other
+ * threads may still be writing: TerminateProcess on ourselves) only the
+ * views are flushed; the file keeps its zero tail. */
+void nvt_log_close(int truncate)
 {
-    if (log_file == INVALID_HANDLE_VALUE || final_mode)
+    if (log_file == INVALID_HANDLE_VALUE || InterlockedExchange(&log_closed, 1))
         return;
-    InterlockedExchange(&stop_writer, 1);
-    if (log_thread) {
-        SetEvent(log_event);
-        if (WaitForSingleObject(log_thread, 2000) != WAIT_OBJECT_0)
-            return;                     /* writer stuck in a write: do not race it */
+    if (!truncate) {
+        if (cur)
+            FlushViewOfFile(cur->view, 0);
+        return;
     }
-    int locked = TryEnterCriticalSection(&log_lock);
-    for (ULONGLONG deadline = GetTickCount64() + 200; !locked && GetTickCount64() < deadline;) {
-        Sleep(1);
-        locked = TryEnterCriticalSection(&log_lock);
+    if (!lock_log()) {
+        if (cur)
+            FlushViewOfFile(cur->view, 0);
+        return;
     }
-    InterlockedExchange(&final_mode, 1);
-    drain_inflight();
-    chunk *list = full_head;
-    full_head = full_tail = NULL;
+    uint64_t end = cur ? cur->file_off + cur->used : 0;
+    while (retired) {
+        segment *s = retired;
+        retired = s->next;
+        seg_free(s);
+    }
     if (cur) {
-        cur->next = NULL;
-        if (list) {
-            chunk *t = list;
-            while (t->next)
-                t = t->next;
-            t->next = cur;
-        } else {
-            list = cur;
-        }
+        seg_free(cur);
         cur = NULL;
     }
-    if (locked)
-        LeaveCriticalSection(&log_lock);
-    inflight_done = 0;
-    inflight = list;
-    drain_inflight();
-}
-
-/* Wait until the writer has written everything queued so far. */
-void nvt_log_sync(DWORD timeout_ms)
-{
-    if (log_file == INVALID_HANDLE_VALUE || final_mode || GetCurrentThreadId() == writer_tid)
-        return;
-    ULONGLONG deadline = GetTickCount64() + timeout_ms;
-    while ((queued > 0 || inflight) && GetTickCount64() < deadline) {
-        SetEvent(log_event);
-        Sleep(1);
-    }
+    unlock_log();
+    LARGE_INTEGER li;
+    li.QuadPart = (LONGLONG)end;
+    if (end && SetFilePointerEx(log_file, li, NULL, FILE_BEGIN))
+        SetEndOfFile(log_file);
+    CloseHandle(log_file);
+    log_file = INVALID_HANDLE_VALUE;
 }
 
 /* ------------------------------------------------------------------ buffers */
+
+static HANDLE buf_heap;
+
+/* ExitProcess kills the other threads; holding our heap's lock across that
+ * guarantees no killed thread holds it (as Windows does for the process heap) */
+void nvt_heap_lock(int lock)
+{
+    if (!buf_heap)
+        return;
+    if (lock)
+        HeapLock(buf_heap);
+    else
+        HeapUnlock(buf_heap);
+}
 
 int nvt_buf_reserve(nvt_buf *b, size_t extra)
 {
@@ -238,6 +314,10 @@ int nvt_buf_reserve(nvt_buf *b, size_t extra)
         return -1;
     if (b->len + extra <= b->cap)
         return 0;
+    if (b->fixed) {
+        b->oom = 1;
+        return -1;
+    }
     if (extra > ((size_t)1 << (sizeof(size_t) == 8 ? 40 : 30)) - b->len) {
         b->oom = 1;
         return -1;
@@ -262,6 +342,11 @@ int nvt_buf_reserve(nvt_buf *b, size_t extra)
 
 void nvt_buf_free(nvt_buf *b)
 {
+    if (b->fixed) {
+        b->len = 0;
+        b->oom = 0;
+        return;
+    }
     if (b->p && buf_heap)
         HeapFree(buf_heap, 0, b->p);
     b->p = NULL;
@@ -305,17 +390,19 @@ void nvt_rec_begin(nvt_buf *b, uint32_t type)
     nvt_buf_put(b, &h, sizeof(h));
 }
 
-void nvt_rec_end(nvt_buf *b)
+uint32_t nvt_rec_end(nvt_buf *b)
 {
     nvt_buf_pad8(b);
-    if (b->oom || b->len < sizeof(ntr_rec_hdr)) {
+    if (b->oom || b->len < sizeof(ntr_rec_hdr) || b->len > 0xFFFFFFF8u) {
         InterlockedIncrement64(&nvt_stat_dropped);
-        return;
+        return 0;
     }
     ntr_rec_hdr *h = (ntr_rec_hdr *)b->p;
     h->size = (uint32_t)b->len;
-    h->seq = nvt_next_seq();
+    if (!h->seq)
+        h->seq = nvt_next_seq();
     nvt_log_submit(b->p, b->len);
+    return h->seq;
 }
 
 void nvt_note(int level, const char *fmt, ...)

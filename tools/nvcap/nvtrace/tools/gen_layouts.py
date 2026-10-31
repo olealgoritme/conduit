@@ -16,7 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import nvt_layouts as L  # noqa: E402
 
 FLAG_IN, FLAG_OUT, FLAG_CHASE = 1, 2, 4
-KIND_FIXED, KIND_FIELD, KIND_WSTR = 0, 1, 2
+KIND_FIXED, KIND_FIELD, KIND_WSTR, KIND_FIELD1 = 0, 1, 2, 3
 
 
 class Node:
@@ -51,7 +51,9 @@ def build(fields, name, off, ptr, P, label, labels):
         n.fixed = target.size(P)
     elif ptr.count is not None:
         o, t = resolve(fields, ptr.count)
-        n.kind = KIND_FIELD
+        n.kind = KIND_FIELD1 if ptr.count_add == 1 else KIND_FIELD
+        if ptr.count_add not in (0, 1):
+            raise ValueError("count_add must be 0 or 1 (%s)" % label)
         n.szoff = o
         n.szw = t.size(P)
         n.fixed = ptr.elem.size(P)
@@ -127,7 +129,45 @@ OFFSETS = [
                 "NewPatchLocationListSize"]),
     ("OBJECT_ATTRIBUTES", ["RootDirectory", "ObjectName"]),
     ("UNICODE_STRING", ["Length", "Buffer"]),
+    ("IO_STATUS_BLOCK", ["Status", "Information"]),
+    ("ESCAPE", ["pPrivateDriverData", "PrivateDriverDataSize"]),
+    # GPU memory tracking (src/gpumem.c)
+    ("LOCK", ["hAllocation", "pData"]),
+    ("LOCK2", ["hAllocation", "pData"]),
+    ("UNLOCK", ["NumAllocations", "phAllocations"]),
+    ("UNLOCK2", ["hAllocation"]),
+    ("CREATEALLOCATION", ["hResource", "NumAllocations", "pAllocationInfo"]),
+    ("ALLOCATIONINFO", ["hAllocation", "pSystemMem"]),
+    ("ALLOCATIONINFO2", ["hAllocation", "pSystemMem", "GpuVirtualAddress"]),
+    ("DESTROYALLOCATION", ["hResource", "phAllocationList", "AllocationCount"]),
+    ("MAPGPUVIRTUALADDRESS", ["hAllocation", "OffsetInPages", "SizeInPages", "VirtualAddress"]),
+    ("RESERVEGPUVIRTUALADDRESS", ["Size", "VirtualAddress"]),
+    ("FREEGPUVIRTUALADDRESS", ["BaseAddress", "Size"]),
+    ("UPDATEGPUVIRTUALADDRESS", ["NumOperations", "Operations"]),
+    ("UPDATEGPUVA_OPERATION", ["OperationType", "BaseAddress", "Size", "hAllocation",
+                               "AllocationOffset", "SourceAddress", "CopySize", "DestAddress"]),
+    ("SUBMITCOMMAND", ["Commands", "CommandLength", "BroadcastContext"]),
+    ("SUBMITCOMMANDTOHWQUEUE", ["hHwQueue", "HwQueueProgressFenceId", "CommandBuffer",
+                                "CommandLength"]),
+    ("NOTIFY_WORK_SUBMISSION", ["hDoorbell"]),
+    ("DESTROY_DOORBELL", ["hDoorbell"]),
+    ("CREATE_DOORBELL", ["hHwQueue", "hRingBuffer", "hRingBufferControl",
+                         "DoorbellCPUVirtualAddress", "DoorbellSecondaryCPUVirtualAddress",
+                         "DoorbellStatusCPUVirtualAddress",
+                         "HwQueueProgressFenceLastQueuedValueCPUVirtualAddress", "hDoorbell"]),
+    ("CREATEHWQUEUE", ["HwQueueProgressFenceCPUVirtualAddress"]),
+    ("CREATEPAGINGQUEUE", ["FenceValueCPUVirtualAddress"]),
+    ("CREATESYNCHRONIZATIONOBJECT2", ["FenceValueCPUVirtualAddress"]),
+    ("CREATENATIVEFENCE", ["CurrentValueCpuVa"]),
+    ("OPENNATIVEFENCEFROMNTHANDLE", ["CurrentValueCpuVa"]),
+    ("OPENSYNCOBJECTFROMNTHANDLE2", ["FenceValueCPUVirtualAddress"]),
+    ("OPENRESOURCE", ["NumAllocations", "pOpenAllocationInfo"]),
+    ("OPENRESOURCEFROMNTHANDLE", ["NumAllocations", "pOpenAllocationInfo2"]),
+    ("OPENALLOCATIONINFO2", ["hAllocation", "GpuVirtualAddress"]),
 ]
+
+SIZES = ["ALLOCATIONINFO", "ALLOCATIONINFO2", "UPDATEGPUVA_OPERATION", "OPENALLOCATIONINFO2",
+         "IO_STATUS_BLOCK"]
 
 
 def emit(out, P, fns, nodes, labels):
@@ -135,6 +175,8 @@ def emit(out, P, fns, nodes, labels):
         st = getattr(L, sname)
         for f in fields:
             out.append("#define NVT_OFF_%s_%s %d" % (sname, f, st.field(P, f)[0]))
+    for sname in SIZES:
+        out.append("#define NVT_SIZE_%s %d" % (sname, getattr(L, sname).size(P)))
     out.append("static const nvt_pdesc nvt_pdescs[] = {")
     for n in nodes:
         child = (n.children[0].index if n.children else 0)

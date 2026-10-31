@@ -194,8 +194,24 @@ static uint8_t *emit_rel32(uint8_t *o, uint64_t o_ip, uint8_t opc, uint64_t to)
 int x86_relocate(const uint8_t *src, uint64_t src_ip, int need, uint8_t *dst, uint64_t dst_ip,
                  int is64, int *dst_len)
 {
+    return x86_relocate_map(src, src_ip, need, dst, dst_ip, is64, dst_len, NULL);
+}
+
+int x86_relocmap_lookup(const x86_relocmap *map, int off)
+{
+    for (int i = 0; i < map->n; i++)
+        if (map->src_off[i] == off)
+            return map->dst_off[i];
+    return -1;
+}
+
+int x86_relocate_map(const uint8_t *src, uint64_t src_ip, int need, uint8_t *dst, uint64_t dst_ip,
+                     int is64, int *dst_len, x86_relocmap *map)
+{
     int off = 0;
     uint8_t *o = dst;
+    if (map)
+        map->n = 0;
     uint64_t targets[32];
     int ntargets = 0;
 #define OIP ((uint64_t)(dst_ip + (uint64_t)(o - dst)))
@@ -204,6 +220,13 @@ int x86_relocate(const uint8_t *src, uint64_t src_ip, int need, uint8_t *dst, ui
         const uint8_t *ip = src + off;
         if (x86_decode(ip, is64, &d))
             return -1;
+        if (map) {
+            if (map->n >= X86_RELOC_MAXMAP || off > 255 || o - dst > 255)
+                return -1;
+            map->src_off[map->n] = (uint8_t)off;
+            map->dst_off[map->n] = (uint8_t)(o - dst);
+            map->n++;
+        }
         uint64_t next = src_ip + (uint64_t)off + (uint64_t)d.len;
         if (d.kind == X86_LOOP)
             return -1;

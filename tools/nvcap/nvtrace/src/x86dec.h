@@ -41,6 +41,24 @@ uint8_t *x86_emit_abs_jmp(uint8_t *o, uint64_t to, int is64);
 int x86_relocate(const uint8_t *src, uint64_t src_ip, int need, uint8_t *dst, uint64_t dst_ip,
                  int is64, int *dst_len);
 
+/* Instruction boundaries of a relocation: src_off[i] in the original code
+ * starts the instruction that was written at dst_off[i] in the copy. Used to
+ * move a suspended thread whose IP is inside the patched bytes. */
+#define X86_RELOC_MAXMAP 16
+typedef struct x86_relocmap {
+    int n;
+    uint8_t src_off[X86_RELOC_MAXMAP];
+    uint8_t dst_off[X86_RELOC_MAXMAP];
+} x86_relocmap;
+
+/* x86_relocate that also fills *map (may be NULL). */
+int x86_relocate_map(const uint8_t *src, uint64_t src_ip, int need, uint8_t *dst, uint64_t dst_ip,
+                     int is64, int *dst_len, x86_relocmap *map);
+
+/* Where a thread at src_ip + off must continue in the copy; -1 if off is not
+ * an instruction start covered by the map. */
+int x86_relocmap_lookup(const x86_relocmap *map, int off);
+
 /* Syscall number from a stub's `mov eax, imm32` (x64: after mov r10, rcx),
  * or 0xFFFFFFFF if p is not a syscall stub. */
 uint32_t x86_stub_syscall_nr(const uint8_t *p, int is64);

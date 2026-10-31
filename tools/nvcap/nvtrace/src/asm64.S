@@ -64,3 +64,36 @@ nvt_call_orig:
         pop     rbp
         ret
         .seh_endproc
+
+/* int nvt_selftest_target{,2,3}(int x): return x + 0x1234 / 0x2234 /
+ * 0x3234. Shaped like ntdll/win32u syscall stubs (mov r10, rcx; mov eax,
+ * imm32) so nvinject --selftest can hook them while other threads run
+ * through them. The three start 8-aligned, at 4 mod 16 and at 13 mod 16,
+ * which exercises the 8-byte, 16-byte and suspended-threads patch paths. */
+        .p2align 5
+        .globl  nvt_selftest_target
+        .def    nvt_selftest_target; .scl 2; .type 32; .endef
+nvt_selftest_target:
+        .byte   0x4C, 0x8B, 0xD1                /* mov r10, rcx */
+        mov     eax, 0x1234
+        add     eax, r10d
+        ret
+        .p2align 5
+        .byte   0x90, 0x90, 0x90, 0x90
+        .globl  nvt_selftest_target2
+        .def    nvt_selftest_target2; .scl 2; .type 32; .endef
+nvt_selftest_target2:
+        .byte   0x4C, 0x8B, 0xD1
+        mov     eax, 0x2234
+        add     eax, r10d
+        ret
+        .p2align 5
+        .byte   0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90
+        .globl  nvt_selftest_target3
+        .def    nvt_selftest_target3; .scl 2; .type 32; .endef
+nvt_selftest_target3:
+        .byte   0x4C, 0x8B, 0xD1
+        mov     eax, 0x3234
+        add     eax, r10d
+        ret
+        .p2align 4

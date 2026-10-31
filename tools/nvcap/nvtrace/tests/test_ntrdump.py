@@ -260,6 +260,144 @@ class DecoderTest(unittest.TestCase):
         self.assertEqual(len(dup.calls), len(log.calls))
 
 
+def build_v2(path):
+    """A version 2 log: GPU memory, regions, registry, late IOCTL, pad and zero tail."""
+    P = 8
+    w = NtrWriter(ptr_size=P, version=2)
+    w.procinfo({"os": "10.0.26100", "ptr_size": P, "exe": r"C:\t\dwm.exe", "nvtrace": "2.0",
+                "start_qpc": 1000})
+    labels = ["pData", "pData.pPrivateDriverData", "ValueName.Buffer", "KeyValueInformation",
+              "ResultLength", "KeyHandle", "ObjectAttributes.ObjectName.Buffer", "OutputBuffer",
+              "pData.ObjectHandleArray", "pData.FenceValueArray"]
+    for i, s_ in enumerate(labels):
+        w.string(i, s_)
+    w.hook(1, "win32u.dll", "NtGdiDdDDISubmitCommandToHwQueue", arg0size=48)
+    w.hook(2, "win32u.dll", "NtGdiDdDDILock2", arg0size=24)
+    w.hook(3, "ntdll.dll", "NtQueryValueKey", nargs=6)
+    w.hook(4, "ntdll.dll", "NtDeviceIoControlFile", nargs=10)
+    w.hook(5, "win32u.dll", "NtDxgkSubmitPresentToHwQueue", arg0size=1504)
+    w.hook(6, "win32u.dll", "NtGdiDdDDISubmitWaitForSyncObjectsToHwQueue", arg0size=24)
+    w.module(NV_DLL, 0x1000000, r"C:\Windows\System32\DriverStore\nvwgf2umx.dll", (32, 0, 16, 1074))
+    frames = [NV_DLL + 0x100]
+    # Lock2 hands out a write-combined CPU mapping of allocation 0x40000042
+    w.call(2, 2000, 2100, 0, [0x3000], frames, [
+        {"label": "pData", "data": pack(L.LOCK2, P, hDevice=0x40000001, hAllocation=0x40000042,
+                                         pData=0x7FF000000000), "phase": 1}])
+    w.region(0x7FF000000000, 2, call_seq=w.seq, handle=0x40000042, size=0x20000, qpc=2100)
+    # submission: GPFIFO with 2 entries, the second names a pushbuffer segment
+    sub = pack(L.SUBMITCOMMANDTOHWQUEUE, P, hHwQueue=0x40000080, HwQueueProgressFenceId=7,
+               CommandBuffer=0x100000000, CommandLength=16)
+    w.call(1, 3000, 3100, 0, [0x3100], frames, [{"label": "pData", "data": sub}])
+    seq = w.seq
+    seg_va = 0x100002000
+    e0 = seg_va & 0xFFFFFFFC
+    e1 = ((seg_va >> 32) & 0xFF) | (6 << 10)
+    ctl = struct.pack("<II", 0, 4)                          # control entry: extended base 0
+    w.gpumem(1, ctl + struct.pack("<II", e0, e1), gpu_va=0x100000000, cpu_va=0x7FF000000000,
+             halloc=0x40000042, call_seq=seq, queue=0x40000080, fence=7, qpc=3050)
+    # methods: SET_OBJECT(subch 0) = 0xCE97, LAUNCH_DMA (0x1b0) = 0x1, host SEM_ADDR_LO
+    hdr_inc = lambda addr, sc, cnt: (1 << 29) | (cnt << 16) | (sc << 13) | (addr >> 2)
+    push = struct.pack("<6I", hdr_inc(0, 0, 1), 0xCE97, hdr_inc(0x1B0, 0, 1), 0x1,
+                       hdr_inc(0x5C, 0, 1), 0x1000)
+    w.gpumem(2, push, gpu_va=seg_va, cpu_va=0x7FF000002000, halloc=0x40000042, call_seq=seq,
+             queue=0x40000080, fence=7, index=1, qpc=3060)
+    w.gpumem(4, b"", gpu_va=0x100000000, cpu_va=0x7FF000000000, req=0x20000, halloc=0x40000042, index=1)
+    w.gpumem(3, push + b"\0" * (4096 - len(push)), gpu_va=0x100000000, cpu_va=0x7FF000000000,
+             halloc=0x40000042, queue=1, index=0, flags=8, qpc=3200)
+    # wait for a fence on the GPU
+    wt = pack(L.SUBMITWAITFORSYNCOBJECTSTOHWQUEUE, P, hHwQueue=0x40000080, ObjectCount=1,
+              ObjectHandleArray=0x5000, FenceValueArray=0x5100)
+    w.call(6, 3300, 3310, 0, [0x3200], frames, [
+        {"label": "pData", "data": wt},
+        {"label": "pData.ObjectHandleArray", "data": struct.pack("<I", 0x40000090), "addr": 0x5000},
+        {"label": "pData.FenceValueArray", "data": struct.pack("<Q", 6), "addr": 0x5100}])
+    # registry: key named by a HANDLE record, DWORD value read
+    w.handle(0x1A4, 3, r"\registry\machine\system\controlset001\control\class"
+             r"\{4d36e968-e325-11ce-bfc1-08002be10318}\0000", qpc=3400)
+    kvpi = struct.pack("<III", 0, 4, 4) + struct.pack("<I", 1)
+    w.call(3, 3500, 3510, 0, [0x1A4, 0x6000, 2, 0x6100, 64, 0x6200], frames, [
+        {"label": "ValueName.Buffer", "data": "EnableMidBufferPreemption".encode("utf-16-le"), "addr": 0x6010},
+        {"label": "KeyValueInformation", "data": kvpi, "phase": 1, "addr": 0x6100}])
+    # an IOCTL that completed later
+    w.call(4, 3600, 3610, 0x103, [0x88, 0, 0, 0, 0x900, 0x0022E00C, 0x7000, 16, 0x7100, 16], frames, [])
+    w.iocomplete(w.seq, 0, 16, b"\x11" * 16, code=0x0022E00C, qpc=3700)
+    w.handle(0x88, 2, r"\device\nvadmindevice", qpc=1500)
+    w.pad(8)
+    w.pad(64)
+    w.zeros(4096)       # killed: mapped-file tail
+    w.save(path)
+
+
+class V2Test(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.p = os.path.join(cls.tmp.name, "dwm-1.ntr")
+        build_v2(cls.p)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def test_parse_v2(self):
+        log = ntrdump.Log(self.p)
+        self.assertIsNone(log.bad)
+        self.assertTrue(log.unclosed)
+        self.assertEqual(len(log.gpumem), 4)
+        self.assertEqual(len(log.regions), 1)
+        self.assertEqual(len(log.iocomplete), 1)
+        self.assertEqual(len(log.handles), 2)
+        out = run([self.p])
+        self.assertIn("log not closed", out)
+        self.assertIn("submit", out)
+        self.assertIn("Lock2", out)
+        self.assertIn("RW|WRITECOMBINE", out)
+        self.assertIn("\\device\\nvadmindevice", out)
+
+    def test_pushbuf(self):
+        out = run([self.p, "--pushbuf"])
+        self.assertIn("GPFIFO entries:", out)
+        self.assertIn("va=0x100002000 dwords=6", out)
+        self.assertIn("SET_OBJECT = 0x0000ce97  -> subchannel 0 = BLACKWELL_B", out)
+        self.assertIn("BLACKWELL_B.LAUNCH_DMA = 0x00000001  DST_MEMORY_LAYOUT=PITCH", out)
+        self.assertNotIn("REDUCTION_OP", out)
+        self.assertIn("SEM_ADDR_LO = 0x00001000", out)
+        log = ntrdump.Log(self.p)
+        sample = [g for g in log.gpumem if g.kind == 3][0]
+        out = run([self.p, "--pushbuf", "--sample", str(sample.seq)])
+        self.assertIn("LAUNCH_DMA", out)
+
+    def test_timeline(self):
+        out = run([self.p, "--timeline"])
+        self.assertIn("hwqueue 0x40000080:", out)
+        self.assertIn("submit cmd=0x100000000 len=16 fence=7", out)
+        self.assertIn("GPFIFO segments", out)
+        self.assertIn("gpu-wait 0x40000090=6", out)
+        self.assertIn("page 0 changed (first copy)", out)
+
+    def test_objects_v2(self):
+        out = run([self.p, "--objects"])
+        self.assertIn("0x40000042  cpu=0x7ff000000000+0x20000 Lock2 RW|WRITECOMBINE", out)
+        self.assertIn("late IOCTL completions: 1", out)
+        self.assertIn("probe", out)
+
+    def test_registry(self):
+        out = run([self.p, "--registry"])
+        self.assertIn("{4d36e968-e325-11ce-bfc1-08002be10318}\\0000\\EnableMidBufferPreemption = DWORD 0x1",
+                      out)
+
+    def test_calls_linked(self):
+        out = run([self.p, "--calls", "-v"])
+        self.assertIn("-> gpumem submit gpu=0x100000000 len=16", out)
+        self.assertIn("-> region Lock2 addr=0x7ff000000000", out)
+        self.assertIn("-> completed later: 0x00000000 SUCCESS info=16", out)
+
+    def test_dxgk_alias(self):
+        self.assertIs(L.FUNC_BY_NAME["NtDxgkSubmitPresentToHwQueue"],
+                      L.FUNC_BY_NAME["NtGdiDdDDISubmitPresentToHwQueue"])
+        self.assertEqual(L.kmt_name("NtDxgkCreateDoorbell"), "CreateDoorbell")
+
+
 class LayoutTest(unittest.TestCase):
     def test_known_sizes_x64(self):
         # values cross-checked against the WSL dxgkrnl uapi header
