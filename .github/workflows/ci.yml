@@ -368,7 +368,7 @@ jobs:
           path: |
             ~/.cargo/bin/bindgen
             ~/.cargo/bin/cbindgen
-          key: cargo-bin-bindgen-0.71.1-cbindgen-0.28.0-${{ steps.tree.outputs.image }}
+          key: cargo-bin-bindgen-0.71.1-cbindgen-0.28.0-llvm20-${{ steps.tree.outputs.image }}
       - name: Build dependencies
         if: steps.tree.outputs.skip == 'false' && steps.cache.outputs.cache-hit != 'true'
         env:
@@ -386,9 +386,12 @@ jobs:
             libgtest-dev libvulkan-dev
           python3 -m pip install --break-system-packages "meson==1.11.2" ninja
           # Mesa builds outside the checkout, on the runner's default
-          # toolchain, not the one rust-toolchain.toml pins
+          # toolchain, not the one rust-toolchain.toml pins; so do bindgen
+          # and cbindgen. bindgen links libclang when it is built: LLVM 20's,
+          # not the runner's default 18 (whose headers it then rejects)
           if [ "$CARGO_BIN_HIT" != true ]; then
-            cd "$RUNNER_TEMP" && cargo install --locked bindgen-cli@0.71.1 cbindgen@0.28.0
+            cd "$RUNNER_TEMP" &&
+              LIBCLANG_PATH=/usr/lib/llvm-20/lib cargo install --locked bindgen-cli@0.71.1 cbindgen@0.28.0
           fi
       - name: Build NVK, the drm-shim and NAK's tests
         if: steps.tree.outputs.skip == 'false' && steps.cache.outputs.cache-hit != 'true'
@@ -396,6 +399,9 @@ jobs:
           TREE: ${{ steps.tree.outputs.tree }}
           WORK_DIR: ${{ runner.temp }}/nak-work
           LLVM_CONFIG: /usr/lib/llvm-20/bin/llvm-config
+          # bindgen at run time: LLVM 20's libclang and clang's own headers
+          LIBCLANG_PATH: /usr/lib/llvm-20/lib
+          CLANG_PATH: /usr/lib/llvm-20/bin/clang
         run: .github/scripts/nak-build.sh "$TREE" "$RUNNER_TEMP/nak-build"
       - name: NAK unit tests
         # The hardware tests need a GPU, the nvdisasm ones NVIDIA's disassembler
