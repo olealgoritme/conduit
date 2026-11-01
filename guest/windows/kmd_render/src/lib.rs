@@ -170,9 +170,9 @@ fn build_ddi_table() -> DRIVER_INITIALIZATION_DATA {
     data.DxgkDdiQueryDependentEngineGroup = Some(ddi::dxgkddi_query_dependent_engine_group);
     data.DxgkDdiQueryEngineStatus = Some(ddi::traced::query_engine_status);
     data.DxgkDdiResetEngine = Some(ddi::traced::reset_engine);
-    if crate::ddi::wddm_surface::nvidia_selected() {
-        register_nvidia_hws(&mut data);
-    } else {
+    // The NVIDIA personality registers its own hardware-scheduling set at the end
+    // of this function (`register_nvidia_hws`), after every shared slot is filled.
+    if !crate::ddi::wddm_surface::nvidia_selected() {
         data.DxgkDdiCreateHwContext = Some(ddi::dxgkddi_create_hw_context);
         data.DxgkDdiDestroyHwContext = Some(ddi::dxgkddi_destroy_hw_context);
         data.DxgkDdiCreateHwQueue = Some(ddi::dxgkddi_create_hw_queue);
@@ -231,6 +231,10 @@ fn build_ddi_table() -> DRIVER_INITIALIZATION_DATA {
     data.DxgkDdiControlInterrupt = Some(ddi::traced::control_interrupt);
     data.DxgkDdiQueryCurrentFence = Some(ddi::dxgkddi_query_current_fence);
 
+    if crate::ddi::wddm_surface::nvidia_selected() {
+        register_nvidia_hws(&mut data);
+    }
+
     data
 }
 
@@ -238,9 +242,12 @@ fn build_ddi_table() -> DRIVER_INITIALIZATION_DATA {
 /// set NVIDIA's 610.88 KMD registers: context-based (`CreateContext` hands the
 /// hHwContext to `CreateHwQueue`), so `CreateHwContext`, `DestroyHwContext` and
 /// `SwitchToHwContextList` stay NULL. `DestroyContext` keeps the shared entry,
-/// which tears a native TSG down first.
+/// which tears a native TSG down first. `PresentToHwQueue` is not in NVIDIA's
+/// table either, and ours only refuses, so it is left NULL here: a registered
+/// refusing slot would invite dxgkrnl to route HW-queue presents into a failure.
 fn register_nvidia_hws(data: &mut DRIVER_INITIALIZATION_DATA) {
     use ddi::hws;
+    data.DxgkDdiPresentToHwQueue = None;
     data.DxgkDdiCreateContext = Some(ddi::traced::hws_create_context);
     data.DxgkDdiCreateHwQueue = Some(hws::dxgkddi_create_hw_queue);
     data.DxgkDdiDestroyHwQueue = Some(hws::dxgkddi_destroy_hw_queue);
