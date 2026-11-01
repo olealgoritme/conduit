@@ -427,6 +427,8 @@ fn ensure_space(io: &Io<'_>, process: usize) -> Result<u32, Error> {
         &cc::vaspace_params_vidmm(),
     )?;
     STATE.lock().spaces.push((process, space));
+    crate::diag::record_named_bytes(b"NvSpaceProc", process as u32);
+    crate::diag::record_named_bytes(b"NvSpaceH", space);
     Ok(space)
 }
 
@@ -1008,6 +1010,22 @@ pub fn update_leaf(
     let mut made = Vec::new();
     for (piece, virt) in planned.iter().copied() {
         if let Err(error) = map_fixed(&io, memory, size, system_backed, space, virt, piece) {
+            // Who collided: the process key, the allocation, its space and how
+            // many allocations / tracked mappings of this process exist.
+            {
+                let state = STATE.lock();
+                let tracked = state
+                    .allocations
+                    .iter()
+                    .flat_map(|a| a.mappings.iter())
+                    .filter(|m| m.process == process)
+                    .count();
+                crate::diag::record_named_bytes(b"NvMapProc", process as u32);
+                crate::diag::record_named_bytes(b"NvMapId", id);
+                crate::diag::record_named_bytes(b"NvMapSpace", space);
+                crate::diag::record_named_bytes(b"NvMapTracked", tracked as u32);
+                crate::diag::record_named_bytes(b"NvMapSpaces", state.spaces.len() as u32);
+            }
             for mapping in made.iter().copied() {
                 let _ = unmap_fixed(&io, memory, mapping);
             }

@@ -702,6 +702,23 @@ impl NativeQueue {
     }
 
     pub(crate) fn destroy(&mut self, passive: PassiveLevel) -> Result<(), NativeError> {
+        // Where the GPU got to (NvQGpGet/NvQGpPut from USERD, NvQFence the
+        // progress fence), recorded for the last queue torn down.
+        if self.parts.ctl.va != 0 {
+            // SAFETY: the queue's live control view; USERD GP_GET/GP_PUT are
+            // four bytes each inside it.
+            let (get, put) = unsafe {
+                let userd = self.parts.ctl.va + cc::USERD_OFFSET;
+                (
+                    ((userd + u64::from(cp::USERD_GP_GET)) as *const u32).read_volatile(),
+                    ((userd + u64::from(cp::USERD_GP_PUT)) as *const u32).read_volatile(),
+                )
+            };
+            crate::diag::record_named_bytes(b"NvQGpGet", get);
+            crate::diag::record_named_bytes(b"NvQGpPut", put);
+            crate::diag::record_named_bytes(b"NvQFence", self.read_progress() as u32);
+            crate::diag::record_named_bytes(b"NvQToken", self.parts.token);
+        }
         let Some(adapter) = (unsafe { self.adapter.as_ref() }) else {
             return Ok(());
         };
