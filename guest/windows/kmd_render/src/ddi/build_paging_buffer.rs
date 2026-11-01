@@ -2244,7 +2244,7 @@ unsafe fn native_paging_operation(
                 flags & 1 != 0,
             ) {
                 Ok(()) => STATUS_SUCCESS,
-                Err(_) => STATUS_UNSUCCESSFUL,
+                Err(_) => native_refused(6, true),
             },
         );
     }
@@ -2257,7 +2257,7 @@ unsafe fn native_paging_operation(
     }
     if unsafe { KeGetCurrentIrql() } != PASSIVE_LEVEL_IRQL {
         note.result = dl::paging_result::BAD_IRQL;
-        return Some(STATUS_UNSUCCESSFUL);
+        return Some(native_refused(7, false));
     }
     // SAFETY: checked immediately above; all native RM and Mm operations are
     // synchronous PASSIVE-level work.
@@ -2286,10 +2286,45 @@ unsafe fn native_paging_operation(
     } else {
         dl::paging_result::SKIPPED
     };
+    let kind = match operation {
+        PagingOperation::UpdatePageTable(_) => 1,
+        PagingOperation::Transfer(_) => 2,
+        PagingOperation::Fill(_) => 3,
+        PagingOperation::VirtualFill(_) => 4,
+        PagingOperation::VirtualTransfer(_) => 5,
+        _ => 0,
+    };
     Some(match result {
         Ok(()) => STATUS_SUCCESS,
-        Err(()) => STATUS_UNSUCCESSFUL,
+        Err(()) => native_refused(kind, true),
     })
+}
+
+static NATIVE_REFUSED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// A native paging operation that could not run. BuildPagingBuffer may only answer success
+/// or a retry status: anything else is bugcheck 0x10E (VIDEO_MEMORY_MANAGEMENT_INTERNAL, 0xB).
+/// The operation is skipped like the legacy path's `SKIPPED`; `NvPgFail` names the last
+/// refused kind (1 leaf update, 2 transfer, 3 fill, 4 virtual fill, 5 virtual transfer,
+/// 6 residency, 7 above PASSIVE) and `NvPgFailN` counts them.
+fn native_refused(kind: u32, passive: bool) -> NTSTATUS {
+    let count = NATIVE_REFUSED.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+    if passive {
+        crate::diag::record_named_bytes(b"NvPgFail", kind);
+        crate::diag::record_named_bytes(b"NvPgFailN", count);
+    }
+    STATUS_SUCCESS
+}
+
+/// Whether VidMm's `segment` is where this native allocation lives: its memory segment, or
+/// the aperture segment for a system-memory backed one (`native_segment` 0, see
+/// `create_native_one`).
+fn native_segment_matches(
+    allocation: crate::ddi::create_allocation::PagingAllocInfo,
+    segment: u32,
+) -> bool {
+    segment == allocation.native_segment
+        || (allocation.native_segment == 0 && segment == crate::ddi::gpummu::APERTURE_SEGMENT_ID)
 }
 
 unsafe fn native_update_leaf(
@@ -2344,10 +2379,7 @@ unsafe fn native_update_leaf(
         // System-memory backed native allocations are placed in the aperture
         // segment (create_native_one); device-local ones in their memory segment.
         let segment = bits.Segment() as u32;
-        let aperture = crate::ddi::gpummu::APERTURE_SEGMENT_ID;
-        if segment != allocation.native_segment
-            && !(allocation.native_segment == 0 && segment == aperture)
-        {
+        if !native_segment_matches(allocation, segment) {
             fail(0x100 | segment);
             return Err(());
         }
@@ -2400,19 +2432,19 @@ unsafe fn native_transfer(
     let destination = unsafe { TransferEnd::destination(&transfer.Destination) };
     if transfer.Source.SegmentId != 0
         && transfer.Destination.SegmentId != 0
-        && transfer.Source.SegmentId == allocation.native_segment
-        && transfer.Destination.SegmentId == allocation.native_segment
+        && native_segment_matches(allocation, transfer.Source.SegmentId)
+        && native_segment_matches(allocation, transfer.Destination.SegmentId)
     {
         return Ok(());
     }
     let (mdl, to_native) = match (source, destination) {
         (TransferEnd::SystemMdl(mdl), TransferEnd::Segment)
-            if transfer.Destination.SegmentId == allocation.native_segment =>
+            if native_segment_matches(allocation, transfer.Destination.SegmentId) =>
         {
             (mdl, true)
         }
         (TransferEnd::Segment, TransferEnd::SystemMdl(mdl))
-            if transfer.Source.SegmentId == allocation.native_segment =>
+            if native_segment_matches(allocation, transfer.Source.SegmentId) =>
         {
             (mdl, false)
         }
@@ -2464,7 +2496,7 @@ unsafe fn native_fill(
     allocation: crate::ddi::create_allocation::PagingAllocInfo,
     fill: &_DXGKARG_BUILDPAGINGBUFFER__bindgen_ty_1__bindgen_ty_2,
 ) -> Result<(), ()> {
-    if fill.Destination.SegmentId != allocation.native_segment {
+    if !native_segment_matches(allocation, fill.Destination.SegmentId) {
         return Err(());
     }
     let size = fill.FillSize as u64;
