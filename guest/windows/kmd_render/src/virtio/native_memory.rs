@@ -955,11 +955,9 @@ pub fn update_leaf(
 
     // A changed live mapping is quiesced in RM before any old object is removed.
     // Fresh mappings need no such wait; permanent errors still cannot retire a fence.
-    if affected_old
-        .iter()
-        .map(|m| m.piece)
-        .ne(affected_new.iter().copied())
-    {
+    // (The unchanged case returned above, so only "replaces a live mapping" is
+    // left to test: quiescing every fresh mapping failed each first page-in.)
+    if !affected_old.is_empty() {
         super::native_channel::quiesce(passive, adapter, process).map_err(|_| Error::Busy)?;
     }
 
