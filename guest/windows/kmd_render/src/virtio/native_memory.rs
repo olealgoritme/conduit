@@ -144,6 +144,8 @@ struct State {
     client: Option<NativeClient>,
     allocations: Vec<Allocation>,
     spaces: Vec<(usize, u32)>,
+    /// Per-process space -> its low window (see [`LOW_WINDOW_BASE`]).
+    windows: Vec<(u32, u32)>,
     orphan_pins: Vec<Pin>,
     idle_spaces: Vec<usize>,
     next_handle: u32,
@@ -155,6 +157,7 @@ impl State {
             client: None,
             allocations: Vec::new(),
             spaces: Vec::new(),
+            windows: Vec::new(),
             orphan_pins: Vec::new(),
             idle_spaces: Vec::new(),
             next_handle: FIRST_DYNAMIC_HANDLE,
@@ -368,6 +371,7 @@ pub fn install_client(
     {
         let mut state = STATE.lock();
         state.spaces.clear();
+        state.windows.clear();
         state
             .spaces
             .try_reserve_exact(1)
@@ -426,54 +430,57 @@ fn ensure_space(io: &Io<'_>, process: usize) -> Result<u32, Error> {
         cc::FERMI_VASPACE_A,
         &cc::vaspace_params_vidmm(),
     )?;
-    STATE.lock().spaces.push((process, space));
+    // One virtual object over all of VidMm's low VAs, before RM maps anything
+    // of its own into the space: RM's first-fit internal mappings (GR context
+    // buffers) then land above 4.5 GiB, in the [4 GiB, 8 GiB) range the KMD
+    // reserves from VidMm, and every VidMm VA below 4 GiB is mapped inside
+    // this window at its exact address.
+    let window = match STATE.lock().mint() {
+        Ok(window) => window,
+        Err(error) => {
+            let _ = io.rm_free(nd::H_DEVICE, space);
+            return Err(error);
+        }
+    };
+    let params = cc::virtual_params(
+        io.client.root,
+        space,
+        Some(LOW_WINDOW_BASE),
+        LOW_WINDOW_END - LOW_WINDOW_BASE,
+    );
+    if let Err(error) = io.rm_alloc(nd::H_DEVICE, window, cc::NV50_MEMORY_VIRTUAL, &params) {
+        let _ = io.rm_free(nd::H_DEVICE, space);
+        return Err(error);
+    }
+    {
+        let mut state = STATE.lock();
+        state.spaces.push((process, space));
+        let _ = state.windows.try_reserve(1);
+        state.windows.push((space, window));
+    }
     crate::diag::record_named_bytes(b"NvSpaceProc", process as u32);
     crate::diag::record_named_bytes(b"NvSpaceH", space);
-    crate::diag::record_named_bytes(b"NvProbeNew", probe_space(io, space));
     Ok(space)
 }
 
-/// Diagnosis: can a fixed 64-KiB virtual object be placed at 0x4000000 (the
-/// D3D11 UMD's GPFIFO VA) in `space` right now? 0 = yes (and freed again),
-/// otherwise the RM status / error code.
-fn probe_space(io: &Io<'_>, space: u32) -> u32 {
-    let Ok(virt) = STATE.lock().mint() else {
-        return 0xffff_fffd;
-    };
-    let params = cc::virtual_params(io.client.root, space, Some(0x400_0000), 0x1_0000);
-    match io.rm_alloc(nd::H_DEVICE, virt, cc::NV50_MEMORY_VIRTUAL, &params) {
-        Ok(_) => {
-            let _ = io.rm_free(nd::H_DEVICE, virt);
-            0
-        }
-        Err(_) => 1,
-    }
+/// The low window of a per-process space: [64 KiB, 4 GiB), VidMm's fences
+/// (0x10000) and the UMDs' low VAs included.
+const LOW_WINDOW_BASE: u64 = 0x1_0000;
+const LOW_WINDOW_END: u64 = 0x1_0000_0000;
+
+fn window_of(space: u32) -> Option<u32> {
+    STATE
+        .lock()
+        .windows
+        .iter()
+        .find(|(owner, _)| *owner == space)
+        .map(|(_, window)| *window)
 }
 
-/// [`probe_space`] on `process`'s space (diagnosis, after context creation).
-pub fn probe_process_space(passive: PassiveLevel, adapter: &AdapterContext, process: usize) -> u32 {
-    let Ok(_guard) = lock(passive) else {
-        return 0xffff_fffe;
-    };
-    let Ok(client) = STATE.lock().client() else {
-        return 0xffff_ffff;
-    };
-    let io = Io {
-        passive,
-        adapter,
-        client,
-    };
-    let space = STATE
-        .lock()
-        .spaces
-        .iter()
-        .find(|(owner, _)| *owner == process)
-        .map(|(_, space)| *space);
-    match space {
-        Some(space) => probe_space(&io, space),
-        None => 0xffff_fffc,
-    }
+fn is_window(virt: u32) -> bool {
+    STATE.lock().windows.iter().any(|(_, window)| *window == virt)
 }
+
 
 /// Validate a UMD GPFIFO allocation before it becomes a hardware queue. The
 /// entire ring must be covered by one live native mapping at the exact VA.
@@ -819,8 +826,17 @@ fn map_fixed(
     space: u32,
     virt: u32,
     piece: nm::MappingPiece,
-) -> Result<(), Error> {
+) -> Result<u32, Error> {
     nm::validate_piece(piece, allocation_size).map_err(|_| Error::Invalid)?;
+    let flags = if system_backed {
+        cc::MAP_FLAGS_SYSMEM
+    } else {
+        LOCAL_4K_MAP_FLAGS
+    };
+    let end = piece.end().ok_or(Error::Invalid)?;
+    if let Some(window) = window_of(space).filter(|_| piece.va >= LOW_WINDOW_BASE && end <= LOW_WINDOW_END) {
+        return map_in_window(io, memory, window, flags, piece);
+    }
     let params = cc::virtual_params(io.client.root, space, Some(piece.va), piece.len);
     io.rm_alloc(nd::H_DEVICE, virt, cc::NV50_MEMORY_VIRTUAL, &params)
         .inspect_err(|_| {
@@ -828,11 +844,6 @@ fn map_fixed(
             crate::diag::record_named_bytes(b"NvMapVaPg", (piece.va >> 12) as u32);
             crate::diag::record_named_bytes(b"NvMapLenPg", (piece.len >> 12) as u32);
         })?;
-    let flags = if system_backed {
-        cc::MAP_FLAGS_SYSMEM
-    } else {
-        LOCAL_4K_MAP_FLAGS
-    };
     let block = nm::nvos46_range(
         io.client.root,
         nd::H_DEVICE,
@@ -883,7 +894,61 @@ fn map_fixed(
         let _ = io.rm_free(nd::H_DEVICE, virt);
         return Err(Error::WrongAddress);
     }
-    Ok(())
+    Ok(virt)
+}
+
+/// `NVOS46_FLAGS_DMA_OFFSET_FIXED_TRUE`: for a virtual object, `dmaOffset` is
+/// the absolute VA of the mapping inside it.
+const MAP_FLAGS_DMA_OFFSET_FIXED: u32 = 1 << 15;
+
+/// Map `piece` at its exact VA inside the space's low window (no virtual object
+/// of its own). Returns the window handle, which the mapping records.
+fn map_in_window(
+    io: &Io<'_>,
+    memory: u32,
+    window: u32,
+    flags: u32,
+    piece: nm::MappingPiece,
+) -> Result<u32, Error> {
+    let mut block = nm::nvos46_range(
+        io.client.root,
+        nd::H_DEVICE,
+        window,
+        memory,
+        piece.memory_offset,
+        piece.len,
+        flags | MAP_FLAGS_DMA_OFFSET_FIXED,
+    );
+    block[cc::NVOS46_DMA_OFFSET_AT..cc::NVOS46_DMA_OFFSET_AT + 8]
+        .copy_from_slice(&piece.va.to_le_bytes());
+    let mut response = [0u8; REPLY_MAX];
+    let n = io.exchange(
+        io.client.ctl,
+        rc::nv_cmd(cc::ESC_RM_MAP_MEMORY_DMA, cc::NVOS46_BYTES as u32),
+        &block,
+        &[],
+        &mut response,
+    )?;
+    let reply = response.get(..n).ok_or(Error::Host)?;
+    let reply = rc::rm_reply(reply, cc::NVOS46_STATUS_AT).map_err(|error| {
+        crate::diag::record_named_bytes(b"NvRmWinSt", rm_error_code(error));
+        crate::diag::record_named_bytes(b"NvMapVaPg", (piece.va >> 12) as u32);
+        Error::Host
+    })?;
+    let got = cc::map_dma_va(reply.data).ok_or(Error::Host)?;
+    if got != piece.va {
+        let unmap = nm::nvos47_unmap(io.client.root, nd::H_DEVICE, window, memory, got);
+        let mut ignored = [0u8; REPLY_MAX];
+        let _ = io.exchange(
+            io.client.ctl,
+            rc::nv_cmd(cc::ESC_RM_UNMAP_MEMORY_DMA, cc::NVOS47_BYTES as u32),
+            &unmap,
+            &[],
+            &mut ignored,
+        );
+        return Err(Error::WrongAddress);
+    }
+    Ok(window)
 }
 
 fn unmap_fixed(io: &Io<'_>, memory: u32, mapping: HostMapping) -> Result<(), Error> {
@@ -904,6 +969,10 @@ fn unmap_fixed(io: &Io<'_>, memory: u32, mapping: HostMapping) -> Result<(), Err
     )?;
     rc::rm_reply(response.get(..n).ok_or(Error::Host)?, cc::NVOS47_STATUS_AT)
         .map_err(|_| Error::Host)?;
+    if is_window(mapping.virt) {
+        // The space's low window outlives its mappings (`release_process`).
+        return Ok(());
+    }
     io.rm_free(nd::H_DEVICE, mapping.virt)
 }
 
@@ -1052,7 +1121,8 @@ pub fn update_leaf(
 
     let mut made = Vec::new();
     for (piece, virt) in planned.iter().copied() {
-        if let Err(error) = map_fixed(&io, memory, size, system_backed, space, virt, piece) {
+        let mapped = map_fixed(&io, memory, size, system_backed, space, virt, piece);
+        if let Err(error) = mapped {
             // Who collided: the process key, the allocation, its space and how
             // many allocations / tracked mappings of this process exist.
             {
@@ -1084,7 +1154,7 @@ pub fn update_leaf(
                         break;
                     }
                 };
-                if map_fixed(
+                let Ok(virt) = map_fixed(
                     &io,
                     memory,
                     size,
@@ -1092,12 +1162,10 @@ pub fn update_leaf(
                     space,
                     virt,
                     old_mapping.piece,
-                )
-                .is_err()
-                {
+                ) else {
                     rollback_ok = false;
                     break;
-                }
+                };
                 rollback.push(HostMapping {
                     virt,
                     ..old_mapping
@@ -1123,7 +1191,8 @@ pub fn update_leaf(
         made.push(HostMapping {
             process,
             piece,
-            virt,
+            // The window's handle when the piece went into the low window.
+            virt: mapped.unwrap_or(virt),
         });
     }
 
@@ -1652,7 +1721,7 @@ pub fn destroy(passive: PassiveLevel, adapter: &AdapterContext, id: u32) -> Resu
             .lock()
             .allocation_mut(id)?
             .mappings
-            .retain(|live| live.virt != mapping.virt);
+            .retain(|live| !(live.virt == mapping.virt && live.piece.va == mapping.piece.va));
     }
     io.rm_free(nd::H_DEVICE, memory)?;
     let mut allocation = {
@@ -1710,7 +1779,9 @@ pub fn release_process(passive: PassiveLevel, adapter: &AdapterContext, process:
     for (id, memory, mapping) in owned {
         if unmap_fixed(&io, memory, mapping).is_ok() {
             if let Ok(allocation) = STATE.lock().allocation_mut(id) {
-                allocation.mappings.retain(|live| live.virt != mapping.virt);
+                allocation
+                    .mappings
+                    .retain(|live| !(live.virt == mapping.virt && live.piece.va == mapping.piece.va));
             }
         } else {
             kept += 1;
@@ -1724,6 +1795,11 @@ pub fn release_process(passive: PassiveLevel, adapter: &AdapterContext, process:
             .find(|(owner, _)| *owner == process)
             .map(|(_, space)| *space);
         if let Some(space) = space {
+            if let Some(window) = window_of(space) {
+                if io.rm_free(nd::H_DEVICE, window).is_ok() {
+                    STATE.lock().windows.retain(|(owner, _)| *owner != space);
+                }
+            }
             if io.rm_free(nd::H_DEVICE, space).is_ok() {
                 STATE.lock().spaces.retain(|(owner, _)| *owner != process);
             } else {
@@ -1767,6 +1843,7 @@ pub fn forget(passive: PassiveLevel) {
     let mut allocations = core::mem::take(&mut state.allocations);
     state.client = None;
     state.spaces.clear();
+    state.windows.clear();
     state.idle_spaces.clear();
     drop(state);
     for allocation in allocations.iter_mut() {

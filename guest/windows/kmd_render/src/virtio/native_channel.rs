@@ -468,15 +468,6 @@ impl NativeContext {
         let epoch = native.epoch;
         restore_process(process, native);
         result?;
-        // Diagnosis: is 0x4000000 still free after the TSG and ctxshare exist?
-        crate::diag::record_named_bytes(
-            b"NvProbeCtx",
-            super::native_memory::probe_process_space(
-                passive,
-                adapter,
-                process as *const ProcessContext as usize,
-            ),
-        );
         Ok(Self {
             adapter: adapter as *const AdapterContext as *mut AdapterContext,
             process,

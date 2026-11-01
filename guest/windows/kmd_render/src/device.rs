@@ -933,9 +933,9 @@ pub unsafe extern "C" fn dxgkddi_create_process(
 
 /// The GPU VA NVIDIA's 610.88 KMD reserves from VidMm in every process
 /// (`DxgkCbReserveGpuVirtualAddressRange` at CreateProcess, from the L3
-/// capture): VidMm never hands these out, so RM's own mappings (confined to
-/// [4 GiB, 4.5 GiB) by `VASPACE_FLAGS_VA_INTERNAL_LIMIT`) cannot collide with
-/// a VidMm-assigned allocation VA. Without them RM's context buffers took VAs
+/// capture): VidMm never hands these out, so RM's own mappings (which land
+/// above 4.5 GiB once `native_memory`'s low window fills [64 KiB, 4 GiB))
+/// cannot collide with a VidMm-assigned allocation VA. Without them RM's context buffers took VAs
 /// VidMm later gave the D3D11 UMD's GPFIFO (NV_ERR_INSUFFICIENT_RESOURCES).
 /// `NvVaRsvSt` records a refused reservation's status.
 fn reserve_nvidia_va(adapter: &AdapterContext, process: HANDLE, system: bool) {

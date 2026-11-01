@@ -294,14 +294,22 @@ pub const RM_INTERNAL_VA_SIZE: u64 = 0x2000_0000;
 /// `NV_VASPACE_ALLOCATION_INDEX_GPU_NEW`: create a new VA space.
 pub const VASPACE_INDEX_GPU_NEW: u32 = 0;
 
-/// A NEW per-process VA space whose addresses VidMm assigns, as NVIDIA's
-/// Windows KMD creates them: RM's internal mappings are confined to the window
-/// the KMD reserves from VidMm. (`GPU_DEVICE` would hand every process the one
-/// device VA space, and the processes' VidMm VAs would collide in it.)
+/// `NV_VASPACE_ALLOCATION_FLAGS_ALLOW_ZERO_ADDRESS`: the space starts at 0, so
+/// VidMm's low VAs (monitored fences at 0x10000) are mappable.
+pub const VASPACE_FLAGS_ALLOW_ZERO_ADDRESS: u32 = 1 << 8;
+
+/// A NEW per-process VA space whose addresses VidMm assigns. (`GPU_DEVICE`
+/// would hand every process the one device VA space, and the processes' VidMm
+/// VAs would collide in it.) Not `VA_INTERNAL_LIMIT`: under GSP its internal
+/// window is exactly the server-RM-owned [4 GiB, 4.5 GiB), and kernel RM could
+/// map no GR context buffer (kgraphicsMapCtxBuffer NV_ERR_NO_MEMORY). The KMD
+/// instead fills [64 KiB, 4 GiB) with one window object up front, so RM's
+/// first-fit internal mappings land above 4.5 GiB, inside the range reserved
+/// from VidMm.
 pub fn vaspace_params_vidmm() -> [u8; VASPACE_BYTES] {
     let mut a = [0u8; VASPACE_BYTES];
     put32(&mut a, 0, VASPACE_INDEX_GPU_NEW);
-    put32(&mut a, 4, VASPACE_FLAGS_VA_INTERNAL_LIMIT);
+    put32(&mut a, 4, VASPACE_FLAGS_ALLOW_ZERO_ADDRESS);
     a
 }
 
@@ -1433,11 +1441,11 @@ mod tests {
     }
 
     #[test]
-    fn per_process_vaspaces_are_new_with_the_windows_internal_window() {
+    fn per_process_vaspaces_are_new_and_start_at_zero() {
         let b = vaspace_params_vidmm();
         assert_eq!(b.len(), VASPACE_BYTES);
-        // index GPU_NEW (0), flags VA_INTERNAL_LIMIT (bit 7), everything else zero.
-        assert_eq!(sparse(&b), [(4, 0x80)]);
+        // index GPU_NEW (0), flags ALLOW_ZERO_ADDRESS (bit 8), everything else zero.
+        assert_eq!(sparse(&b), [(5, 0x01)]);
         // The shared device space stays index GPU_DEVICE.
         assert_eq!(sparse(&vaspace_params()), [(0, 3)]);
     }
