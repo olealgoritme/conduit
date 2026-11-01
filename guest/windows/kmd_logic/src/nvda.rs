@@ -38,6 +38,9 @@ pub const PSEUDO_CLIENT_CUDA: u32 = 0xff02_8010;
 pub const PSEUDO_DEVICE: u32 = 0xff02_0000;
 pub const PSEUDO_DEVICE_CUDA: u32 = 0xff02_0010;
 pub const PSEUDO_SUBDEVICE: u32 = 0xff03_0000;
+/// The escape context's KernelGraphicsContext (NV0090) in UMD RM controls.
+pub const PSEUDO_GRAPHICS_CONTEXT: u32 = 0xff04_0000;
+pub const NV0090_CTRL_CMD_SET_LG_SECTOR_PROMOTION: u32 = 0x0090_010b;
 
 /// The validated fixed part of an NVDA escape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -418,6 +421,31 @@ pub fn apply_local(
             // result words with a 0x30-byte reply; the request tail is kept.
             exact(buf, 0x3c)?;
             put32(buf, NVDA_SIZE_AT, NVDA_COMMON_HEADER_BYTES as u32);
+            put32(buf, NVDA_RESULT_AT, 1);
+            put32(buf, NVDA_RESULT2_AT, 1);
+        }
+        0x0100_006b => {
+            // Device-scoped 0x268-byte request the D3D11 UMD makes before its
+            // first resource allocations (+0x30 = 4, +0x38 varies per run).
+            // The 610.88 capture answers it like 0x01000090.
+            exact(buf, 0x268)?;
+            put32(buf, NVDA_SIZE_AT, NVDA_COMMON_HEADER_BYTES as u32);
+            put32(buf, NVDA_RESULT_AT, 1);
+            put32(buf, NVDA_RESULT2_AT, 1);
+        }
+        function
+            if is_rm_control_function(function)
+                && parse_rm_control(buf).is_ok_and(|c| {
+                    c.cmd == NV0090_CTRL_CMD_SET_LG_SECTOR_PROMOTION
+                        && c.h_object == PSEUDO_GRAPHICS_CONTEXT
+                }) =>
+        {
+            // NV0090 SET_LG_SECTOR_PROMOTION on the escape's context's
+            // KernelGraphicsContext (pseudo handle 0xff040000), sent by the D3D11
+            // UMD after its first queue. That object is RM-internal to the
+            // channel group and has no client handle here; the control is an L2
+            // promotion hint. Answered as the 610.88 capture shows (result 1
+            // in both result words, params untouched), not forwarded.
             put32(buf, NVDA_RESULT_AT, 1);
             put32(buf, NVDA_RESULT2_AT, 1);
         }
@@ -1051,6 +1079,44 @@ mod tests {
         }
         let mut short = local_request(0x0100_0152, 0x3d);
         assert_eq!(apply_local(&mut short, 0, 0), Err(LocalError::Invalid));
+    }
+
+    #[test]
+    fn query_006b_matches_the_capture() {
+        let mut buf = local_request(0x0100_006b, 0x268);
+        buf[0x30..0x34].copy_from_slice(&4u32.to_le_bytes());
+        buf[0x38..0x3c].copy_from_slice(&0x3264u32.to_le_bytes());
+        let before = buf.clone();
+        assert_eq!(apply_local(&mut buf, 0, 0), Ok(LocalOutcome::Applied));
+        assert_eq!(&buf[0x08..0x0c], &0x30u32.to_le_bytes());
+        assert_eq!(&buf[0x14..0x18], &1u32.to_le_bytes());
+        assert_eq!(&buf[0x2c..0x30], &1u32.to_le_bytes());
+        for at in (0..buf.len()).filter(|a| !(0x08..0x0c).contains(a) && !(0x14..0x18).contains(a) && !(0x2c..0x30).contains(a)) {
+            assert_eq!(buf[at], before[at], "byte {at:#x}");
+        }
+        let mut short = local_request(0x0100_006b, 0x267);
+        assert_eq!(apply_local(&mut short, 0, 0), Err(LocalError::Invalid));
+    }
+
+    #[test]
+    fn lg_sector_promotion_is_answered_as_captured() {
+        // 610.88 D3D11: fn 0x0500002b, hObject 0xff040000, cmd 0x0090010b, 4 bytes = 1.
+        let mut buf = local_request(0x0500_002b, NVDA_HEADER_BYTES + 4);
+        test_put32(&mut buf, RM_H_OBJECT_AT, PSEUDO_GRAPHICS_CONTEXT);
+        test_put32(&mut buf, RM_CMD_AT, NV0090_CTRL_CMD_SET_LG_SECTOR_PROMOTION);
+        test_put32(&mut buf, RM_PARAMS_SIZE_AT, 4);
+        test_put32(&mut buf, RM_PARAMS_AT, 1);
+        let before = buf.clone();
+        assert_eq!(apply_local(&mut buf, 0, 0), Ok(LocalOutcome::Applied));
+        assert_eq!(&buf[0x14..0x18], &1u32.to_le_bytes());
+        assert_eq!(&buf[0x2c..0x30], &1u32.to_le_bytes());
+        for at in (0..buf.len()).filter(|a| !(0x14..0x18).contains(a) && !(0x2c..0x30).contains(a)) {
+            assert_eq!(buf[at], before[at], "byte {at:#x}");
+        }
+        // Any other control on that object is still forwarded (and refused there).
+        let mut other = before.clone();
+        test_put32(&mut other, RM_CMD_AT, 0x0090_0101);
+        assert_eq!(apply_local(&mut other, 0, 0), Ok(LocalOutcome::ForwardRmControl));
     }
 
     #[test]
