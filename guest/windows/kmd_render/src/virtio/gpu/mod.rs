@@ -2102,6 +2102,12 @@ struct WddmPending {
     /// The WDDM node it was submitted on (`D3d12Node`); completion is in order
     /// per node.
     node: u8,
+    /// NVIDIA personality only: a software HW queue submission (`ddi::hws`).
+    /// It completes like every other entry, but reports its queue's progress
+    /// fence and `MONITORED_FENCE_SIGNALED` instead of `DMA_COMPLETED`; `fence`
+    /// is then 0 and takes no part in the node's SubmissionFenceId sequence.
+    /// Always `None` in the default personality.
+    hw_queue: Option<crate::ddi::hws::HwQueueDone>,
 }
 
 // ---- WDDM nodes (`D3d12Node`) ---------------------------------------------------
@@ -2408,6 +2414,12 @@ impl WddmReady {
 
     pub(crate) fn terminal_prefix(&self) -> Option<WindowedBltTerminalPrefix> {
         self.terminal_prefix
+    }
+
+    /// `Some` for a software HW queue submission (`ddi::hws`): deliver its
+    /// progress fence and `MONITORED_FENCE_SIGNALED`, never `DMA_COMPLETED`.
+    pub(crate) fn hw_queue(&self) -> Option<crate::ddi::hws::HwQueueDone> {
+        self.pending.hw_queue
     }
 
     /// Consume the token after `DMA_COMPLETED` was delivered successfully.
@@ -8096,14 +8108,21 @@ impl VirtioGpu {
     /// every undispatched request loses its residency proof. Submitted host
     /// copies keep their reader until ring completion but no longer retain a
     /// terminal WDDM membership that the reset destroyed.
+    ///
+    /// Software HW queue entries (`ddi::hws`, NVIDIA personality) leave too, but
+    /// nothing resubmits them and their queue's progress fence is the only
+    /// completion dxgkrnl waits on, so their fences are written here (the reset
+    /// ended their work) and the returned mask names the nodes owed a
+    /// `MONITORED_FENCE_SIGNALED`. They are not counted in the dropped total.
     pub fn terminal_abandon_wddm_epoch(
         &mut self,
         _order: &crate::adapter::NotifyOrdered<'_>,
         // `Some(node)`: only that node's entries (ResetEngine, `D3d12Node`);
         // `None`: every node (ResetFromTimeout).
         node: Option<u32>,
-    ) -> u32 {
+    ) -> (u32, u32) {
         let mut n = 0u32;
+        let mut hw_queue_nodes = 0u32;
         let mut i = 0;
         while i < self.wddm_pending.len() {
             if node.is_some_and(|node| u32::from(self.wddm_pending[i].node) != node) {
@@ -8113,7 +8132,15 @@ impl VirtioGpu {
             let Some(pending) = self.wddm_pending.remove(i) else {
                 break;
             };
-            n += 1;
+            if let Some(done) = pending.hw_queue {
+                done.write();
+                crate::ddi::hws::note_soft_abandoned();
+                if pending.node < 32 {
+                    hw_queue_nodes |= 1 << pending.node;
+                }
+            } else {
+                n += 1;
+            }
             if let Some(prefix) = pending
                 .blt_token
                 .zip(pending.blt_stream_boundary)
@@ -8125,7 +8152,7 @@ impl VirtioGpu {
         // The WindowedBlt ledger is node 0's (presents); a D3D12-node reset
         // leaves it.
         if node.is_some_and(|node| node != 0) {
-            return n;
+            return (n, hw_queue_nodes);
         }
         while let Some((token, boundary, adapter)) =
             self.windowed_blt.pending.iter().find_map(|request| {
@@ -8144,6 +8171,36 @@ impl VirtioGpu {
         }
         self.windowed_blt.ready.clear();
         self.windowed_blt.terminal.clear();
+        (n, hw_queue_nodes)
+    }
+
+    /// NVIDIA personality: `DestroyHwQueue` of a software HW queue (`ddi::hws`).
+    /// Its entries leave the FIFO WITHOUT a fence write: the progress-fence
+    /// storage goes away with the queue. Returns how many were removed.
+    pub fn purge_hw_queue(
+        &mut self,
+        _order: &crate::adapter::NotifyOrdered<'_>,
+        queue: usize,
+    ) -> u32 {
+        let mut n = 0u32;
+        let mut i = 0;
+        while i < self.wddm_pending.len() {
+            if self.wddm_pending[i].hw_queue.map_or(true, |done| done.queue() != queue) {
+                i += 1;
+                continue;
+            }
+            let Some(pending) = self.wddm_pending.remove(i) else {
+                break;
+            };
+            n += 1;
+            if let Some(prefix) = pending
+                .blt_token
+                .zip(pending.blt_stream_boundary)
+                .and_then(|(token, boundary)| WindowedBltTerminalPrefix::new(token, boundary))
+            {
+                self.abandon_windowed_blt_wddm_prefix(prefix);
+            }
+        }
         n
     }
 
@@ -8312,13 +8369,20 @@ impl VirtioGpu {
         gdi_seq: Option<u64>,
         // The WDDM node (`D3d12Node`); 0 unless the adapter reports two.
         node: u32,
+        // NVIDIA personality: a software HW queue submission (`ddi::hws`), which
+        // completes through its progress fence. `None` on every other path.
+        hw_queue: Option<crate::ddi::hws::HwQueueDone>,
     ) -> bool {
         let node = node.min(MAX_WDDM_NODES as u32 - 1) as u8;
         if self.failed {
             // Transport failure is not producer completion. Let the scheduler
             // reset the failed epoch; never advance its successful watermark.
+            //
+            // A software HW queue submission is the exception: no scheduler reset
+            // reaches this FIFO for it, so "signal now" (its work can no longer
+            // run) is the only completion it will ever get.
             WDDM_SIGNAL_AFTER_FAILURE.fetch_add(1, Ordering::Relaxed);
-            return false;
+            return hw_queue.is_some();
         }
         let mut execution =
             execution_boundary.and_then(helios_kmd_logic::execution_completion::Wait::new);
@@ -8614,7 +8678,8 @@ impl VirtioGpu {
             // Fail the transport and retain the FIFO until scheduler reset.
             WDDM_PENDING_OVERFLOWS.fetch_add(1, Ordering::Relaxed);
             self.failed = true;
-            return false;
+            // As in the `failed` arm above: a HW-queue submission completes now.
+            return hw_queue.is_some();
         }
         self.wddm_pending.push_back(WddmPending {
             fence,
@@ -8631,6 +8696,7 @@ impl VirtioGpu {
             gdi_seq,
             queued_100ns: qd_now_100ns(),
             node,
+            hw_queue,
         });
         false
     }
@@ -9101,11 +9167,16 @@ impl VirtioGpu {
         node: Option<u32>,
     ) -> u32 {
         let before = self.wddm_pending.len();
+        // Software HW queue entries (`ddi::hws`, NVIDIA personality) stay: they
+        // are not part of the preempted SubmissionFenceId stream and dxgkrnl
+        // never resubmits them, so dropping one would lose its progress fence.
+        // With none queued (always, in the default personality) this is the old
+        // clear/retain.
         match node {
-            None => self.wddm_pending.clear(),
+            None => self.wddm_pending.retain(|pending| pending.hw_queue.is_some()),
             Some(node) => self
                 .wddm_pending
-                .retain(|pending| u32::from(pending.node) != node),
+                .retain(|pending| u32::from(pending.node) != node || pending.hw_queue.is_some()),
         }
         let n = (before - self.wddm_pending.len()) as u32;
         // WindowedBlt admission is node 0's (presents); a D3D12-node preempt

@@ -290,14 +290,34 @@ pub(crate) fn drain_used_and_complete(adapter: &AdapterContext) {
                 let _ = guard.with_virtio(|o, v| v.requeue_wddm_front(o, ready));
                 break;
             };
-            // SAFETY: the WDDM notification lock is held; the helper
-            // raises to DIRQL for the callback without re-locking.
-            let status = unsafe {
-                super::submit_command::signal_dma_completed(guard, dxgkrnl, ready.fence(), ready.node())
+            // NVIDIA personality: a software HW queue submission (`ddi::hws`)
+            // reports its queue's progress fence and MONITORED_FENCE_SIGNALED, not
+            // DMA_COMPLETED; it is not part of the node's SubmissionFenceId
+            // sequence. Every other entry (all of them in the default
+            // personality) takes the DMA_COMPLETED arm unchanged.
+            let hw_queue = ready.hw_queue();
+            let status = match hw_queue {
+                // SAFETY: as below; the fence storage lives until DestroyHwQueue,
+                // which purges the queue's entries under this same lock.
+                Some(done) => unsafe {
+                    super::hws::complete_soft_submission(dxgkrnl, &done, ready.node())
+                },
+                // SAFETY: the WDDM notification lock is held; the helper
+                // raises to DIRQL for the callback without re-locking.
+                None => unsafe {
+                    super::submit_command::signal_dma_completed(
+                        guard,
+                        dxgkrnl,
+                        ready.fence(),
+                        ready.node(),
+                    )
+                },
             };
             if status == STATUS_SUCCESS {
                 // Flush-gate trace (atomics only; one load when no `HEFL` fence is queued).
-                super::flush_trace::note_retire(ready.fence(), ready.rebased());
+                if hw_queue.is_none() {
+                    super::flush_trace::note_retire(ready.fence(), ready.rebased());
+                }
                 let terminal_prefix = ready.terminal_prefix();
                 ready.delivered();
                 if let Some(prefix) = terminal_prefix {

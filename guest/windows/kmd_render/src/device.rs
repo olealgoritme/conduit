@@ -151,6 +151,19 @@ pub struct ContextContext {
     /// NVIDIA personality only: what the WDDM 2.7 scheduling DDIs stored for
     /// this context (`ddi::hws`). Plain atomics; untouched otherwise.
     hws: crate::ddi::hws::ContextSched,
+    /// `DXGKARG_CREATECONTEXT.Flags.Value`. Read by the NVIDIA personality's
+    /// software HW queues (`ddi::hws`) to tell dxgkrnl's own contexts apart.
+    create_flags: u32,
+    /// NVIDIA personality only: the context was created with NVDA private data
+    /// (native TSG or not). Always `false` in the default personality.
+    nvda: bool,
+    /// NVIDIA personality only: live software HW queues on this context
+    /// (`ddi::hws::SoftQueue`). 0 in the default personality.
+    soft_queues: AtomicU32,
+    /// NVIDIA personality only: a `SignalMonitoredFence` held for the next
+    /// software-queue submission on this context (`ddi::hws`). Never set in the
+    /// default personality.
+    smf_stash: crate::sync::SpinLock<Option<helios_kmd_logic::hws::FenceWrite>>,
 }
 
 /// Typed borrowed view of a scheduler context handle.
@@ -215,6 +228,28 @@ impl<'a> ContextHandleRef<'a> {
     /// NVIDIA personality: the scheduling state `ddi::hws` stores.
     pub(crate) fn hws(&self) -> &'a crate::ddi::hws::ContextSched {
         &self.context.hws
+    }
+
+    /// `DXGKARG_CREATECONTEXT.Flags.Value` of this context.
+    pub fn create_flags(&self) -> u32 {
+        self.context.create_flags
+    }
+
+    /// NVIDIA personality: created with NVDA private data.
+    pub(crate) fn nvda(&self) -> bool {
+        self.context.nvda
+    }
+
+    /// NVIDIA personality: the live software HW queue count (`ddi::hws`).
+    pub(crate) fn soft_queues(&self) -> &'a AtomicU32 {
+        &self.context.soft_queues
+    }
+
+    /// NVIDIA personality: the held `SignalMonitoredFence` (`ddi::hws`).
+    pub(crate) fn smf_stash(
+        &self,
+    ) -> &'a crate::sync::SpinLock<Option<helios_kmd_logic::hws::FenceWrite>> {
+        &self.context.smf_stash
     }
 
     pub fn belongs_to_device(&self, device: HANDLE) -> bool {
@@ -713,12 +748,13 @@ pub unsafe extern "C" fn dxgkddi_create_context(
     create_context: *mut DXGKARG_CREATECONTEXT,
 ) -> NTSTATUS {
     // SAFETY: forwarded unchanged; `create_context_with` null-checks both.
-    unsafe { create_context_with(h_device, create_context, None) }
+    unsafe { create_context_with(h_device, create_context, None, false) }
 }
 
 /// The body of [`dxgkddi_create_context`], with the NVIDIA personality's native
-/// TSG (`ddi::hws`) attached when it built one. `native` is always `None` on the
-/// default path, which this keeps byte-for-byte as it was.
+/// TSG (`ddi::hws`) attached when it built one. `native` is always `None` and
+/// `nvda` always `false` on the default path, which this keeps byte-for-byte as
+/// it was.
 ///
 /// # Safety
 /// As `DxgkDdiCreateContext`.
@@ -726,6 +762,7 @@ pub(crate) unsafe fn create_context_with(
     h_device: *mut c_void,
     create_context: *mut DXGKARG_CREATECONTEXT,
     native: Option<Box<crate::virtio::native_channel::NativeContext>>,
+    nvda: bool,
 ) -> NTSTATUS {
     crate::diag::record(0x0800_0001);
     if h_device.is_null() || create_context.is_null() {
@@ -759,6 +796,10 @@ pub(crate) unsafe fn create_context_with(
         node_ordinal: args.NodeOrdinal,
         native,
         hws: crate::ddi::hws::ContextSched::new(),
+        create_flags,
+        nvda,
+        soft_queues: AtomicU32::new(0),
+        smf_stash: crate::sync::SpinLock::new(None),
     });
     args.hContext = Box::into_raw(ctx) as HANDLE;
     // `GdiAccel`: GDI contexts are counted and remembered (their submissions name their job by

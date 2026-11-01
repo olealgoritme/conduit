@@ -1074,12 +1074,22 @@ fn note_and_maybe_signal(
     gdi_seq: Option<u64>,
     // The WDDM node the submission is on (`D3d12Node`).
     node: u32,
+    // NVIDIA personality: a software HW queue submission (`ddi::hws`). It is
+    // gated exactly as a DMA submission, and completes with its queue's progress
+    // fence + `MONITORED_FENCE_SIGNALED` instead of `DMA_COMPLETED`. `None` on
+    // both legacy SubmitCommand DDIs.
+    hw_queue: Option<crate::ddi::hws::HwQueueDone>,
 ) -> SubmitAck {
     let Ok(dxgkrnl) = adapter.dxgkrnl() else {
         // Effectively unreachable: dxgkrnl is set at StartDevice and never
         // cleared, and SubmitCommand cannot precede it. The submission stays in
         // the FIFO for the DPC either way.
         DMA_NOTIFY_FAILS.fetch_add(1, Ordering::Relaxed);
+        // A HW-queue submission is in no FIFO yet: write its fence, so nothing
+        // waits on it forever (no interrupt can be raised without dxgkrnl).
+        if let Some(done) = hw_queue {
+            done.write();
+        }
         // The pending record was already taken: record it so the trace stays consistent
         // (nothing delivered, nothing tracked).
         if let Some(trace) = trace {
@@ -1087,6 +1097,9 @@ fn note_and_maybe_signal(
         }
         return SubmitAck::Accepted;
     };
+    // A HW-queue completion whose MONITORED_FENCE_SIGNALED could not be raised:
+    // the node, for a retry outside the notification lock.
+    let mut retry_node = None;
     adapter.with_wddm_notify_lock(|guard| {
         let signal_now = guard
             .with_virtio(|o, v| {
@@ -1120,15 +1133,28 @@ fn note_and_maybe_signal(
                     execution_boundary_value,
                     gdi_seq,
                     node,
+                    hw_queue,
                 )
             })
             // Transport down (bring-up / teardown): no venus work can gate it.
-            .unwrap_or(false);
+            // A HW-queue submission completes now: no FIFO holds it and no
+            // scheduler reset reaches it, so this is its only completion.
+            .unwrap_or(hw_queue.is_some());
         // What became of the fence, for the trace (recorded below, still under the
         // notification lock, so the completion DPC cannot retire a queued fence before its
         // submit is recorded).
         let mut disposition = crate::ddi::flush_trace::Disposition::Queued;
-        if signal_now {
+        if let (true, Some(done)) = (signal_now, hw_queue) {
+            // SAFETY: dxgkrnl is live; raised to DIRQL by the helper. Under the
+            // notification lock, like every other completion of this node.
+            let status = unsafe { crate::ddi::hws::complete_soft_submission(dxgkrnl, &done, node) };
+            disposition = if status == STATUS_SUCCESS {
+                crate::ddi::flush_trace::Disposition::Immediate
+            } else {
+                retry_node = Some(node);
+                crate::ddi::flush_trace::Disposition::SignalFailed
+            };
+        } else if signal_now {
             // SAFETY: the notification lock is held and dxgkrnl is live.
             let status = unsafe { signal_dma_completed(guard, dxgkrnl, fence, node) };
             disposition = if status == STATUS_SUCCESS {
@@ -1151,6 +1177,10 @@ fn note_and_maybe_signal(
             trace.record(fence, disposition);
         }
     });
+    if let Some(node) = retry_node {
+        // The fence value is already written; only the interrupt is owed.
+        crate::ddi::hws::retry_monitored_fence(adapter, node);
+    }
     if execution_boundary.is_some() {
         crate::ddi::interrupt::request_wddm_completion_dpc(adapter);
     }
@@ -1450,10 +1480,37 @@ pub unsafe extern "C" fn dxgkddi_submit_command_virtual(
     }
     let adapter = unsafe { &*(h_adapter as *const AdapterContext) };
     let submit = unsafe { &*submit_command };
+    // SAFETY: dxgkrnl's live args for this DMA buffer.
+    unsafe { submit_virtual(adapter, submit, None) };
+    STATUS_SUCCESS
+}
+
+/// The body of [`dxgkddi_submit_command_virtual`]: everything the legacy path
+/// does with one DMA buffer (flip arming, present / execution / GDI-job
+/// decoding, the completion gate). `hw_queue` is `None` there, and the
+/// submission completes with `DMA_COMPLETED` for `SubmissionFenceId`.
+///
+/// The NVIDIA personality's software HW queues (`ddi::hws`) run their
+/// submissions through here too, with a `DXGKARG_SUBMITCOMMANDVIRTUAL` built
+/// from `DXGKARG_SUBMITCOMMANDTOHWQUEUE` (`SubmissionFenceId` 0) and `hw_queue`
+/// set: the same work and gating, completed through the queue's progress fence
+/// and `MONITORED_FENCE_SIGNALED` instead.
+///
+/// # Safety
+/// `submit` describes a live submission (its private data readable and
+/// writable for `DmaBufferPrivateDataSize` bytes for the duration of the call);
+/// DISPATCH_LEVEL or below.
+pub(crate) unsafe fn submit_virtual(
+    adapter: &AdapterContext,
+    submit: &DXGKARG_SUBMITCOMMANDVIRTUAL,
+    hw_queue: Option<crate::ddi::hws::HwQueueDone>,
+) {
     let fence = submit.SubmissionFenceId;
 
     SUBMIT_COUNT.fetch_add(1, Ordering::Relaxed);
-    SUBMIT_LAST_FENCE.store(fence, Ordering::Relaxed);
+    if hw_queue.is_none() {
+        SUBMIT_LAST_FENCE.store(fence, Ordering::Relaxed);
+    }
     // SAFETY: `Value` is a plain UINT view of the (valid) flags union.
     let is_paging = (unsafe { submit.Flags.__bindgen_anon_1.Value } & 1) != 0;
     if is_paging {
@@ -1520,8 +1577,8 @@ pub unsafe extern "C" fn dxgkddi_submit_command_virtual(
         trace.as_ref(),
         gdi_seq,
         crate::virtio::gpu::wddm_node_of(submit.NodeOrdinal),
+        hw_queue,
     );
-    STATUS_SUCCESS
 }
 
 /// `DxgkDdiSubmitCommand` — submit a DMA buffer to the GPU. Critically, this is
@@ -1609,6 +1666,7 @@ pub unsafe extern "C" fn dxgkddi_submit_command(
         trace.as_ref(),
         gdi_seq,
         crate::virtio::gpu::wddm_node_of(submit.NodeOrdinal),
+        None,
     );
     STATUS_SUCCESS
 }
@@ -1731,15 +1789,27 @@ pub(crate) fn abandon_pending_submissions(
     // or retained only through an already-dispatched host response.
     let retain_for_resubmit = matches!(&outcome, AbandonOutcome::Preempted { .. });
     adapter.with_wddm_notify_lock(|guard| {
-        let dropped = guard
+        let (dropped, hw_queue_nodes) = guard
             .with_virtio(|o, v| {
                 if retain_for_resubmit {
-                    v.preempt_flush(o, node)
+                    (v.preempt_flush(o, node), 0)
                 } else {
                     v.terminal_abandon_wddm_epoch(o, node)
                 }
             })
-            .unwrap_or(0);
+            .unwrap_or((0, 0));
+        // NVIDIA personality: software HW queue entries the reset ended had
+        // their progress fences written; tell dxgkrnl. 0 otherwise.
+        if hw_queue_nodes != 0 {
+            if let Some(dxgkrnl) = adapter.dxgkrnl_opt() {
+                for n in 0..32u32 {
+                    if hw_queue_nodes & (1 << n) != 0 {
+                        // SAFETY: live callback table; raised to DIRQL by the helper.
+                        let _ = unsafe { signal_monitored_fence(dxgkrnl, n) };
+                    }
+                }
+            }
+        }
         if dropped != 0 {
             ABANDONED_FENCES.fetch_add(dropped, Ordering::Relaxed);
         }

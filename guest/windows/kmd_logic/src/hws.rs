@@ -221,6 +221,73 @@ pub const fn suspend_fence_newer(last: u64, new: u64) -> bool {
     new > last
 }
 
+// ── software HW queues (contexts without a native TSG) ───────────────────────────────────────
+
+/// `DXGK_CREATECONTEXTFLAGS.SystemContext` (bit 0): dxgkrnl's system / paging context.
+pub const CONTEXT_FLAG_SYSTEM: u32 = 1 << 0;
+/// `DXGK_CREATECONTEXTFLAGS.GdiContext` (bit 1): the GDI / CDD context.
+pub const CONTEXT_FLAG_GDI: u32 = 1 << 1;
+/// `DXGK_CREATECONTEXTFLAGS.SystemProtectedContext` (bit 3).
+pub const CONTEXT_FLAG_SYSTEM_PROTECTED: u32 = 1 << 3;
+
+/// A context dxgkrnl created for itself: every DMA buffer submitted on it was
+/// built by this KMD (BuildPagingBuffer, RenderKm/RenderGdi, Present), so its
+/// private data is the KMD's own record, never UMD bytes.
+pub const fn is_kernel_context(create_flags: u32) -> bool {
+    create_flags & (CONTEXT_FLAG_SYSTEM | CONTEXT_FLAG_GDI | CONTEXT_FLAG_SYSTEM_PROTECTED) != 0
+}
+
+/// `DXGK_SUBMITCOMMANDFLAGS` bits that mark a kernel-built DMA buffer: `Paging`
+/// (0), `Present` (1), `RedirectedPresent` (2), `Flip` (4), `FlipWithNoWait` (5).
+/// `DXGKARG_SUBMITCOMMANDTOHWQUEUE.Flags` is zero for UMD-generated buffers.
+pub const SUBMIT_FLAGS_KERNEL_BUILT: u32 = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 4) | (1 << 5);
+
+/// How many leading bytes of a software HW queue submission's private data the
+/// UMD wrote, as the `DmaBufferUmdPrivateDataSize` the legacy
+/// `SubmitCommandVirtual` path is handed. A HW-queue submission has no UMD/KMD
+/// split of its own: the buffer is either the UMD's (`pfnSubmitToHwQueueCb`) or
+/// the KMD's (a kernel submission). Kernel contexts and kernel-built buffers are
+/// all KMD bytes (0); anything else is treated as UMD bytes end to end, so the
+/// KMD-only decoders (execution record, GDI job record) never read it.
+pub const fn soft_submit_umd_private_size(
+    kernel_context: bool,
+    submit_flags: u32,
+    private_size: u32,
+) -> u32 {
+    if kernel_context || submit_flags & SUBMIT_FLAGS_KERNEL_BUILT != 0 {
+        0
+    } else {
+        private_size
+    }
+}
+
+/// A `SignalMonitoredFence` request held for the next software-queue submission
+/// of its context: write `value` to the fence at kernel CPU VA `cpu` once that
+/// submission's work completed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FenceWrite {
+    pub cpu: u64,
+    pub value: u64,
+}
+
+/// Merge a new `SignalMonitoredFence` into a context's single-entry stash.
+/// Returns the new stash and a write that no longer fits (a different fence was
+/// already held: it is written at once, as before deferral existed). The same
+/// fence keeps the larger value: fence values only move forward.
+pub const fn smf_stash_merge(
+    held: Option<FenceWrite>,
+    new: FenceWrite,
+) -> (FenceWrite, Option<FenceWrite>) {
+    match held {
+        None => (new, None),
+        Some(old) if old.cpu == new.cpu => {
+            let value = if new.value > old.value { new.value } else { old.value };
+            (FenceWrite { cpu: new.cpu, value }, None)
+        }
+        Some(old) => (new, Some(old)),
+    }
+}
+
 /// The `Hws*` registry counter names `kmd_render/src/ddi/hws.rs` writes.
 pub const COUNTERS: &[&str] = &[
     "NvHwsEn",
@@ -247,6 +314,13 @@ pub const COUNTERS: &[&str] = &[
     "HwsSmf",
     "HwsSmfKind",
     "HwsQFull",
+    "HwsSoftLeg",
+    "HwsSoftDone",
+    "HwsSoftPurge",
+    "HwsSoftAbn",
+    "HwsSmfDefer",
+    "HwsSmfEarly",
+    "HwsSmfTaken",
 ];
 
 #[cfg(test)]
@@ -342,6 +416,40 @@ mod tests {
         assert!(suspend_fence_newer(0, 1));
         assert!(!suspend_fence_newer(4, 4));
         assert!(!suspend_fence_newer(4, 3));
+    }
+
+    #[test]
+    fn kernel_contexts_and_umd_private_split() {
+        assert!(is_kernel_context(CONTEXT_FLAG_SYSTEM));
+        assert!(is_kernel_context(CONTEXT_FLAG_GDI | CONTEXT_FLAG_HW_QUEUE_SUPPORTED));
+        assert!(is_kernel_context(CONTEXT_FLAG_SYSTEM_PROTECTED));
+        assert!(!is_kernel_context(0x14));
+        assert!(!is_kernel_context(0));
+        // Kernel context: always the KMD's private data.
+        assert_eq!(soft_submit_umd_private_size(true, 0, 80), 0);
+        // User context, UMD buffer (Flags 0): all UMD bytes.
+        assert_eq!(soft_submit_umd_private_size(false, 0, 80), 80);
+        // User context, kernel-built buffers.
+        for bit in [0u32, 1, 2, 4, 5] {
+            assert_eq!(soft_submit_umd_private_size(false, 1 << bit, 80), 0, "bit {bit}");
+        }
+        // NullRendering / ContextSwitch / Resubmission do not make a buffer the KMD's.
+        for bit in [3u32, 6, 7, 8] {
+            assert_eq!(soft_submit_umd_private_size(false, 1 << bit, 80), 80, "bit {bit}");
+        }
+    }
+
+    #[test]
+    fn smf_stash_keeps_one_fence_and_its_largest_value() {
+        let a1 = FenceWrite { cpu: 0x1000, value: 1 };
+        let a5 = FenceWrite { cpu: 0x1000, value: 5 };
+        let b2 = FenceWrite { cpu: 0x2000, value: 2 };
+        assert_eq!(smf_stash_merge(None, a1), (a1, None));
+        assert_eq!(smf_stash_merge(Some(a1), a5), (a5, None));
+        // A smaller value for the same fence never lowers it.
+        assert_eq!(smf_stash_merge(Some(a5), a1), (a5, None));
+        // A different fence displaces the held one, which is written at once.
+        assert_eq!(smf_stash_merge(Some(a5), b2), (b2, Some(a5)));
     }
 
     #[test]

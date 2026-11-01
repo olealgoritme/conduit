@@ -36,11 +36,23 @@
 //!   engine (best effort: they only kick the progress poll).
 //! * `ValidateSubmitCommand` succeeds; `SubmitCommandToHwQueue` validates its
 //!   own private data.
-//! * `SignalMonitoredFence` writes the fence value with the CPU at the time of
-//!   the call and raises the interrupt: correct for paging buffers (this KMD's
-//!   paging executor ran the operation synchronously in BuildPagingBuffer),
-//!   EARLY for RenderGdi / PresentBlt kernel submissions (TODO: defer to the
-//!   DMA completion of that buffer).
+//! * Software HW queues ([`SoftQueue`]): queues on contexts without NVDA
+//!   private data (dxgkrnl's system / paging, GDI / CDD contexts) run every
+//!   submission through the legacy `SubmitCommandVirtual` body
+//!   (`submit_command::submit_virtual`): flip arming, present / execution /
+//!   GDI-job decoding and the WDDM completion FIFO, exactly as that DMA buffer
+//!   would run on the legacy path. Where the legacy path reports
+//!   `DMA_COMPLETED`, the queue's progress fence is written instead and
+//!   `MONITORED_FENCE_SIGNALED` raised for the node ([`HwQueueDone`],
+//!   delivered at submit time or by the completion DPC in
+//!   `interrupt::drain_used_and_complete`).
+//! * `SignalMonitoredFence` (kernel submissions, `RingBufferFenceRelease` 0): a
+//!   RenderGdi / PresentBlt request on a context with software queues is held
+//!   and written when that context's next software-queue submission completes
+//!   ([`HwQueueDone`]'s second write). Anything else is written with the CPU at
+//!   the time of the call and the interrupt raised: correct for paging buffers
+//!   (this KMD's paging executor ran the operation synchronously in
+//!   BuildPagingBuffer), EARLY for RenderGdi / PresentBlt on NVDA contexts.
 
 use alloc::boxed::Box;
 use core::ffi::c_void;
@@ -64,14 +76,29 @@ static QUEUES: AtomicU32 = AtomicU32::new(0);
 static QUEUE_FAIL: AtomicU32 = AtomicU32::new(0);
 static SOFT_QUEUES: AtomicU32 = AtomicU32::new(0);
 static SOFT_SUBMITS: AtomicU32 = AtomicU32::new(0);
+static SOFT_LEGACY: AtomicU32 = AtomicU32::new(0);
+static SOFT_DONE: AtomicU32 = AtomicU32::new(0);
+static SOFT_PURGED: AtomicU32 = AtomicU32::new(0);
+static SOFT_ABANDONED: AtomicU32 = AtomicU32::new(0);
+static SMF_DEFERRED: AtomicU32 = AtomicU32::new(0);
+static SMF_EARLY: AtomicU32 = AtomicU32::new(0);
+static SMF_TAKEN: AtomicU32 = AtomicU32::new(0);
+
+/// `DXGK_KERNEL_SUBMISSION_BUILD_PAGING_BUFFER` (`DXGK_KERNEL_SUBMISSION_TYPE` 0).
+const KERNEL_SUBMISSION_PAGING: u32 = 0;
 
 /// A HW queue on a context without native channel state: dxgkrnl's own system /
 /// paging contexts (HWS creates queues for them during AddAdapter, and fails the
-/// adapter STATUS_NOT_SUPPORTED if that is refused), and NVDA contexts on nodes
-/// with no backing yet. Their DMA buffers carry no GPU work this KMD must run
-/// (paging operations already complete inside BuildPagingBuffer), so a
-/// submission completes at once: the progress fence is written and the node's
-/// monitored-fence interrupt raised, as the legacy path completes its DMA.
+/// adapter STATUS_NOT_SUPPORTED if that is refused), GDI / CDD contexts, and
+/// NVDA contexts on nodes with no backing yet.
+///
+/// On a context without NVDA private data (`legacy`) the DMA buffers carry the
+/// same work the legacy path runs (presents and flips, RenderKm / RenderGdi
+/// jobs, paging), so each submission goes through `submit_command::submit_virtual`
+/// and completes when the legacy path would report `DMA_COMPLETED` for it
+/// ([`HwQueueDone`]). On an NVDA context without a native TSG there is no
+/// legacy equivalent (NVIDIA command streams for an engine this KMD does not
+/// back): the submission completes at once.
 const HW_TAG_SOFT_QUEUE: u32 = 0x5357_5148; // "HQWS"
 
 #[repr(C)]
@@ -80,6 +107,86 @@ struct SoftQueue {
     node: u32,
     adapter: *mut AdapterContext,
     fence_cpu: *mut u64,
+    /// The hContext this queue was created on (`DxgkDdiCreateHwQueue`'s
+    /// `hHwContext`). dxgkrnl destroys every queue before its context.
+    context: HANDLE,
+    /// Submissions run through the legacy path (a context without NVDA data).
+    legacy: bool,
+    /// The context is one of dxgkrnl's own (`hws::is_kernel_context`): its
+    /// private data is always the KMD's.
+    kernel: bool,
+}
+
+/// What a software HW queue submission reports once its work is complete: its
+/// progress fence, and the monitored fence a `SignalMonitoredFence` held for it.
+/// Carried by the WDDM completion FIFO entry (`virtio::gpu::WddmPending`).
+#[derive(Clone, Copy)]
+pub(crate) struct HwQueueDone {
+    /// The `SoftQueue` as an identity (`DestroyHwQueue` purges by it).
+    queue: usize,
+    /// dxgkrnl's kernel CPU view of the queue's progress fence, and the
+    /// submission's `HwQueueProgressFenceId`.
+    progress_cpu: usize,
+    progress_id: u64,
+    /// The held `SignalMonitoredFence` (cpu 0 = none).
+    extra_cpu: usize,
+    extra_value: u64,
+}
+
+impl HwQueueDone {
+    pub(crate) fn queue(&self) -> usize {
+        self.queue
+    }
+
+    /// Write both fences (never moving either backwards). Atomics only: legal at
+    /// any IRQL, and race-free against another completion of the same queue.
+    pub(crate) fn write(&self) {
+        fence_max(self.extra_cpu, self.extra_value);
+        fence_max(self.progress_cpu, self.progress_id);
+    }
+}
+
+fn fence_max(cpu: usize, value: u64) {
+    if cpu == 0 || cpu & 7 != 0 {
+        return;
+    }
+    // SAFETY: dxgkrnl's kernel CPU view of a monitored fence, 8-aligned (checked)
+    // and live while the queue (or the fence object) is: entries of a destroyed
+    // queue are purged first. Fence values only move forward.
+    unsafe { (*(cpu as *const AtomicU64)).fetch_max(value, Ordering::AcqRel) };
+}
+
+/// Deliver one software HW queue completion: write its fences, then raise
+/// `MONITORED_FENCE_SIGNALED` for `node`. Callers hold the WDDM notification
+/// lock (the completion DPC and the immediate arm of `note_and_maybe_signal`).
+///
+/// # Safety
+/// `dxgkrnl` is the live adapter's callback table; <= DISPATCH_LEVEL.
+pub(crate) unsafe fn complete_soft_submission(
+    dxgkrnl: &DXGKRNL_INTERFACE,
+    done: &HwQueueDone,
+    node: u32,
+) -> NTSTATUS {
+    done.write();
+    SOFT_DONE.fetch_add(1, Ordering::Relaxed);
+    // SAFETY: as the caller's.
+    let status = unsafe { crate::ddi::submit_command::signal_monitored_fence(dxgkrnl, node) };
+    if status == STATUS_SUCCESS {
+        MF_SIGNALS.fetch_add(1, Ordering::Relaxed);
+    }
+    status
+}
+
+/// A completion whose interrupt could not be raised (the fence is written):
+/// raise it again now and on the next poll tick. Outside the notification lock.
+pub(crate) fn retry_monitored_fence(adapter: &AdapterContext, node: u32) {
+    after_submit(adapter, 0, None, node_bit(node));
+}
+
+/// A software HW queue entry completed by a scheduler reset
+/// (`VirtioGpu::terminal_abandon_wddm_epoch`). Atomics only.
+pub(crate) fn note_soft_abandoned() {
+    SOFT_ABANDONED.fetch_add(1, Ordering::Relaxed);
 }
 
 /// # Safety
@@ -93,18 +200,6 @@ unsafe fn soft_queue(h: IN_CONST_HANDLE) -> Option<&'static SoftQueue> {
     (tag == HW_TAG_SOFT_QUEUE).then(|| unsafe { &*(h as *const SoftQueue) })
 }
 
-fn write_fence(cpu: *mut u64, value: u64) {
-    if cpu.is_null() || (cpu as usize) & 7 != 0 {
-        return;
-    }
-    // SAFETY: dxgkrnl's progress-fence CPU mapping, valid for the queue's life;
-    // it only ever moves forward.
-    unsafe {
-        if core::ptr::read_volatile(cpu) < value {
-            core::ptr::write_volatile(cpu, value);
-        }
-    }
-}
 static QUEUE_FULL: AtomicU32 = AtomicU32::new(0);
 static SUBMITS: AtomicU32 = AtomicU32::new(0);
 static SUBMIT_FAIL: AtomicU32 = AtomicU32::new(0);
@@ -150,6 +245,13 @@ pub(crate) fn publish_counters() {
     crate::diag::record_named_bytes(b"HwsEngResume", r(&ENGINE_RESUMES));
     crate::diag::record_named_bytes(b"HwsSmf", r(&SMF));
     crate::diag::record_named_bytes(b"HwsSmfKind", r(&SMF_KINDS));
+    crate::diag::record_named_bytes(b"HwsSoftLeg", r(&SOFT_LEGACY));
+    crate::diag::record_named_bytes(b"HwsSoftDone", r(&SOFT_DONE));
+    crate::diag::record_named_bytes(b"HwsSoftPurge", r(&SOFT_PURGED));
+    crate::diag::record_named_bytes(b"HwsSoftAbn", r(&SOFT_ABANDONED));
+    crate::diag::record_named_bytes(b"HwsSmfDefer", r(&SMF_DEFERRED));
+    crate::diag::record_named_bytes(b"HwsSmfEarly", r(&SMF_EARLY));
+    crate::diag::record_named_bytes(b"HwsSmfTaken", r(&SMF_TAKEN));
 }
 
 // ── StartDevice: the HWSCH handshake ─────────────────────────────────────────────────────────
@@ -418,7 +520,7 @@ pub unsafe extern "C" fn dxgkddi_create_context(
     };
     if !native_format::is_context_private(private) {
         // SAFETY: forwarded unchanged.
-        return unsafe { crate::device::create_context_with(h_device, create_context, None) };
+        return unsafe { crate::device::create_context_with(h_device, create_context, None, false) };
     }
     // SAFETY: Value is the plain UINT arm of DXGK_CREATECONTEXTFLAGS.
     let flags = unsafe { args.Flags.__bindgen_anon_1.Value };
@@ -434,7 +536,9 @@ pub unsafe extern "C" fn dxgkddi_create_context(
             // refused.
             CTX_NVDA_BAD.fetch_add(1, Ordering::Relaxed);
             // SAFETY: forwarded unchanged.
-            return unsafe { crate::device::create_context_with(h_device, create_context, None) };
+            return unsafe {
+                crate::device::create_context_with(h_device, create_context, None, true)
+            };
         }
     };
     let native = if parsed.native {
@@ -455,7 +559,8 @@ pub unsafe extern "C" fn dxgkddi_create_context(
     let is_native = native.is_some();
     // SAFETY: both pointers were null-checked above, so this cannot fail and drop
     // the native TSG without its teardown.
-    let status = unsafe { crate::device::create_context_with(h_device, create_context, native) };
+    let status =
+        unsafe { crate::device::create_context_with(h_device, create_context, native, true) };
     if status != STATUS_SUCCESS {
         return status;
     }
@@ -498,12 +603,19 @@ pub unsafe extern "C" fn dxgkddi_create_hw_queue(
     // SAFETY: dxgkrnl's live args; the context outlives its queues.
     let args = unsafe { &mut *args };
     let Some(native) = context.native() else {
+        let legacy = !context.nvda();
         let queue = Box::new(SoftQueue {
             tag: HW_TAG_SOFT_QUEUE,
             node: context.node_ordinal(),
             adapter: context.adapter_ptr(),
             fence_cpu: args.HwQueueProgressFenceCPUVirtualAddress as *mut u64,
+            context: h_hw_context as HANDLE,
+            legacy,
+            kernel: logic::is_kernel_context(context.create_flags()),
         });
+        if legacy {
+            context.soft_queues().fetch_add(1, Ordering::AcqRel);
+        }
         args.hHwQueue = Box::into_raw(queue) as HANDLE;
         SOFT_QUEUES.fetch_add(1, Ordering::Relaxed);
         return STATUS_SUCCESS;
@@ -529,7 +641,12 @@ pub unsafe extern "C" fn dxgkddi_create_hw_queue(
 }
 
 pub unsafe extern "C" fn dxgkddi_destroy_hw_queue(h_hw_queue: IN_CONST_HANDLE) -> NTSTATUS {
-    if unsafe { soft_queue(h_hw_queue) }.is_some() {
+    if let Some(queue) = unsafe { soft_queue(h_hw_queue) } {
+        if queue.legacy {
+            // SAFETY: PASSIVE (DestroyHwQueue); the queue's context and adapter
+            // outlive it.
+            unsafe { retire_soft_queue(queue, h_hw_queue as usize) };
+        }
         // SAFETY: minted by Box::into_raw in CreateHwQueue; freed once here.
         drop(unsafe { Box::from_raw(h_hw_queue as *mut SoftQueue) });
         return STATUS_SUCCESS;
@@ -547,6 +664,54 @@ pub unsafe extern "C" fn dxgkddi_destroy_hw_queue(h_hw_queue: IN_CONST_HANDLE) -
         }
     }
     status
+}
+
+/// DestroyHwQueue of a legacy software queue: its FIFO entries leave without a
+/// fence write (the storage goes with the queue), a held `SignalMonitoredFence`
+/// aimed at its progress fence is dropped, and one aimed elsewhere is written
+/// now once the context has no software queue left to carry it.
+///
+/// # Safety
+/// `queue` is live; its `context` and `adapter` are live; PASSIVE_LEVEL.
+unsafe fn retire_soft_queue(queue: &SoftQueue, key: usize) {
+    // SAFETY: the context outlives its queues (WDDM contract).
+    let context = unsafe { ContextHandleRef::from_raw(queue.context) };
+    if let Some(adapter) = unsafe { queue.adapter.as_ref() } {
+        let purged = adapter.with_wddm_notify_lock(|guard| {
+            guard
+                .with_virtio(|order, v| v.purge_hw_queue(order, key))
+                .unwrap_or(0)
+        });
+        if purged != 0 {
+            SOFT_PURGED.fetch_add(purged, Ordering::Relaxed);
+            // The node's next entry may be ready now.
+            crate::ddi::interrupt::request_wddm_completion_dpc(adapter);
+        }
+    }
+    let Some(context) = context else {
+        return;
+    };
+    let last = context.soft_queues().fetch_sub(1, Ordering::AcqRel) == 1;
+    let orphan = {
+        let mut stash = context.smf_stash().lock();
+        match *stash {
+            // Aimed at the storage that is going away: nothing left to write.
+            Some(w) if w.cpu as usize == queue.fence_cpu as usize => {
+                *stash = None;
+                None
+            }
+            // No queue left on the context to carry it.
+            Some(_) if last => stash.take(),
+            _ => None,
+        }
+    };
+    if let Some(w) = orphan {
+        fence_max(w.cpu as usize, w.value);
+        SMF_EARLY.fetch_add(1, Ordering::Relaxed);
+        if let Some(adapter) = unsafe { queue.adapter.as_ref() } {
+            after_submit(adapter, 0, None, node_bit(queue.node));
+        }
+    }
 }
 
 pub unsafe extern "C" fn dxgkddi_submit_command_to_hw_queue(
@@ -567,11 +732,17 @@ pub unsafe extern "C" fn dxgkddi_submit_command_to_hw_queue(
         } else {
             submit.HwQueueProgressFenceCpuVa as *mut u64
         };
-        write_fence(cpu, submit.HwQueueProgressFenceId);
         SOFT_SUBMITS.fetch_add(1, Ordering::Relaxed);
         // SAFETY: our adapter (checked above).
         let adapter = unsafe { &*(h_adapter as *const AdapterContext) };
-        signal_nodes(adapter, node_bit(queue.node));
+        if !queue.legacy {
+            // NVDA context on an unbacked node: nothing to run, complete now.
+            fence_max(cpu as usize, submit.HwQueueProgressFenceId);
+            signal_nodes(adapter, node_bit(queue.node));
+            return STATUS_SUCCESS;
+        }
+        // SAFETY: dxgkrnl's live args (this call) and a live queue.
+        unsafe { submit_soft_legacy(adapter, queue, submit, cpu as usize) };
         return STATUS_SUCCESS;
     }
     // SAFETY: forwarded unchanged; it validates the handle and args.
@@ -588,6 +759,59 @@ pub unsafe extern "C" fn dxgkddi_submit_command_to_hw_queue(
         .map_or(0, |queue| queue as *const NativeQueue as usize);
     after_submit(adapter, key, Some(args.HwQueueProgressFenceId), 0);
     STATUS_SUCCESS
+}
+
+/// A legacy software queue's submission: the `DXGKARG_SUBMITCOMMANDVIRTUAL` the
+/// legacy path would have been handed for this DMA buffer, run through
+/// `submit_command::submit_virtual`, which completes it through [`HwQueueDone`].
+///
+/// # Safety
+/// `submit` is dxgkrnl's live args (the private data is valid only for this
+/// call, which is all the legacy path reads it for); `queue` is live.
+unsafe fn submit_soft_legacy(
+    adapter: &AdapterContext,
+    queue: &SoftQueue,
+    submit: &DXGKARG_SUBMITCOMMANDTOHWQUEUE,
+    progress_cpu: usize,
+) {
+    // SAFETY: the context outlives its queues (WDDM contract).
+    let held = unsafe { ContextHandleRef::from_raw(queue.context) }
+        .and_then(|context| context.smf_stash().lock().take());
+    if held.is_some() {
+        SMF_TAKEN.fetch_add(1, Ordering::Relaxed);
+    }
+    let done = HwQueueDone {
+        queue: submit.hHwQueue as usize,
+        progress_cpu,
+        progress_id: submit.HwQueueProgressFenceId,
+        extra_cpu: held.map_or(0, |w| w.cpu as usize),
+        extra_value: held.map_or(0, |w| w.value),
+    };
+    // SAFETY: Value is the plain UINT arm of DXGK_SUBMITCOMMANDFLAGS.
+    let flags = unsafe { submit.Flags.__bindgen_anon_1.Value };
+    let (private, private_size) =
+        if submit.pDmaBufferPrivateData.is_null() || submit.DmaBufferPrivateDataSize == 0 {
+            (core::ptr::null_mut(), 0)
+        } else {
+            (submit.pDmaBufferPrivateData, submit.DmaBufferPrivateDataSize)
+        };
+    // SAFETY: an all-zero DXGKARG_SUBMITCOMMANDVIRTUAL is valid plain data.
+    let mut virt: DXGKARG_SUBMITCOMMANDVIRTUAL = unsafe { core::mem::zeroed() };
+    virt.hContext = queue.context;
+    virt.DmaBufferVirtualAddress = submit.DmaBufferVirtualAddress;
+    virt.DmaBufferSize = submit.DmaBufferSize;
+    virt.pDmaBufferPrivateData = private;
+    virt.DmaBufferPrivateDataSize = private_size;
+    virt.DmaBufferUmdPrivateDataSize =
+        logic::soft_submit_umd_private_size(queue.kernel, flags, private_size);
+    // Not part of any SubmissionFenceId sequence: completion is `done`.
+    virt.SubmissionFenceId = 0;
+    virt.Flags = submit.Flags;
+    virt.NodeOrdinal = queue.node;
+    virt.EngineOrdinal = 0;
+    SOFT_LEGACY.fetch_add(1, Ordering::Relaxed);
+    // SAFETY: built from dxgkrnl's live args for this call; <= DISPATCH.
+    unsafe { crate::ddi::submit_command::submit_virtual(adapter, &virt, Some(done)) };
 }
 
 // ── scheduler control DDIs ───────────────────────────────────────────────────────────────────
@@ -821,15 +1045,25 @@ pub unsafe extern "C" fn dxgkddi_validate_submit_command(
 }
 
 /// Kernel submissions (paging, RenderGdi, PresentBlt) ask for a GPU write of
-/// the monitored fence at the end of their DMA buffer. This KMD's paging
-/// executor already ran the operation synchronously in BuildPagingBuffer, so
-/// the value is written by the CPU now and the node is signalled (now and
-/// again on the next poll tick, in case dxgkrnl registers its wait after this
-/// call). Nothing is appended to the DMA buffer.
+/// the monitored fence at the end of their DMA buffer (with
+/// `RingBufferFenceRelease` 0 that is how the HW queue's progress fence of a
+/// kernel submission gets written). Nothing is appended to the DMA buffer.
 ///
-/// TODO: RenderGdi / PresentBlt run asynchronously here; for those this signal
-/// is EARLY (counted in `HwsSmfKind` bits 1/2). Defer it to the DMA completion
-/// of the buffer.
+/// RenderGdi / PresentBlt on a context with legacy software queues: the write
+/// is held on the context and attached to its next software-queue submission,
+/// which writes it when the legacy completion gate releases that buffer
+/// (`HwQueueDone`; `HwsSmfDefer` held, `HwsSmfTaken` attached). A second request
+/// for a different fence before that submission writes the first one at once
+/// (`HwsSmfEarly`). This relies on dxgkrnl's order for a kernel submission
+/// (build the buffer, SignalMonitoredFence, SubmitCommandToHwQueue on the same
+/// context); a held write whose buffer is never submitted waits for the
+/// context's next submission.
+///
+/// Everything else (paging, NVDA contexts) is written by the CPU now and the
+/// node is signalled (now and again on the next poll tick, in case dxgkrnl
+/// registers its wait after this call): correct for paging (the executor ran
+/// the operation synchronously in BuildPagingBuffer), EARLY for RenderGdi /
+/// PresentBlt on NVDA contexts (counted in `HwsSmfKind` bits 1/2).
 pub unsafe extern "C" fn dxgkddi_signal_monitored_fence(
     h_context: IN_CONST_HANDLE,
     args: INOUT_PDXGKARG_SIGNALMONITOREDFENCE,
@@ -855,6 +1089,38 @@ pub unsafe extern "C" fn dxgkddi_signal_monitored_fence(
     if fence == 0 || fence % 8 != 0 {
         return STATUS_INVALID_PARAMETER;
     }
+    let node = node_bit(context.node_ordinal());
+    // A RenderGdi / PresentBlt buffer on a context with legacy software queues:
+    // it is submitted on one of them next and runs through the legacy path, so
+    // the write is held for that submission's completion (`HwQueueDone`) instead
+    // of landing before its work. Paging keeps the immediate write: its work
+    // already ran inside BuildPagingBuffer, and VidMm's paging progress must not
+    // depend on a later submission arriving.
+    if kind != KERNEL_SUBMISSION_PAGING
+        && !context.nvda()
+        && context.soft_queues().load(Ordering::Acquire) != 0
+    {
+        let new = logic::FenceWrite {
+            cpu: fence as u64,
+            value: args.MonitoredFenceValue,
+        };
+        let displaced = {
+            let mut stash = context.smf_stash().lock();
+            let (held, displaced) = logic::smf_stash_merge(*stash, new);
+            *stash = Some(held);
+            displaced
+        };
+        SMF_DEFERRED.fetch_add(1, Ordering::Relaxed);
+        if let Some(w) = displaced {
+            // A second fence before a submission took the first: write the first
+            // now (the pre-deferral behaviour) rather than lose it.
+            fence_max(w.cpu as usize, w.value);
+            SMF_EARLY.fetch_add(1, Ordering::Relaxed);
+            signal_nodes(adapter, node);
+            after_submit(adapter, 0, None, node);
+        }
+        return STATUS_SUCCESS;
+    }
     let fence = fence as *mut u64;
     // SAFETY: dxgkrnl's kernel CPU view of the monitored fence, 8-aligned
     // (checked), live for the call. Never moved backwards.
@@ -863,7 +1129,6 @@ pub unsafe extern "C" fn dxgkddi_signal_monitored_fence(
             fence.write_volatile(args.MonitoredFenceValue);
         }
     }
-    let node = node_bit(context.node_ordinal());
     signal_nodes(adapter, node);
     after_submit(adapter, 0, None, node);
     STATUS_SUCCESS
