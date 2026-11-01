@@ -19,9 +19,11 @@ pub const SYSTEM_MEMORY_SEGMENT_ID: u32 = 0;
 
 pub const SYSTEM_MEMORY_AT: usize = 0xc8;
 pub const SIZE_UNITS_AT: usize = 0xd0;
-/// D3D (NVDX) records leave `SIZE_UNITS_AT` zero and describe the size in
-/// 64-KiB units as a fixed-point value: fraction at 0x10c, integer in the low
-/// 24 bits of 0x110, and the rounded-up count at 0x114. Vulkan records put the
+/// D3D (NVDX) records leave `SIZE_UNITS_AT` zero and describe the size at
+/// 0x110: whole 64-KiB units in the low 16 bits and the remainder in 256-byte
+/// steps in the top byte (0xd000_0000 is mapped as 0xd000 bytes, 0x4000_001d as
+/// 0x1e units); bits 16..24 are not size (0x000c_0000 got one page from
+/// NVIDIA's KMD). 0x114 can carry a larger count. Vulkan records put the
 /// integer at `SIZE_UNITS_AT` and a nonzero fraction at 0x114 (or repeat the
 /// count there). Checked against every mapped allocation of the 610.88 D3D11,
 /// D3D12, Vulkan and CUDA captures (384 of 384).
@@ -37,9 +39,15 @@ pub fn allocation_units(bytes: &[u8]) -> Option<u64> {
         // CUDA: count 0. Vulkan: a fraction, or the count repeated.
         return Some(units + u64::from(count != 0 && count != units));
     }
-    let fraction = get32(bytes, SIZE_FRACTION_AT)?;
-    let integer = u64::from(get32(bytes, SIZE_INTEGER_AT)? & 0x00ff_ffff);
-    Some(count.max(integer + u64::from(fraction != 0)))
+    let encoded = get32(bytes, SIZE_INTEGER_AT)?;
+    let integer = u64::from(encoded & 0xffff);
+    let remainder = encoded >> 24;
+    // A record with only flag bits still describes an allocation (one page).
+    Some(
+        count
+            .max(integer + u64::from(remainder != 0))
+            .max(u64::from(encoded != 0)),
+    )
 }
 pub const KIND_AT: usize = 0x1a0;
 pub const TILING_AT: usize = 0x1a4;
@@ -763,5 +771,29 @@ mod size_rule_tests {
         set(&mut g, SIZE_COUNT_AT, 1);
         assert_eq!(allocation_units(&g), Some(1));
         assert_eq!(parse_allocation_private(&g).map(|p| p.size), Ok(ALLOCATION_UNIT));
+    }
+
+    #[test]
+    fn d3d_sizes_mapped_in_the_capture() {
+        // (0x10c, 0x110, 0x114) -> 64-KiB units covering the mapped size.
+        for (fraction, encoded, count, units) in [
+            (0xd000_0000, 0xd000_0000, 0, 1),     // mapped 0xd000
+            (0x0040_0000, 0xb000_0000, 0, 1),     // mapped 0xb000
+            (0x8100_0000, 0xc000_0029, 0x29, 0x2a), // mapped 0x2a0000
+            (0xc000_0000, 0xc000_003f, 0x3f, 0x40), // mapped 0x400000
+            (0xf200_0000, 0x0000_000f, 0x10, 0x10), // mapped 0x100000
+            (0x0a00_0000, 0, 0x14, 0x14),           // mapped 0x140000
+            (0x0040_0000, 0, 1, 1),                 // mapped 0x10000
+            (0, 0x100, 0x100, 0x100),               // mapped 0x1000000
+            // Flag bits only: NVIDIA's KMD answered one 4-KiB page; reading
+            // them as units asked RM for 48 GiB.
+            (0x000c_0000, 0x000c_0000, 0, 1),
+        ] {
+            let mut b = record();
+            set(&mut b, SIZE_FRACTION_AT, fraction);
+            set(&mut b, SIZE_INTEGER_AT, encoded);
+            set(&mut b, SIZE_COUNT_AT, count);
+            assert_eq!(allocation_units(&b), Some(units), "{encoded:#x}");
+        }
     }
 }
