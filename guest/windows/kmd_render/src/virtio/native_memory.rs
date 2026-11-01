@@ -424,12 +424,22 @@ fn ensure_space(io: &Io<'_>, process: usize) -> Result<u32, Error> {
         .try_reserve_exact(1)
         .map_err(|_| Error::NoMemory)?;
     let space = STATE.lock().mint()?;
-    io.rm_alloc(
+    let reply = io.rm_alloc(
         nd::H_DEVICE,
         space,
         cc::FERMI_VASPACE_A,
         &cc::vaspace_params_vidmm(),
     )?;
+    // Diagnosis: the space RM made (vaSize at +8, vaBase at +40 of the
+    // returned NV_VASPACE_ALLOCATION_PARAMETERS), in 64-KiB units.
+    crate::diag::record_named_bytes(
+        b"NvSpaceSz",
+        (rc::get64(&reply, 8).unwrap_or(u64::MAX) >> 16) as u32,
+    );
+    crate::diag::record_named_bytes(
+        b"NvSpaceBase",
+        (rc::get64(&reply, 40).unwrap_or(u64::MAX) >> 16) as u32,
+    );
     // One virtual object over all of VidMm's low VAs, before RM maps anything
     // of its own into the space: RM's first-fit internal mappings (GR context
     // buffers) then land above 4.5 GiB, in the [4 GiB, 8 GiB) range the KMD
@@ -460,6 +470,19 @@ fn ensure_space(io: &Io<'_>, process: usize) -> Result<u32, Error> {
     }
     crate::diag::record_named_bytes(b"NvSpaceProc", process as u32);
     crate::diag::record_named_bytes(b"NvSpaceH", space);
+    // Diagnosis: where RM puts a non-fixed 2-MiB virtual object now (in 64-KiB
+    // units; 0xffffffff = refused), i.e. where its own mappings would go.
+    if let Ok(probe) = STATE.lock().mint() {
+        let params = cc::virtual_params(io.client.root, space, None, 0x20_0000);
+        let at = match io.rm_alloc(nd::H_DEVICE, probe, cc::NV50_MEMORY_VIRTUAL, &params) {
+            Ok(reply) => {
+                let _ = io.rm_free(nd::H_DEVICE, probe);
+                (rc::get64(&reply, 80).unwrap_or(u64::MAX) >> 16) as u32
+            }
+            Err(_) => u32::MAX,
+        };
+        crate::diag::record_named_bytes(b"NvSpaceFree", at);
+    }
     Ok(space)
 }
 
