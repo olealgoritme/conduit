@@ -2585,12 +2585,16 @@ unsafe fn native_virtual_transfer(
 ) -> Result<(), ()> {
     use crate::dxgk::_DXGK_MEMORY_TRANSFER_DIRECTION as Direction;
 
+    // NvPgVtWhy: 1 range past the allocation, 2 direction, 3 flags, 4 no
+    // shadowed system pages, 5 native CPU range, 6 copy refused.
+    let why = |code: u32| crate::diag::record_named_bytes(b"NvPgVtWhy", code);
     let offset = transfer.AllocationOffsetInBytes;
     let size = transfer.TransferSizeInBytes;
     if offset
         .checked_add(size)
         .is_none_or(|end| end > allocation.size)
     {
+        why(1);
         return Err(());
     }
     let (system_va, to_system) = match transfer.TransferDirection {
@@ -2599,15 +2603,19 @@ unsafe fn native_virtual_transfer(
         }
         Direction::DXGK_MEMORY_TRANSFER_SYSTEM_TO_LOCAL => (transfer.SourceVirtualAddress, false),
         Direction::DXGK_MEMORY_TRANSFER_LOCAL_TO_LOCAL => return Ok(()),
-        _ => return Err(()),
+        _ => {
+            why(2);
+            return Err(());
+        }
     };
     if unsafe { transfer.Flags.__bindgen_anon_1.Flags } != 0 {
+        why(3);
         return Err(());
     }
-    let pages = adapter
-        .paging_pte_shadow
-        .resolve(passive, system_va, size)
-        .ok_or(())?;
+    let Some(pages) = adapter.paging_pte_shadow.resolve(passive, system_va, size) else {
+        why(4);
+        return Err(());
+    };
     let copied = unsafe {
         crate::virtio::native_memory::with_cpu_range(
             passive,
@@ -2649,10 +2657,11 @@ unsafe fn native_virtual_transfer(
             },
         )
     }
-    .map_err(|_| ())?;
+    .map_err(|_| why(5))?;
     if copied {
         Ok(())
     } else {
+        why(6);
         Err(())
     }
 }
