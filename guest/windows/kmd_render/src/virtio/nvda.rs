@@ -144,11 +144,6 @@ impl Session {
         }
     }
 
-    /// Register one real object returned by native allocation for later RM controls.
-    pub fn note_memory(memory: u32) {
-        SESSION.lock().note_memory(memory);
-    }
-
     fn next(&self) -> Option<Step> {
         STEPS.get(usize::from(self.up)).copied()
     }
@@ -681,4 +676,9 @@ pub fn escape(
             STATUS_IO_DEVICE_ERROR
         }
     }
+}
+
+/// Register one real object returned by native allocation for later RM controls.
+pub fn note_memory(memory: u32) {
+    SESSION.lock().note_memory(memory);
 }

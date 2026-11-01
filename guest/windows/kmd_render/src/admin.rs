@@ -32,10 +32,22 @@ const DOS_NAME: &[u16] = &[
 ];
 
 static DRIVER: AtomicPtr<DRIVER_OBJECT> = AtomicPtr::new(core::ptr::null_mut());
-type IoDispatch = unsafe extern "C" fn(PDEVICE_OBJECT, PIRP) -> NTSTATUS;
-static PREV_CREATE: AtomicPtr<IoDispatch> = AtomicPtr::new(core::ptr::null_mut());
-static PREV_CLOSE: AtomicPtr<IoDispatch> = AtomicPtr::new(core::ptr::null_mut());
-static PREV_CONTROL: AtomicPtr<IoDispatch> = AtomicPtr::new(core::ptr::null_mut());
+// The previous MajorFunction entries, as addresses (0 = none). A
+// `PDRIVER_DISPATCH` is `Option<fn>`, which has the null-pointer layout, so the
+// address round-trips through `usize`.
+static PREV_CREATE: AtomicUsize = AtomicUsize::new(0);
+static PREV_CLOSE: AtomicUsize = AtomicUsize::new(0);
+static PREV_CONTROL: AtomicUsize = AtomicUsize::new(0);
+
+fn dispatch_addr(f: PDRIVER_DISPATCH) -> usize {
+    // SAFETY: Option<extern fn> has the same size as usize; None is 0.
+    unsafe { core::mem::transmute::<PDRIVER_DISPATCH, usize>(f) }
+}
+
+fn previous_dispatch(slot: &AtomicUsize) -> PDRIVER_DISPATCH {
+    // SAFETY: the slot only ever holds a value produced by `dispatch_addr`.
+    unsafe { core::mem::transmute::<usize, PDRIVER_DISPATCH>(slot.load(Ordering::Acquire)) }
+}
 static DEVICE: AtomicPtr<DEVICE_OBJECT> = AtomicPtr::new(core::ptr::null_mut());
 static ADAPTERS: AtomicU32 = AtomicU32::new(0);
 static STOPPING: AtomicU32 = AtomicU32::new(0);
@@ -70,10 +82,16 @@ pub unsafe fn install_dispatch(driver: PDRIVER_OBJECT) {
     // SAFETY: DriverEntry supplies the live DRIVER_OBJECT. The three indices are
     // WDM's fixed MajorFunction slots and the table is at least 0x1c entries.
     unsafe {
-        PREV_CREATE.store((*driver).MajorFunction[IRP_MJ_CREATE], Ordering::Release);
-        PREV_CLOSE.store((*driver).MajorFunction[IRP_MJ_CLOSE], Ordering::Release);
+        PREV_CREATE.store(
+            dispatch_addr((*driver).MajorFunction[IRP_MJ_CREATE]),
+            Ordering::Release,
+        );
+        PREV_CLOSE.store(
+            dispatch_addr((*driver).MajorFunction[IRP_MJ_CLOSE]),
+            Ordering::Release,
+        );
         PREV_CONTROL.store(
-            (*driver).MajorFunction[IRP_MJ_DEVICE_CONTROL],
+            dispatch_addr((*driver).MajorFunction[IRP_MJ_DEVICE_CONTROL]),
             Ordering::Release,
         );
         (*driver).MajorFunction[IRP_MJ_CREATE] = Some(dispatch_create);
@@ -209,7 +227,7 @@ fn enter() -> bool {
 
 unsafe extern "C" fn dispatch_create(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
     if device != DEVICE.load(Ordering::Acquire) {
-        let previous = PREV_CREATE.load(Ordering::Acquire);
+        let previous = previous_dispatch(&PREV_CREATE);
         return if let Some(previous) = previous {
             unsafe { previous(device, irp) }
         } else {
@@ -233,7 +251,7 @@ unsafe extern "C" fn dispatch_create(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTA
 
 unsafe extern "C" fn dispatch_close(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
     if device != DEVICE.load(Ordering::Acquire) {
-        let previous = PREV_CLOSE.load(Ordering::Acquire);
+        let previous = previous_dispatch(&PREV_CLOSE);
         return if let Some(previous) = previous {
             unsafe { previous(device, irp) }
         } else {
@@ -257,7 +275,7 @@ unsafe extern "C" fn dispatch_close(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTAT
 
 unsafe extern "C" fn dispatch_device_control(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
     if device != DEVICE.load(Ordering::Acquire) {
-        let previous = PREV_CONTROL.load(Ordering::Acquire);
+        let previous = previous_dispatch(&PREV_CONTROL);
         return if let Some(previous) = previous {
             unsafe { previous(device, irp) }
         } else {
@@ -320,7 +338,7 @@ unsafe fn complete(irp: PIRP, status: NTSTATUS, information: usize) -> NTSTATUS 
     // completing it, and return the same status to the I/O manager.
     unsafe {
         (*irp).IoStatus.__bindgen_anon_1.Status = status;
-        (*irp).IoStatus.Information = information;
+        (*irp).IoStatus.Information = information as _;
         IofCompleteRequest(irp, 0);
     }
     status

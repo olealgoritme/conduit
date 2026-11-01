@@ -708,7 +708,7 @@ pub fn create(
     };
     {
         let mut state = STATE.lock();
-        if state.try_reserve_exact(1).is_err() {
+        if state.allocations.try_reserve_exact(1).is_err() {
             drop(state);
             let mut allocation = allocation;
             if io.rm_free(nd::H_DEVICE, memory).is_ok() {

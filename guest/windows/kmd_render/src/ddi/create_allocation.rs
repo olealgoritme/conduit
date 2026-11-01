@@ -3162,16 +3162,19 @@ pub(crate) unsafe fn native_ring_backing(
 ) -> Option<crate::virtio::native_channel::NativeRingBacking> {
     let dxg = adapter.dxgkrnl().ok()?;
     let passive = unsafe { crate::irql::PassiveLevel::assume() };
-    adapter
-        .producer
-        .with_allocation_reference(passive, dxg, allocation, false, |ctx| {
-            if ctx.native_id == 0 {
-                return None;
-            }
-            crate::virtio::native_memory::ring_backing(ctx.native_id, gpfifo_va, ring_bytes).ok()
-        })
-        .ok()
-        .flatten()
+    use helios_kmd_logic::producer_completion::Error as RefError;
+    crate::adapter::producer::with_allocation_reference(passive, dxg, allocation, false, |handle| {
+        // SAFETY: the global handle data of an allocation is the hAllocation
+        // this driver returned from CreateAllocation; resolve_alloc checks its
+        // magic before trusting any field.
+        let ctx = unsafe { resolve_alloc(handle as HANDLE) }.ok_or(RefError::Invalid)?;
+        if ctx.native_id == 0 {
+            return Err(RefError::Invalid);
+        }
+        crate::virtio::native_memory::ring_backing(ctx.native_id, gpfifo_va, ring_bytes)
+            .map_err(|_| RefError::Invalid)
+    })
+    .ok()
 }
 
 /// Create one native 610.88 allocation.  This is deliberately entered before
@@ -3294,11 +3297,7 @@ unsafe fn create_native_one(
         } else {
             0x0000_0001 // CpuVisible (uncached/write-combined)
         };
-        info.__bindgen_anon_4
-            .FlagsWddm2
-            .__bindgen_anon_1
-            .__bindgen_anon_1
-            .Value = flags;
+        info.__bindgen_anon_4.FlagsWddm2.__bindgen_anon_1.Value = flags;
     }
     Ok(())
 }

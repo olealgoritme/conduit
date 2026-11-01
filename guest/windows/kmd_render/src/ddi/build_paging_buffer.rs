@@ -2240,7 +2240,7 @@ unsafe fn native_paging_operation(
         return Some(
             match crate::virtio::native_memory::notify_residency(
                 allocation.native_id,
-                n.PhysicalAddress,
+                n.PhysicalAddress.SegmentOffset,
                 flags & 1 != 0,
             ) {
                 Ok(()) => STATUS_SUCCESS,

@@ -313,7 +313,11 @@ fn replace_process(process: &ProcessContext, next: NativeProcessState) -> Native
     core::mem::replace(&mut *process_slot(process).lock(), next)
 }
 
-fn ensure_process(adapter: &AdapterContext, process: &ProcessContext) -> Result<(), NativeError> {
+fn ensure_process(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    process: &ProcessContext,
+) -> Result<(), NativeError> {
     let epoch = adapter.with_virtio(|v| v.nvrm_epoch()).unwrap_or(0);
     match replace_process(process, NativeProcessState::Busy) {
         NativeProcessState::Ready(previous) => {
@@ -430,7 +434,7 @@ impl NativeContext {
         process: &mut ProcessContext,
         owner: DeviceOwner,
     ) -> Result<Self, NativeError> {
-        ensure_process(adapter, process)?;
+        ensure_process(passive, adapter, process)?;
         let handles = ObjectHandles::mint()?;
         let tsg = handles.at(0);
         let ctxshare = handles.at(1);

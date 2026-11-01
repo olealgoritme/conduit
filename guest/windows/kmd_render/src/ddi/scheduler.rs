@@ -381,16 +381,16 @@ pub unsafe extern "C" fn dxgkddi_submit_command_to_hw_queue(
     if queue.handle.adapter != h_adapter as *mut AdapterContext {
         return STATUS_INVALID_PARAMETER;
     }
-    if args.pPrivateDriverData.is_null() {
+    if args.pDmaBufferPrivateData.is_null() {
         return STATUS_INVALID_PARAMETER;
     }
-    // SAFETY: dxgkrnl supplies exactly PrivateDriverDataSize readable bytes.
+    // SAFETY: dxgkrnl supplies exactly DmaBufferPrivateDataSize readable bytes.
     // NativeQueue::submit performs only its leaf spinlock and volatile stores;
     // in particular there is no registry/host call or allocation at this IRQL.
     let private = unsafe {
         core::slice::from_raw_parts(
-            args.pPrivateDriverData as *const u8,
-            args.PrivateDriverDataSize as usize,
+            args.pDmaBufferPrivateData as *const u8,
+            args.DmaBufferPrivateDataSize as usize,
         )
     };
     match queue.native.submit(private) {
