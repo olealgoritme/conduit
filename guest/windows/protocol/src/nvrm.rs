@@ -277,8 +277,10 @@ pub const HELIOS_NVRM_PIN_DEEP_BIT_INDIRECT: u32 = 1 << 1;
 /// `Mmap` (4) / `Munmap` (5) are refused — they need KMD mapping work and have
 /// their own ops. Everything else (EventReady 8, input/clipboard 21–27, GpuCmd
 /// 30) is refused; those have dedicated paths or are host → guest only.
+/// `MmapAt` (35) is deliberately absent: only the KMD sends it, on its own
+/// control path, for the NVIDIA personality's exact CPU-aperture placement.
 pub const HELIOS_NVRM_FORWARD_MSG_TYPES: u64 =
-    (1 << 1) | (1 << 2) | (1 << 3) | (1 << 6) | (1 << 7) | (1 << 20) | (1u64 << 35);
+    (1 << 1) | (1 << 2) | (1 << 3) | (1 << 6) | (1 << 7) | (1 << 20);
 
 /// Bytes of the `ScanoutFlip` payload that follows the `MsgHeader`.
 pub const HELIOS_NVRM_SCANOUT_FLIP_BYTES: usize = 64;
