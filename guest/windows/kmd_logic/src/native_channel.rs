@@ -13,6 +13,9 @@ pub const NVDA_CONTEXT_VERSION: u32 = 0x0001_0000;
 pub const CONTEXT_PRIVATE_BYTES: usize = 3200;
 pub const QUEUE_PRIVATE_BYTES: usize = 180;
 pub const SUBMIT_PRIVATE_BYTES: usize = 536;
+/// The 610.88 D3D11 UMD's SubmitCommandToHwQueue record (NVDA header, size
+/// 0x118 at +0x0c); its new GP_PUT sits at the same +0x78 as the CUDA record's.
+pub const D3D_SUBMIT_PRIVATE_BYTES: usize = 280;
 
 pub const CUDA_RING_BYTES: u32 = 0x2000;
 /// The 610.88 D3D11 UMD's GPFIFO ring (8192 entries).
@@ -329,7 +332,10 @@ pub fn parse_submit_private(
     previous_gp_put: u32,
     ring_bytes: u32,
 ) -> Result<SubmitPrivate, PrivateError> {
-    if buf.len() != SUBMIT_PRIVATE_BYTES || ring_bytes == 0 || ring_bytes % GP_ENTRY_BYTES != 0 {
+    if !matches!(buf.len(), SUBMIT_PRIVATE_BYTES | D3D_SUBMIT_PRIVATE_BYTES)
+        || ring_bytes == 0
+        || ring_bytes % GP_ENTRY_BYTES != 0
+    {
         return Err(PrivateError::Size);
     }
     let new_gp_put = get32(buf, SUBMIT_NEW_GP_PUT_AT).ok_or(PrivateError::Size)?;
@@ -471,6 +477,23 @@ mod tests {
         let mut bad = queue();
         bad[0x24..0x28].copy_from_slice(&0u32.to_le_bytes());
         assert_eq!(parse_queue_private(&bad), Err(PrivateError::Allocation));
+    }
+
+    #[test]
+    fn submit_format_accepts_the_captured_d3d11_record() {
+        let mut b = vec![0u8; D3D_SUBMIT_PRIVATE_BYTES];
+        b[0..4].copy_from_slice(&NVDA_MAGIC.to_le_bytes());
+        b[4..8].copy_from_slice(&0x0001_0000u32.to_le_bytes());
+        b[0x0c..0x10].copy_from_slice(&0x118u32.to_le_bytes());
+        b[0x14..0x18].copy_from_slice(&0x15u32.to_le_bytes());
+        b[0x78..0x7c].copy_from_slice(&0x23u32.to_le_bytes());
+        b[0x7c..0x80].copy_from_slice(&0x0400_0000u32.to_le_bytes());
+        let submit = parse_submit_private(&b, 0x20, D3D_RING_BYTES).unwrap();
+        assert_eq!((submit.new_gp_put, submit.entries_advanced), (0x23, 3));
+        assert_eq!(
+            parse_submit_private(&b[..279], 0x20, D3D_RING_BYTES),
+            Err(PrivateError::Size)
+        );
     }
 
     #[test]
