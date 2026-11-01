@@ -913,12 +913,11 @@ pub fn update_leaf(
     }
     nm::coalesce(&mut final_pieces);
 
+    // GPU VAs are per process: only this process's other mappings can collide.
     for other in STATE.lock().allocations.iter().filter(|a| a.id != id) {
-        if other
-            .mappings
-            .iter()
-            .any(|m| nm::ranges_overlap(m.piece.va, m.piece.len, first_va, len))
-        {
+        if other.mappings.iter().any(|m| {
+            m.process == process && nm::ranges_overlap(m.piece.va, m.piece.len, first_va, len)
+        }) {
             return Err(Error::Overlap);
         }
     }
