@@ -72,6 +72,15 @@ pub unsafe extern "C" fn dxgkddi_query_adapter_info(
         },
         DXGKQAITYPE_HISTORYBUFFERPRECISION => unsafe { query_history_buffer_precision(args) },
         DXGKQAITYPE_64BITONLYCAPS => unsafe { query_zeroed::<DXGK_64_BIT_ONLY_CAPS>(args) },
+        // NVIDIA personality only: NVIDIA's KMD answers the Task Manager perf polls with
+        // success, and its UMDs read them. No telemetry exists here, so zeros. The default
+        // personality keeps NOT_SUPPORTED (the arm below).
+        _DXGK_QUERYADAPTERINFOTYPE::DXGKQAITYPE_NODEPERFDATA
+            if crate::ddi::wddm_surface::nvidia_selected() =>
+        unsafe { query_zeroed::<DXGK_NODE_PERFDATA>(args) },
+        _DXGK_QUERYADAPTERINFOTYPE::DXGKQAITYPE_ADAPTERPERFDATA
+            if crate::ddi::wddm_surface::nvidia_selected() =>
+        unsafe { query_zeroed::<DXGK_ADAPTER_PERFDATA>(args) },
         // Everything else stays unsupported until backed by real implementation
         // (checklist rule: "unknown must stay unadvertised"). Notably dxgkrnl
         // steady-state-polls NODEPERFDATA (0x18) and ADAPTERPERFDATA (0x19) to
@@ -485,7 +494,15 @@ unsafe fn query_driver_caps(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTE
     // `D3d12Node`: a second 3D node (ordinal 1) for the D3D12 UMD's contexts,
     // completed independently of node 0 (`virtio::gpu`, "WDDM nodes"). The count
     // dxgkrnl gets here is the one every per-node path validates against.
-    let nb_asymetric_processing_nodes: UINT = if knobs.d3d12_node { 2 } else { 1 };
+    // The NVIDIA personality reports NVIDIA's 16 nodes (`kmd_logic::hws::NVIDIA_NODES`),
+    // which its UMDs enumerate; the default personality is unchanged.
+    let nb_asymetric_processing_nodes: UINT = if crate::ddi::wddm_surface::nvidia_selected() {
+        helios_kmd_logic::hws::NVIDIA_NODES.len() as UINT
+    } else if knobs.d3d12_node {
+        2
+    } else {
+        1
+    };
     crate::virtio::gpu::WDDM_NODE_COUNT.store(nb_asymetric_processing_nodes, Ordering::Relaxed);
     out.set(
         caps_offset!(
@@ -1344,6 +1361,24 @@ pub unsafe extern "C" fn dxgkddi_get_node_metadata(
     let node = unsafe { &mut *get_node_metadata };
     unsafe {
         core::ptr::write_bytes(node as *mut _ as *mut u8, 0, size_of::<DXGK_NODEMETADATA>());
+    }
+    if crate::ddi::wddm_surface::nvidia_selected() {
+        // NVIDIA personality: NVIDIA's captured 16-node topology. `wddm_node_valid`
+        // above already admits all 16 (WDDM_NODE_COUNT was set from the same table).
+        let Some(desc) = helios_kmd_logic::hws::nvidia_node(node_ordinal) else {
+            return STATUS_INVALID_PARAMETER;
+        };
+        node.EngineType = desc.engine_type as DXGK_ENGINE_TYPE::Type;
+        // DXGK_NODEMETADATA is packed: write the name through an unaligned raw pointer.
+        let name = core::ptr::addr_of_mut!(node.FriendlyName) as *mut WCHAR;
+        for (i, ch) in desc.name.bytes().take(31).enumerate() {
+            // SAFETY: i < 31 < 32 elements of the zeroed FriendlyName array.
+            unsafe { name.add(i).write_unaligned(WCHAR::from(ch)) };
+        }
+        node.Flags.__bindgen_anon_1.Value = desc.flags;
+        node.GpuMmuSupported = 1;
+        node.IoMmuSupported = 0;
+        return STATUS_SUCCESS;
     }
     node.EngineType = DXGK_ENGINE_TYPE::DXGK_ENGINE_TYPE_3D;
     // The node memory model must match the DRIVERCAPS surface, so it reads the same

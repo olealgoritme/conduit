@@ -2113,12 +2113,16 @@ struct WddmPending {
 // D3D12 batch waiting for its RM fence no longer holds back DWM's packets, and a
 // slow present no longer holds back the D3D12 batches behind it: the pending
 // FIFO stays one queue, but each node completes from its own first entry.
+//
+// The NVIDIA personality reports NVIDIA's 16-node topology instead
+// (`helios_kmd_logic::hws::NVIDIA_NODES`): the per-node state is sized for it,
+// and the default personality still reports 1 or 2 (`WDDM_NODE_COUNT`).
 /// Most WDDM nodes this driver can report.
-pub const MAX_WDDM_NODES: usize = 2;
+pub const MAX_WDDM_NODES: usize = helios_kmd_logic::native_channel::HWS_NODE_COUNT as usize;
 /// WDDM nodes reported, fixed when the caps were answered (AddAdapter).
 pub static WDDM_NODE_COUNT: AtomicU32 = AtomicU32::new(1);
 
-/// Nodes reported now (1 or 2).
+/// Nodes reported now (1 or 2; 16 in the NVIDIA personality).
 pub fn wddm_node_count() -> u32 {
     WDDM_NODE_COUNT
         .load(Ordering::Relaxed)

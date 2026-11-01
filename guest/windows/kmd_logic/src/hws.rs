@@ -47,6 +47,85 @@ pub const fn is_hw_queue_context(flags: u32) -> bool {
     flags & want == want
 }
 
+/// `DXGK_ENGINE_TYPE` values used by the NVIDIA topology.
+pub const ENGINE_OTHER: u32 = 0;
+pub const ENGINE_3D: u32 = 1;
+pub const ENGINE_VIDEO_DECODE: u32 = 2;
+pub const ENGINE_VIDEO_ENCODE: u32 = 3;
+pub const ENGINE_COPY: u32 = 6;
+
+/// `DXGK_NODEMETADATA_FLAGS.Value`: `ContextSchedulingSupported` (bit 0) with
+/// `MaxInFlightHwQueueBuffers` in bits 16..32.
+pub const fn node_flags(context_scheduling: bool, max_in_flight_hw_queue_buffers: u16) -> u32 {
+    (context_scheduling as u32) | ((max_in_flight_hw_queue_buffers as u32) << 16)
+}
+
+/// One node of the NVIDIA personality's engine topology.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NodeDesc {
+    pub engine_type: u32,
+    pub flags: u32,
+    /// `FriendlyName`, only for `DXGK_ENGINE_TYPE_OTHER` nodes (WDK: standard
+    /// engines carry an empty name).
+    pub name: &'static str,
+}
+
+const fn node(engine_type: u32) -> NodeDesc {
+    NodeDesc {
+        engine_type,
+        flags: 0,
+        name: "",
+    }
+}
+
+const fn other(name: &'static str) -> NodeDesc {
+    NodeDesc {
+        engine_type: ENGINE_OTHER,
+        flags: 0,
+        name,
+    }
+}
+
+/// The 16 nodes NVIDIA's 610.88 KMD reports from `DxgkDdiGetNodeMetadata`
+/// (captured on an RTX 5090), all with `GpuMmuSupported = 1`. Only nodes 0 and 4
+/// carry context scheduling; the UMDs query all 16 and the CUDA loader creates
+/// its context on node 4.
+pub const NVIDIA_NODES: [NodeDesc; 16] = [
+    NodeDesc {
+        engine_type: ENGINE_3D,
+        flags: node_flags(true, 12),
+        name: "",
+    },
+    node(ENGINE_VIDEO_DECODE),
+    node(ENGINE_VIDEO_DECODE),
+    node(ENGINE_COPY),
+    NodeDesc {
+        engine_type: ENGINE_COPY,
+        flags: node_flags(true, 32),
+        name: "",
+    },
+    other("Security"),
+    node(ENGINE_VIDEO_ENCODE),
+    node(ENGINE_VIDEO_ENCODE),
+    node(ENGINE_VIDEO_ENCODE),
+    other("OFA_0"),
+    other("JPEG_Decode_3"),
+    other("VR"),
+    node(ENGINE_COPY),
+    node(ENGINE_COPY),
+    node(ENGINE_COPY),
+    node(ENGINE_COPY),
+];
+
+/// The node's description, or `None` past the 16th.
+pub const fn nvidia_node(node_ordinal: u32) -> Option<NodeDesc> {
+    if (node_ordinal as usize) < NVIDIA_NODES.len() {
+        Some(NVIDIA_NODES[node_ordinal as usize])
+    } else {
+        None
+    }
+}
+
 /// Monitored-fence progress of one HW queue, as the KMD sees it.
 ///
 /// `submitted` is the highest `HwQueueProgressFenceId` handed to
@@ -186,6 +265,34 @@ mod tests {
         assert!(!is_hw_queue_context(0x10));
         assert!(!is_hw_queue_context(0x04));
         assert!(!is_hw_queue_context(0));
+    }
+
+    #[test]
+    fn nvidia_topology_matches_the_capture() {
+        assert_eq!(NVIDIA_NODES.len(), 16);
+        assert_eq!(
+            NVIDIA_NODES.len() as u32,
+            crate::native_channel::HWS_NODE_COUNT
+        );
+        assert_eq!(nvidia_node(0).unwrap().flags, 0xc0001);
+        assert_eq!(nvidia_node(4).unwrap().flags, 0x200001);
+        let types: Vec<u32> = NVIDIA_NODES.iter().map(|n| n.engine_type).collect();
+        assert_eq!(types, [1, 2, 2, 6, 6, 0, 3, 3, 3, 0, 0, 0, 6, 6, 6, 6]);
+        let names: Vec<&str> = NVIDIA_NODES.iter().map(|n| n.name).collect();
+        assert_eq!(names[5], "Security");
+        assert_eq!(names[9], "OFA_0");
+        assert_eq!(names[10], "JPEG_Decode_3");
+        assert_eq!(names[11], "VR");
+        for n in &NVIDIA_NODES {
+            // FriendlyName is WCHAR[32] with a terminator; only OTHER nodes are named.
+            assert!(n.name.len() < 32 && n.name.is_ascii());
+            assert_eq!(n.name.is_empty(), n.engine_type != ENGINE_OTHER);
+        }
+        // Only the two scheduling nodes carry flags; they are the native-TSG nodes.
+        for (i, n) in NVIDIA_NODES.iter().enumerate() {
+            assert_eq!(n.flags != 0, crate::native_channel::hws_native_node(i as u32));
+        }
+        assert_eq!(nvidia_node(16), None);
     }
 
     #[test]
