@@ -378,7 +378,11 @@ pub fn channel_client(
     adapter: &AdapterContext,
     process: usize,
 ) -> Result<(NativeClient, u32), Error> {
-    if let Some(client) = STATE.lock().client.as_ref().copied() {
+    // Copy the client out first: a guard in an `if let` scrutinee lives through
+    // the body (edition 2021), and `ensure_space` takes STATE again on this
+    // non-reentrant spinlock (CreateContext spun forever in ensure_space).
+    let existing = STATE.lock().client.as_ref().copied();
+    if let Some(client) = existing {
         let io = Io {
             passive,
             adapter,
@@ -603,7 +607,9 @@ pub fn create(
     private_bytes: &mut [u8],
 ) -> Result<Created, Error> {
     let _guard = lock(passive)?;
-    let client = match STATE.lock().client.as_ref().copied() {
+    // As in `channel_client`: release STATE before `channel_client` re-takes it.
+    let existing = STATE.lock().client.as_ref().copied();
+    let client = match existing {
         Some(client) => client,
         None => channel_client(passive, adapter, 0)?.0,
     };
