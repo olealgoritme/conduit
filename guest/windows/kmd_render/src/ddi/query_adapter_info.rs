@@ -89,6 +89,12 @@ pub unsafe extern "C" fn dxgkddi_query_adapter_info(
         _DXGK_QUERYADAPTERINFOTYPE::DXGKQAITYPE_PHYSICALADAPTERCAPS
             if crate::ddi::wddm_surface::nvidia_selected() =>
         unsafe { query_physical_adapter_caps(adapter, args) },
+        // NVIDIA personality only (WDDM 3.2 surface): AddAdapter asks for it and
+        // fails STATUS_NOT_SUPPORTED without an answer (DxgKrnl-Admin 549). No
+        // HDR / virtual-mode / secure-display capability here: all bits clear.
+        _DXGK_QUERYADAPTERINFOTYPE::DXGKQAITYPE_DISPLAY_DRIVERCAPS_EXTENSION
+            if crate::ddi::wddm_surface::nvidia_selected() =>
+        unsafe { query_zeroed::<DXGK_DISPLAY_DRIVERCAPS_EXTENSION>(args) },
         // Everything else stays unsupported until backed by real implementation
         // (checklist rule: "unknown must stay unadvertised"). Notably dxgkrnl
         // steady-state-polls NODEPERFDATA (0x18) and ADAPTERPERFDATA (0x19) to
