@@ -3194,14 +3194,36 @@ unsafe fn create_native_one(
     // SAFETY: dxgkrnl owns this writable per-allocation buffer for the call;
     // create/writeback both use the authoritative byte length above.
     let bytes = unsafe { core::slice::from_raw_parts_mut(info.pPrivateDriverData as *mut u8, len) };
-    let private = native::parse_allocation_private(bytes).map_err(|error| match error {
+    let private = native::parse_allocation_private(bytes).map_err(|error| {
+        // Why the record was refused (PrivateError discriminant + 1).
+        let code = match error {
+            native::PrivateError::Short => 1,
+            native::PrivateError::BadMagic => 2,
+            native::PrivateError::BadVersion => 3,
+            native::PrivateError::BadDeclaredSize => 4,
+            native::PrivateError::SizeZero => 5,
+            native::PrivateError::SizeOverflow => 6,
+            native::PrivateError::SystemMemoryAlignment => 7,
+            native::PrivateError::UnsupportedKind(_) => 8,
+            native::PrivateError::UnsupportedTiling(_) => 9,
+            native::PrivateError::UnsupportedCompression(_) => 10,
+        };
+        crate::diag::record_named_bytes(b"NvAlParse", code);
+        error
+    });
+    let private = private.map_err(|error| match error {
         native::PrivateError::UnsupportedKind(_)
         | native::PrivateError::UnsupportedTiling(_)
         | native::PrivateError::UnsupportedCompression(_) => STATUS_NOT_SUPPORTED,
         _ => STATUS_INVALID_PARAMETER,
     })?;
     let created = crate::virtio::native_memory::create(passive, adapter, &private, bytes)
-        .map_err(|error| error.ntstatus())?;
+        .map_err(|error| {
+            // Which native-memory error refused it (Error discriminant + 1), and where.
+            crate::diag::record_named_bytes(b"NvAlCreate", 1 + error as u32);
+            crate::diag::record_named_bytes(b"NvAlStep", crate::virtio::native_memory::last_step());
+            error.ntstatus()
+        })?;
     let Ok(size) = SIZE_T::try_from(created.size) else {
         let _ = crate::virtio::native_memory::destroy(passive, adapter, created.id);
         return Err(STATUS_NO_MEMORY);

@@ -600,19 +600,31 @@ fn alloc_system_descriptor(io: &Io<'_>, memory: u32, pfns: &[u64], size: u64) ->
 /// Create the real local-linear or pSystemMem OS-descriptor backing.  All
 /// private-data validation has already completed in `kmd_logic`; no host
 /// allocation is attempted for an unsupported shape.
+static STEP: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+fn step(n: u32) {
+    STEP.store(n, Ordering::Relaxed);
+}
+/// The last checkpoint `create` reached (diagnostic for refused allocations).
+pub fn last_step() -> u32 {
+    STEP.load(Ordering::Relaxed)
+}
+
 pub fn create(
     passive: PassiveLevel,
     adapter: &AdapterContext,
     private: &nm::AllocationPrivate,
     private_bytes: &mut [u8],
 ) -> Result<Created, Error> {
+    step(1);
     let _guard = lock(passive)?;
+    step(2);
     // As in `channel_client`: release STATE before `channel_client` re-takes it.
     let existing = STATE.lock().client.as_ref().copied();
     let client = match existing {
         Some(client) => client,
         None => channel_client(passive, adapter, 0)?.0,
     };
+    step(3);
     let epoch = adapter.with_virtio(|v| v.nvrm_epoch()).unwrap_or(0);
     if epoch == 0 || epoch != client.epoch {
         return Err(Error::NotReady);
@@ -622,6 +634,7 @@ pub fn create(
         adapter,
         client,
     };
+    step(4);
     let (memory, pins) = {
         let mut state = STATE.lock();
         (state.mint()?, Vec::new())
@@ -647,6 +660,7 @@ pub fn create(
         }
         (private.size, pins)
     } else {
+        step(5);
         let params = local_params(client.root, private.size);
         match io.rm_alloc(nd::H_DEVICE, memory, rc::NV01_MEMORY_LOCAL_USER, &params) {
             Ok(reply) => {
@@ -664,6 +678,7 @@ pub fn create(
         }
     };
 
+    step(6);
     let writeback = match nm::PrivateWriteback::new(
         memory,
         client.root,
@@ -684,6 +699,7 @@ pub fn create(
             return Err(Error::Invalid);
         }
     };
+    step(7);
     if nm::writeback_allocation_private(private_bytes, &writeback).is_err() {
         if io.rm_free(nd::H_DEVICE, memory).is_ok() {
             unlock_pins(&mut pins);
