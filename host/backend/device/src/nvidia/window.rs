@@ -253,6 +253,110 @@ impl NvidiaBackend {
         off
     }
 
+    /// Parse an exact-placement request. UVM pools have their own addressing
+    /// contract and are never silently accepted by this native-WDDM path.
+    pub(super) fn handle_mmap_at(&mut self, payload: &[u8], resp_buf: &mut [u8]) -> usize {
+        if payload.len() < size_of::<MmapAtReq>() {
+            return self.write_error_resp(resp_buf, Status::InvalidMsgType, 0, libc::EINVAL);
+        }
+        let req = read_struct::<MmapAtReq>(payload, 0);
+        if self.handle_kinds.get(&(self.current_handle as u64)) == Some(&DeviceKind::Uvm) {
+            return self.write_error_resp(resp_buf, Status::IoctlFailed, 0, libc::EINVAL);
+        }
+        self.map_unrecorded_at(req.size, req.offset, req.window_offset, resp_buf)
+    }
+
+    /// Serve an mmap whose shared-window offset is fixed by WDDM. This is the
+    /// same object mapping protocol as `map_unrecorded`, but placement is a
+    /// requirement, not a hint: no other offset is tried and no live mapping is
+    /// displaced to make room.
+    pub(super) fn map_unrecorded_at(
+        &mut self,
+        size: u64,
+        offset: u64,
+        window_offset: u64,
+        resp_buf: &mut [u8],
+    ) -> usize {
+        let handle = self.current_handle as u64;
+        let need = size_of::<MsgHeader>() + size_of::<MmapResp>();
+        if resp_buf.len() < need {
+            return self.write_error_resp(resp_buf, Status::BufferTooSmall, 0, 0);
+        }
+        if self.window.is_none() {
+            log::warn!("mmap-at on handle {handle}: no shared window to place it in");
+            return self.write_error_resp(resp_buf, Status::IoctlFailed, 0, libc::ENOTSUP);
+        }
+        let host_fd = match self.handles.get_raw(handle) {
+            Ok(fd) => fd,
+            Err(_) => return self.write_error_resp(resp_buf, Status::BadHandle, 0, libc::ENOENT),
+        };
+        let kind = self.handle_kinds.get(&handle).copied();
+        let pgprot = match kind {
+            Some(DeviceKind::Gpu(_)) | Some(DeviceKind::Dri(_)) => {
+                crate::shm::PgprotKind::WriteCombine
+            }
+            _ => crate::shm::PgprotKind::WriteBack,
+        };
+        let fd_offset = match kind {
+            Some(DeviceKind::Dri(_)) => offset,
+            _ => 0,
+        };
+        let length = size.max(4096);
+        let region = match self.shm.alloc_at(window_offset, length, pgprot) {
+            Ok(region) => region,
+            Err(e) => {
+                log::warn!(
+                    "mmap-at on handle {handle}: fixed window offset {window_offset:#x}+{length:#x} is unavailable: {e}"
+                );
+                return self.write_error_resp(resp_buf, Status::IoctlFailed, 0, libc::ENOMEM);
+            }
+        };
+        let Some(window) = self.window.as_ref() else {
+            unreachable!("window presence was checked before allocation");
+        };
+        if let Err(e) = window.place(region.offset, length, host_fd, fd_offset, true) {
+            log::warn!("mmap-at on handle {handle}: fixed placement failed: {e}");
+            if let Err(e) = self.shm.free(&region) {
+                log::warn!("mmap-at on handle {handle}: freeing the unplaced region failed: {e}");
+            }
+            return self.write_error_resp(resp_buf, Status::IoctlFailed, 0, libc::EINVAL);
+        }
+        let offset = region.offset;
+        let id = self.next_mapping_id;
+        self.next_mapping_id = self.next_mapping_id.wrapping_add(1).max(1);
+        self.dri_maps.insert((handle, fd_offset), id);
+        self.live_maps.insert(
+            id,
+            LiveMap {
+                key: (handle, fd_offset),
+                region,
+                length,
+            },
+        );
+        self.active_maps.insert(
+            offset,
+            crate::mmap::MmapEntry {
+                host_p_linear_address: 0,
+                shm_length: length,
+                h_client: 0,
+                h_memory: 0,
+                map_fd_handle: handle,
+                region,
+            },
+        );
+        let mut off = self.write_hdr(resp_buf, self.current_handle, 0);
+        off += write_struct(
+            &mut resp_buf[off..],
+            &MmapResp {
+                guest_phys_addr: offset,
+                size: length.div_ceil(4096) * 4096,
+                mapping_id: id,
+                padding: 0,
+            },
+        );
+        off
+    }
+
     pub(super) fn handle_munmap(&mut self, payload: &[u8], resp_buf: &mut [u8]) -> usize {
         if payload.len() < size_of::<MunmapReq>() {
             return self.write_error_resp(resp_buf, Status::InvalidMsgType, 0, libc::EINVAL);

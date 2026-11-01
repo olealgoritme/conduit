@@ -274,6 +274,35 @@ impl Io<'_> {
             Err(_) => Ok(()),
         }
     }
+
+    /// Quiesce every channel in this KMD client before a live VA replacement or
+    /// teardown. This is a real host-RM wait, not a bookkeeping "idle" flag.
+    fn idle_channels(self, client: &NativeClient) -> Result<(), NativeError> {
+        let mut data = [0u8; 52];
+        data[0..4].copy_from_slice(&client.root.to_le_bytes());
+        data[4..8].copy_from_slice(&nd::H_DEVICE.to_le_bytes());
+        let mut response = [0u8; 512];
+        let n = self.exchange(client.gpu, rc::nv_cmd(0x41, 52), &data, &[], &mut response)?;
+        let reply = response.get(..n).ok_or(NativeError::Transport)?;
+        rc::rm_reply(reply, 48).map_err(|_| NativeError::Transport)?;
+        Ok(())
+    }
+}
+
+/// Stop new submissions and wait for outstanding work before touching live VAs.
+pub(crate) fn quiesce(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    process: usize,
+) -> Result<(), NativeError> {
+    let (client, _) = super::native_memory::channel_client(passive, adapter, process)
+        .map_err(|_| NativeError::Transport)?;
+    let io = Io {
+        passive,
+        adapter,
+        epoch: client.epoch,
+    };
+    io.idle_channels(&client)
 }
 
 fn process_slot(process: &ProcessContext) -> &SpinLock<NativeProcessState> {
@@ -533,14 +562,14 @@ impl QueueParts {
             io.free(client, tsg, handles.at(5))?;
             self.channel_allocated = false;
         }
-        cpu_unmap(io, client, &mut self.usermode);
+        cpu_unmap(io, client, &mut self.usermode)?;
         if self.usermode_allocated {
-            let _ = io.free(client, nd::H_SUBDEVICE, handles.at(4));
+            io.free(client, nd::H_SUBDEVICE, handles.at(4))?;
             self.usermode_allocated = false;
         }
-        cpu_unmap(io, client, &mut self.ctl);
+        cpu_unmap(io, client, &mut self.ctl)?;
         if self.ctl_allocated {
-            let _ = io.free(client, nd::H_DEVICE, handles.at(3));
+            io.free(client, nd::H_DEVICE, handles.at(3))?;
             self.ctl_allocated = false;
         }
         Ok(())
@@ -864,7 +893,7 @@ fn cpu_map(
         Ok(())
     })();
     if let Err(error) = result {
-        cpu_unmap(io, client, &mut view);
+        let _ = cpu_unmap(io, client, &mut view);
         return Err(error);
     }
     Ok(view)
@@ -891,38 +920,40 @@ fn kernel_map(
     Ok(va as u64)
 }
 
-fn cpu_unmap(io: Io<'_>, client: &NativeClient, view: &mut CpuView) {
+fn cpu_unmap(io: Io<'_>, client: &NativeClient, view: &mut CpuView) -> Result<(), NativeError> {
     if view.va != 0 {
         // SAFETY: this exact view came from MmMapIoSpace and is removed once.
         unsafe { MmUnmapIoSpace(view.va as *mut c_void, view.len) };
         view.va = 0;
     }
     if view.host_mapped {
-        let _ = nvrm::release_host_map_within(
+        nvrm::release_host_map_within(
             io.passive,
             io.adapter,
             view.map_ch,
             view.host_id,
             TIMEOUT_MS,
-        );
+        )
+        .map_err(|_| NativeError::Transport)?;
         view.host_mapped = false;
     }
     if view.cookie & MAPPED != 0 {
         let block = rc::nvos34(client.root, view.parent, view.mem, view.cookie & !MAPPED);
         let mut resp = [0u8; 128];
-        if let Ok(n) = io.exchange(
+        let n = io.exchange(
             client.ctl,
             rc::nv_cmd(rc::ESC_RM_UNMAP_MEMORY, rc::NVOS34_BYTES as u32),
             &block,
             &[],
             &mut resp,
-        ) {
-            let _ = rc::rm_reply(&resp[..n], rc::NVOS34_STATUS_AT);
-        }
+        )?;
+        let reply = resp.get(..n).ok_or(NativeError::Transport)?;
+        rc::rm_reply(reply, rc::NVOS34_STATUS_AT).map_err(|_| NativeError::Transport)?;
         view.cookie = 0;
     }
-    let _ = io.close_file(view.map_ch);
+    io.close_file(view.map_ch)?;
     view.map_ch = 0;
+    Ok(())
 }
 
 fn zero(base: u64, len: u64) {

@@ -277,8 +277,8 @@ pub const HELIOS_NVRM_PIN_DEEP_BIT_INDIRECT: u32 = 1 << 1;
 /// `Mmap` (4) / `Munmap` (5) are refused — they need KMD mapping work and have
 /// their own ops. Everything else (EventReady 8, input/clipboard 21–27, GpuCmd
 /// 30) is refused; those have dedicated paths or are host → guest only.
-pub const HELIOS_NVRM_FORWARD_MSG_TYPES: u32 =
-    (1 << 1) | (1 << 2) | (1 << 3) | (1 << 6) | (1 << 7) | (1 << 20);
+pub const HELIOS_NVRM_FORWARD_MSG_TYPES: u64 =
+    (1 << 1) | (1 << 2) | (1 << 3) | (1 << 6) | (1 << 7) | (1 << 20) | (1u64 << 35);
 
 /// Bytes of the `ScanoutFlip` payload that follows the `MsgHeader`.
 pub const HELIOS_NVRM_SCANOUT_FLIP_BYTES: usize = 64;

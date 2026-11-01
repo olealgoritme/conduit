@@ -81,6 +81,8 @@ const MSG_IOCTL: u32 = 3;
 const MSG_MMAP: u32 = 4;
 const MSG_MUNMAP: u32 = 5;
 const MSG_SCANOUT_FLIP: u32 = 20;
+// `MmapAt` (35) carries an exact WDDM CPU-aperture placement.
+const MSG_MMAP_AT: u32 = 35;
 
 /// `NV_ESC_RM_FREE` as the low 16 bits of the Linux ioctl number the guest sends:
 /// `('F' << 8) | 0x29`.
@@ -372,7 +374,7 @@ pub fn forward(
         return Err(refused(Refusal::BadRange));
     };
     // `msg >= 32` first: the mask is a u32 bitmap over the value.
-    if msg >= 32 || (HELIOS_NVRM_FORWARD_MSG_TYPES >> msg) & 1 == 0 {
+    if msg >= 64 || (HELIOS_NVRM_FORWARD_MSG_TYPES >> msg) & 1 == 0 {
         return Err(refused(Refusal::MsgType));
     }
     if pin_id != 0 && msg != MSG_IOCTL {
@@ -497,7 +499,9 @@ pub fn forward(
                     // host would create the fence, fail to write its handle back
                     // (BufferTooSmall) and leave one the guest can never close:
                     // refuse before anything is reserved or sent.
-                    if resp.len() < nvrm_fence::REPLY_DATA + nvrm_fence::FENCE_CREATE_DATA_LEN as usize {
+                    if resp.len()
+                        < nvrm_fence::REPLY_DATA + nvrm_fence::FENCE_CREATE_DATA_LEN as usize
+                    {
                         return Err(refused(Refusal::BadRange));
                     }
                     return forward_fence_create(passive, adapter, owner, req, resp, timeout_ms);
@@ -536,7 +540,9 @@ pub fn forward(
                     return Err(Refusal::Transport(e));
                 }
             };
-            harden::after_reply(adapter, owner, process, handle, hmode, reserved, req, resp, n);
+            harden::after_reply(
+                adapter, owner, process, handle, hmode, reserved, req, resp, n,
+            );
             after_ioctl(adapter, owner, req, resp, n);
             Ok(n)
         }
@@ -744,7 +750,8 @@ fn check_ioctl(req: &[u8], pinned: bool) -> Result<(), Refusal> {
     if pinned && (deep_ptr != 0 || deep_len != 0) {
         return Err(Refusal::Forbidden);
     }
-    let declared = IOCTL_HDR as u64 + u64::from(data_len) + u64::from(nested_len) + u64::from(deep_len);
+    let declared =
+        IOCTL_HDR as u64 + u64::from(data_len) + u64::from(nested_len) + u64::from(deep_len);
     if declared > req.len() as u64 {
         return Err(Refusal::BadRange);
     }
@@ -1091,9 +1098,12 @@ pub(crate) fn forward_kmd_registration(
     resp: &mut [u8],
     timeout_ms: u64,
 ) -> Result<usize, Refusal> {
-    let (Some(msg), Some(handle), Some(data_len), Some(nested_len)) =
-        (rd_u32(req, 0), rd_u32(req, 4), rd_u32(req, 20), rd_u32(req, 28))
-    else {
+    let (Some(msg), Some(handle), Some(data_len), Some(nested_len)) = (
+        rd_u32(req, 0),
+        rd_u32(req, 4),
+        rd_u32(req, 20),
+        rd_u32(req, 28),
+    ) else {
         return Err(Refusal::BadRange);
     };
     if msg != MSG_IOCTL
@@ -1258,6 +1268,84 @@ pub fn host_mmap_within(
         }
     }
     // MsgHeader | MmapResp { guest_phys_addr u64, size u64, mapping_id u32, pad u32 }.
+    if n < MSG_HDR + 24 {
+        return Err(MapRefusal::Transport(VirtioError::DeviceError));
+    }
+    let (Some(lo), Some(hi), Some(slo), Some(shi), Some(host_id)) = (
+        rd_u32(&resp, 16),
+        rd_u32(&resp, 20),
+        rd_u32(&resp, 24),
+        rd_u32(&resp, 28),
+        rd_u32(&resp, 32),
+    ) else {
+        return Err(MapRefusal::Transport(VirtioError::DeviceError));
+    };
+    Ok(HostMapping {
+        offset: u64::from(lo) | (u64::from(hi) << 32),
+        size: u64::from(slo) | (u64::from(shi) << 32),
+        host_id,
+        device_type,
+    })
+}
+
+/// Map an RM object at an exact WDDM aperture offset. Unlike `host_mmap_within`,
+/// this never lets RM or the host choose the placement.
+pub fn host_mmap_at_within(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    owner: DeviceOwner,
+    handle: u32,
+    write: bool,
+    offset: u64,
+    window_offset: u64,
+    size: u64,
+    timeout_ms: u64,
+) -> Result<HostMapping, MapRefusal> {
+    let Some(device_type) = adapter
+        .with_virtio(|v| v.nvrm_handle_device_type(owner, handle))
+        .ok()
+        .flatten()
+    else {
+        return Err(MapRefusal::NotOwned);
+    };
+    if nvrm_fence::is_fence(device_type) {
+        return Err(MapRefusal::NotOwned);
+    }
+    if size == 0 || size % PAGE != 0 || size > MAX_MAP_BYTES || offset % PAGE != 0 {
+        return Err(MapRefusal::BadRange);
+    }
+    super::gpu::grow_nvrm_tables(adapter);
+    let table_ok = adapter
+        .with_virtio(|v| v.nvrm_map_admit(owner) == helios_kmd_logic::rm_limits::Admit::Ok)
+        .unwrap_or(false);
+    if !table_ok {
+        super::nvrm_window::count_map_table_refusal();
+        return Err(MapRefusal::NoResources);
+    }
+    let live_privileged = super::nvrm_window::live_privileged(adapter, owner);
+    let window_ok = adapter
+        .with_virtio(|v| v.nvrm_window_admit(owner, device_type == 256, size, live_privileged))
+        .map(|r| r.is_ok())
+        .unwrap_or(false);
+    if !window_ok {
+        return Err(MapRefusal::NoResources);
+    }
+    let mut req = [0u8; MSG_HDR + 32];
+    req[..4].copy_from_slice(&MSG_MMAP_AT.to_le_bytes());
+    req[4..8].copy_from_slice(&handle.to_le_bytes());
+    req[16..24].copy_from_slice(&size.to_le_bytes());
+    req[24..32].copy_from_slice(&offset.to_le_bytes());
+    req[32..40].copy_from_slice(&window_offset.to_le_bytes());
+    req[40..44].copy_from_slice(&(if write { 3u32 } else { 1u32 }).to_le_bytes());
+    let mut resp = [0u8; 64];
+    let n = ctrl::raw_roundtrip(passive, adapter, &req, &mut resp, timeout_ms)
+        .map_err(MapRefusal::Transport)?;
+    if let Some(status) = rd_i32(&resp, 8) {
+        if status < 0 {
+            super::nvrm_window::count_host_refused(status.wrapping_neg().max(1) as u32);
+            return Err(MapRefusal::Host(status.wrapping_neg().max(1)));
+        }
+    }
     if n < MSG_HDR + 24 {
         return Err(MapRefusal::Transport(VirtioError::DeviceError));
     }

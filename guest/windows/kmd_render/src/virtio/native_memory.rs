@@ -20,7 +20,9 @@ use helios_kmd_logic::native_memory as nm;
 use helios_kmd_logic::nvda as nd;
 use helios_kmd_logic::rm_ce_channel as cc;
 use helios_kmd_logic::rm_client as rc;
-use wdk_sys::ntddk::{MmMapIoSpace, MmUnmapIoSpace};
+use wdk_sys::ntddk::{
+    MmMapIoSpace, MmMapLockedPagesSpecifyCache, MmUnmapIoSpace, MmUnmapLockedPages,
+};
 use wdk_sys::{MDL, NTSTATUS, PHYSICAL_ADDRESS, PMDL, _MEMORY_CACHING_TYPE};
 
 use super::gpu::DeviceOwner;
@@ -106,6 +108,7 @@ struct HostMapping {
 struct Pin {
     mdl: usize,
     pages: usize,
+    kernel_va: u64,
 }
 
 struct CpuMapping {
@@ -123,6 +126,7 @@ struct Allocation {
     memory: u32,
     size: u64,
     system_memory: u64,
+    system_kernel_va: u64,
     pins: Vec<Pin>,
     mappings: Vec<HostMapping>,
     cpu: Option<CpuMapping>,
@@ -133,6 +137,7 @@ struct Allocation {
 struct State {
     client: Option<NativeClient>,
     allocations: Vec<Allocation>,
+    spaces: Vec<(usize, u32)>,
     orphan_pins: Vec<Pin>,
     idle_spaces: Vec<usize>,
     next_handle: u32,
@@ -143,6 +148,7 @@ impl State {
         Self {
             client: None,
             allocations: Vec::new(),
+            spaces: Vec::new(),
             orphan_pins: Vec::new(),
             idle_spaces: Vec::new(),
             next_handle: FIRST_DYNAMIC_HANDLE,
@@ -320,9 +326,9 @@ impl Io<'_> {
     }
 }
 
-/// Install the base client and allocate the one GPU_DEVICE VA space.  The
-/// parent's base RM bring-up owns ctl/gpu/root; this VA space is native-memory
-/// service state and is freed only by the transport-wide client teardown.
+/// Install the base client and its GPU_DEVICE VA space. Per-process spaces are
+/// created on demand; the parent's base RM bring-up owns ctl/gpu/root. All VA
+/// spaces are freed by the transport-wide client teardown.
 pub fn install_client(
     passive: PassiveLevel,
     adapter: &AdapterContext,
@@ -346,7 +352,16 @@ pub fn install_client(
         cc::FERMI_VASPACE_A,
         &cc::vaspace_params(),
     )?;
+    {
+        let mut state = STATE.lock();
+        state.spaces.clear();
+        state
+            .spaces
+            .try_reserve_exact(1)
+            .map_err(|_| Error::NoMemory)?;
+    }
     STATE.lock().client = Some(client);
+    STATE.lock().spaces.push((0, H_VASPACE));
     Ok(())
 }
 
@@ -358,10 +373,44 @@ pub fn channel_client(
     process: usize,
 ) -> Result<(NativeClient, u32), Error> {
     if let Some(client) = STATE.lock().client.as_ref().copied() {
-        return Ok((client, H_VASPACE));
+        let io = Io {
+            passive,
+            adapter,
+            client,
+        };
+        let space = ensure_space(&io, process)?;
+        return Ok((client, space));
     }
     let client = super::nvda::memory_client(passive, adapter, process)?;
     Ok((client, H_VASPACE))
+}
+
+/// Return this process's real VA space, creating it on first use. VidMm's
+/// address ranges remain process-scoped; no second process can alias them by
+/// sharing a root VA space.
+fn ensure_space(io: &Io<'_>, process: usize) -> Result<u32, Error> {
+    if let Some((_, space)) = STATE
+        .lock()
+        .spaces
+        .iter()
+        .find(|(owner, _)| *owner == process)
+    {
+        return Ok(*space);
+    }
+    STATE
+        .lock()
+        .spaces
+        .try_reserve_exact(1)
+        .map_err(|_| Error::NoMemory)?;
+    let space = STATE.lock().mint()?;
+    io.rm_alloc(
+        nd::H_DEVICE,
+        space,
+        cc::FERMI_VASPACE_A,
+        &cc::vaspace_params(),
+    )?;
+    STATE.lock().spaces.push((process, space));
+    Ok(space)
 }
 
 /// Validate a UMD GPFIFO allocation before it becomes a hardware queue. The
@@ -374,20 +423,30 @@ pub fn ring_backing(
     let state = STATE.lock();
     let allocation = state.allocation(id)?;
     let end = gpfifo_va.checked_add(ring_bytes).ok_or(Error::Invalid)?;
-    let covered = allocation.mappings.iter().any(|mapping| {
-        mapping.piece.va <= gpfifo_va
-            && mapping
-                .piece
-                .end()
-                .is_some_and(|mapping_end| mapping_end >= end)
-    });
-    if ring_bytes == 0 || !covered {
+    let mapping = allocation
+        .mappings
+        .iter()
+        .find(|mapping| {
+            mapping.piece.va <= gpfifo_va
+                && mapping
+                    .piece
+                    .end()
+                    .is_some_and(|mapping_end| mapping_end >= end)
+        })
+        .ok_or(Error::Invalid)?;
+    if ring_bytes == 0 {
         return Err(Error::Invalid);
     }
+    let va_space = state
+        .spaces
+        .iter()
+        .find(|(process, _)| *process == mapping.process)
+        .map(|(_, space)| *space)
+        .ok_or(Error::NotReady)?;
     Ok(super::native_channel::NativeRingBacking {
         memory: allocation.memory,
         mapped_bytes: ring_bytes,
-        va_space: H_VASPACE,
+        va_space,
     })
 }
 
@@ -410,6 +469,11 @@ extern "C" {
 
 fn unlock_pins(pins: &mut Vec<Pin>) {
     for pin in pins.drain(..) {
+        if pin.kernel_va != 0 {
+            // SAFETY: this exact kernel mapping belongs to the pin and is removed
+            // before its MDL is unlocked, at PASSIVE.
+            unsafe { MmUnmapLockedPages(pin.kernel_va as *mut c_void, pin.mdl as PMDL) };
+        }
         if pin.mdl != 0 {
             // SAFETY: each MDL was returned by helios_lock_user_pages_seh and is
             // owned by this pin.  PASSIVE, outside STATE's spinlock.
@@ -446,9 +510,24 @@ fn pin_system_memory(system_memory: u64, size: u64) -> Result<(Vec<Pin>, Vec<u64
             )
         };
         pfns.extend_from_slice(chunk);
+        let kernel_va = if size <= PIN_CHUNK_BYTES {
+            unsafe {
+                MmMapLockedPagesSpecifyCache(
+                    mdl,
+                    0, // KernelMode: this view is valid in every process context
+                    _MEMORY_CACHING_TYPE::MmCached,
+                    core::ptr::null_mut(),
+                    0,
+                    16, // NormalPagePriority
+                ) as u64
+            }
+        } else {
+            0
+        };
         pins.push(Pin {
             mdl: mdl as usize,
             pages,
+            kernel_va,
         });
         offset += len;
     }
@@ -520,7 +599,7 @@ pub fn create(
     let _guard = lock(passive)?;
     let client = match STATE.lock().client.as_ref().copied() {
         Some(client) => client,
-        None => channel_client(passive, adapter, 0)?,
+        None => channel_client(passive, adapter, 0)?.0,
     };
     let epoch = adapter.with_virtio(|v| v.nvrm_epoch()).unwrap_or(0);
     if epoch == 0 || epoch != client.epoch {
@@ -581,7 +660,7 @@ pub fn create(
         private.kind,
         rc::SURFACE_ATTR,
         rc::SURFACE_ATTR2,
-        H_VASPACE,
+        ensure_space(&io, 0)?,
     ) {
         Some(writeback) => writeback,
         None => {
@@ -610,6 +689,11 @@ pub fn create(
         memory,
         size: actual_size,
         system_memory: private.system_memory,
+        system_kernel_va: if pins.len() == 1 {
+            pins[0].kernel_va
+        } else {
+            0
+        },
         pins,
         mappings: Vec::new(),
         cpu: None,
@@ -644,11 +728,12 @@ fn map_fixed(
     memory: u32,
     allocation_size: u64,
     system_backed: bool,
+    space: u32,
     virt: u32,
     piece: nm::MappingPiece,
 ) -> Result<(), Error> {
     nm::validate_piece(piece, allocation_size).map_err(|_| Error::Invalid)?;
-    let params = cc::virtual_params(io.client.root, H_VASPACE, Some(piece.va), piece.len);
+    let params = cc::virtual_params(io.client.root, space, Some(piece.va), piece.len);
     io.rm_alloc(nd::H_DEVICE, virt, cc::NV50_MEMORY_VIRTUAL, &params)?;
     let flags = if system_backed {
         cc::MAP_FLAGS_SYSMEM
@@ -759,6 +844,7 @@ pub fn update_leaf(
             allocation.mappings.clone(),
         )
     };
+    let space = ensure_space(&io, process)?;
     let count = pieces.len() as u64;
     let len = count.checked_mul(nm::PAGE_BYTES).ok_or(Error::Invalid)?;
     if count == 0 || first_va & (nm::PAGE_BYTES - 1) != 0 {
@@ -799,10 +885,6 @@ pub fn update_leaf(
     }
     nm::coalesce(&mut final_pieces);
 
-    let replacement = nm::live_replacement(&old_pieces, &final_pieces, first_va, len);
-    if replacement && !new.is_empty() && !STATE.lock().idle_spaces.contains(&process) {
-        return Err(Error::Busy);
-    }
     for other in STATE.lock().allocations.iter().filter(|a| a.id != id) {
         if other
             .mappings
@@ -844,6 +926,16 @@ pub fn update_leaf(
         return Ok(());
     }
 
+    // A changed live mapping is quiesced in RM before any old object is removed.
+    // Fresh mappings need no such wait; permanent errors still cannot retire a fence.
+    if affected_old
+        .iter()
+        .map(|m| m.piece)
+        .ne(affected_new.iter().copied())
+    {
+        super::native_channel::quiesce(passive, adapter, process).map_err(|_| Error::Busy)?;
+    }
+
     // Mint handles before tearing down anything.  A local handle-space
     // exhaustion therefore cannot strand the old mapping.
     let mut planned = Vec::new();
@@ -862,7 +954,7 @@ pub fn update_leaf(
 
     let mut made = Vec::new();
     for (piece, virt) in planned.iter().copied() {
-        if let Err(error) = map_fixed(&io, memory, size, system_backed, virt, piece) {
+        if let Err(error) = map_fixed(&io, memory, size, system_backed, space, virt, piece) {
             for mapping in made.iter().copied() {
                 let _ = unmap_fixed(&io, memory, mapping);
             }
@@ -878,7 +970,17 @@ pub fn update_leaf(
                         break;
                     }
                 };
-                if map_fixed(&io, memory, size, system_backed, virt, old_mapping.piece).is_err() {
+                if map_fixed(
+                    &io,
+                    memory,
+                    size,
+                    system_backed,
+                    space,
+                    virt,
+                    old_mapping.piece,
+                )
+                .is_err()
+                {
                     rollback_ok = false;
                     break;
                 }
@@ -954,9 +1056,14 @@ fn cpu_map(
     expected_gpa: Option<u64>,
 ) -> Result<CpuMapping, Error> {
     if allocation.system_memory != 0 {
+        // Separate MDL mappings are not contiguous. Never expose the first
+        // chunk (or a process-local user VA) as a view of the whole allocation.
+        if allocation.system_kernel_va == 0 {
+            return Err(Error::Unsupported);
+        }
         return Ok(CpuMapping {
             view: CpuView {
-                address: allocation.system_memory,
+                address: allocation.system_kernel_va,
                 len: allocation.size,
                 generation: 0,
             },
@@ -1002,16 +1109,36 @@ fn cpu_map(
             return Err(error);
         }
     };
-    let mapped = match nvrm::host_mmap_within(
-        io.passive,
-        io.adapter,
-        KMD,
-        map_ch,
-        true,
-        0,
-        allocation.size,
-        TIMEOUT_MS,
-    ) {
+    let region = nvrm::region_for(io.adapter, io.client.minor).ok_or(Error::Host)?;
+    let mapped = match (aperture_offset, expected_gpa) {
+        (Some(_), Some(expected)) => {
+            let window_offset = expected
+                .checked_sub(region.base)
+                .ok_or(Error::WrongAddress)?;
+            nvrm::host_mmap_at_within(
+                io.passive,
+                io.adapter,
+                KMD,
+                map_ch,
+                true,
+                0,
+                window_offset,
+                allocation.size,
+                TIMEOUT_MS,
+            )
+        }
+        _ => nvrm::host_mmap_within(
+            io.passive,
+            io.adapter,
+            KMD,
+            map_ch,
+            true,
+            0,
+            allocation.size,
+            TIMEOUT_MS,
+        ),
+    };
+    let mapped = match mapped {
         Ok(mapped) if mapped.size >= allocation.size => mapped,
         _ => {
             let block = rc::nvos34(io.client.root, nd::H_DEVICE, allocation.memory, cookie);
@@ -1026,7 +1153,6 @@ fn cpu_map(
             return Err(Error::Host);
         }
     };
-    let region = nvrm::region_for(io.adapter, io.client.minor).ok_or(Error::Host)?;
     let physical = region
         .base
         .checked_add(mapped.offset)
@@ -1171,6 +1297,7 @@ pub unsafe fn with_cpu_bytes(
                 memory: a.memory,
                 size: a.size,
                 system_memory: a.system_memory,
+                system_kernel_va: a.system_kernel_va,
                 pins: Vec::new(),
                 mappings: Vec::new(),
                 cpu: None,
@@ -1215,6 +1342,7 @@ pub fn map_aperture(
             memory: a.memory,
             size: a.size,
             system_memory: a.system_memory,
+            system_kernel_va: a.system_kernel_va,
             pins: Vec::new(),
             mappings: Vec::new(),
             cpu: None,
@@ -1354,6 +1482,7 @@ pub fn forget(passive: PassiveLevel) {
     let mut state = STATE.lock();
     let mut allocations = core::mem::take(&mut state.allocations);
     state.client = None;
+    state.spaces.clear();
     state.idle_spaces.clear();
     drop(state);
     for allocation in allocations.iter_mut() {

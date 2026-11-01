@@ -143,7 +143,7 @@ HELIOS_NVRM_STATIC_ASSERT(offsetof(HeliosNvrmQueryCaps, pin_deep_kinds) == 84, "
  * file the caller opened: scanout 0, 64-byte payload). Mmap/Munmap use their own
  * ops; everything else is refused. */
 #define HELIOS_NVRM_FORWARD_MSG_TYPES                                          \
-  ((1u << 1) | (1u << 2) | (1u << 3) | (1u << 6) | (1u << 7) | (1u << 20))
+  ((1u << 1) | (1u << 2) | (1u << 3) | (1u << 6) | (1u << 7) | (1u << 20) | (1ull << 35))
 #define HELIOS_NVRM_SCANOUT_FLIP_BYTES 64u
 #define HELIOS_NVRM_MSG_HEADER_BYTES 16u
 

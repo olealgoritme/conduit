@@ -141,6 +141,10 @@ pub enum MsgType {
     /// [`NVGPU_CFG_RM_RESOURCE_IMPORT`]. See docs/VENUS.md "RM-export
     /// resources in a second process".
     RmResourceImport = 31,
+    /// Guest → host: map device memory at an exact shared-window offset.
+    /// Used by the native Windows WDDM CPU aperture, where placement is not
+    /// optional and an RM-chosen alternative would be incorrect.
+    MmapAt = 35,
 }
 
 impl MsgType {
@@ -168,6 +172,7 @@ impl MsgType {
             34 => Self::DisplayModeList,
             30 => Self::GpuCmd,
             31 => Self::RmResourceImport,
+            35 => Self::MmapAt,
             _ => return None,
         })
     }
@@ -358,6 +363,19 @@ pub struct IoctlResp {
 pub struct MmapReq {
     pub size: u64,
     pub offset: u64,
+    pub prot: u32,
+    pub padding: u32,
+}
+
+/// Request payload for `MsgType::MmapAt`, following a `MsgHeader`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MmapAtReq {
+    pub size: u64,
+    /// RM mapping cookie, as in `MmapReq::offset`.
+    pub offset: u64,
+    /// Exact byte offset within the shared window, not a hint.
+    pub window_offset: u64,
     pub prot: u32,
     pub padding: u32,
 }
@@ -1386,6 +1404,7 @@ const _: () = {
     assert!(size_of::<IoctlReq>() == 24);
     assert!(size_of::<IoctlResp>() == 12);
     assert!(size_of::<MmapReq>() == 24);
+    assert!(size_of::<MmapAtReq>() == 32);
     assert!(size_of::<MmapResp>() == 24);
     assert!(size_of::<MunmapReq>() == 8);
     assert!(size_of::<FileEntry>() == 8);
@@ -1613,6 +1632,8 @@ mod tests {
         assert_eq!(NVGPU_F_EVENT_PACKED, 1 << 22);
         assert_eq!(MsgType::DisplayModeList as u32, 34);
         assert_eq!(MsgType::from_u32(34), Some(MsgType::DisplayModeList));
+        assert_eq!(MsgType::MmapAt as u32, 35);
+        assert_eq!(MsgType::from_u32(35), Some(MsgType::MmapAt));
         let modes = [(5120, 1440), (1920, 1080)];
         let mut buf = [0u8; 64];
         assert_eq!(
