@@ -402,6 +402,16 @@ pub fn apply_local(
             put32(buf, NVDA_RESULT_AT, 1);
             put32(buf, NVDA_RESULT2_AT, 1);
         }
+        0x0100_0152 => {
+            // Adapter-scoped query D3D's UMD makes first (also from DWM). The
+            // 610.88 capture on a real RTX 5090 answers it with result 1,
+            // status -23 (0xffffffe9) and a 0x30-byte reply, and the UMD
+            // carries on; mirror exactly that.
+            exact(buf, 0x3e)?;
+            put32(buf, NVDA_SIZE_AT, NVDA_COMMON_HEADER_BYTES as u32);
+            put32(buf, NVDA_RESULT_AT, 1);
+            put32(buf, NVDA_RESULT2_AT, 0xffff_ffe9);
+        }
         function if is_rm_control_function(function) => {
             // 0x0500002b and every other RM control remain real host-RM work.
             return Ok(LocalOutcome::ForwardRmControl);
@@ -1016,6 +1026,22 @@ mod tests {
         let snapshot = no_device.clone();
         assert_eq!(apply_local(&mut no_device, 0, 1), Err(LocalError::Invalid));
         assert_eq!(no_device, snapshot);
+    }
+
+    #[test]
+    fn query_0152_matches_the_capture() {
+        let mut buf = local_request(0x0100_0152, 0x3e);
+        buf[0x20..0x24].copy_from_slice(&0x7e08_f710u32.to_le_bytes());
+        let before = buf.clone();
+        assert_eq!(apply_local(&mut buf, 0, 0), Ok(LocalOutcome::Applied));
+        assert_eq!(&buf[0x08..0x0c], &0x30u32.to_le_bytes());
+        assert_eq!(&buf[0x14..0x18], &1u32.to_le_bytes());
+        assert_eq!(&buf[0x2c..0x30], &0xffff_ffe9u32.to_le_bytes());
+        for at in (0..buf.len()).filter(|a| !(0x08..0x0c).contains(a) && !(0x14..0x18).contains(a) && !(0x2c..0x30).contains(a)) {
+            assert_eq!(buf[at], before[at], "byte {at:#x}");
+        }
+        let mut short = local_request(0x0100_0152, 0x3d);
+        assert_eq!(apply_local(&mut short, 0, 0), Err(LocalError::Invalid));
     }
 
     #[test]
