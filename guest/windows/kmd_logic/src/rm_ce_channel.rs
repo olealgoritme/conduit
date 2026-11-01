@@ -284,6 +284,21 @@ pub fn vaspace_params() -> [u8; VASPACE_BYTES] {
     a
 }
 
+/// `NV_VASPACE_ALLOCATION_FLAGS_VA_INTERNAL_LIMIT`: RM's own mappings in the
+/// space (context buffers and the like) stay in [4 GiB, 4.5 GiB), "the range we
+/// use for windows" (RM's SPLIT_VAS_SERVER_RM_MANAGED_VA_START/SIZE).
+pub const VASPACE_FLAGS_VA_INTERNAL_LIMIT: u32 = 1 << 7;
+pub const RM_INTERNAL_VA_START: u64 = 0x1_0000_0000;
+pub const RM_INTERNAL_VA_SIZE: u64 = 0x2000_0000;
+
+/// A per-process VA space whose addresses VidMm assigns: RM's internal
+/// mappings are confined to the window the KMD reserves from VidMm.
+pub fn vaspace_params_vidmm() -> [u8; VASPACE_BYTES] {
+    let mut a = vaspace_params();
+    put32(&mut a, 4, VASPACE_FLAGS_VA_INTERNAL_LIMIT);
+    a
+}
+
 /// `NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS { hVASpace, engineType }`.
 pub fn channel_group_params(h_vaspace: u32, engine_type: u32) -> [u8; TSG_BYTES] {
     let mut a = [0u8; TSG_BYTES];
