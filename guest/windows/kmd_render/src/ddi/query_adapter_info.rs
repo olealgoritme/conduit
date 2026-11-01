@@ -17,7 +17,7 @@ use crate::dxgk::_DXGK_QUERYADAPTERINFOTYPE::{
     DXGKQAITYPE_HARDWARERESERVEDRANGES2, DXGKQAITYPE_HISTORYBUFFERPRECISION,
     DXGKQAITYPE_IOMMU_CAPS, DXGKQAITYPE_PAGETABLELEVELDESC, DXGKQAITYPE_PHYSICAL_MEMORY_CAPS,
     DXGKQAITYPE_QUERYSEGMENT, DXGKQAITYPE_QUERYSEGMENT3, DXGKQAITYPE_QUERYSEGMENT4,
-    DXGKQAITYPE_WDDMDEVICECAPS,
+    DXGKQAITYPE_UMDRIVERPRIVATE, DXGKQAITYPE_WDDMDEVICECAPS,
 };
 use crate::dxgk::*;
 
@@ -62,7 +62,8 @@ pub unsafe extern "C" fn dxgkddi_query_adapter_info(
         DXGKQAITYPE_HARDWARERESERVEDRANGES2 => unsafe {
             query_zeroed::<DXGK_HARDWARERESERVEDRANGES>(args)
         },
-        DXGKQAITYPE_GPUVERSION => unsafe { query_gpu_version(args) },
+        DXGKQAITYPE_GPUVERSION => unsafe { query_gpu_version(adapter, args) },
+        DXGKQAITYPE_UMDRIVERPRIVATE => unsafe { query_umdriver_private(args) },
         DXGKQAITYPE_ADAPTERPERFDATA_CAPS => unsafe {
             query_zeroed::<DXGK_ADAPTER_PERFDATACAPS>(args)
         },
@@ -560,10 +561,47 @@ unsafe fn query_physical_memory_caps(args: &DXGKARG_QUERYADAPTERINFO) -> NTSTATU
     STATUS_SUCCESS
 }
 
-unsafe fn query_gpu_version(args: &DXGKARG_QUERYADAPTERINFO) -> NTSTATUS {
+fn nvidia_umd_enabled() -> bool {
+    crate::virtio::nvda::enabled()
+}
+
+/// Captured NVIDIA 610.88 ABI, pinned to the Blackwell personality and the RTX
+/// 5090 IDs in this template.
+const NVIDIA_UMD_PRIVATE: &[u8; 50_600] = include_bytes!("nvidia_umd_private.bin");
+
+unsafe fn query_umdriver_private(args: &DXGKARG_QUERYADAPTERINFO) -> NTSTATUS {
+    if !nvidia_umd_enabled() {
+        return STATUS_NOT_SUPPORTED;
+    }
+    if (args.OutputDataSize as usize) < NVIDIA_UMD_PRIVATE.len() {
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+
+    // SAFETY: the size gate proves the output can hold exactly this template;
+    // bytes beyond it remain untouched when dxgkrnl supplies a larger buffer.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            NVIDIA_UMD_PRIVATE.as_ptr(),
+            args.pOutputData as *mut u8,
+            NVIDIA_UMD_PRIVATE.len(),
+        );
+    }
+    STATUS_SUCCESS
+}
+
+unsafe fn query_gpu_version(
+    _adapter: &AdapterContext,
+    args: &DXGKARG_QUERYADAPTERINFO,
+) -> NTSTATUS {
     if (args.OutputDataSize as usize) < size_of::<DXGK_GPUVERSION>() {
         return STATUS_BUFFER_TOO_SMALL;
     }
+
+    let gpu_architecture: &[u8] = if nvidia_umd_enabled() {
+        b"Blackwell"
+    } else {
+        b"virtio-gpu"
+    };
 
     // SAFETY: pOutputData points to a DXGK_GPUVERSION of sufficient size.
     let version = args.pOutputData as *mut DXGK_GPUVERSION;
@@ -577,7 +615,7 @@ unsafe fn query_gpu_version(args: &DXGKARG_QUERYADAPTERINFO) -> NTSTATUS {
         write_wchar_z_unaligned(
             core::ptr::addr_of_mut!((*version).GpuArchitecture) as *mut WCHAR,
             32,
-            b"virtio-gpu",
+            gpu_architecture,
         );
     }
     STATUS_SUCCESS

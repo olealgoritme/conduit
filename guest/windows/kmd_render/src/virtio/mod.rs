@@ -22,6 +22,7 @@ pub mod foreign_scanout;
 pub mod gpu;
 pub mod hal;
 pub mod msi;
+pub mod nvda;
 pub mod nvrm;
 pub mod nvrm_harden;
 pub mod nvrm_window;

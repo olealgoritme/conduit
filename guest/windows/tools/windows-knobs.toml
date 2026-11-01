@@ -299,6 +299,11 @@ class = "experiment"
 read = "RM service bring-up (with KmdRmClient 5)"
 effect = "Memory type of the RM system-memory primary: 0 or 1 write-combined, 2 cached with the `Cached` flag, 3 a cached/write-combined alias. Other values mean 0."
 
+[kmd.NvUmd]
+class = "experiment"
+read = "transport generation (StartDevice)"
+effect = "NVIDIA Windows UMD research personality: 1 records NVDA calls only, 2 forwards root/device/subdevice RM controls through a KMD-owned client. 0 = off. The NVIDIA PCI personality's INF selects 2. Allocation, channel and submission formats are not implemented."
+
 [kmd.KmdRmSysPollMs]
 class = "experiment"
 read = "transport generation (with KmdRmClient 5)"

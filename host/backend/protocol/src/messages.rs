@@ -474,12 +474,16 @@ pub const NVGPU_CFG_RM_RESOURCE_IMPORT: u32 = 1 << 14;
 /// [`NVGPU_F_SCANOUT_RELEASE`]).
 pub const NVGPU_CFG_GUEST_BLOB: u32 = 1 << 16;
 
+/// Device config `features` bit: present the captured RTX 5090 PCI identity
+/// instead of Conduit's virtio identity. Set only with `CONDUIT_NVIDIA_UMD=1`.
+pub const NVGPU_CFG_NVIDIA_UMD: u32 = 1 << 17;
+
 /// Device config `features` bit, only together with [`NVGPU_CFG_VENUS`] and
 /// [`NVGPU_CFG_CURSOR`]: the backend serves
 /// [`crate::venus::CMD_SET_CURSOR_BLOB`], a Windows guest's hardware cursor
 /// as a Venus blob (docs/SCANOUT.md "Hardware cursor, Windows guests").
-/// Set whenever Venus and the cursor plane both are. Bit 17 is kept for the
-/// proposed host vblank feature.
+/// Set whenever Venus and the cursor plane both are. Bit 17 is the NVIDIA PCI
+/// personality's.
 pub const NVGPU_CFG_VENUS_CURSOR: u32 = 1 << 18;
 
 /// Device config `features` bit, only together with [`NVGPU_CFG_VENUS_CURSOR`]:
@@ -489,7 +493,7 @@ pub const NVGPU_CFG_VENUS_CURSOR: u32 = 1 << 18;
 /// traffic: the backend serves the cursor queue first, between any two control
 /// requests. A guest also needs the VMM to expose the queue (`num_vqs=3`).
 /// Bit 19 is the presentation-feedback virtio feature's (config bit 19 stays
-/// unused), bit 17 the host vblank proposal's.
+/// unused), bit 17 the NVIDIA PCI personality's.
 pub const NVGPU_CFG_CURSOR_QUEUE: u32 = 1 << 20;
 
 /// A **virtio device feature** the guest acks (like [`NVGPU_CFG_TAKES_INPUT`],
@@ -604,7 +608,7 @@ pub fn encode_scanout_released(r: &ScanoutReleased, out: &mut [u8]) -> Option<us
 /// A **virtio device feature** the guest acks (like [`NVGPU_F_SCANOUT_RELEASE`]; config
 /// `features` bit 19 stays unused): the guest wants `ScanoutPresented` events. The
 /// backend offers it whenever it has a display; a guest that does not ack it never
-/// gets one. Bit 17 is kept for the proposed host vblank feature.
+/// gets one. Bit 17 is the NVIDIA PCI personality's.
 pub const NVGPU_F_SCANOUT_PRESENTED: u32 = 1 << 19;
 
 /// [`ScanoutPresented::flags`]: the frame was shown through Venus
@@ -1482,11 +1486,10 @@ mod tests {
         assert_eq!(MsgType::from_u32(32), None);
         assert_eq!(MsgType::ScanoutPresented as u32, 33);
         assert_eq!(MsgType::from_u32(33), Some(MsgType::ScanoutPresented));
-        // A device feature like SCANOUT_RELEASE, above every config bit in use
-        // (17 is kept for the host vblank proposal).
+        // A device feature like SCANOUT_RELEASE, above every config bit in use.
         assert_eq!(NVGPU_F_SCANOUT_PRESENTED, 1 << 19);
         assert_eq!(NVGPU_CFG_RM_RESOURCE_IMPORT, 1 << 14);
-        // Bit 17 is the proposed host vblank feature's.
+        assert_eq!(NVGPU_CFG_NVIDIA_UMD, 1 << 17);
         assert_eq!(NVGPU_CFG_VENUS_CURSOR, 1 << 18);
         assert_eq!(NVGPU_CFG_CURSOR_QUEUE, 1 << 20);
         let r = RmResourceImport {
@@ -1512,6 +1515,29 @@ mod tests {
         assert_eq!(crate::venus::BLOB_MEM_RM_EXPORT, 0x8000_0001);
         assert_eq!(crate::venus::rm_export_ids(0x0000_0007_0000_004d), (7, 77));
         assert_eq!(crate::venus::errno_padding(-34), [34, 0, 0]);
+    }
+
+    #[test]
+    fn nvidia_umd_feature_bit_does_not_collide() {
+        for other in [
+            NVGPU_CFG_DISPLAY,
+            NVGPU_CFG_CURSOR,
+            NVGPU_CFG_VENUS,
+            NVGPU_CFG_DRM_FENCES,
+            NVGPU_CFG_TAKES_INPUT,
+            NVGPU_CFG_RM_IMPORT,
+            NVGPU_CFG_RM_RESOURCE_IMPORT,
+            NVGPU_F_SCANOUT_RELEASE,
+            NVGPU_CFG_GUEST_BLOB,
+            NVGPU_CFG_VENUS_CURSOR,
+            NVGPU_F_SCANOUT_PRESENTED,
+            NVGPU_CFG_CURSOR_QUEUE,
+            NVGPU_F_MODE_LIST,
+            NVGPU_F_EVENT_PACKED,
+        ] {
+            assert_eq!(NVGPU_CFG_NVIDIA_UMD & other, 0, "{other:#x}");
+        }
+        assert_eq!(NVGPU_CFG_NVIDIA_UMD, 1 << 17);
     }
 
     /// Header, then {scanout, flags, owner_handle, host_handle, seq, 0}.

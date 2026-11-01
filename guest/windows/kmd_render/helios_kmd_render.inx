@@ -1,6 +1,7 @@
 ; helios_kmd_render.inx — Helios vGPU WDDM render and display miniport driver.
-; Matches the virtio-gpu PCI device (VEN_1AF4 & DEV_106D / DEV_1069). The wdk-build
-; toolchain stamps DriverVer and produces helios_kmd_render.inf during packaging.
+; Matches the virtio-gpu PCI device (VEN_1AF4 & DEV_106D / DEV_1069) and the
+; opt-in RTX 5090 personality (VEN_10DE & DEV_2B85). The wdk-build toolchain
+; stamps DriverVer and produces helios_kmd_render.inf during packaging.
 ; Test-signed package. FeatureScore is set below the inbox and virtual display
 ; drivers so PnP selects Helios on its own PCI IDs; see Helios_Install below.
 ; Branding strings are synchronized from metadata/helios.env by tools/sync-metadata.py.
@@ -48,6 +49,7 @@ helios_gl32.dll = 1,,
 ; Conduit's device is virtio id 45 (DEV_106D). QEMU cannot express id 45, so
 ; test VMs run it as id 41 (DEV_1069), as `insmod conduit_gpu.ko virtio_id=41`.
 %DeviceDesc% = Helios_Install, PCI\VEN_1AF4&DEV_106D, PCI\VEN_1AF4&DEV_1069
+%DeviceDesc% = Helios_NVIDIA_Install, PCI\VEN_10DE&DEV_2B85&SUBSYS_20591771&REV_A1, PCI\VEN_10DE&DEV_2B85&SUBSYS_20591771
 
 ; ──── Installation ─────────────────────────────────────────────────────────
 
@@ -71,10 +73,18 @@ Include = msdv.inf
 ; F6 is below all three, so Helios wins the rank against Basic Display and
 ; the Red Hat DOD and binds on a running system. It is not 0x00, so it makes no
 ; absolute-best claim; the signature byte still carries the test-signing
-; penalty, and this cannot outrank a real GPU's driver because the Models
-; entries match only VEN_1AF4&DEV_106D / DEV_1069.
+; penalty. The Models entries match only Conduit's virtio IDs and the captured
+; RTX 5090 subsystem identity.
 FeatureScore = F6
 CopyFiles = Helios_CopyFiles
+AddReg = Helios_DeviceSettings
+
+[Helios_NVIDIA_Install]
+Include = msdv.inf
+FeatureScore = F6
+CopyFiles = Helios_CopyFiles
+; Research slice: the existing Helios UMD registration stays intact. NVIDIA's
+; version-matched UMDs are registered separately by the experimental setup.
 AddReg = Helios_DeviceSettings
 
 [Helios_CopyFiles]
@@ -95,6 +105,20 @@ helios_gl32.dll
 [Helios_Install.Services]
 AddService = helios_kmd_render, 0x00000002, Helios_ServiceInstall, Helios_EventLog
 
+[Helios_NVIDIA_Install.Services]
+AddService = helios_kmd_render, 0x00000002, Helios_NVIDIA_ServiceInstall, Helios_EventLog
+
+[Helios_NVIDIA_ServiceInstall]
+ServiceType    = 1                   ; SERVICE_KERNEL_DRIVER
+StartType      = 3                   ; SERVICE_DEMAND_START
+ErrorControl   = 0                   ; SERVICE_ERROR_IGNORE
+ServiceBinary  = %13%\helios_kmd_render.sys
+AddReg         = Helios_NVIDIA_Service_AddReg
+
+[Helios_NVIDIA_Service_AddReg]
+HKR,,SingleDeviceInstall,%REG_DWORD%,1
+HKR,,NvUmd,%REG_DWORD%,2
+
 [Helios_ServiceInstall]
 ServiceType    = 1                   ; SERVICE_KERNEL_DRIVER
 StartType      = 3                   ; SERVICE_DEMAND_START
@@ -113,6 +137,9 @@ HKR,,EventMessageFile,%REG_EXPAND_SZ%,"%%SystemRoot%%\System32\IoLogMsg.dll"
 HKR,,TypesSupported,%REG_DWORD%,7
 
 [Helios_Install.HW]
+AddReg = Helios_PCI_MSIX
+
+[Helios_NVIDIA_Install.HW]
 AddReg = Helios_PCI_MSIX
 
 ; Message-signalled interrupts: SHIPPED OFF (INTx), opt-in. The device is vhost-user-test-device-pci

@@ -118,9 +118,22 @@ pub struct Paths<'a> {
 /// "communication controller" -- without being VGA (0x0300), which Linux's
 /// VGA arbiter would take an interest in. conduit-vmm uses the same class.
 pub fn gpu_device(chardev: &str) -> String {
-    format!(
-        "vhost-user-test-device-pci,chardev={chardev},virtio-id={NVGPU_VIRTIO_ID},class=0x0380,num_vqs=3,vq_size=256,config_size={NVGPU_CONFIG_SIZE}"
+    gpu_device_with_nvidia_umd(
+        chardev,
+        std::env::var("CONDUIT_NVIDIA_UMD").as_deref() == Ok("1"),
     )
+}
+
+fn gpu_device_with_nvidia_umd(chardev: &str, nvidia_umd: bool) -> String {
+    let mut device = format!(
+        "vhost-user-test-device-pci,chardev={chardev},virtio-id={NVGPU_VIRTIO_ID},class=0x0380,num_vqs=3,vq_size=256,config_size={NVGPU_CONFIG_SIZE}"
+    );
+    if nvidia_umd {
+        device.push_str(
+            ",vendor=0x10de,device=0x2b85,subsystem-vendor=0x1771,subsystem-id=0x2059,revision=0xa1",
+        );
+    }
+    device
 }
 
 /// Kernel command line: the console is the first serial port under QEMU.
@@ -363,6 +376,21 @@ mod tests {
         assert!(!j.contains("process="));
         let quiet = args(&c, &p, None);
         assert!(!joined(&quiet).contains("audiodev"));
+    }
+
+    #[test]
+    fn nvidia_umd_gpu_device_is_opt_in() {
+        let default = gpu_device_with_nvidia_umd("nvgpu", false);
+        assert_eq!(
+            default,
+            "vhost-user-test-device-pci,chardev=nvgpu,virtio-id=45,class=0x0380,num_vqs=3,vq_size=256,config_size=4036"
+        );
+        assert_eq!(
+            gpu_device_with_nvidia_umd("nvgpu", true),
+            format!(
+                "{default},vendor=0x10de,device=0x2b85,subsystem-vendor=0x1771,subsystem-id=0x2059,revision=0xa1"
+            )
+        );
     }
 
     #[test]

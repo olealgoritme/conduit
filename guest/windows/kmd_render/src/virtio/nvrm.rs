@@ -1941,6 +1941,7 @@ pub fn retire_transport(
     adapter.set_virtio(None);
     // Its handles were closed by the sweep (or died with the transport): forget them.
     super::rm_client::forget();
+    super::nvda::forget();
     // `ForeignFlip`: the shown allocation and its presenter belong to the old generation.
     super::foreign_flip::forget();
     // The mapping table died with the transport; the gauge is only refreshed by a

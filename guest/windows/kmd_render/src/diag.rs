@@ -1252,6 +1252,10 @@ pub mod knobs {
     /// Read once per transport generation. Values above 5 count as 5 (before level 3
     /// existed, 3 and more counted as 2: a service key left at 3 turns the ring on).
     pub const KMD_RM_CLIENT: KnobName = KnobName::new(b"KmdRmClient");
+    /// `NvUmd` (default 0 = off): NVIDIA's Windows UMD personality. 1 = census only,
+    /// 2 = forward NVDA RM controls through the KMD-owned RM client. Read once per
+    /// transport generation; the NVIDIA PCI personality's INF install selects 2.
+    pub const NVIDIA_UMD: KnobName = KnobName::new(b"NvUmd");
     /// `KmdRmSysCache` (default 0). With `KmdRmClient` = 5: what the RM system-memory
     /// primary is made of (read at the service's bring-up; `docs/kmd-rm-client.md` 15.5).
     /// 0 or 1 = WRITE-COMBINED memory (the default: every view of it agrees with dxgkrnl's

@@ -2441,6 +2441,10 @@ impl NvGpuBackend {
 
         let nvidia_vram_mib = nvidia.vram_limit_mib();
         let mut config = VirtioGpuNvConfig::new(&version, &gpus, caps, nvidia_vram_mib);
+        if std::env::var("CONDUIT_NVIDIA_UMD").as_deref() == Ok("1") {
+            config.set_nvidia_umd();
+            log::info!("NVIDIA UMD personality: RTX 5090 PCI identity");
+        }
         // The event pump below reports fence handles once (docs/SYNC.md).
         config.set_drm_fences();
         let mut display_link = None;

@@ -11,7 +11,8 @@
   picked the Basic Display and /internal picked Helios.
 
   This script asks Windows for every display path (QueryDisplayConfig), finds the
-  adapter whose PCI vendor is virtio (VEN_1AF4, which is Helios), and applies a
+  adapter whose PCI identity is Conduit's virtio device or the opt-in RTX 5090
+  personality, and applies a
   topology containing only that adapter's path (SetDisplayConfig, saved to the
   display database, so it persists across reboots). It then reads the active
   topology back and fails if anything else is still active.
@@ -264,9 +265,9 @@ function Get-AdapterTable($paths) {
 function Get-AdapterKey($luid) { return "{0}:{1}" -f $luid.HighPart, $luid.LowPart }
 
 function Test-HeliosAdapterPath([string]$DevicePath) {
-    # Helios is the virtio device: PCI vendor 1AF4. The Basic Display adapter is
-    # Bochs/std VGA (1234) or QXL (1B36); do not rely on either of those.
-    return $DevicePath -match "ven_1af4"
+    # Conduit's virtio identity is VEN_1AF4; the opt-in RTX 5090 personality is
+    # VEN_10DE. The Basic Display adapter is Bochs/std VGA (1234) or QXL (1B36).
+    return $DevicePath -match "ven_(1af4|10de)"
 }
 
 function Show-Paths($title, $config, $adapters) {
@@ -310,7 +311,7 @@ Write-Host "Display adapters seen by Windows:"
 foreach ($entry in $adapters.GetEnumerator()) { Write-Host ("  {0}  {1}" -f $entry.Key, $entry.Value) }
 
 if (-not $chosen) {
-    Write-Warning "No available display path on a Helios (VEN_1AF4) adapter. Is the Helios driver started?"
+    Write-Warning "No available display path on a Helios (VEN_1AF4 or VEN_10DE) adapter. Is the Helios driver started?"
     exit 3
 }
 

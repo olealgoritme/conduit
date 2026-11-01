@@ -1,16 +1,51 @@
 diff -ru a/hw/virtio/vhost-user-test-device-pci.c b/hw/virtio/vhost-user-test-device-pci.c
 --- a/hw/virtio/vhost-user-test-device-pci.c	2026-10-05 18:38:25.877424273 +0200
 +++ b/hw/virtio/vhost-user-test-device-pci.c	2026-10-05 18:38:25.884265651 +0200
-@@ -85,6 +85,12 @@
+@@ -21,3 +21,8 @@ struct VHostUserDevicePCI {
+     VHostUserBase vub;
+     MemoryRegion shmembar;
++    uint32_t vendor_id;
++    uint32_t device_id;
++    uint32_t subsystem_vendor_id;
++    uint32_t subsystem_id;
++    uint32_t revision;
+ };
+@@ -50,1 +55,20 @@ static void vhost_user_device_pci_realize(VirtIOPCIProxy *vpci_dev, Error **errp
++    /* Zero keeps the identity virtio-pci selected above. */
++    if (dev->vendor_id) {
++        pci_config_set_vendor_id(vpci_dev->pci_dev.config, dev->vendor_id);
++    }
++    if (dev->device_id) {
++        pci_config_set_device_id(vpci_dev->pci_dev.config, dev->device_id);
++    }
++    if (dev->subsystem_vendor_id) {
++        pci_set_word(vpci_dev->pci_dev.config + PCI_SUBSYSTEM_VENDOR_ID,
++                     dev->subsystem_vendor_id);
++    }
++    if (dev->subsystem_id) {
++        pci_set_word(vpci_dev->pci_dev.config + PCI_SUBSYSTEM_ID,
++                     dev->subsystem_id);
++    }
++    if (dev->revision) {
++        pci_config_set_revision(vpci_dev->pci_dev.config, dev->revision);
++    }
++
+     QSIMPLEQ_FOREACH(shmem, &vdev->shmem_list, entry) {
+@@ -85,4 +109,17 @@ static void vhost_user_device_pci_realize(VirtIOPCIProxy *vpci_dev, Error **errp
  static const Property vhost_user_device_pci_properties[] = {
      DEFINE_PROP_UINT32("vectors", VirtIOPCIProxy, nvectors,
                         DEV_NVECTORS_UNSPECIFIED),
 +    /*
 +     * The PCI class the device reports (as virtio-blk-pci's "class"):
-+     * 0 keeps "communication controller". A GPU device sets 0x0300 so a
++     * 0 keeps "communication controller". A GPU device sets 0x0380 so a
 +     * guest's display stack (Windows' DXGK) treats it as a display adapter.
 +     */
 +    DEFINE_PROP_UINT32("class", VirtIOPCIProxy, class_code, 0),
++    /* Optional PCI identity overrides; zero preserves the virtio default. */
++    DEFINE_PROP_UINT32("vendor", VHostUserDevicePCI, vendor_id, 0),
++    DEFINE_PROP_UINT32("device", VHostUserDevicePCI, device_id, 0),
++    DEFINE_PROP_UINT32("subsystem-vendor", VHostUserDevicePCI,
++                       subsystem_vendor_id, 0),
++    DEFINE_PROP_UINT32("subsystem-id", VHostUserDevicePCI, subsystem_id, 0),
++    DEFINE_PROP_UINT32("revision", VHostUserDevicePCI, revision, 0),
  };
- 
- static void vhost_user_device_pci_class_init(ObjectClass *klass,

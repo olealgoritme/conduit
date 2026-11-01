@@ -335,6 +335,17 @@ unsafe fn dxgkddi_escape_inner(
     // is the trust boundary; every read below is bounds-checked against buf_len.
     let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr, buf_len) };
 
+    // NVIDIA's own UMDs use a different private namespace. Detect it before the
+    // Helios header check, and allow adapter-scoped calls (hDevice = 0): their
+    // KMD-owned RM client does not belong to a user D3D device.
+    if buf_len >= 4
+        && u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) == helios_kmd_logic::nvda::NVDA_MAGIC
+        && crate::virtio::nvda::enabled()
+    {
+        let passive = unsafe { crate::irql::PassiveLevel::assume() };
+        return crate::virtio::nvda::escape(passive, adapter, buf);
+    }
+
     let hdr: HeliosEscapeHeader = pod_read_unaligned(&buf[..size_of::<HeliosEscapeHeader>()]);
     // Reject bad magic/version, and any header that claims to be larger than the
     // buffer the runtime actually gave us.

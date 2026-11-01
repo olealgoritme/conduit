@@ -104,8 +104,9 @@ function Get-HeliosDeviceInstanceId {
     # Prefer a currently present device. WinBoat can change QEMU's device set
     # between bootstrap and accelerated boots, leaving a non-present PCI
     # instance in CIM that must not receive the WGL registration.
+    $deviceIdPattern = "^PCI\\VEN_(?:1AF4&DEV_106|10DE&DEV_2B85)"
     $presentDevices = @(Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue |
-        Where-Object { $_.InstanceId -like "PCI\VEN_1AF4&DEV_106*" })
+        Where-Object { $_.InstanceId -match $deviceIdPattern })
     $device = $presentDevices |
         Where-Object { $_.FriendlyName -like "*Helios*" } |
         Select-Object -First 1
@@ -115,14 +116,14 @@ function Get-HeliosDeviceInstanceId {
     if ($device) { return [string]$device.InstanceId }
 
     $device = Get-CimInstance Win32_PnPEntity |
-        Where-Object { $_.PNPDeviceID -like "PCI\VEN_1AF4&DEV_106*" -and $_.Name -like "*Helios*" } |
+        Where-Object { $_.PNPDeviceID -match $deviceIdPattern -and $_.Name -like "*Helios*" } |
         Select-Object -First 1
     if (-not $device) {
         $device = Get-CimInstance Win32_PnPEntity |
-            Where-Object { $_.PNPDeviceID -like "PCI\VEN_1AF4&DEV_106*" } |
+            Where-Object { $_.PNPDeviceID -match $deviceIdPattern } |
             Select-Object -First 1
     }
-    if (-not $device) { throw "The Helios virtio-gpu PCI device (1af4:106d (or 1069 under QEMU)) was not found." }
+    if (-not $device) { throw "The Helios GPU PCI device (1af4:106d/1069 or 10de:2b85) was not found." }
     return [string]$device.PNPDeviceID
 }
 

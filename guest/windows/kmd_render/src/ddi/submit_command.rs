@@ -314,6 +314,8 @@ pub(crate) fn publish_nvrm_counters() {
         b"FgRelDup",
         crate::virtio::foreign::RELEASE_DUP.load(Ordering::Relaxed),
     );
+    // NVIDIA's own UMD personality (`NvUmd`): NVDA census, RM controls and bring-up.
+    crate::virtio::nvda::publish_counters();
     // The KMD's own RM client (`KmdRmClient`): `Rm*`, written only once it has run.
     crate::virtio::rm_client::publish_counters();
     // The KMD's flip of a foreign allocation (`ForeignFlip`): `Ff*`, written only once the

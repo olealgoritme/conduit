@@ -285,6 +285,13 @@ impl VirtioGpuNvConfig {
         self.features |= protocol::messages::NVGPU_CFG_CURSOR;
     }
 
+    /// Present the captured RTX 5090 PCI identity: sets
+    /// [`protocol::messages::NVGPU_CFG_NVIDIA_UMD`]. Only with
+    /// `CONDUIT_NVIDIA_UMD=1`; the VMM reads this before building PCI config.
+    pub fn set_nvidia_umd(&mut self) {
+        self.features |= protocol::messages::NVGPU_CFG_NVIDIA_UMD;
+    }
+
     /// Serve Venus (docs/VENUS.md): sets
     /// [`protocol::messages::NVGPU_CFG_VENUS`]. Only with `--venus`; a guest
     /// sends `GpuCmd` only when it sees the bit.
@@ -501,6 +508,18 @@ mod tests {
             FEATURE_RMCTRL_SEGMENTS | NVGPU_CFG_DISPLAY | protocol::messages::NVGPU_CFG_CURSOR
         );
         assert_eq!(protocol::messages::NVGPU_CFG_CURSOR, 1 << 9);
+    }
+
+    #[test]
+    fn nvidia_umd_is_announced_only_when_set() {
+        use protocol::messages::NVGPU_CFG_NVIDIA_UMD;
+        let mut cfg = VirtioGpuNvConfig::new("615.71.09", &[], crate::caps::Caps::DEFAULT, 0);
+        assert_eq!({ cfg.features } & NVGPU_CFG_NVIDIA_UMD, 0);
+        cfg.set_nvidia_umd();
+        assert_eq!(
+            { cfg.features },
+            FEATURE_RMCTRL_SEGMENTS | NVGPU_CFG_NVIDIA_UMD
+        );
     }
 
     /// Venus is one feature bit, clear unless asked for.
