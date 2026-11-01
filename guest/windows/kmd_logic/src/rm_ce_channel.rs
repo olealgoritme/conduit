@@ -291,10 +291,16 @@ pub const VASPACE_FLAGS_VA_INTERNAL_LIMIT: u32 = 1 << 7;
 pub const RM_INTERNAL_VA_START: u64 = 0x1_0000_0000;
 pub const RM_INTERNAL_VA_SIZE: u64 = 0x2000_0000;
 
-/// A per-process VA space whose addresses VidMm assigns: RM's internal
-/// mappings are confined to the window the KMD reserves from VidMm.
+/// `NV_VASPACE_ALLOCATION_INDEX_GPU_NEW`: create a new VA space.
+pub const VASPACE_INDEX_GPU_NEW: u32 = 0;
+
+/// A NEW per-process VA space whose addresses VidMm assigns, as NVIDIA's
+/// Windows KMD creates them: RM's internal mappings are confined to the window
+/// the KMD reserves from VidMm. (`GPU_DEVICE` would hand every process the one
+/// device VA space, and the processes' VidMm VAs would collide in it.)
 pub fn vaspace_params_vidmm() -> [u8; VASPACE_BYTES] {
-    let mut a = vaspace_params();
+    let mut a = [0u8; VASPACE_BYTES];
+    put32(&mut a, 0, VASPACE_INDEX_GPU_NEW);
     put32(&mut a, 4, VASPACE_FLAGS_VA_INTERNAL_LIMIT);
     a
 }
@@ -1424,6 +1430,16 @@ mod tests {
 
     fn sparse(block: &[u8]) -> Vec<(usize, u8)> {
         block.iter().enumerate().filter(|(_, b)| **b != 0).map(|(i, b)| (i, *b)).collect()
+    }
+
+    #[test]
+    fn per_process_vaspaces_are_new_with_the_windows_internal_window() {
+        let b = vaspace_params_vidmm();
+        assert_eq!(b.len(), VASPACE_BYTES);
+        // index GPU_NEW (0), flags VA_INTERNAL_LIMIT (bit 7), everything else zero.
+        assert_eq!(sparse(&b), [(4, 0x80)]);
+        // The shared device space stays index GPU_DEVICE.
+        assert_eq!(sparse(&vaspace_params()), [(0, 3)]);
     }
 
     #[test]
