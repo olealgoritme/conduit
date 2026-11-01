@@ -23,6 +23,8 @@ pub mod ecl_done;
 pub mod edid;
 pub mod event_ready;
 pub mod external_memory;
+pub mod native_channel;
+pub mod native_memory;
 pub mod nvda;
 pub mod nvrm_clients;
 pub mod nvrm_events;

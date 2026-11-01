@@ -33,6 +33,7 @@ use wdk_alloc::WdkAllocator;
 static GLOBAL_ALLOCATOR: WdkAllocator = WdkAllocator;
 
 mod adapter;
+mod admin;
 mod ddi;
 mod device;
 // TEMPORARY: post-start bring-up tracer to locate the AddAdapter failure.
@@ -76,6 +77,11 @@ pub unsafe extern "system" fn driver_entry(
     // SAFETY: pointers are valid for the call; `init` outlives the call on this
     // stack frame, and DxgkInitialize copies what it needs.
     let status = unsafe { DxgkInitialize(driver_object, registry_path, &mut init) };
+    if status >= 0 {
+        // WDM control-device dispatch is installed only after the display
+        // miniport registration succeeded. No dxgkrnl DDI slots are affected.
+        unsafe { admin::install_dispatch(driver_object) };
+    }
     diag::record(0x0D00_0002);
     diag::record(status as u32);
     status

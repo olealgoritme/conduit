@@ -10,6 +10,9 @@ use crate::rm_client as rc;
 pub const NVDA_MAGIC: u32 = 0x4e56_4441;
 pub const NVDA_VERSION: u32 = 0x0001_0002;
 pub const NVDA_HEADER_BYTES: usize = 0x44;
+/// Bytes through the second common result word. Several local-only NVDA
+/// requests are shorter than the RM-control header.
+pub const NVDA_COMMON_HEADER_BYTES: usize = 0x30;
 pub const NVDA_MAX_BYTES: usize = 1024 * 1024;
 
 pub const NVDA_SIZE_AT: usize = 0x08;
@@ -65,7 +68,7 @@ pub enum HeaderError {
 /// Validate the complete escape, not merely the prefix. `size` is the exact
 /// buffer length and is capped before it can be used for any later arithmetic.
 pub fn parse_header(buf: &[u8]) -> Result<Header, HeaderError> {
-    if buf.len() < NVDA_HEADER_BYTES {
+    if buf.len() < NVDA_COMMON_HEADER_BYTES {
         return Err(HeaderError::Short);
     }
     if rc::get32(buf, 0) != Some(NVDA_MAGIC) {
@@ -78,7 +81,7 @@ pub fn parse_header(buf: &[u8]) -> Result<Header, HeaderError> {
     if size > NVDA_MAX_BYTES || buf.len() > NVDA_MAX_BYTES {
         return Err(HeaderError::TooLarge);
     }
-    if size < NVDA_HEADER_BYTES || size != buf.len() {
+    if size < NVDA_COMMON_HEADER_BYTES || size != buf.len() {
         return Err(HeaderError::BadSize);
     }
     Ok(Header {
@@ -113,6 +116,9 @@ impl From<HeaderError> for ControlError {
 
 pub fn parse_rm_control(buf: &[u8]) -> Result<RmControl<'_>, ControlError> {
     let header = parse_header(buf)?;
+    if buf.len() < NVDA_HEADER_BYTES {
+        return Err(ControlError::Header(HeaderError::Short));
+    }
     if !header.is_rm_control() {
         return Err(ControlError::NotRmControl);
     }
@@ -137,6 +143,10 @@ pub struct ClientMap {
     pub root: u32,
     pub device: u32,
     pub subdevice: u32,
+    /// Real objects created by the native WDDM path and therefore safe to name
+    /// in a later RM control. Zero is the empty slot marker.
+    pub objects: [u32; 64],
+    pub objects_len: u8,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -154,12 +164,16 @@ pub fn translate_handles(
 ) -> Result<(u32, u32), HandleError> {
     let client = match h_client {
         0 | PSEUDO_CLIENT_CUDA => map.root,
+        other if other == map.root => map.root,
         other => return Err(HandleError::Client(other)),
     };
     let object = match h_object {
         0 => map.root,
         PSEUDO_DEVICE | PSEUDO_DEVICE_CUDA => map.device,
         PSEUDO_SUBDEVICE => map.subdevice,
+        other if other == map.device => map.device,
+        other if other == map.subdevice => map.subdevice,
+        other if map.objects[..usize::from(map.objects_len)].contains(&other) => other,
         other => return Err(HandleError::Object(other)),
     };
     Ok((client, object))
@@ -284,6 +298,125 @@ pub fn apply_host_reply(escape: &mut [u8], reply: &HostReply<'_>) -> Result<(), 
     Ok(())
 }
 
+/// Result of trying the capture-backed local NVDA subset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalOutcome {
+    /// A complete local reply is already in the original buffer.
+    Applied,
+    /// This is an RM control and must continue down the real host-RM path.
+    ForwardRmControl,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalError {
+    /// The function is outside the implemented local subset and is not RM control.
+    Unsupported,
+    /// Bad function-specific size or a missing handle required by that function.
+    Invalid,
+}
+
+/// Apply the pure-local, native 610.88 CUDA/NVAPI replies observed in
+/// `cudatest-12300.escapes-v.txt` / `.rm-v.txt`.
+///
+/// Every function has an exact REQUEST size. The three replies whose declared
+/// size becomes 0x30 still occupy and preserve the entire original allocation;
+/// in particular this routine never reparses the shortened reply as though its
+/// backing slice had shrunk. All bytes not listed in a function's arm survive.
+/// `h_device == 0` is valid for the adapter-scoped NVAPI calls.
+pub fn apply_local(
+    buf: &mut [u8],
+    h_device: usize,
+    h_context: usize,
+) -> Result<LocalOutcome, LocalError> {
+    let header = parse_header(buf).map_err(|_| LocalError::Invalid)?;
+    fn exact(buf: &[u8], size: usize) -> Result<(), LocalError> {
+        if buf.len() == size {
+            Ok(())
+        } else {
+            Err(LocalError::Invalid)
+        }
+    }
+    fn context(device: usize, context: usize) -> Result<(), LocalError> {
+        if device == 0 || context == 0 {
+            Err(LocalError::Invalid)
+        } else {
+            Ok(())
+        }
+    }
+    match header.function {
+        0x0700_0002 => {
+            exact(buf, 0x238)?;
+            put32(buf, NVDA_RESULT_AT, 1);
+            put32(buf, NVDA_RESULT2_AT, 1);
+            put32(buf, 0x34, 1);
+            put32(buf, 0x38, 0x100);
+            put32(buf, 0x138, 1);
+        }
+        0x0700_0003 => {
+            exact(buf, 0x238)?;
+            put32(buf, NVDA_RESULT_AT, 1);
+            put32(buf, NVDA_RESULT2_AT, 1);
+        }
+        0x0700_00ad => {
+            exact(buf, 0x3c)?;
+            put32(buf, NVDA_RESULT_AT, 1);
+            put32(buf, 0x28, 0);
+            put32(buf, NVDA_RESULT2_AT, 1);
+            put32(buf, 0x34, 0x3200);
+            put32(buf, 0x38, 1);
+        }
+        0x0700_0016 => {
+            exact(buf, 0x38)?;
+            put32(buf, NVDA_RESULT_AT, 1);
+            put32(buf, NVDA_RESULT2_AT, 1);
+            put32(buf, 0x34, 1);
+        }
+        0x0100_0113 => {
+            exact(buf, 0x45)?;
+            // Device-scoped, deliberately without an hContext requirement.
+            if h_device == 0 {
+                return Err(LocalError::Invalid);
+            }
+            put32(buf, NVDA_SIZE_AT, NVDA_COMMON_HEADER_BYTES as u32);
+            put32(buf, NVDA_RESULT_AT, 1);
+            put32(buf, 0x30, 0x2000_0001);
+            put32(buf, 0x34, 0);
+            put32(buf, 0x38, 0x20);
+            put32(buf, 0x3c, 0xffff_ff00);
+            put8(buf, 0x40, 0xff);
+        }
+        0x0200_001e => {
+            exact(buf, 0x38)?;
+            // EXPERIMENTAL: the capture proves this field-level reply shape, not
+            // the full semantics of the operation. Require the real WDDM device
+            // and context scopes rather than faking success for unscoped calls.
+            context(h_device, h_context)?;
+            put32(buf, NVDA_SIZE_AT, NVDA_COMMON_HEADER_BYTES as u32);
+            put32(buf, NVDA_RESULT_AT, 1);
+            put32(buf, NVDA_RESULT2_AT, 1);
+        }
+        0x0100_0140 => {
+            exact(buf, 0x36)?;
+            context(h_device, h_context)?;
+            put32(buf, NVDA_SIZE_AT, NVDA_COMMON_HEADER_BYTES as u32);
+            put32(buf, NVDA_RESULT_AT, 1);
+            put32(buf, NVDA_RESULT2_AT, 1);
+        }
+        function if is_rm_control_function(function) => {
+            // 0x0500002b and every other RM control remain real host-RM work.
+            return Ok(LocalOutcome::ForwardRmControl);
+        }
+        _ => return Err(LocalError::Unsupported),
+    }
+    Ok(LocalOutcome::Applied)
+}
+
+fn put8(buf: &mut [u8], at: usize, value: u8) {
+    if let Some(byte) = buf.get_mut(at) {
+        *byte = value;
+    }
+}
+
 fn put32(buf: &mut [u8], at: usize, value: u32) {
     if let Some(word) = buf.get_mut(at..at.checked_add(4).unwrap_or(usize::MAX)) {
         word.copy_from_slice(&value.to_le_bytes());
@@ -327,6 +460,8 @@ mod tests {
         root: 0xc100_0001,
         device: H_DEVICE,
         subdevice: H_SUBDEVICE,
+        objects: [0; 64],
+        objects_len: 0,
     };
 
     fn test_put32(buf: &mut [u8], at: usize, value: u32) {
@@ -467,6 +602,22 @@ mod tests {
         assert_eq!(
             translate_handles(PSEUDO_CLIENT_CUDA, 0, &MAP),
             Ok((MAP.root, MAP.root))
+        );
+        assert_eq!(
+            translate_handles(MAP.root, MAP.device, &MAP),
+            Ok((MAP.root, MAP.device))
+        );
+        assert_eq!(
+            translate_handles(MAP.root, MAP.subdevice, &MAP),
+            Ok((MAP.root, MAP.subdevice))
+        );
+        let memory = 0x4e57_1234;
+        let mut with_memory = MAP;
+        with_memory.objects[0] = memory;
+        with_memory.objects_len = 1;
+        assert_eq!(
+            translate_handles(0, memory, &with_memory),
+            Ok((MAP.root, memory))
         );
     }
 
@@ -677,6 +828,233 @@ mod tests {
         assert_eq!(mismatch, snapshot);
     }
 
+    fn local_request(function: u32, len: usize) -> Vec<u8> {
+        let mut buf = vec![0xa5; len];
+        test_put32(&mut buf, 0, NVDA_MAGIC);
+        test_put32(&mut buf, 4, NVDA_VERSION);
+        test_put32(&mut buf, NVDA_SIZE_AT, len as u32);
+        test_put32(&mut buf, NVDA_TAG_AT, 0x4e56_2a2a);
+        test_put32(&mut buf, NVDA_FUNCTION_AT, function);
+        buf
+    }
+
+    fn check_local_reply(
+        function: u32,
+        request_len: usize,
+        device: usize,
+        context: usize,
+        changes: &[(usize, u32)],
+        byte_changes: &[(usize, u8)],
+    ) {
+        let original = local_request(function, request_len);
+        let mut expected = original.clone();
+        for &(at, value) in changes {
+            test_put32(&mut expected, at, value);
+        }
+        for &(at, value) in byte_changes {
+            expected[at] = value;
+        }
+        let mut actual = original;
+        assert_eq!(
+            apply_local(&mut actual, device, context),
+            Ok(LocalOutcome::Applied)
+        );
+        assert_eq!(actual, expected, "function {function:#010x}");
+    }
+
+    #[test]
+    fn local_replies_match_every_capture_offset_and_preserve_every_other_byte() {
+        check_local_reply(
+            0x0700_0002,
+            0x238,
+            0,
+            0,
+            &[
+                (NVDA_RESULT_AT, 1),
+                (NVDA_RESULT2_AT, 1),
+                (0x34, 1),
+                (0x38, 0x100),
+                (0x138, 1),
+            ],
+            &[],
+        );
+        check_local_reply(
+            0x0700_0003,
+            0x238,
+            0,
+            0,
+            &[(NVDA_RESULT_AT, 1), (NVDA_RESULT2_AT, 1)],
+            &[],
+        );
+        check_local_reply(
+            0x0700_00ad,
+            0x3c,
+            0,
+            0,
+            &[
+                (NVDA_RESULT_AT, 1),
+                (0x28, 0),
+                (NVDA_RESULT2_AT, 1),
+                (0x34, 0x3200),
+                (0x38, 1),
+            ],
+            &[],
+        );
+        check_local_reply(
+            0x0700_0016,
+            0x38,
+            0,
+            0,
+            &[(NVDA_RESULT_AT, 1), (NVDA_RESULT2_AT, 1), (0x34, 1)],
+            &[],
+        );
+        check_local_reply(
+            0x0100_0113,
+            0x45,
+            0x1234,
+            0,
+            &[
+                (NVDA_SIZE_AT, 0x30),
+                (NVDA_RESULT_AT, 1),
+                (0x30, 0x2000_0001),
+                (0x34, 0),
+                (0x38, 0x20),
+                (0x3c, 0xffff_ff00),
+            ],
+            &[(0x40, 0xff)],
+        );
+        check_local_reply(
+            0x0200_001e,
+            0x38,
+            0x1234,
+            0x5678,
+            &[
+                (NVDA_SIZE_AT, 0x30),
+                (NVDA_RESULT_AT, 1),
+                (NVDA_RESULT2_AT, 1),
+            ],
+            &[],
+        );
+        check_local_reply(
+            0x0100_0140,
+            0x36,
+            0x1234,
+            0x5678,
+            &[
+                (NVDA_SIZE_AT, 0x30),
+                (NVDA_RESULT_AT, 1),
+                (NVDA_RESULT2_AT, 1),
+            ],
+            &[],
+        );
+    }
+
+    #[test]
+    fn shortened_replies_keep_the_original_allocation_and_trailing_bytes() {
+        for (function, len) in [
+            (0x0100_0113, 0x45),
+            (0x0200_001e, 0x38),
+            (0x0100_0140, 0x36),
+        ] {
+            let mut buf = local_request(function, len);
+            let original = buf.clone();
+            assert_eq!(apply_local(&mut buf, 1, 1), Ok(LocalOutcome::Applied));
+            assert_eq!(buf.len(), len);
+            assert_eq!(rc::get32(&buf, NVDA_SIZE_AT), Some(0x30));
+            assert!(buf.len() > NVDA_COMMON_HEADER_BYTES);
+            for at in 0x30..len {
+                let changed = match function {
+                    0x0100_0113 => (0x30..=0x40).contains(&at),
+                    _ => false,
+                };
+                if !changed {
+                    assert_eq!(
+                        buf[at], original[at],
+                        "function {function:#x}, byte {at:#x}"
+                    );
+                }
+            }
+            // A consumer must use the original slice length. Reparsing the
+            // shortened declaration as the allocation length is deliberately
+            // invalid and is not part of the local reply path.
+            assert_eq!(parse_header(&buf), Err(HeaderError::BadSize));
+            let declared_only = &buf[..NVDA_COMMON_HEADER_BYTES];
+            assert!(parse_header(declared_only).is_ok());
+        }
+    }
+
+    #[test]
+    fn local_requests_require_exact_sizes_and_required_scopes_without_mutation() {
+        for (function, len) in [
+            (0x0700_0002, 0x238),
+            (0x0700_0003, 0x238),
+            (0x0700_00ad, 0x3c),
+            (0x0700_0016, 0x38),
+            (0x0100_0113, 0x45),
+            (0x0200_001e, 0x38),
+            (0x0100_0140, 0x36),
+        ] {
+            for bad_len in [len - 1, len + 1] {
+                let mut bad = local_request(function, bad_len);
+                let snapshot = bad.clone();
+                assert_eq!(apply_local(&mut bad, 1, 1), Err(LocalError::Invalid));
+                assert_eq!(bad, snapshot);
+            }
+        }
+        for (function, len) in [(0x0200_001e, 0x38), (0x0100_0140, 0x36)] {
+            for (device, context) in [(0, 0), (0, 1), (1, 0)] {
+                let mut bad = local_request(function, len);
+                let snapshot = bad.clone();
+                assert_eq!(
+                    apply_local(&mut bad, device, context),
+                    Err(LocalError::Invalid)
+                );
+                assert_eq!(bad, snapshot);
+            }
+        }
+        let mut no_device = local_request(0x0100_0113, 0x45);
+        let snapshot = no_device.clone();
+        assert_eq!(apply_local(&mut no_device, 0, 1), Err(LocalError::Invalid));
+        assert_eq!(no_device, snapshot);
+    }
+
+    #[test]
+    fn local_dispatch_forwards_only_rm_control_and_rejects_unknown_functions() {
+        let mut control = local_request(0x0500_002b, NVDA_HEADER_BYTES);
+        test_put32(&mut control, RM_PARAMS_SIZE_AT, 0);
+        let snapshot = control.clone();
+        assert_eq!(
+            apply_local(&mut control, 0, 0),
+            Ok(LocalOutcome::ForwardRmControl)
+        );
+        assert_eq!(control, snapshot);
+        assert_eq!(parse_rm_control(&control).unwrap().cmd, 0xa5a5_a5a5);
+
+        let mut unknown = local_request(0x0100_9999, NVDA_COMMON_HEADER_BYTES);
+        let snapshot = unknown.clone();
+        assert_eq!(
+            apply_local(&mut unknown, 1, 1),
+            Err(LocalError::Unsupported)
+        );
+        assert_eq!(unknown, snapshot);
+    }
+
+    #[test]
+    fn common_header_accepts_short_local_requests_but_rm_control_still_needs_0x44() {
+        for len in [NVDA_COMMON_HEADER_BYTES, 0x36, 0x38, 0x3c] {
+            let buf = local_request(0x0100_0140, len);
+            assert!(parse_header(&buf).is_ok());
+            assert_eq!(
+                parse_rm_control(&buf),
+                Err(ControlError::Header(HeaderError::Short))
+            );
+        }
+        for len in 0..NVDA_COMMON_HEADER_BYTES {
+            let buf = vec![0xa5; len];
+            assert_eq!(parse_header(&buf), Err(HeaderError::Short));
+        }
+    }
+
     #[test]
     fn arbitrary_short_buffers_never_panic() {
         for len in 0..84 {
@@ -684,6 +1062,8 @@ mod tests {
             let _ = parse_header(&buf);
             let _ = parse_rm_control(&buf);
             let _ = parse_host_reply(&buf, usize::MAX);
+            let mut local = buf.clone();
+            let _ = apply_local(&mut local, 1, 1);
             let mut output = buf;
             let reply = HostReply {
                 rm_status: u32::MAX,

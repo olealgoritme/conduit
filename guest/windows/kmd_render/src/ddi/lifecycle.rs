@@ -737,9 +737,7 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     );
     crate::diag::record_named_bytes(
         b"GenEpoch",
-        adapter
-            .with_virtio(|v| v.nvrm_epoch())
-            .unwrap_or(0) as u32,
+        adapter.with_virtio(|v| v.nvrm_epoch()).unwrap_or(0) as u32,
     );
 
     if knobs.display_half {
@@ -880,8 +878,8 @@ pub unsafe extern "C" fn dxgkddi_stop_device(miniport_device_context: *mut c_voi
         let marker_from = crate::adapter::foreign_scanout::now_100ns();
         if crate::virtio::msi::service_stop(passive_stop) {
             budget = stop_credit(budget, marker_from);
-        }        // The HPD worker did the `Nv*` registry mirror and is gone: leave the
-        // registry with the final counts (PASSIVE, StopDevice).
+        } // The HPD worker did the `Nv*` registry mirror and is gone: leave the
+          // registry with the final counts (PASSIVE, StopDevice).
         crate::ddi::stall_diag::stop_sub(ss::FINAL_PUBLISH);
         crate::ddi::publish_nvrm_counters();
         crate::ddi::stall_diag::stop_sub(ss::RESET_PUBLICATION);
@@ -1040,6 +1038,9 @@ pub unsafe extern "C" fn dxgkddi_remove_device(miniport_device_context: *mut c_v
     crate::diag::record(0x0C00_0001);
     crate::ddi::stall_diag::stop_sub(helios_kmd_logic::stall_diag::stop_sub::REMOVE_ENTER);
     if !miniport_device_context.is_null() {
+        // The NVIDIA WDM control device survives StopDevice. Final RemoveDevice
+        // stops new work and drains accepted dispatches before deleting it.
+        unsafe { crate::admin::remove_device() };
         // SAFETY: our adapter context; only read here.
         let adapter = unsafe { &*(miniport_device_context as *const AdapterContext) };
         if adapter.hpd_worker_may_be_running() {
@@ -1050,9 +1051,7 @@ pub unsafe extern "C" fn dxgkddi_remove_device(miniport_device_context: *mut c_v
             crate::diag::record(0x0C00_00E1);
         } else {
             // SAFETY: this pointer came from Box::into_raw in AddDevice; freed once.
-            crate::ddi::stall_diag::stop_sub(
-                helios_kmd_logic::stall_diag::stop_sub::REMOVE_DROP,
-            );
+            crate::ddi::stall_diag::stop_sub(helios_kmd_logic::stall_diag::stop_sub::REMOVE_DROP);
             drop(unsafe { Box::from_raw(miniport_device_context as *mut AdapterContext) });
         }
     }

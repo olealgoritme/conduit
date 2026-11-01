@@ -96,6 +96,8 @@ struct Session {
     root: u32,
     minor: u32,
     version: [u8; rc::VERSION_STR_BYTES],
+    objects: [u32; 64],
+    objects_len: u8,
     failure: Option<rc::Failure>,
 }
 
@@ -111,6 +113,8 @@ impl Session {
             root: 0,
             minor: 0,
             version: [0; rc::VERSION_STR_BYTES],
+            objects: [0; 64],
+            objects_len: 0,
             failure: None,
         }
     }
@@ -124,7 +128,25 @@ impl Session {
             root: self.root,
             device: nd::H_DEVICE,
             subdevice: nd::H_SUBDEVICE,
+            objects: self.objects,
+            objects_len: self.objects_len,
         }
+    }
+
+    fn note_memory(&mut self, memory: u32) {
+        if memory == 0 || self.objects[..usize::from(self.objects_len)].contains(&memory) {
+            return;
+        }
+        let index = usize::from(self.objects_len);
+        if let Some(slot) = self.objects.get_mut(index) {
+            *slot = memory;
+            self.objects_len += 1;
+        }
+    }
+
+    /// Register one real object returned by native allocation for later RM controls.
+    pub fn note_memory(memory: u32) {
+        SESSION.lock().note_memory(memory);
     }
 
     fn next(&self) -> Option<Step> {
@@ -432,6 +454,9 @@ impl Io<'_> {
 struct Ready {
     epoch: u64,
     ctl: u32,
+    gpu: u32,
+    root: u32,
+    minor: u32,
     map: nd::ClientMap,
 }
 
@@ -439,6 +464,9 @@ fn ready(session: &Session) -> Ready {
     Ready {
         epoch: session.epoch,
         ctl: session.ctl,
+        gpu: session.gpu,
+        root: session.root,
+        minor: session.minor,
         map: session.map(),
     }
 }
@@ -519,8 +547,41 @@ fn ensure_ready(passive: PassiveLevel, adapter: &AdapterContext) -> Result<Ready
     Err(Error::Malformed)
 }
 
+/// Return the shared native-memory client, installing its GPU_DEVICE VA space on
+/// first use. The client belongs to the KMD, never to the escaping process.
+pub fn memory_client(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    _process: usize,
+) -> Result<super::native_memory::NativeClient, super::native_memory::Error> {
+    let ready = ensure_ready(passive, adapter).map_err(|_| super::native_memory::Error::Host)?;
+    let client = super::native_memory::NativeClient {
+        epoch: ready.epoch,
+        ctl: ready.ctl,
+        gpu: ready.gpu,
+        root: ready.root,
+        minor: ready.minor,
+    };
+    match super::native_memory::install_client(passive, adapter, client) {
+        Ok(()) => Ok(client),
+        Err(super::native_memory::Error::Busy) => {
+            super::native_memory::channel_client(passive, adapter, _process)
+                .map(|(client, _)| client)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 /// Serve one NVDA private buffer. The caller has already matched NVDA_MAGIC.
-pub fn escape(passive: PassiveLevel, adapter: &AdapterContext, buf: &mut [u8]) -> NTSTATUS {
+/// `h_device` may be zero for NVAPI's adapter-scoped calls. CUDA's two
+/// context-scoped local replies validate both raw WDDM scopes in pure logic.
+pub fn escape(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    h_device: usize,
+    h_context: usize,
+    buf: &mut [u8],
+) -> NTSTATUS {
     let header = match nd::parse_header(buf) {
         Ok(header) => header,
         Err(_) => {
@@ -530,6 +591,21 @@ pub fn escape(passive: PassiveLevel, adapter: &AdapterContext, buf: &mut [u8]) -
     };
     ESCAPES.fetch_add(1, Ordering::Relaxed);
     LAST_FUNCTION.store(header.function, Ordering::Relaxed);
+    // Pure local replies never initialize the KMD RM client and never touch the
+    // transport. This also returns shortened 0x30 replies directly, while the
+    // backing buffer still has its original (larger) length.
+    match nd::apply_local(buf, h_device, h_context) {
+        Ok(nd::LocalOutcome::Applied) => return STATUS_SUCCESS,
+        Ok(nd::LocalOutcome::ForwardRmControl) => {}
+        Err(nd::LocalError::Invalid) => {
+            REFUSALS.fetch_add(1, Ordering::Relaxed);
+            return STATUS_INVALID_PARAMETER;
+        }
+        Err(nd::LocalError::Unsupported) => {
+            UNSUPPORTED.fetch_add(1, Ordering::Relaxed);
+            return STATUS_NOT_IMPLEMENTED;
+        }
+    }
     let control = match nd::parse_rm_control(buf) {
         Ok(control) => control,
         Err(nd::ControlError::NotRmControl) => {

@@ -1,0 +1,1368 @@
+//! Native NVIDIA RM memory service for the 610.88 Windows UMD personality.
+//!
+//! This path does not create, import, or adopt a GEM/Venus object.  The parent
+//! supplies an already brought-up host RM client (`NativeClient`); this module
+//! adds a `FERMI_VASPACE_A(GPU_DEVICE)`, real memory objects, and fixed
+//! `NV50_MEMORY_VIRTUAL` + `MAP_MEMORY_DMA` mappings at VidMm's exact VAs.
+//!
+//! Locking: one PASSIVE mutex serializes every RM operation and every lifetime
+//! change.  The leaf spinlock is used only to copy or publish plain state; it is
+//! never held over a host round trip, an MDL operation, or an allocation.
+
+use alloc::boxed::Box;
+use alloc::vec;
+use alloc::vec::Vec;
+use core::ffi::c_void;
+use core::sync::atomic::{AtomicU32, Ordering};
+
+use helios_kmd_logic::ce_route as cr;
+use helios_kmd_logic::native_memory as nm;
+use helios_kmd_logic::nvda as nd;
+use helios_kmd_logic::rm_ce_channel as cc;
+use helios_kmd_logic::rm_client as rc;
+use wdk_sys::ntddk::{MmMapIoSpace, MmUnmapIoSpace};
+use wdk_sys::{MDL, NTSTATUS, PHYSICAL_ADDRESS, PMDL, _MEMORY_CACHING_TYPE};
+
+use super::gpu::DeviceOwner;
+use super::nvrm::{self, Refusal};
+use super::VirtioError;
+use crate::adapter::AdapterContext;
+use crate::irql::PassiveLevel;
+use crate::sync::{PassiveMutex, PassiveMutexGuard, SpinLock};
+
+const KMD: DeviceOwner = DeviceOwner::KMD_RM;
+const TIMEOUT_MS: u64 = 2_500;
+const REPLY_MAX: usize = 512;
+const H_VASPACE: u32 = 0x4e57_0001;
+const FIRST_DYNAMIC_HANDLE: u32 = 0x4e57_1000;
+const PIN_CHUNK_BYTES: u64 = 256 << 20;
+const LOCAL_4K_MAP_FLAGS: u32 = 1 << 8;
+
+static NEXT_ID: AtomicU32 = AtomicU32::new(1);
+static IO_MUTEX: SpinLock<Option<&'static PassiveMutex>> = SpinLock::new(None);
+static STATE: SpinLock<State> = SpinLock::new(State::new());
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Error {
+    NotReady,
+    Busy,
+    Invalid,
+    Unsupported,
+    NoMemory,
+    Host,
+    WrongAddress,
+    Overlap,
+    Poisoned,
+}
+
+impl Error {
+    pub const fn ntstatus(self) -> NTSTATUS {
+        match self {
+            Self::NotReady => wdk_sys::STATUS_DEVICE_NOT_READY,
+            Self::Busy => wdk_sys::STATUS_DEVICE_BUSY,
+            Self::Invalid | Self::Overlap => wdk_sys::STATUS_INVALID_PARAMETER,
+            Self::Unsupported => wdk_sys::STATUS_NOT_SUPPORTED,
+            Self::NoMemory => wdk_sys::STATUS_NO_MEMORY,
+            Self::Host | Self::WrongAddress | Self::Poisoned => wdk_sys::STATUS_IO_DEVICE_ERROR,
+        }
+    }
+}
+
+/// Base RM objects supplied by the parent's normal root/device/subdevice
+/// bring-up.  No handle is guessed or borrowed from a process client.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NativeClient {
+    pub epoch: u64,
+    pub ctl: u32,
+    pub gpu: u32,
+    pub root: u32,
+    pub minor: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Created {
+    pub id: u32,
+    pub size: u64,
+    pub segment: u32,
+    pub system_memory: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CpuView {
+    pub address: u64,
+    pub len: u64,
+    /// Zero for the direct `pSystemMem` view.  Aperture unmaps use this value
+    /// only as a generation check for RM-backed views.
+    pub generation: u32,
+}
+
+#[derive(Clone, Copy)]
+struct HostMapping {
+    process: usize,
+    piece: nm::MappingPiece,
+    virt: u32,
+}
+
+struct Pin {
+    mdl: usize,
+    pages: usize,
+}
+
+struct CpuMapping {
+    view: CpuView,
+    map_ch: u32,
+    cookie: u64,
+    host_id: u32,
+    kernel_va: u64,
+    aperture_offset: Option<u64>,
+}
+
+struct Allocation {
+    id: u32,
+    epoch: u64,
+    memory: u32,
+    size: u64,
+    system_memory: u64,
+    pins: Vec<Pin>,
+    mappings: Vec<HostMapping>,
+    cpu: Option<CpuMapping>,
+    resident: Option<(u64, bool)>,
+    poisoned: bool,
+}
+
+struct State {
+    client: Option<NativeClient>,
+    allocations: Vec<Allocation>,
+    orphan_pins: Vec<Pin>,
+    idle_spaces: Vec<usize>,
+    next_handle: u32,
+}
+
+impl State {
+    const fn new() -> Self {
+        Self {
+            client: None,
+            allocations: Vec::new(),
+            orphan_pins: Vec::new(),
+            idle_spaces: Vec::new(),
+            next_handle: FIRST_DYNAMIC_HANDLE,
+        }
+    }
+
+    fn client(&self) -> Result<NativeClient, Error> {
+        self.client.ok_or(Error::NotReady)
+    }
+
+    fn allocation(&self, id: u32) -> Result<&Allocation, Error> {
+        self.allocations
+            .iter()
+            .find(|a| a.id == id)
+            .ok_or(Error::Invalid)
+    }
+
+    fn allocation_mut(&mut self, id: u32) -> Result<&mut Allocation, Error> {
+        self.allocations
+            .iter_mut()
+            .find(|a| a.id == id)
+            .ok_or(Error::Invalid)
+    }
+
+    fn mint(&mut self) -> Result<u32, Error> {
+        let out = self.next_handle;
+        if out == 0 || out >= 0x4e5f_ffff {
+            return Err(Error::NoMemory);
+        }
+        self.next_handle = out.checked_add(1).ok_or(Error::NoMemory)?;
+        Ok(out)
+    }
+}
+
+fn mutex(passive: PassiveLevel) -> Result<&'static PassiveMutex, Error> {
+    if let Some(mutex) = *IO_MUTEX.lock() {
+        return Ok(mutex);
+    }
+    let mutex = Box::leak(Box::new(
+        PassiveMutex::try_new(passive).ok_or(Error::NoMemory)?,
+    ));
+    let mut slot = IO_MUTEX.lock();
+    if let Some(existing) = *slot {
+        return Ok(existing);
+    }
+    *slot = Some(mutex);
+    Ok(mutex)
+}
+
+fn lock(passive: PassiveLevel) -> Result<PassiveMutexGuard<'static>, Error> {
+    mutex(passive)?.lock(passive).ok_or(Error::Busy)
+}
+
+struct Io<'a> {
+    passive: PassiveLevel,
+    adapter: &'a AdapterContext,
+    client: NativeClient,
+}
+
+impl Io<'_> {
+    fn send(&self, req: &[u8], resp: &mut [u8]) -> Result<usize, Error> {
+        let mut seen = None;
+        let n = nvrm::forward(
+            self.passive,
+            self.adapter,
+            KMD,
+            0,
+            req,
+            resp,
+            TIMEOUT_MS,
+            0,
+            0,
+            &mut seen,
+        )
+        .map_err(|_| Error::Host)?;
+        if seen.is_some_and(|epoch| epoch != self.client.epoch) {
+            return Err(Error::NotReady);
+        }
+        Ok(n)
+    }
+
+    fn exchange(
+        &self,
+        file: u32,
+        cmd: u32,
+        data: &[u8],
+        nested: &[u8],
+        resp: &mut [u8],
+    ) -> Result<usize, Error> {
+        let total = rc::MSG_HDR + rc::IOCTL_REQ + data.len() + nested.len();
+        let mut request = Vec::new();
+        request
+            .try_reserve_exact(total)
+            .map_err(|_| Error::NoMemory)?;
+        request.resize(total, 0);
+        let n = rc::build_ioctl(&mut request, file, cmd, data, nested).ok_or(Error::Invalid)?;
+        self.send(request.get(..n).ok_or(Error::Invalid)?, resp)
+    }
+
+    fn rm_alloc(
+        &self,
+        parent: u32,
+        object: u32,
+        class: u32,
+        params: &[u8],
+    ) -> Result<Vec<u8>, Error> {
+        let block = rc::nvos64(self.client.root, parent, object, class, params.len() as u32);
+        let mut response = [0u8; REPLY_MAX];
+        let n = self.exchange(
+            self.client.ctl,
+            rc::nv_cmd(rc::ESC_RM_ALLOC, rc::NVOS64_BYTES as u32),
+            &block,
+            params,
+            &mut response,
+        )?;
+        let reply = rc::parse_ioctl_reply(response.get(..n).ok_or(Error::Host)?)
+            .map_err(|_| Error::Host)?;
+        rc::rm_reply(response.get(..n).ok_or(Error::Host)?, rc::NVOS64_STATUS_AT)
+            .map_err(|_| Error::Host)?;
+        Ok(reply.nested.to_vec())
+    }
+
+    fn rm_free(&self, parent: u32, object: u32) -> Result<(), Error> {
+        let block = rc::nvos00(self.client.root, parent, object);
+        let mut response = [0u8; REPLY_MAX];
+        let n = self.exchange(
+            self.client.ctl,
+            rc::nv_cmd(rc::ESC_RM_FREE, rc::NVOS00_BYTES as u32),
+            &block,
+            &[],
+            &mut response,
+        )?;
+        rc::rm_reply(response.get(..n).ok_or(Error::Host)?, rc::NVOS00_STATUS_AT)
+            .map(|_| ())
+            .map_err(|_| Error::Host)
+    }
+
+    fn open_file(&self, device_type: u32) -> Result<u32, Error> {
+        let mut request = [0u8; 32];
+        let n = rc::build_open(&mut request, device_type).ok_or(Error::Invalid)?;
+        let mut response = [0u8; 64];
+        let len = self.send(request.get(..n).ok_or(Error::Invalid)?, &mut response)?;
+        rc::parse_open_reply(response.get(..len).ok_or(Error::Host)?).ok_or(Error::Host)
+    }
+
+    fn close_file(&self, handle: u32) -> Result<(), Error> {
+        if handle == 0 {
+            return Ok(());
+        }
+        let mut request = [0u8; 32];
+        let n = rc::build_close(&mut request, handle).ok_or(Error::Invalid)?;
+        let mut response = [0u8; 64];
+        let len = self.send(request.get(..n).ok_or(Error::Invalid)?, &mut response)?;
+        response
+            .get(..len)
+            .and_then(rc::reply_status)
+            .filter(|status| *status == 0)
+            .map(|_| ())
+            .ok_or(Error::Host)
+    }
+
+    fn register_fd(&self, channel: u32) -> Result<(), Error> {
+        let params = rc::register_fd_params(self.client.ctl);
+        let mut response = [0u8; REPLY_MAX];
+        let n = self.exchange(
+            channel,
+            rc::nv_cmd(rc::ESC_REGISTER_FD, 4),
+            &params,
+            &[],
+            &mut response,
+        )?;
+        rc::parse_ioctl_reply(response.get(..n).ok_or(Error::Host)?)
+            .map(|_| ())
+            .map_err(|_| Error::Host)
+    }
+}
+
+/// Install the base client and allocate the one GPU_DEVICE VA space.  The
+/// parent's base RM bring-up owns ctl/gpu/root; this VA space is native-memory
+/// service state and is freed only by the transport-wide client teardown.
+pub fn install_client(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    client: NativeClient,
+) -> Result<(), Error> {
+    let _guard = lock(passive)?;
+    {
+        let state = STATE.lock();
+        if state.client.is_some() || !state.allocations.is_empty() {
+            return Err(Error::Busy);
+        }
+    }
+    let io = Io {
+        passive,
+        adapter,
+        client,
+    };
+    io.rm_alloc(
+        nd::H_DEVICE,
+        H_VASPACE,
+        cc::FERMI_VASPACE_A,
+        &cc::vaspace_params(),
+    )?;
+    STATE.lock().client = Some(client);
+    Ok(())
+}
+
+/// The shared client and VA space used by channel creation. The process token is
+/// only an association key; it never selects or borrows a user-mode RM client.
+pub fn channel_client(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    process: usize,
+) -> Result<(NativeClient, u32), Error> {
+    if let Some(client) = STATE.lock().client.as_ref().copied() {
+        return Ok((client, H_VASPACE));
+    }
+    let client = super::nvda::memory_client(passive, adapter, process)?;
+    Ok((client, H_VASPACE))
+}
+
+/// Validate a UMD GPFIFO allocation before it becomes a hardware queue. The
+/// entire ring must be covered by one live native mapping at the exact VA.
+pub fn ring_backing(
+    id: u32,
+    gpfifo_va: u64,
+    ring_bytes: u64,
+) -> Result<super::native_channel::NativeRingBacking, Error> {
+    let state = STATE.lock();
+    let allocation = state.allocation(id)?;
+    let end = gpfifo_va.checked_add(ring_bytes).ok_or(Error::Invalid)?;
+    let covered = allocation.mappings.iter().any(|mapping| {
+        mapping.piece.va <= gpfifo_va
+            && mapping
+                .piece
+                .end()
+                .is_some_and(|mapping_end| mapping_end >= end)
+    });
+    if ring_bytes == 0 || !covered {
+        return Err(Error::Invalid);
+    }
+    Ok(super::native_channel::NativeRingBacking {
+        memory: allocation.memory,
+        mapped_bytes: ring_bytes,
+        va_space: H_VASPACE,
+    })
+}
+
+fn local_params(root: u32, size: u64) -> [u8; rc::MEM_ALLOC_BYTES] {
+    rc::mem_alloc_params(
+        root,
+        &rc::SurfaceLayout {
+            width: 0,
+            height: 0,
+            pitch: 0,
+            size,
+        },
+    )
+}
+
+extern "C" {
+    fn helios_lock_user_pages_seh(virtual_address: *mut c_void, length: u32) -> PMDL;
+    fn helios_unlock_system_buffer(mdl: PMDL);
+}
+
+fn unlock_pins(pins: &mut Vec<Pin>) {
+    for pin in pins.drain(..) {
+        if pin.mdl != 0 {
+            // SAFETY: each MDL was returned by helios_lock_user_pages_seh and is
+            // owned by this pin.  PASSIVE, outside STATE's spinlock.
+            unsafe { helios_unlock_system_buffer(pin.mdl as PMDL) };
+        }
+    }
+}
+
+fn preserve_ambiguous_pins(pins: &mut Vec<Pin>) {
+    STATE.lock().orphan_pins.append(pins);
+}
+
+fn pin_system_memory(system_memory: u64, size: u64) -> Result<(Vec<Pin>, Vec<u64>), Error> {
+    let page_count = usize::try_from(size / nm::PAGE_BYTES).map_err(|_| Error::NoMemory)?;
+    let mut pins = Vec::new();
+    let mut pfns = Vec::new();
+    pfns.try_reserve_exact(page_count)
+        .map_err(|_| Error::NoMemory)?;
+    let mut offset = 0u64;
+    while offset < size {
+        let len = (size - offset).min(PIN_CHUNK_BYTES);
+        let address = system_memory.checked_add(offset).ok_or(Error::Invalid)?;
+        let mdl = unsafe { helios_lock_user_pages_seh(address as *mut c_void, len as u32) };
+        if mdl.is_null() {
+            unlock_pins(&mut pins);
+            return Err(Error::Invalid);
+        }
+        let pages = usize::try_from(len / nm::PAGE_BYTES).map_err(|_| Error::NoMemory)?;
+        // SAFETY: a locked MDL's PFN array follows MDL and has `pages` entries.
+        let chunk = unsafe {
+            core::slice::from_raw_parts(
+                (mdl as *const u8).add(core::mem::size_of::<MDL>()) as *const u64,
+                pages,
+            )
+        };
+        pfns.extend_from_slice(chunk);
+        pins.push(Pin {
+            mdl: mdl as usize,
+            pages,
+        });
+        offset += len;
+    }
+    if pfns.len() != page_count || pins.iter().map(|p| p.pages).sum::<usize>() != page_count {
+        unlock_pins(&mut pins);
+        return Err(Error::Invalid);
+    }
+    Ok((pins, pfns))
+}
+
+fn alloc_system_descriptor(io: &Io<'_>, memory: u32, pfns: &[u64], size: u64) -> Result<(), Error> {
+    let (kind, deep, big) = nvrm::page_run_table(io.passive, pfns).map_err(|_| Error::NoMemory)?;
+    let block = cr::nvos02_osdesc(
+        io.client.root,
+        nd::H_DEVICE,
+        memory,
+        pfns.first()
+            .copied()
+            .unwrap_or(0)
+            .wrapping_mul(nm::PAGE_BYTES),
+        size,
+    );
+    let mut request = [0u8; rc::MSG_HDR + rc::IOCTL_REQ + cr::NVOS02_FD_BYTES];
+    let n = rc::build_ioctl(
+        &mut request,
+        io.client.gpu,
+        rc::nv_cmd(cr::ESC_RM_ALLOC_MEMORY, cr::NVOS02_FD_BYTES as u32),
+        &block,
+        &[],
+    )
+    .ok_or(Error::Invalid)?;
+    let mut response = [0u8; REPLY_MAX];
+    let sent = nvrm::forward_kmd_registration(
+        io.passive,
+        io.adapter,
+        request.get(..n).ok_or(Error::Invalid)?,
+        kind,
+        &deep,
+        &mut response,
+        TIMEOUT_MS,
+    );
+    let reply = match sent {
+        Ok(len) => {
+            drop(big);
+            response.get(..len).ok_or(Error::Host)?
+        }
+        Err(Refusal::Transport(VirtioError::Timeout)) => {
+            // The host may have consumed the table and retained the registration;
+            // the MDLs must remain locked until the client/transport is torn down.
+            core::mem::forget(big);
+            return Err(Error::Host);
+        }
+        Err(_) => return Err(Error::Host),
+    };
+    rc::rm_reply(reply, cr::NVOS02_STATUS_AT)
+        .map(|_| ())
+        .map_err(|_| Error::Host)
+}
+
+/// Create the real local-linear or pSystemMem OS-descriptor backing.  All
+/// private-data validation has already completed in `kmd_logic`; no host
+/// allocation is attempted for an unsupported shape.
+pub fn create(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    private: &nm::AllocationPrivate,
+    private_bytes: &mut [u8],
+) -> Result<Created, Error> {
+    let _guard = lock(passive)?;
+    let client = match STATE.lock().client.as_ref().copied() {
+        Some(client) => client,
+        None => channel_client(passive, adapter, 0)?,
+    };
+    let epoch = adapter.with_virtio(|v| v.nvrm_epoch()).unwrap_or(0);
+    if epoch == 0 || epoch != client.epoch {
+        return Err(Error::NotReady);
+    }
+    let io = Io {
+        passive,
+        adapter,
+        client,
+    };
+    let (memory, pins) = {
+        let mut state = STATE.lock();
+        (state.mint()?, Vec::new())
+    };
+    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    if id == 0 {
+        return Err(Error::NoMemory);
+    }
+
+    let (actual_size, mut pins) = if private.system_backed() {
+        let (mut pins, pfns) = pin_system_memory(private.system_memory, private.size)?;
+        if let Err(error) = alloc_system_descriptor(&io, memory, &pfns, private.size) {
+            // A timeout may have left the descriptor live.  Its memory handle is
+            // deliberately leaked with the pins until the transport sweep.
+            if matches!(error, Error::Host) {
+                preserve_ambiguous_pins(&mut pins);
+            } else if io.rm_free(nd::H_DEVICE, memory).is_ok() {
+                unlock_pins(&mut pins);
+            } else {
+                preserve_ambiguous_pins(&mut pins);
+            }
+            return Err(error);
+        }
+        (private.size, pins)
+    } else {
+        let params = local_params(client.root, private.size);
+        match io.rm_alloc(nd::H_DEVICE, memory, rc::NV01_MEMORY_LOCAL_USER, &params) {
+            Ok(reply) => {
+                let actual = rc::get64(&reply, 64).unwrap_or(private.size);
+                if actual < private.size
+                    || actual % nm::PAGE_BYTES != 0
+                    || actual >= nm::GPU_ADDRESS_LIMIT
+                {
+                    let _ = io.rm_free(nd::H_DEVICE, memory);
+                    return Err(Error::Host);
+                }
+                (actual, pins)
+            }
+            Err(error) => return Err(error),
+        }
+    };
+
+    let writeback = match nm::PrivateWriteback::new(
+        memory,
+        client.root,
+        nd::H_DEVICE,
+        actual_size,
+        private.kind,
+        rc::SURFACE_ATTR,
+        rc::SURFACE_ATTR2,
+        H_VASPACE,
+    ) {
+        Some(writeback) => writeback,
+        None => {
+            if io.rm_free(nd::H_DEVICE, memory).is_ok() {
+                unlock_pins(&mut pins);
+            } else {
+                preserve_ambiguous_pins(&mut pins);
+            }
+            return Err(Error::Invalid);
+        }
+    };
+    if nm::writeback_allocation_private(private_bytes, &writeback).is_err() {
+        if io.rm_free(nd::H_DEVICE, memory).is_ok() {
+            unlock_pins(&mut pins);
+        }
+        return Err(Error::Invalid);
+    }
+    let segment = if private.system_backed() {
+        nm::SYSTEM_MEMORY_SEGMENT_ID
+    } else {
+        crate::ddi::gpummu::MEMORY_SEGMENT_ID
+    };
+    let allocation = Allocation {
+        id,
+        epoch,
+        memory,
+        size: actual_size,
+        system_memory: private.system_memory,
+        pins,
+        mappings: Vec::new(),
+        cpu: None,
+        resident: None,
+        poisoned: false,
+    };
+    {
+        let mut state = STATE.lock();
+        if state.try_reserve_exact(1).is_err() {
+            drop(state);
+            let mut allocation = allocation;
+            if io.rm_free(nd::H_DEVICE, memory).is_ok() {
+                unlock_pins(&mut allocation.pins);
+            } else {
+                preserve_ambiguous_pins(&mut allocation.pins);
+            }
+            return Err(Error::NoMemory);
+        }
+        state.allocations.push(allocation);
+    }
+    super::nvda::note_memory(memory);
+    Ok(Created {
+        id,
+        size: actual_size,
+        segment,
+        system_memory: private.system_memory,
+    })
+}
+
+fn map_fixed(
+    io: &Io<'_>,
+    memory: u32,
+    allocation_size: u64,
+    system_backed: bool,
+    virt: u32,
+    piece: nm::MappingPiece,
+) -> Result<(), Error> {
+    nm::validate_piece(piece, allocation_size).map_err(|_| Error::Invalid)?;
+    let params = cc::virtual_params(io.client.root, H_VASPACE, Some(piece.va), piece.len);
+    io.rm_alloc(nd::H_DEVICE, virt, cc::NV50_MEMORY_VIRTUAL, &params)?;
+    let flags = if system_backed {
+        cc::MAP_FLAGS_SYSMEM
+    } else {
+        LOCAL_4K_MAP_FLAGS
+    };
+    let block = nm::nvos46_range(
+        io.client.root,
+        nd::H_DEVICE,
+        virt,
+        memory,
+        piece.memory_offset,
+        piece.len,
+        flags,
+    );
+    let mut response = [0u8; REPLY_MAX];
+    let mapped = io.exchange(
+        io.client.ctl,
+        rc::nv_cmd(cc::ESC_RM_MAP_MEMORY_DMA, cc::NVOS46_BYTES as u32),
+        &block,
+        &[],
+        &mut response,
+    );
+    let got = match mapped {
+        Ok(n) => (|| {
+            let reply = response.get(..n).ok_or(Error::Host)?;
+            let reply = rc::rm_reply(reply, cc::NVOS46_STATUS_AT).map_err(|_| Error::Host)?;
+            cc::map_dma_va(reply.data).ok_or(Error::Host)
+        })(),
+        Err(error) => Err(error),
+    };
+    let got = match got {
+        Ok(got) => got,
+        Err(error) => {
+            let _ = io.rm_free(nd::H_DEVICE, virt);
+            return Err(error);
+        }
+    };
+    if got != piece.va {
+        // RM must not silently relocate a WDDM mapping.  Tear down the address
+        // RM returned, not the address we wished it had returned.
+        let unmap = nm::nvos47_unmap(io.client.root, nd::H_DEVICE, virt, memory, got);
+        let mut ignored = [0u8; REPLY_MAX];
+        let _ = io.exchange(
+            io.client.ctl,
+            rc::nv_cmd(cc::ESC_RM_UNMAP_MEMORY_DMA, cc::NVOS47_BYTES as u32),
+            &unmap,
+            &[],
+            &mut ignored,
+        );
+        let _ = io.rm_free(nd::H_DEVICE, virt);
+        return Err(Error::WrongAddress);
+    }
+    Ok(())
+}
+
+fn unmap_fixed(io: &Io<'_>, memory: u32, mapping: HostMapping) -> Result<(), Error> {
+    let block = nm::nvos47_unmap(
+        io.client.root,
+        nd::H_DEVICE,
+        mapping.virt,
+        memory,
+        mapping.piece.va,
+    );
+    let mut response = [0u8; REPLY_MAX];
+    let n = io.exchange(
+        io.client.ctl,
+        rc::nv_cmd(cc::ESC_RM_UNMAP_MEMORY_DMA, cc::NVOS47_BYTES as u32),
+        &block,
+        &[],
+        &mut response,
+    )?;
+    rc::rm_reply(response.get(..n).ok_or(Error::Host)?, cc::NVOS47_STATUS_AT)
+        .map_err(|_| Error::Host)?;
+    io.rm_free(nd::H_DEVICE, mapping.virt)
+}
+
+/// Apply one native leaf update.  Non-leaf updates deliberately have no host
+/// operation.  Invalid PTEs unmap.  A changed live mapping is refused until the
+/// parent marks that address space idle; unmapping and fresh mapping remain
+/// synchronous, so a following FLUSH_TLB has no deferred work.
+pub fn update_leaf(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    id: u32,
+    process: usize,
+    first_va: u64,
+    allocation_offset: u64,
+    pieces: &[Option<nm::MappingPiece>],
+) -> Result<(), Error> {
+    let _guard = lock(passive)?;
+    let client = STATE.lock().client()?;
+    let io = Io {
+        passive,
+        adapter,
+        client,
+    };
+    let (memory, size, system_backed, old) = {
+        let state = STATE.lock();
+        let allocation = state.allocation(id)?;
+        if allocation.poisoned || allocation.epoch != client.epoch {
+            return Err(Error::Poisoned);
+        }
+        (
+            allocation.memory,
+            allocation.size,
+            allocation.system_memory != 0,
+            allocation.mappings.clone(),
+        )
+    };
+    let count = pieces.len() as u64;
+    let len = count.checked_mul(nm::PAGE_BYTES).ok_or(Error::Invalid)?;
+    if count == 0 || first_va & (nm::PAGE_BYTES - 1) != 0 {
+        return Err(Error::Invalid);
+    }
+    let mut new = Vec::new();
+    new.try_reserve_exact(pieces.len() + 2)
+        .map_err(|_| Error::NoMemory)?;
+    for (index, piece) in pieces.iter().enumerate() {
+        if let Some(piece) = piece {
+            let expected = nm::MappingPiece {
+                va: first_va + index as u64 * nm::PAGE_BYTES,
+                memory_offset: allocation_offset + index as u64 * nm::PAGE_BYTES,
+                len: nm::PAGE_BYTES,
+            };
+            if *piece != expected {
+                return Err(Error::Invalid);
+            }
+            nm::validate_piece(*piece, size).map_err(|_| Error::Invalid)?;
+            new.push(*piece);
+        }
+    }
+    nm::coalesce(&mut new);
+
+    let old_process: Vec<HostMapping> = old
+        .iter()
+        .copied()
+        .filter(|m| m.process == process)
+        .collect();
+    let old_pieces: Vec<nm::MappingPiece> = old_process.iter().map(|m| m.piece).collect();
+    let unmapped =
+        nm::replace_range(&old_pieces, first_va, len, None, size).map_err(|_| Error::Invalid)?;
+    let mut final_pieces = unmapped.pieces;
+    for piece in new.iter().copied() {
+        final_pieces = nm::replace_range(&final_pieces, piece.va, piece.len, Some(piece), size)
+            .map_err(|_| Error::Overlap)?
+            .pieces;
+    }
+    nm::coalesce(&mut final_pieces);
+
+    let replacement = nm::live_replacement(&old_pieces, &final_pieces, first_va, len);
+    if replacement && !new.is_empty() && !STATE.lock().idle_spaces.contains(&process) {
+        return Err(Error::Busy);
+    }
+    for other in STATE.lock().allocations.iter().filter(|a| a.id != id) {
+        if other
+            .mappings
+            .iter()
+            .any(|m| nm::ranges_overlap(m.piece.va, m.piece.len, first_va, len))
+        {
+            return Err(Error::Overlap);
+        }
+    }
+
+    let affected_old: Vec<HostMapping> = old_process
+        .iter()
+        .copied()
+        .filter(|m| nm::ranges_overlap(m.piece.va, m.piece.len, first_va, len))
+        .collect();
+    let update_end = first_va.checked_add(len).ok_or(Error::Invalid)?;
+    let span_start = affected_old
+        .iter()
+        .map(|m| m.piece.va)
+        .min()
+        .unwrap_or(first_va)
+        .min(first_va);
+    let span_end = affected_old
+        .iter()
+        .filter_map(|m| m.piece.end())
+        .max()
+        .unwrap_or(update_end)
+        .max(update_end);
+    let affected_new: Vec<nm::MappingPiece> = final_pieces
+        .iter()
+        .copied()
+        .filter(|piece| piece.va < span_end && span_start < piece.end().unwrap_or(piece.va))
+        .collect();
+    if affected_old
+        .iter()
+        .map(|m| m.piece)
+        .eq(affected_new.iter().copied())
+    {
+        return Ok(());
+    }
+
+    // Mint handles before tearing down anything.  A local handle-space
+    // exhaustion therefore cannot strand the old mapping.
+    let mut planned = Vec::new();
+    planned
+        .try_reserve_exact(affected_new.len())
+        .map_err(|_| Error::NoMemory)?;
+    for piece in affected_new.iter().copied() {
+        planned.push((piece, STATE.lock().mint()?));
+    }
+    for mapping in affected_old.iter().copied() {
+        if unmap_fixed(&io, memory, mapping).is_err() {
+            STATE.lock().allocation_mut(id)?.poisoned = true;
+            return Err(Error::Poisoned);
+        }
+    }
+
+    let mut made = Vec::new();
+    for (piece, virt) in planned.iter().copied() {
+        if let Err(error) = map_fixed(&io, memory, size, system_backed, virt, piece) {
+            for mapping in made.iter().copied() {
+                let _ = unmap_fixed(&io, memory, mapping);
+            }
+            // Best-effort rollback.  If it cannot be completed, poison this
+            // allocation: no success may be reported against a guessed map set.
+            let mut rollback = Vec::new();
+            let mut rollback_ok = true;
+            for old_mapping in affected_old.iter().copied() {
+                let virt = match STATE.lock().mint() {
+                    Ok(v) => v,
+                    Err(_) => {
+                        rollback_ok = false;
+                        break;
+                    }
+                };
+                if map_fixed(&io, memory, size, system_backed, virt, old_mapping.piece).is_err() {
+                    rollback_ok = false;
+                    break;
+                }
+                rollback.push(HostMapping {
+                    virt,
+                    ..old_mapping
+                });
+            }
+            if !rollback_ok {
+                STATE.lock().allocation_mut(id)?.poisoned = true;
+                return Err(Error::Poisoned);
+            }
+            let mut state = STATE.lock();
+            let allocation = state.allocation_mut(id)?;
+            allocation.mappings.retain(|mapping| {
+                !(mapping.process == process
+                    && mapping.piece.va < span_end
+                    && span_start < mapping.piece.end().unwrap_or(mapping.piece.va))
+            });
+            allocation.mappings.extend(rollback);
+            allocation
+                .mappings
+                .sort_unstable_by_key(|mapping| (mapping.process, mapping.piece.va));
+            return Err(error);
+        }
+        made.push(HostMapping {
+            process,
+            piece,
+            virt,
+        });
+    }
+
+    let mut state = STATE.lock();
+    let allocation = state.allocation_mut(id)?;
+    allocation.mappings.retain(|mapping| {
+        !(mapping.process == process
+            && nm::ranges_overlap(mapping.piece.va, mapping.piece.len, first_va, len))
+    });
+    allocation.mappings.extend(made);
+    allocation
+        .mappings
+        .sort_unstable_by_key(|mapping| (mapping.process, mapping.piece.va));
+    Ok(())
+}
+
+/// Mark whether an address space has been quiesced for a live replacement.
+/// The scheduler/root-page-table integration calls this; absence means busy.
+pub fn set_address_space_idle(process: usize, idle: bool) {
+    let mut state = STATE.lock();
+    if idle {
+        if !state.idle_spaces.contains(&process) {
+            let _ = state.idle_spaces.try_reserve_exact(1);
+            if !state.idle_spaces.contains(&process) {
+                state.idle_spaces.push(process);
+            }
+        }
+    } else {
+        state.idle_spaces.retain(|p| *p != process);
+    }
+}
+
+pub fn notify_residency(id: u32, physical_address: u64, resident: bool) -> Result<(), Error> {
+    let mut state = STATE.lock();
+    let allocation = state.allocation_mut(id)?;
+    allocation.resident = resident.then_some((physical_address, true));
+    Ok(())
+}
+
+fn cpu_map(
+    io: &Io<'_>,
+    allocation: &Allocation,
+    aperture_offset: Option<u64>,
+    expected_gpa: Option<u64>,
+) -> Result<CpuMapping, Error> {
+    if allocation.system_memory != 0 {
+        return Ok(CpuMapping {
+            view: CpuView {
+                address: allocation.system_memory,
+                len: allocation.size,
+                generation: 0,
+            },
+            map_ch: 0,
+            cookie: 0,
+            host_id: 0,
+            kernel_va: 0,
+            aperture_offset,
+        });
+    }
+    let map_ch = io.open_file(io.client.minor)?;
+    if let Err(error) = io.register_fd(map_ch) {
+        let _ = io.close_file(map_ch);
+        return Err(error);
+    }
+    let block = rc::nvos33_with_fd(
+        io.client.root,
+        nd::H_DEVICE,
+        allocation.memory,
+        0,
+        allocation.size,
+        map_ch,
+    );
+    let mut response = [0u8; REPLY_MAX];
+    let cookie = match io.exchange(
+        io.client.ctl,
+        rc::nv_cmd(rc::ESC_RM_MAP_MEMORY, rc::NVOS33_FD_BYTES as u32),
+        &block,
+        &[],
+        &mut response,
+    ) {
+        Ok(n) => (|| {
+            let reply = response.get(..n).ok_or(Error::Host)?;
+            let reply = rc::rm_reply(reply, rc::NVOS33_STATUS_AT).map_err(|_| Error::Host)?;
+            rc::map_cookie(&reply).ok_or(Error::Host)
+        })(),
+        Err(error) => Err(error),
+    };
+    let cookie = match cookie {
+        Ok(cookie) => cookie,
+        Err(error) => {
+            let _ = io.close_file(map_ch);
+            return Err(error);
+        }
+    };
+    let mapped = match nvrm::host_mmap_within(
+        io.passive,
+        io.adapter,
+        KMD,
+        map_ch,
+        true,
+        0,
+        allocation.size,
+        TIMEOUT_MS,
+    ) {
+        Ok(mapped) if mapped.size >= allocation.size => mapped,
+        _ => {
+            let block = rc::nvos34(io.client.root, nd::H_DEVICE, allocation.memory, cookie);
+            let _ = io.exchange(
+                io.client.ctl,
+                rc::nv_cmd(rc::ESC_RM_UNMAP_MEMORY, rc::NVOS34_BYTES as u32),
+                &block,
+                &[],
+                &mut response,
+            );
+            let _ = io.close_file(map_ch);
+            return Err(Error::Host);
+        }
+    };
+    let region = nvrm::region_for(io.adapter, io.client.minor).ok_or(Error::Host)?;
+    let physical = region
+        .base
+        .checked_add(mapped.offset)
+        .ok_or(Error::WrongAddress)?;
+    if let Some(expected) = expected_gpa {
+        if physical != expected {
+            let _ = nvrm::release_host_map_within(
+                io.passive,
+                io.adapter,
+                map_ch,
+                mapped.host_id,
+                TIMEOUT_MS,
+            );
+            let block = rc::nvos34(io.client.root, nd::H_DEVICE, allocation.memory, cookie);
+            let _ = io.exchange(
+                io.client.ctl,
+                rc::nv_cmd(rc::ESC_RM_UNMAP_MEMORY, rc::NVOS34_BYTES as u32),
+                &block,
+                &[],
+                &mut response,
+            );
+            let _ = io.close_file(map_ch);
+            return Err(Error::WrongAddress);
+        }
+    }
+    let mut pa: PHYSICAL_ADDRESS = unsafe { core::mem::zeroed() };
+    pa.QuadPart = physical as i64;
+    // Device-local memory must never acquire a WB alias.  The view is retained
+    // until the matching unmap, then removed before RM's window mapping.
+    let kernel_va =
+        unsafe { MmMapIoSpace(pa, allocation.size, _MEMORY_CACHING_TYPE::MmNonCached) } as u64;
+    if kernel_va == 0 {
+        let _ = nvrm::release_host_map_within(
+            io.passive,
+            io.adapter,
+            map_ch,
+            mapped.host_id,
+            TIMEOUT_MS,
+        );
+        let block = rc::nvos34(io.client.root, nd::H_DEVICE, allocation.memory, cookie);
+        let _ = io.exchange(
+            io.client.ctl,
+            rc::nv_cmd(rc::ESC_RM_UNMAP_MEMORY, rc::NVOS34_BYTES as u32),
+            &block,
+            &[],
+            &mut response,
+        );
+        let _ = io.close_file(map_ch);
+        return Err(Error::NoMemory);
+    }
+    Ok(CpuMapping {
+        view: CpuView {
+            address: kernel_va,
+            len: allocation.size,
+            generation: mapped.host_id,
+        },
+        map_ch,
+        cookie,
+        host_id: mapped.host_id,
+        kernel_va,
+        aperture_offset,
+    })
+}
+
+fn cpu_unmap_for(io: &Io<'_>, memory: u32, mapping: &mut CpuMapping) -> Result<(), Error> {
+    if mapping.kernel_va != 0 {
+        unsafe { MmUnmapIoSpace(mapping.kernel_va as *mut c_void, mapping.view.len) };
+        mapping.kernel_va = 0;
+    }
+    if mapping.map_ch == 0 {
+        return Ok(());
+    }
+    let mut ok = true;
+    if mapping.host_id != 0 {
+        if nvrm::release_host_map_within(
+            io.passive,
+            io.adapter,
+            mapping.map_ch,
+            mapping.host_id,
+            TIMEOUT_MS,
+        )
+        .is_ok()
+        {
+            mapping.host_id = 0;
+        } else {
+            ok = false;
+        }
+    }
+    let block = rc::nvos34(io.client.root, nd::H_DEVICE, memory, mapping.cookie);
+    let mut response = [0u8; REPLY_MAX];
+    if io
+        .exchange(
+            io.client.ctl,
+            rc::nv_cmd(rc::ESC_RM_UNMAP_MEMORY, rc::NVOS34_BYTES as u32),
+            &block,
+            &[],
+            &mut response,
+        )
+        .ok()
+        .and_then(|n| response.get(..n))
+        .is_none_or(|reply| rc::rm_reply(reply, rc::NVOS34_STATUS_AT).is_err())
+    {
+        ok = false;
+    } else {
+        mapping.cookie = 0;
+    }
+    if io.close_file(mapping.map_ch).is_ok() {
+        mapping.map_ch = 0;
+    } else {
+        ok = false;
+    }
+    if ok {
+        Ok(())
+    } else {
+        Err(Error::Host)
+    }
+}
+
+/// Run a synchronous content operation over the allocation's real CPU bytes.
+/// The NVOS33/window view is created for the operation when no aperture view
+/// already exists, and every view is destroyed before the RM mapping is dropped.
+pub unsafe fn with_cpu_bytes(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    id: u32,
+    f: impl FnOnce(*mut u8, u64) -> bool,
+) -> Result<bool, Error> {
+    let _guard = lock(passive)?;
+    let client = STATE.lock().client()?;
+    let io = Io {
+        passive,
+        adapter,
+        client,
+    };
+    let (snapshot, existing) = {
+        let state = STATE.lock();
+        let a = state.allocation(id)?;
+        (
+            Allocation {
+                id: a.id,
+                epoch: a.epoch,
+                memory: a.memory,
+                size: a.size,
+                system_memory: a.system_memory,
+                pins: Vec::new(),
+                mappings: Vec::new(),
+                cpu: None,
+                resident: None,
+                poisoned: a.poisoned,
+            },
+            a.cpu.as_ref().map(|cpu| cpu.view),
+        )
+    };
+    if let Some(view) = existing {
+        return Ok(f(view.address as *mut u8, view.len));
+    }
+    let mut mapping = cpu_map(&io, &snapshot, None, None)?;
+    let copied = f(mapping.view.address as *mut u8, mapping.view.len);
+    cpu_unmap_for(&io, snapshot.memory, &mut mapping)?;
+    Ok(copied)
+}
+
+/// Map a native CPU-host-aperture request.  pSystemMem is already the direct
+/// Lock2 view.  Device local memory uses NVOS33 + the RM window, and succeeds
+/// only when that window placement is exactly dxgkrnl's requested GPA.
+pub fn map_aperture(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    id: u32,
+    aperture_offset: u64,
+    expected_gpa: u64,
+) -> Result<CpuView, Error> {
+    let _guard = lock(passive)?;
+    let client = STATE.lock().client()?;
+    let io = Io {
+        passive,
+        adapter,
+        client,
+    };
+    let snapshot = {
+        let state = STATE.lock();
+        let a = state.allocation(id)?;
+        Allocation {
+            id: a.id,
+            epoch: a.epoch,
+            memory: a.memory,
+            size: a.size,
+            system_memory: a.system_memory,
+            pins: Vec::new(),
+            mappings: Vec::new(),
+            cpu: None,
+            resident: None,
+            poisoned: a.poisoned,
+        }
+    };
+    let mut mapping = cpu_map(&io, &snapshot, Some(aperture_offset), Some(expected_gpa))?;
+    let view = mapping.view;
+    let mut state = STATE.lock();
+    let allocation = state.allocation_mut(id)?;
+    if allocation.cpu.is_some() {
+        drop(state);
+        let mut mapping = mapping;
+        let _ = cpu_unmap_for(&io, snapshot.memory, &mut mapping);
+        return Err(Error::Busy);
+    }
+    allocation.cpu = Some(mapping);
+    Ok(view)
+}
+
+pub fn unmap_aperture(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    aperture_offset: u64,
+) -> Result<(), Error> {
+    let _guard = lock(passive)?;
+    let client = STATE.lock().client()?;
+    let io = Io {
+        passive,
+        adapter,
+        client,
+    };
+    let (id, memory) = {
+        let state = STATE.lock();
+        let allocation = state
+            .allocations
+            .iter()
+            .find(|a| {
+                a.cpu
+                    .as_ref()
+                    .is_some_and(|cpu| cpu.aperture_offset == Some(aperture_offset))
+            })
+            .ok_or(Error::Invalid)?;
+        (allocation.id, allocation.memory)
+    };
+    let mut mapping = STATE
+        .lock()
+        .allocation_mut(id)?
+        .cpu
+        .take()
+        .ok_or(Error::Invalid)?;
+    match cpu_unmap_for(&io, memory, &mut mapping) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            // Preserve whatever remains live for a later retry or transport
+            // teardown; a failed host unmap is not permission to forget it.
+            STATE.lock().allocation_mut(id)?.cpu = Some(mapping);
+            Err(error)
+        }
+    }
+}
+
+/// Destroy an allocation only after every GPU and CPU view is gone.  Failure
+/// leaves the record and its MDLs alive; the caller must not report reclamation
+/// or unlock pSystemMem early.
+pub fn destroy(passive: PassiveLevel, adapter: &AdapterContext, id: u32) -> Result<(), Error> {
+    let _guard = lock(passive)?;
+    let client = STATE.lock().client()?;
+    let io = Io {
+        passive,
+        adapter,
+        client,
+    };
+    let (memory, mappings, has_cpu) = {
+        let state = STATE.lock();
+        let allocation = state.allocation(id)?;
+        (
+            allocation.memory,
+            allocation.mappings.clone(),
+            allocation.cpu.is_some(),
+        )
+    };
+    if has_cpu {
+        return Err(Error::Busy);
+    }
+    for mapping in mappings {
+        unmap_fixed(&io, memory, mapping)?;
+        STATE
+            .lock()
+            .allocation_mut(id)?
+            .mappings
+            .retain(|live| live.virt != mapping.virt);
+    }
+    io.rm_free(nd::H_DEVICE, memory)?;
+    let mut allocation = {
+        let mut state = STATE.lock();
+        let index = state
+            .allocations
+            .iter()
+            .position(|a| a.id == id)
+            .ok_or(Error::Invalid)?;
+        state.allocations.remove(index)
+    };
+    unlock_pins(&mut allocation.pins);
+    Ok(())
+}
+
+/// Drop only guest-owned state after the transport already destroyed every RM
+/// object.  No host request is sent and no pSystemMem page is unlocked early.
+pub fn discard(id: u32) -> Result<(), Error> {
+    let mut state = STATE.lock();
+    let index = state
+        .allocations
+        .iter()
+        .position(|a| a.id == id)
+        .ok_or(Error::Invalid)?;
+    let mut allocation = state.allocations.remove(index);
+    drop(state);
+    if let Some(cpu) = allocation.cpu.as_mut() {
+        if cpu.kernel_va != 0 {
+            // PASSIVE (DestroyAllocation); the host mapping is already gone.
+            unsafe { MmUnmapIoSpace(cpu.kernel_va as *mut c_void, cpu.view.len) };
+            cpu.kernel_va = 0;
+        }
+    }
+    unlock_pins(&mut allocation.pins);
+    Ok(())
+}
+
+/// Forget host objects after the transport-wide close sweep.  Kernel CPU views
+/// and MDLs still belong to the guest and are released here, at PASSIVE.
+pub fn forget(passive: PassiveLevel) {
+    let Ok(_guard) = lock(passive) else {
+        return;
+    };
+    let mut state = STATE.lock();
+    let mut allocations = core::mem::take(&mut state.allocations);
+    state.client = None;
+    state.idle_spaces.clear();
+    drop(state);
+    for allocation in allocations.iter_mut() {
+        if let Some(cpu) = allocation.cpu.as_mut() {
+            if cpu.kernel_va != 0 {
+                unsafe { MmUnmapIoSpace(cpu.kernel_va as *mut c_void, cpu.view.len) };
+                cpu.kernel_va = 0;
+            }
+        }
+        unlock_pins(&mut allocation.pins);
+    }
+}

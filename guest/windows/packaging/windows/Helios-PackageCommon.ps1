@@ -427,3 +427,66 @@ function Protect-ConduitDataDirectory([string]$Dir = (Join-Path $env:ProgramData
     # What is already inside takes the folder's rules (links are not followed).
     & (Join-Path $env:SystemRoot "System32\icacls.exe") (Join-Path $dir "*") /reset /T /L /C /Q | Out-Null
 }
+
+function Get-HeliosNvidiaRequiredFiles {
+    return @(
+        "nvldumdx.dll", "nvldumd.dll", "nvoglv64.dll", "nvoglv32.dll",
+        "nvcuda64.dll", "nvcuda32.dll", "nvdxgdmal64.dll", "nvdxgdmal32.dll",
+        "nvapi64.dll", "nvapi64_impl.dll", "nvapi.dll", "nvapi_impl.dll",
+        "nv-vk64.json", "nv-vk32.json", "nvlddmkm.sys"
+    )
+}
+
+function Resolve-HeliosNvidiaPackage([string]$Path) {
+    $required = Get-HeliosNvidiaRequiredFiles
+    $candidates = if ($Path) {
+        @(Get-Item -LiteralPath $Path -ErrorAction Stop)
+    } else {
+        $root = Join-Path $env:windir "System32\DriverStore\FileRepository"
+        @(Get-ChildItem -LiteralPath $root -Directory -Filter "nv_disp*.inf_amd64_*" -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending)
+    }
+    foreach ($candidate in $candidates) {
+        $missing = @($required | Where-Object { -not (Test-Path -LiteralPath (Join-Path $candidate.FullName $_) -PathType Leaf) })
+        if ($missing.Count -eq 0) {
+            $version = (Get-Item -LiteralPath (Join-Path $candidate.FullName "nvlddmkm.sys")).VersionInfo.FileVersion
+            if ($version -eq "32.0.16.1088") { return $candidate.FullName }
+        }
+    }
+    if ($Path) { throw "NVIDIA 610.88 package files are incomplete at $Path." }
+    throw "NVIDIA 610.88 (32.0.16.1088) was not found in DriverStore. Pass -NvidiaPackage with the extracted Display.Driver directory."
+}
+
+function Get-HeliosDriverStorePath {
+    $instanceId = Get-HeliosDeviceInstanceId
+    $classKey = Get-HeliosDisplayClassKey $instanceId
+    $registered = @((Get-Item -LiteralPath $classKey).GetValue("UserModeDriverName", $null))
+    $path = @($registered | Where-Object { $_ -and [IO.Path]::IsPathRooted($_) } | Select-Object -First 1)
+    if ($path.Count -eq 1 -and (Test-Path -LiteralPath $path[0] -PathType Leaf)) {
+        return Split-Path -Parent $path[0]
+    }
+    throw "The active Helios UMD registration does not name a file in the active DriverStore."
+}
+
+function Install-HeliosNvidiaUmd([string]$Package) {
+    $source = Resolve-HeliosNvidiaPackage $Package
+    $destination = Get-HeliosDriverStorePath
+    Get-ChildItem -LiteralPath $source -File -Recurse | ForEach-Object {
+        $relative = $_.FullName.Substring($source.Length).TrimStart("\")
+        $target = Join-Path $destination $relative
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $target) | Out-Null
+        Copy-Item -LiteralPath $_.FullName -Destination $target -Force
+    }
+    foreach ($file in Get-HeliosNvidiaRequiredFiles) {
+        if (-not (Test-Path -LiteralPath (Join-Path $destination $file) -PathType Leaf)) {
+            throw "NVIDIA UMD staging did not produce $file in $destination."
+        }
+    }
+    Assert-HeliosPeArchitecture (Join-Path $destination "nvldumdx.dll") "x64"
+    Assert-HeliosPeArchitecture (Join-Path $destination "nvldumd.dll") "x86"
+    Assert-HeliosPeArchitecture (Join-Path $destination "nvoglv64.dll") "x64"
+    Assert-HeliosPeArchitecture (Join-Path $destination "nvoglv32.dll") "x86"
+    Assert-HeliosPeArchitecture (Join-Path $destination "nvcuda64.dll") "x64"
+    Assert-HeliosPeArchitecture (Join-Path $destination "nvcuda32.dll") "x86"
+    return [pscustomobject]@{ Source = $source; Destination = $destination }
+}

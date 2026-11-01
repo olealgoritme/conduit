@@ -12,7 +12,11 @@ param(
     # The GUI/silent front-end is non-interactive and cannot answer the
     # viogpudo prompt; installing Helios already implies replacing the display
     # driver, so it approves the removal without a console prompt.
-    [switch]$ReplaceViogpudo
+    [switch]$ReplaceViogpudo,
+    # Optional path to an extracted NVIDIA 610.88 Display.Driver directory.
+    # Required only for the RTX-personality adapter when no matching package is
+    # already present in DriverStore.
+    [string]$NvidiaPackage
 )
 
 Set-StrictMode -Version Latest
@@ -56,8 +60,9 @@ function Initialize-HeliosAutomaticProvisioning([Parameter(Mandatory)][string]$B
 
     $scriptPath = Join-Path $provisioningRoot "Install-Helios.ps1"
     $powerShellPath = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
+    $nvidiaArgument = if ($NvidiaPackage) { " -NvidiaPackage `"$NvidiaPackage`"" } else { "" }
     $action = New-ScheduledTaskAction -Execute $powerShellPath -Argument (
-        "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`" -Automatic"
+        "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`" -Automatic$nvidiaArgument"
     )
     $trigger = New-ScheduledTaskTrigger -AtStartup
     Register-ScheduledTask -TaskName $provisioningTaskName -Action $action -Trigger $trigger `
@@ -393,6 +398,12 @@ if ($activeInfText -notmatch "helios_kmd_render") {
 }
 $classKey = Get-HeliosDisplayClassKey $instanceId
 $state.classKey = $classKey
+if ($instanceId -match "^PCI\\VEN_10DE&DEV_2B85") {
+    Write-HeliosProgress 70 "Staging NVIDIA 610.88 user-mode drivers"
+    $nvidiaStage = Install-HeliosNvidiaUmd $NvidiaPackage
+    $state.nvidiaPackage = $nvidiaStage.Source
+    $state.nvidiaDriverStore = $nvidiaStage.Destination
+}
 if (-not $previousState) {
     $state.previousOpenGL = [ordered]@{
         OpenGLDriverName = Get-HeliosRegistrySnapshot $classKey "OpenGLDriverName"
@@ -462,7 +473,8 @@ New-ItemProperty -LiteralPath $vulkanRegistryX86 -Name $vulkanManifestX86Path -V
 # hands it the Venus ICD registered above. The Venus ICD stays registered:
 # the UMDs' DXVK on Venus (DWM and every denied process) reaches it through
 # the loader.
-if ([string](Get-Item -LiteralPath $classKey).GetValue("OpenGLDriverName", "") -notmatch "helios_gl64\.dll") {
+if ($instanceId -notmatch "^PCI\\VEN_10DE&DEV_2B85" -and
+    [string](Get-Item -LiteralPath $classKey).GetValue("OpenGLDriverName", "") -notmatch "helios_gl64\.dll") {
     Write-Warning "The driver package did not register Zink on NVK as the OpenGL ICD; registering the Venus Zink."
     New-ItemProperty -LiteralPath $classKey -Name "OpenGLDriverName" -Value $wglPath -PropertyType String -Force | Out-Null
     New-ItemProperty -LiteralPath $classKey -Name "OpenGLVersion" -Value 2 -PropertyType DWord -Force | Out-Null

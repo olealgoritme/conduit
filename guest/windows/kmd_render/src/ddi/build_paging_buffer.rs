@@ -52,7 +52,7 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use wdk_sys::ntddk::{
     KeGetCurrentIrql, MmMapIoSpace, MmMapLockedPagesSpecifyCache, MmUnmapIoSpace,
 };
-use wdk_sys::{_MEMORY_CACHING_TYPE, PHYSICAL_ADDRESS, PMDL};
+use wdk_sys::{PHYSICAL_ADDRESS, PMDL, _MEMORY_CACHING_TYPE};
 
 use crate::adapter::{AdapterContext, SystemBackingGuard, MAX_SYSTEM_BACKING_RANGES};
 use crate::ddi::create_allocation::SystemBackingPolicy;
@@ -1021,7 +1021,10 @@ unsafe fn with_blob_bytes_cached(
         g.1 += 1;
         let tick = g.1;
         let e = g.0.iter_mut().flatten().find(|e| {
-            e.resid == resource_id && e.gpa == prep.gpa && e.size == prep.size && e.cache == prep.map_cache
+            e.resid == resource_id
+                && e.gpa == prep.gpa
+                && e.size == prep.size
+                && e.cache == prep.map_cache
         });
         e.map(|e| {
             e.used = tick;
@@ -1037,22 +1040,21 @@ unsafe fn with_blob_bytes_cached(
             // A stale view of the same resource (moved, resized) goes, then the least recently used.
             let victim = {
                 let mut g = CPU_VIEW_CACHE.lock();
-                let i = g
-                    .0
-                    .iter()
-                    .position(|e| e.is_some_and(|e| e.resid == resource_id))
-                    .or_else(|| g.0.iter().position(Option::is_none))
-                    .unwrap_or_else(|| {
-                        let mut best = 0;
-                        for (k, e) in g.0.iter().enumerate() {
-                            if let (Some(e), Some(b)) = (e, g.0[best]) {
-                                if e.used < b.used {
-                                    best = k;
+                let i =
+                    g.0.iter()
+                        .position(|e| e.is_some_and(|e| e.resid == resource_id))
+                        .or_else(|| g.0.iter().position(Option::is_none))
+                        .unwrap_or_else(|| {
+                            let mut best = 0;
+                            for (k, e) in g.0.iter().enumerate() {
+                                if let (Some(e), Some(b)) = (e, g.0[best]) {
+                                    if e.used < b.used {
+                                        best = k;
+                                    }
                                 }
                             }
-                        }
-                        best
-                    });
+                            best
+                        });
                 (i, g.0[i].take())
             };
             if let (_, Some(old)) = victim {
@@ -1083,7 +1085,10 @@ unsafe fn with_blob_bytes_cached(
     let t1 = now_us();
     f(va, prep.size);
     CPU_MAP_US.store((t1 - t0).min(u64::from(u32::MAX)) as u32, Ordering::Relaxed);
-    CPU_CPY_US.store((now_us() - t1).min(u64::from(u32::MAX)) as u32, Ordering::Relaxed);
+    CPU_CPY_US.store(
+        (now_us() - t1).min(u64::from(u32::MAX)) as u32,
+        Ordering::Relaxed,
+    );
     true
 }
 
@@ -1092,7 +1097,9 @@ unsafe fn with_blob_bytes_cached(
 pub(crate) fn drop_cpu_view(resource_id: u32) {
     let taken = {
         let mut g = CPU_VIEW_CACHE.lock();
-        let i = g.0.iter().position(|e| e.is_some_and(|e| e.resid == resource_id));
+        let i =
+            g.0.iter()
+                .position(|e| e.is_some_and(|e| e.resid == resource_id));
         i.and_then(|i| g.0[i].take())
     };
     if let Some(e) = taken {
@@ -1207,7 +1214,11 @@ pub(crate) fn read_standard_buffer(
         with_blob_bytes_cached(passive, adapter, resource_id, |blob, len| {
             if want_end <= len {
                 // SAFETY: `[offset, want_end)` is inside the mapped blob (`len` bytes).
-                core::ptr::copy_nonoverlapping(blob.add(offset as usize), out.as_mut_ptr(), out.len());
+                core::ptr::copy_nonoverlapping(
+                    blob.add(offset as usize),
+                    out.as_mut_ptr(),
+                    out.len(),
+                );
                 ok = true;
             }
         })
@@ -1245,7 +1256,9 @@ pub(crate) fn write_standard_buffer(
     let Some(end) = offset.checked_add(span) else {
         return std_fail(11);
     };
-    if let Some(ok) = crate::ddi::aperture_pages::write(resource_id, offset, pitch, row_bytes, rows, data) {
+    if let Some(ok) =
+        crate::ddi::aperture_pages::write(resource_id, offset, pitch, row_bytes, rows, data)
+    {
         return ok || std_fail(12);
     }
     let Some(guard) = adapter.system_backings.serialize(passive) else {
@@ -1950,6 +1963,8 @@ enum PagingOperation<'a> {
     DiscardContent(&'a _DXGKARG_BUILDPAGINGBUFFER__bindgen_ty_1__bindgen_ty_3),
     VirtualFill(&'a DXGK_BUILDPAGINGBUFFER_FILLVIRTUAL),
     VirtualTransfer(&'a DXGK_BUILDPAGINGBUFFER_TRANSFERVIRTUAL),
+    NotifyResidency(&'a DXGK_BUILDPAGINGBUFFER_NOTIFYRESIDENCY),
+    FlushTlb,
     /// Any operation this driver does not service — the null engine.
     Other,
 }
@@ -1983,6 +1998,10 @@ impl<'a> PagingOperation<'a> {
                 PagingOp::DXGK_OPERATION_VIRTUAL_TRANSFER => {
                     Self::VirtualTransfer(args.__bindgen_anon_1.TransferVirtual.as_ref())
                 }
+                PagingOp::DXGK_OPERATION_NOTIFY_RESIDENCY => {
+                    Self::NotifyResidency(args.__bindgen_anon_1.NotifyResidency.as_ref())
+                }
+                PagingOp::DXGK_OPERATION_FLUSH_TLB => Self::FlushTlb,
                 _ => Self::Other,
             }
         }
@@ -2178,12 +2197,399 @@ impl PagingNote {
             PagingOperation::UpdatePageTable(u) => {
                 self.handle = u.hAllocation as usize as u32;
             }
-            PagingOperation::Other => {}
+            PagingOperation::NotifyResidency(n) => {
+                self.handle = n.hAllocation as usize as u32;
+            }
+            PagingOperation::FlushTlb | PagingOperation::Other => {}
         }
     }
 }
 
-/// The body of [`dxgkddi_build_paging_buffer`]; every return records its outcome in `note`.
+/// Native 610.88 paging operations.  `None` means the operation belongs to the
+/// default Venus engine.  Every native failure is returned before a paging
+/// submission can be accepted; no failed operation is converted into a retired
+/// success fence as the legacy decorative engine requires.
+unsafe fn native_paging_operation(
+    adapter: &AdapterContext,
+    operation: &PagingOperation<'_>,
+    note: &mut PagingNote,
+) -> Option<NTSTATUS> {
+    let allocation = match operation {
+        PagingOperation::UpdatePageTable(u) => unsafe { paging_alloc_info(adapter, u.hAllocation) },
+        PagingOperation::Transfer(t) => unsafe { paging_alloc_info(adapter, t.hAllocation) },
+        PagingOperation::Fill(f) => unsafe { paging_alloc_info(adapter, f.hAllocation) },
+        PagingOperation::DiscardContent(d) => unsafe { paging_alloc_info(adapter, d.hAllocation) },
+        PagingOperation::VirtualFill(f) => unsafe { paging_alloc_info(adapter, f.hAllocation) },
+        PagingOperation::VirtualTransfer(t) => unsafe { paging_alloc_info(adapter, t.hAllocation) },
+        PagingOperation::NotifyResidency(n) => unsafe { paging_alloc_info(adapter, n.hAllocation) },
+        PagingOperation::FlushTlb | PagingOperation::Other => return None,
+    }?;
+    if allocation.native_id == 0 {
+        return None;
+    }
+    note.describe(operation, allocation.native_segment);
+
+    if let PagingOperation::NotifyResidency(n) = operation {
+        let flags = unsafe {
+            core::ptr::read_unaligned(
+                (n as *const _ as *const u8)
+                    .add(core::mem::size_of::<DXGK_BUILDPAGINGBUFFER_NOTIFYRESIDENCY>() - 4)
+                    as *const u32,
+            )
+        };
+        return Some(
+            match crate::virtio::native_memory::notify_residency(
+                allocation.native_id,
+                n.PhysicalAddress,
+                flags & 1 != 0,
+            ) {
+                Ok(()) => STATUS_SUCCESS,
+                Err(_) => STATUS_UNSUCCESSFUL,
+            },
+        );
+    }
+    if let PagingOperation::UpdatePageTable(update) = operation {
+        if update.PageTableLevel != 0 {
+            // RM owns every non-leaf level of its GPU_DEVICE VA space.
+            note.result = dl::paging_result::PTE;
+            return Some(STATUS_SUCCESS);
+        }
+    }
+    if unsafe { KeGetCurrentIrql() } != PASSIVE_LEVEL_IRQL {
+        note.result = dl::paging_result::BAD_IRQL;
+        return Some(STATUS_UNSUCCESSFUL);
+    }
+    // SAFETY: checked immediately above; all native RM and Mm operations are
+    // synchronous PASSIVE-level work.
+    let passive = unsafe { PassiveLevel::assume() };
+    let result = match operation {
+        PagingOperation::UpdatePageTable(update) => unsafe {
+            native_update_leaf(passive, adapter, allocation, update)
+        },
+        PagingOperation::Transfer(transfer) => unsafe {
+            native_transfer(passive, adapter, allocation, transfer)
+        },
+        PagingOperation::Fill(fill) => unsafe { native_fill(passive, adapter, allocation, fill) },
+        PagingOperation::DiscardContent(_) => Ok(()),
+        PagingOperation::VirtualFill(fill) => unsafe {
+            native_virtual_fill(passive, adapter, allocation, fill)
+        },
+        PagingOperation::VirtualTransfer(transfer) => unsafe {
+            native_virtual_transfer(passive, adapter, allocation, transfer)
+        },
+        PagingOperation::NotifyResidency(_)
+        | PagingOperation::FlushTlb
+        | PagingOperation::Other => Ok(()),
+    };
+    note.result = if result.is_ok() {
+        dl::paging_result::EXECUTED
+    } else {
+        dl::paging_result::SKIPPED
+    };
+    Some(match result {
+        Ok(()) => STATUS_SUCCESS,
+        Err(()) => STATUS_UNSUCCESSFUL,
+    })
+}
+
+unsafe fn native_update_leaf(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    allocation: crate::ddi::create_allocation::PagingAllocInfo,
+    update: &DXGK_BUILDPAGINGBUFFER_UPDATEPAGETABLE,
+) -> Result<(), ()> {
+    use helios_kmd_logic::native_memory as native;
+
+    if update.pPageTableEntries.is_null() || update.NumPageTableEntries == 0 {
+        return Err(());
+    }
+    let count = update.NumPageTableEntries as usize;
+    let mut pieces = Vec::new();
+    pieces.try_reserve_exact(count).map_err(|_| ())?;
+    let repeat = update.Flags.Repeat() != 0;
+    for index in 0..count {
+        let pte_index = if repeat { 0 } else { index };
+        // SAFETY: Repeat selects one entry; otherwise DXGK supplies Num entries.
+        let pte = unsafe { core::ptr::read_unaligned(update.pPageTableEntries.add(pte_index)) };
+        let bits = unsafe { pte.__bindgen_anon_1.__bindgen_anon_1 };
+        if bits.Zero() != 0 {
+            // Sparse zero was not advertised.
+            return Err(());
+        }
+        if bits.Valid() == 0 {
+            pieces.push(None);
+            continue;
+        }
+        if repeat && count != 1 {
+            // Repeating one placement cannot describe the sequential allocation
+            // offsets promised for a native multi-page update.
+            return Err(());
+        }
+        if bits.Segment() as u32 != allocation.native_segment {
+            return Err(());
+        }
+        let page_address = unsafe { pte.__bindgen_anon_2.PageAddress };
+        if page_address > (u64::MAX >> 12) {
+            return Err(());
+        }
+        // PageAddress is VidMm's segment placement, never a host GPA.  The RM
+        // memory offset comes only from AllocationOffsetInBytes + page index.
+        let piece = native::MappingPiece {
+            va: update
+                .FirstPteVirtualAddress
+                .checked_add((index as u64).checked_mul(native::PAGE_BYTES).ok_or(())?)
+                .ok_or(())?,
+            memory_offset: update
+                .AllocationOffsetInBytes
+                .checked_add((index as u64).checked_mul(native::PAGE_BYTES).ok_or(())?)
+                .ok_or(())?,
+            len: native::PAGE_BYTES,
+        };
+        pieces.push(Some(piece));
+    }
+    if !unsafe {
+        adapter
+            .paging_pte_shadow
+            .update_leaf(update, allocation.native_segment == 0)
+    } {
+        return Err(());
+    }
+    crate::virtio::native_memory::update_leaf(
+        passive,
+        adapter,
+        allocation.native_id,
+        update.hProcess as usize,
+        update.FirstPteVirtualAddress,
+        update.AllocationOffsetInBytes,
+        &pieces,
+    )
+    .map_err(|_| ())
+}
+
+unsafe fn native_transfer(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    allocation: crate::ddi::create_allocation::PagingAllocInfo,
+    transfer: &_DXGKARG_BUILDPAGINGBUFFER__bindgen_ty_1__bindgen_ty_1,
+) -> Result<(), ()> {
+    let source = unsafe { TransferEnd::source(&transfer.Source) };
+    let destination = unsafe { TransferEnd::destination(&transfer.Destination) };
+    if transfer.Source.SegmentId != 0
+        && transfer.Destination.SegmentId != 0
+        && transfer.Source.SegmentId == allocation.native_segment
+        && transfer.Destination.SegmentId == allocation.native_segment
+    {
+        return Ok(());
+    }
+    let (mdl, to_native) = match (source, destination) {
+        (TransferEnd::SystemMdl(mdl), TransferEnd::Segment)
+            if transfer.Destination.SegmentId == allocation.native_segment =>
+        {
+            (mdl, true)
+        }
+        (TransferEnd::Segment, TransferEnd::SystemMdl(mdl))
+            if transfer.Source.SegmentId == allocation.native_segment =>
+        {
+            (mdl, false)
+        }
+        _ => return Err(()),
+    };
+    let offset = transfer.TransferOffset as u64;
+    let size = transfer.TransferSize as u64;
+    if offset
+        .checked_add(size)
+        .is_none_or(|end| end > allocation.size)
+    {
+        return Err(());
+    }
+    let window = unsafe { mdl_system_va(passive, mdl) }.ok_or(())?;
+    let system = window.slice_at_page(transfer.MdlOffset, size).ok_or(())?;
+    let copied = unsafe {
+        crate::virtio::native_memory::with_cpu_bytes(
+            passive,
+            adapter,
+            allocation.native_id,
+            |native, len| {
+                if offset.checked_add(size).is_none_or(|end| end > len) {
+                    return false;
+                }
+                let (Ok(offset), Ok(size)) = (usize::try_from(offset), usize::try_from(size))
+                else {
+                    return false;
+                };
+                if to_native {
+                    core::ptr::copy_nonoverlapping(system, native.add(offset), size);
+                } else {
+                    core::ptr::copy_nonoverlapping(native.add(offset), system, size);
+                }
+                true
+            },
+        )
+    }
+    .map_err(|_| ())?;
+    if copied {
+        Ok(())
+    } else {
+        Err(())
+    }
+}
+
+unsafe fn native_fill(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    allocation: crate::ddi::create_allocation::PagingAllocInfo,
+    fill: &_DXGKARG_BUILDPAGINGBUFFER__bindgen_ty_1__bindgen_ty_2,
+) -> Result<(), ()> {
+    if fill.Destination.SegmentId != allocation.native_segment {
+        return Err(());
+    }
+    let size = fill.FillSize as u64;
+    if size > allocation.size {
+        return Err(());
+    }
+    let filled = unsafe {
+        crate::virtio::native_memory::with_cpu_bytes(
+            passive,
+            adapter,
+            allocation.native_id,
+            |native, len| {
+                if size > len {
+                    return false;
+                }
+                fill_pattern(native, size as usize, fill.FillPattern);
+                true
+            },
+        )
+    }
+    .map_err(|_| ())?;
+    if filled {
+        Ok(())
+    } else {
+        Err(())
+    }
+}
+
+unsafe fn native_virtual_fill(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    allocation: crate::ddi::create_allocation::PagingAllocInfo,
+    fill: &DXGK_BUILDPAGINGBUFFER_FILLVIRTUAL,
+) -> Result<(), ()> {
+    let offset = fill.AllocationOffsetInBytes;
+    let size = fill.FillSizeInBytes;
+    if offset
+        .checked_add(size)
+        .is_none_or(|end| end > allocation.size)
+    {
+        return Err(());
+    }
+    let filled = unsafe {
+        crate::virtio::native_memory::with_cpu_bytes(
+            passive,
+            adapter,
+            allocation.native_id,
+            |native, len| {
+                if offset.checked_add(size).is_none_or(|end| end > len) {
+                    return false;
+                }
+                let (Ok(offset), Ok(size)) = (usize::try_from(offset), usize::try_from(size))
+                else {
+                    return false;
+                };
+                fill_pattern(native.add(offset), size, fill.FillPattern);
+                true
+            },
+        )
+    }
+    .map_err(|_| ())?;
+    if filled {
+        Ok(())
+    } else {
+        Err(())
+    }
+}
+
+unsafe fn native_virtual_transfer(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    allocation: crate::ddi::create_allocation::PagingAllocInfo,
+    transfer: &DXGK_BUILDPAGINGBUFFER_TRANSFERVIRTUAL,
+) -> Result<(), ()> {
+    use crate::dxgk::_DXGK_MEMORY_TRANSFER_DIRECTION as Direction;
+
+    let offset = transfer.AllocationOffsetInBytes;
+    let size = transfer.TransferSizeInBytes;
+    if offset
+        .checked_add(size)
+        .is_none_or(|end| end > allocation.size)
+    {
+        return Err(());
+    }
+    let (system_va, to_system) = match transfer.TransferDirection {
+        Direction::DXGK_MEMORY_TRANSFER_LOCAL_TO_SYSTEM => {
+            (transfer.DestinationVirtualAddress, true)
+        }
+        Direction::DXGK_MEMORY_TRANSFER_SYSTEM_TO_LOCAL => (transfer.SourceVirtualAddress, false),
+        Direction::DXGK_MEMORY_TRANSFER_LOCAL_TO_LOCAL => return Ok(()),
+        _ => return Err(()),
+    };
+    if unsafe { transfer.Flags.__bindgen_anon_1.Flags } != 0 {
+        return Err(());
+    }
+    let pages = adapter
+        .paging_pte_shadow
+        .resolve(passive, system_va, size)
+        .ok_or(())?;
+    let copied = unsafe {
+        crate::virtio::native_memory::with_cpu_bytes(
+            passive,
+            adapter,
+            allocation.native_id,
+            |native, len| {
+                if offset.checked_add(size).is_none_or(|end| end > len) {
+                    return false;
+                }
+                for_each_paging_system_run(
+                    passive,
+                    &pages,
+                    system_va,
+                    size,
+                    |system, run_offset, run_size| {
+                        let Some(native_offset) = offset.checked_add(run_offset) else {
+                            return false;
+                        };
+                        let (Ok(native_offset), Ok(run_size)) =
+                            (usize::try_from(native_offset), usize::try_from(run_size))
+                        else {
+                            return false;
+                        };
+                        if to_system {
+                            core::ptr::copy_nonoverlapping(
+                                native.add(native_offset),
+                                system,
+                                run_size,
+                            );
+                        } else {
+                            core::ptr::copy_nonoverlapping(
+                                system,
+                                native.add(native_offset),
+                                run_size,
+                            );
+                        }
+                        true
+                    },
+                )
+            },
+        )
+    }
+    .map_err(|_| ())?;
+    if copied {
+        Ok(())
+    } else {
+        Err(())
+    }
+}
+
 #[inline(never)]
 unsafe fn build_paging_buffer_inner(
     h_adapter: *mut c_void,
@@ -2209,15 +2615,18 @@ unsafe fn build_paging_buffer_inner(
 
     // SAFETY: dxgkrnl hands back our AdapterContext as the miniport context.
     let adapter = unsafe { &*(h_adapter as *const AdapterContext) };
+    // ONE union read for the whole DDI.
+    // SAFETY: `Operation` describes the arm dxgkrnl initialised — the DDI
+    // contract, now relied on in exactly one place instead of six.
+    let operation = unsafe { PagingOperation::parse(args) };
+    if let Some(status) = unsafe { native_paging_operation(adapter, &operation, note) } {
+        return status;
+    }
     let Some(bar) = adapter.bar_segment() else {
         note.result = dl::paging_result::NO_BAR;
         return STATUS_SUCCESS; // BAR segment inactive → pure null engine
     };
 
-    // ONE union read for the whole DDI.
-    // SAFETY: `Operation` describes the arm dxgkrnl initialised — the DDI
-    // contract, now relied on in exactly one place instead of six.
-    let operation = unsafe { PagingOperation::parse(args) };
     note.describe(&operation, bar.seg_id);
 
     // Placement harvest is DISPATCH-safe (atomic store only) — no IRQL gate.
@@ -2452,7 +2861,10 @@ unsafe fn build_paging_buffer_inner(
         // Exhaustive: `is_content_op` already returned for these, so reaching
         // them here is impossible. Named rather than wildcarded so a new variant
         // is a compile error in BOTH places at once.
-        PagingOperation::UpdatePageTable(_) | PagingOperation::Other => PagingOpOutcome::NotOurs,
+        PagingOperation::UpdatePageTable(_)
+        | PagingOperation::NotifyResidency(_)
+        | PagingOperation::FlushTlb
+        | PagingOperation::Other => PagingOpOutcome::NotOurs,
     };
     // Counted BEFORE the mirror below, so the registry carries it on this op.
     if matches!(outcome, PagingOpOutcome::Failed(_)) {

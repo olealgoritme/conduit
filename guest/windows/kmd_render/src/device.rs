@@ -39,7 +39,11 @@ pub struct DeviceContext {
 pub enum StashedMarker {
     /// A registered Venus stream point `(ctx, value, cookie)`; the Present resolves
     /// it against the stream table.
-    Stream { ctx_id: u32, value: u32, cookie: u64 },
+    Stream {
+        ctx_id: u32,
+        value: u32,
+        cookie: u64,
+    },
     /// An RM fence already attached at Render (`docs/rm-fence-marker.md`): the
     /// boundary it named. Attaching takes the fence over, so it happens exactly once,
     /// at Render, and Present only carries the result.
@@ -322,7 +326,8 @@ impl<'a> ContextHandleRef<'a> {
         let mut slot = ctx.window_tag.lock();
         let orphan = slot.is_some();
         *slot = tag;
-        ctx.window_flag.store(u32::from(tag.is_some()), Ordering::Relaxed);
+        ctx.window_flag
+            .store(u32::from(tag.is_some()), Ordering::Relaxed);
         orphan
     }
 
@@ -471,23 +476,33 @@ impl<'a> DeviceHandleRef<'a> {
     pub fn creator_process(&self) -> usize {
         self.device.creator_process
     }
+
+    /// The process object which owns native-channel VA/RM state, when dxgkrnl
+    /// supplied one at CreateDevice.
+    pub fn native_process_ptr(&self) -> *mut ProcessContext {
+        self.device.creator_process as *mut ProcessContext
+    }
 }
 
-/// State for one GPU process object (WDDM 2.0 GPU-VA requirement). We keep no
-/// per-process GPU virtual address space (host-owned VA), but dxgkrnl requires a
-/// non-NULL driver handle it can round-trip through every per-process DDI and
-/// hand back at DestroyProcess, so we allocate a real object to back the handle.
-///
-/// DELIBERATELY EMPTY. It used to carry an `adapter` back-pointer that was
-/// written at CreateProcess and never read, which implied an ownership edge that
-/// does not exist. The allocation stays — dxgkrnl needs the non-NULL handle — but
-/// the object is an opaque token and nothing more.
+/// State for one GPU process object (WDDM 2.0 GPU-VA requirement). The legacy
+/// render path keeps its host-owned VA model. Native CUDA contexts lazily add
+/// an association with the native-memory RM client and VA space, shared by
+/// reference across that process's HW contexts.
 pub struct ProcessContext {
-    /// Zero-sized structs still get a unique non-null address from `Box`, but a
-    /// field makes the allocation's purpose (a handle dxgkrnl can round-trip)
-    /// legible and keeps `Box::into_raw` returning a real pointer under any
-    /// future allocator.
+    /// Kept nonzero-sized so `Box::into_raw` is a distinct opaque handle even
+    /// before native channel state is requested.
     _opaque: u32,
+    /// Empty until the first native CreateHwContext. Host calls are made only
+    /// after taking the value out of this lock.
+    native: crate::sync::SpinLock<crate::virtio::native_channel::NativeProcessState>,
+}
+
+impl ProcessContext {
+    pub(crate) fn native_state(
+        &self,
+    ) -> &crate::sync::SpinLock<crate::virtio::native_channel::NativeProcessState> {
+        &self.native
+    }
 }
 
 /// `DxgkDdiCreateDevice` — allocate per-device state.
@@ -502,7 +517,9 @@ pub unsafe extern "C" fn dxgkddi_create_device(
     let args = unsafe { &mut *create_device };
     // `GdiAccel` census: GDI devices (`DXGK_CREATEDEVICEFLAGS.GdiDevice`). An atomic add.
     // SAFETY: `Flags` is the input arm of the union (`pInfo` is the obsolete output arm).
-    crate::ddi::gdi_accel::note_create_device(unsafe { args.__bindgen_anon_1.Flags.__bindgen_anon_1.Value });
+    crate::ddi::gdi_accel::note_create_device(unsafe {
+        args.__bindgen_anon_1.Flags.__bindgen_anon_1.Value
+    });
     let ctx = Box::new(DeviceContext {
         adapter: miniport_device_context as *mut AdapterContext,
         creator_process: args.hKmdProcess as usize,
@@ -774,9 +791,13 @@ pub unsafe extern "C" fn dxgkddi_create_process(
     }
     // SAFETY: Dxgkrnl passes our adapter context and a valid args struct.
     let args = unsafe { &mut *args };
-    // The handle is an opaque token: dxgkrnl only round-trips it. The old
-    // `adapter` back-pointer here was written and never read.
-    let ctx = Box::new(ProcessContext { _opaque: 0 });
+    // The handle is an opaque token to dxgkrnl; native channel state is lazy.
+    let ctx = Box::new(ProcessContext {
+        _opaque: 0,
+        native: crate::sync::SpinLock::new(
+            crate::virtio::native_channel::NativeProcessState::Empty,
+        ),
+    });
     // Hand the process handle back to Dxgkrnl; reclaimed in destroy_process.
     args.hKmdProcess = Box::into_raw(ctx) as HANDLE;
     STATUS_SUCCESS
@@ -788,6 +809,25 @@ pub unsafe extern "C" fn dxgkddi_destroy_process(
     h_process: *mut c_void,
 ) -> NTSTATUS {
     if !h_process.is_null() {
+        // A native process closes its RM client after every queue and context
+        // has been destroyed, before the opaque process object is reclaimed.
+        if let Some(adapter) =
+            unsafe { (miniport_device_context as *const AdapterContext).as_ref() }
+        {
+            let passive = unsafe { crate::irql::PassiveLevel::assume() };
+            let native = crate::virtio::native_channel::destroy_process(passive, adapter, unsafe {
+                &mut *(h_process as *mut ProcessContext)
+            });
+            if matches!(
+                native,
+                Err(crate::virtio::native_channel::NativeError::Busy)
+            ) {
+                // A queue/context teardown is still in flight. Retain the process
+                // object those raw pointers name instead of freeing it early.
+                core::mem::forget(h_process);
+                return STATUS_DEVICE_BUSY;
+            }
+        }
         // The process's RM gate (`docs/rm-fence-marker.md`) goes with it: waits that
         // named it are discharged and the fences it still held are closed. The token
         // is only compared, never dereferenced.

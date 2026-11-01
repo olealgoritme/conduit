@@ -80,11 +80,16 @@ try {
 # selected architecture and installed bytes against the bundle's recorded hash.
 # Slot 0 (D3D9) is dxgkrnl's "no D3D9 driver" marker, which makes d3d9.dll run
 # D3D9 through D3D9On12 on the D3D12 UMD (helios_kmd_render.inx).
-$noDriverSlot = "<>"
+$noDriverSlot = if ($instanceId -match "^PCI\\VEN_10DE&DEV_2B85") { $null } else { "<>" }
 $driverDirectories = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
 foreach ($registration in @(
-    @{ name = "UserModeDriverName"; architecture = "x64"; files = @($noDriverSlot, "helios_umd.dll", "helios_umd.dll", "helios_umd12.dll") },
-    @{ name = "UserModeDriverNameWoW"; architecture = "x86"; files = @($noDriverSlot, "helios_umd32.dll", "helios_umd32.dll", "helios_umd12_32.dll") }
+    if ($instanceId -match "^PCI\\VEN_10DE&DEV_2B85") {
+        @{ name = "UserModeDriverName"; architecture = "x64"; files = @("nvldumdx.dll", "nvldumdx.dll", "nvldumdx.dll", "nvldumdx.dll") },
+        @{ name = "UserModeDriverNameWoW"; architecture = "x86"; files = @("nvldumd.dll", "nvldumd.dll", "nvldumd.dll", "nvldumd.dll") }
+    } else {
+        @{ name = "UserModeDriverName"; architecture = "x64"; files = @($noDriverSlot, "helios_umd.dll", "helios_umd.dll", "helios_umd12.dll") },
+        @{ name = "UserModeDriverNameWoW"; architecture = "x86"; files = @($noDriverSlot, "helios_umd32.dll", "helios_umd32.dll", "helios_umd12_32.dll") }
+    }
 )) {
     try {
         if (-not $classKey) { throw "No display software key for $($registration.name)." }
@@ -127,9 +132,13 @@ if ($driverDirectories.Count -ne 1) {
 }
 if ($classKey) {
     $installedDrivers = @((Get-Item -LiteralPath $classKey).GetValue("InstalledDisplayDrivers", $null))
-    $expectedDrivers = @("helios_umd", "helios_umd12", "helios_umd32", "helios_umd12_32")
-    if ($installedDrivers.Count -ne 4 -or (Compare-Object $expectedDrivers $installedDrivers)) {
-        $failures.Add("InstalledDisplayDrivers does not list all four distinct Helios UMDs.")
+    $expectedDrivers = if ($instanceId -match "^PCI\\VEN_10DE&DEV_2B85") {
+        @("nvldumdx", "nvldumd")
+    } else {
+        @("helios_umd", "helios_umd12", "helios_umd32", "helios_umd12_32")
+    }
+    if ($installedDrivers.Count -ne $expectedDrivers.Count -or (Compare-Object $expectedDrivers $installedDrivers)) {
+        $failures.Add("InstalledDisplayDrivers does not match the active UMD personality.")
     }
 }
 
@@ -155,8 +164,10 @@ function Get-HeliosClassValue([string]$Name) {
     return (@($value) -join ";")
 }
 foreach ($check in @(
-    @{ name = "OpenGLDriverName"; label = "OpenGL"; nvk = "\\helios_gl64\.dll$"; venus = (Join-Path ([string]$state.installRoot) "runtime\mesa\libgallium_wgl.dll") },
-    @{ name = "OpenGLDriverNameWow"; label = "OpenGL x86"; nvk = "\\helios_gl32\.dll$"; venus = (Join-Path ([string]$state.installRoot) "runtime\mesa\x86\libgallium_wgl.dll") }
+    if ($instanceId -notmatch "^PCI\\VEN_10DE&DEV_2B85") {
+        @{ name = "OpenGLDriverName"; label = "OpenGL"; nvk = "\\helios_gl64\.dll$"; venus = (Join-Path ([string]$state.installRoot) "runtime\mesa\libgallium_wgl.dll") },
+        @{ name = "OpenGLDriverNameWow"; label = "OpenGL x86"; nvk = "\\helios_gl32\.dll$"; venus = (Join-Path ([string]$state.installRoot) "runtime\mesa\x86\libgallium_wgl.dll") }
+    }
 )) {
     $value = Get-HeliosClassValue $check.name
     if ($value -match $check.nvk) {
