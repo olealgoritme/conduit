@@ -348,7 +348,7 @@ fn stop_unbind_scanout(
 #[inline(never)]
 pub unsafe extern "C" fn dxgkddi_start_device(
     miniport_device_context: *mut c_void,
-    _dxgk_start_info: *mut DXGK_START_INFO,
+    dxgk_start_info: *mut DXGK_START_INFO,
     dxgkrnl_interface: *mut DXGKRNL_INTERFACE,
     number_of_video_present_sources: *mut u32,
     number_of_children: *mut u32,
@@ -377,6 +377,13 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     //
     // SAFETY: Dxgkrnl passes our adapter context and valid out-pointers.
     let adapter = unsafe { &*(miniport_device_context as *const AdapterContext) };
+    // SAFETY: dxgkrnl's DXGK_START_INFO for this call, or null.
+    if let Some(start) = unsafe { dxgk_start_info.as_ref() } {
+        crate::ddi::query_adapter_info::note_adapter_luid(
+            start.AdapterLuid.LowPart,
+            start.AdapterLuid.HighPart,
+        );
+    }
 
     // Clear the start edge FIRST. On a stop/start cycle the flag survives from
     // the previous start (the context does), and `init_hpd` below spawns a fresh

@@ -622,6 +622,22 @@ fn nvidia_umd_enabled() -> bool {
 /// 5090 IDs in this template.
 const NVIDIA_UMD_PRIVATE: &[u8; 50_600] = include_bytes!("nvidia_umd_private.bin");
 
+/// Where the template carries the adapter LUID (LowPart, then HighPart): the
+/// capture machine's 0x7a45. nvwgf2umx opens the adapter by this LUID
+/// (D3DKMTOpenAdapterFromLuid), so it must be this adapter's.
+const UMD_PRIVATE_LUID_AT: usize = 0xc45c;
+
+/// This adapter's LUID from `DxgkDdiStartDevice` (LowPart | HighPart << 32).
+static ADAPTER_LUID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Record the LUID dxgkrnl assigned at StartDevice.
+pub(crate) fn note_adapter_luid(low: u32, high: i32) {
+    ADAPTER_LUID.store(
+        u64::from(low) | (u64::from(high as u32) << 32),
+        core::sync::atomic::Ordering::Relaxed,
+    );
+}
+
 unsafe fn query_umdriver_private(args: &DXGKARG_QUERYADAPTERINFO) -> NTSTATUS {
     if !nvidia_umd_enabled() {
         return STATUS_NOT_SUPPORTED;
@@ -638,6 +654,16 @@ unsafe fn query_umdriver_private(args: &DXGKARG_QUERYADAPTERINFO) -> NTSTATUS {
             args.pOutputData as *mut u8,
             NVIDIA_UMD_PRIVATE.len(),
         );
+    }
+    let luid = ADAPTER_LUID.load(core::sync::atomic::Ordering::Relaxed);
+    if luid != 0 {
+        // SAFETY: inside the template-sized prefix checked above.
+        unsafe {
+            core::ptr::write_unaligned(
+                (args.pOutputData as *mut u8).add(UMD_PRIVATE_LUID_AT) as *mut u64,
+                luid,
+            );
+        }
     }
     STATUS_SUCCESS
 }
