@@ -37,7 +37,7 @@ const TIMEOUT_MS: u64 = 2_500;
 const REPLY_MAX: usize = 512;
 const H_VASPACE: u32 = 0x4e57_0001;
 const FIRST_DYNAMIC_HANDLE: u32 = 0x4e57_1000;
-const PIN_CHUNK_BYTES: u64 = 256 << 20;
+const PIN_CHUNK_BYTES: u64 = u32::MAX as u64 & !(nm::PAGE_BYTES - 1);
 const LOCAL_4K_MAP_FLAGS: u32 = 1 << 8;
 
 static NEXT_ID: AtomicU32 = AtomicU32::new(1);
@@ -111,11 +111,17 @@ struct Pin {
     kernel_va: u64,
 }
 
-struct CpuMapping {
-    view: CpuView,
+struct CpuChunk {
+    physical: u64,
     map_ch: u32,
     cookie: u64,
+    rm_mapped: bool,
     host_id: u32,
+}
+
+struct CpuMapping {
+    view: CpuView,
+    chunks: Vec<CpuChunk>,
     kernel_va: u64,
     aperture_offset: Option<u64>,
 }
@@ -1049,42 +1055,79 @@ pub fn notify_residency(id: u32, physical_address: u64, resident: bool) -> Resul
     Ok(())
 }
 
-fn cpu_map(
+fn release_cpu_chunk(io: &Io<'_>, memory: u32, chunk: &mut CpuChunk) -> Result<(), Error> {
+    if chunk.map_ch == 0 {
+        return Ok(());
+    }
+    if chunk.host_id != 0 {
+        nvrm::release_host_map_within(
+            io.passive,
+            io.adapter,
+            chunk.map_ch,
+            chunk.host_id,
+            TIMEOUT_MS,
+        )
+        .map_err(|_| Error::Host)?;
+        chunk.host_id = 0;
+    }
+    if chunk.rm_mapped {
+        let block = rc::nvos34(io.client.root, nd::H_DEVICE, memory, chunk.cookie);
+        let mut response = [0u8; REPLY_MAX];
+        let n = io.exchange(
+            io.client.ctl,
+            rc::nv_cmd(rc::ESC_RM_UNMAP_MEMORY, rc::NVOS34_BYTES as u32),
+            &block,
+            &[],
+            &mut response,
+        )?;
+        rc::rm_reply(response.get(..n).ok_or(Error::Host)?, rc::NVOS34_STATUS_AT)
+            .map_err(|_| Error::Host)?;
+        chunk.cookie = 0;
+        chunk.rm_mapped = false;
+    }
+    io.close_file(chunk.map_ch)?;
+    chunk.map_ch = 0;
+    Ok(())
+}
+
+fn cpu_map_chunk(
     io: &Io<'_>,
     allocation: &Allocation,
-    aperture_offset: Option<u64>,
+    offset: u64,
+    len: u64,
     expected_gpa: Option<u64>,
-) -> Result<CpuMapping, Error> {
-    if allocation.system_memory != 0 {
-        // Separate MDL mappings are not contiguous. Never expose the first
-        // chunk (or a process-local user VA) as a view of the whole allocation.
-        if allocation.system_kernel_va == 0 {
-            return Err(Error::Unsupported);
-        }
-        return Ok(CpuMapping {
-            view: CpuView {
-                address: allocation.system_kernel_va,
-                len: allocation.size,
-                generation: 0,
-            },
-            map_ch: 0,
-            cookie: 0,
-            host_id: 0,
-            kernel_va: 0,
-            aperture_offset,
-        });
-    }
+) -> Result<CpuChunk, Error> {
+    let region = nvrm::region_for(io.adapter, io.client.minor).ok_or(Error::Host)?;
+    let expected = match expected_gpa {
+        Some(base) => Some(base.checked_add(offset).ok_or(Error::WrongAddress)?),
+        None => None,
+    };
+    let window_offset = match expected {
+        Some(expected) => Some(
+            expected
+                .checked_sub(region.base)
+                .ok_or(Error::WrongAddress)?,
+        ),
+        None => None,
+    };
     let map_ch = io.open_file(io.client.minor)?;
     if let Err(error) = io.register_fd(map_ch) {
         let _ = io.close_file(map_ch);
         return Err(error);
     }
+    let mut chunk = CpuChunk {
+        physical: 0,
+        map_ch,
+        cookie: 0,
+        rm_mapped: false,
+        host_id: 0,
+    };
     let block = rc::nvos33_with_fd(
         io.client.root,
         nd::H_DEVICE,
         allocation.memory,
-        0,
-        allocation.size,
+        offset,
+        len,
         map_ch,
     );
     let mut response = [0u8; REPLY_MAX];
@@ -1102,119 +1145,142 @@ fn cpu_map(
         })(),
         Err(error) => Err(error),
     };
-    let cookie = match cookie {
-        Ok(cookie) => cookie,
+    match cookie {
+        Ok(cookie) => {
+            chunk.cookie = cookie;
+            chunk.rm_mapped = true;
+        }
         Err(error) => {
             let _ = io.close_file(map_ch);
             return Err(error);
         }
-    };
-    let region = nvrm::region_for(io.adapter, io.client.minor).ok_or(Error::Host)?;
-    let mapped = match (aperture_offset, expected_gpa) {
-        (Some(_), Some(expected)) => {
-            let window_offset = expected
-                .checked_sub(region.base)
-                .ok_or(Error::WrongAddress)?;
-            nvrm::host_mmap_at_within(
-                io.passive,
-                io.adapter,
-                KMD,
-                map_ch,
-                true,
-                0,
-                window_offset,
-                allocation.size,
-                TIMEOUT_MS,
-            )
-        }
-        _ => nvrm::host_mmap_within(
+    }
+    let mapped = match window_offset {
+        Some(window_offset) => nvrm::host_mmap_at_within(
             io.passive,
             io.adapter,
             KMD,
             map_ch,
             true,
             0,
-            allocation.size,
+            window_offset,
+            len,
             TIMEOUT_MS,
+        ),
+        None => nvrm::host_mmap_within(
+            io.passive, io.adapter, KMD, map_ch, true, 0, len, TIMEOUT_MS,
         ),
     };
     let mapped = match mapped {
-        Ok(mapped) if mapped.size >= allocation.size => mapped,
-        _ => {
-            let block = rc::nvos34(io.client.root, nd::H_DEVICE, allocation.memory, cookie);
-            let _ = io.exchange(
-                io.client.ctl,
-                rc::nv_cmd(rc::ESC_RM_UNMAP_MEMORY, rc::NVOS34_BYTES as u32),
-                &block,
-                &[],
-                &mut response,
-            );
-            let _ = io.close_file(map_ch);
+        Ok(mapped) => {
+            chunk.host_id = mapped.host_id;
+            mapped
+        }
+        Err(_) => {
+            let _ = release_cpu_chunk(io, allocation.memory, &mut chunk);
             return Err(Error::Host);
         }
     };
-    let physical = region
-        .base
-        .checked_add(mapped.offset)
-        .ok_or(Error::WrongAddress)?;
-    if let Some(expected) = expected_gpa {
-        if physical != expected {
-            let _ = nvrm::release_host_map_within(
-                io.passive,
-                io.adapter,
-                map_ch,
-                mapped.host_id,
-                TIMEOUT_MS,
-            );
-            let block = rc::nvos34(io.client.root, nd::H_DEVICE, allocation.memory, cookie);
-            let _ = io.exchange(
-                io.client.ctl,
-                rc::nv_cmd(rc::ESC_RM_UNMAP_MEMORY, rc::NVOS34_BYTES as u32),
-                &block,
-                &[],
-                &mut response,
-            );
-            let _ = io.close_file(map_ch);
-            return Err(Error::WrongAddress);
-        }
+    if mapped.size < len {
+        let _ = release_cpu_chunk(io, allocation.memory, &mut chunk);
+        return Err(Error::Host);
     }
+    let physical = region.base.checked_add(mapped.offset);
+    if physical.is_none_or(|physical| expected.is_some_and(|expected| physical != expected)) {
+        let _ = release_cpu_chunk(io, allocation.memory, &mut chunk);
+        return Err(Error::WrongAddress);
+    }
+    chunk.physical = physical.ok_or(Error::WrongAddress)?;
+    Ok(chunk)
+}
+
+fn cpu_map(
+    io: &Io<'_>,
+    allocation: &Allocation,
+    offset: u64,
+    len: u64,
+    aperture_offset: Option<u64>,
+    expected_gpa: Option<u64>,
+) -> Result<CpuMapping, Error> {
+    let end = offset.checked_add(len).ok_or(Error::Invalid)?;
+    if len == 0
+        || end > allocation.size
+        || (allocation.system_memory == 0
+            && (offset & (nm::PAGE_BYTES - 1) != 0 || len & (nm::PAGE_BYTES - 1) != 0))
+        || aperture_offset.is_some() != expected_gpa.is_some()
+        || (expected_gpa.is_none() && len > nvrm::MAX_MAP_BYTES)
+    {
+        return Err(Error::Invalid);
+    }
+    if allocation.system_memory != 0 {
+        // Separate MDL mappings are not contiguous. Never expose the first
+        // chunk (or a process-local user VA) as a view of the whole allocation.
+        if allocation.system_kernel_va == 0 {
+            return Err(Error::Unsupported);
+        }
+        let address = allocation
+            .system_kernel_va
+            .checked_add(offset)
+            .ok_or(Error::Invalid)?;
+        return Ok(CpuMapping {
+            view: CpuView {
+                address,
+                len,
+                generation: 0,
+            },
+            chunks: Vec::new(),
+            kernel_va: 0,
+            aperture_offset,
+        });
+    }
+
+    let count =
+        usize::try_from((len - 1) / nvrm::MAX_MAP_BYTES + 1).map_err(|_| Error::NoMemory)?;
+    let mut chunks = Vec::new();
+    chunks
+        .try_reserve_exact(count)
+        .map_err(|_| Error::NoMemory)?;
+    let mut chunk_offset = offset;
+    while chunk_offset < end {
+        let chunk_len = (end - chunk_offset).min(nvrm::MAX_MAP_BYTES);
+        match cpu_map_chunk(io, allocation, chunk_offset, chunk_len, expected_gpa) {
+            Ok(chunk) => chunks.push(chunk),
+            Err(error) => {
+                for chunk in chunks.iter_mut() {
+                    let _ = release_cpu_chunk(io, allocation.memory, chunk);
+                }
+                return Err(error);
+            }
+        }
+        chunk_offset += chunk_len;
+    }
+    let physical = match expected_gpa {
+        Some(expected) => expected,
+        None => chunks
+            .first()
+            .map(|chunk| chunk.physical)
+            .ok_or(Error::Host)?,
+    };
     let mut pa: PHYSICAL_ADDRESS = unsafe { core::mem::zeroed() };
     pa.QuadPart = physical as i64;
-    // Device-local memory must never acquire a WB alias.  The view is retained
-    // until the matching unmap, then removed before RM's window mapping.
-    let kernel_va =
-        unsafe { MmMapIoSpace(pa, allocation.size, _MEMORY_CACHING_TYPE::MmNonCached) } as u64;
-    if kernel_va == 0 {
-        let _ = nvrm::release_host_map_within(
-            io.passive,
-            io.adapter,
-            map_ch,
-            mapped.host_id,
-            TIMEOUT_MS,
-        );
-        let block = rc::nvos34(io.client.root, nd::H_DEVICE, allocation.memory, cookie);
-        let _ = io.exchange(
-            io.client.ctl,
-            rc::nv_cmd(rc::ESC_RM_UNMAP_MEMORY, rc::NVOS34_BYTES as u32),
-            &block,
-            &[],
-            &mut response,
-        );
-        let _ = io.close_file(map_ch);
-        return Err(Error::NoMemory);
-    }
-    Ok(CpuMapping {
+    // A fixed aperture has contiguous placements by construction, so one
+    // aggregate guest view is valid. Dynamic mappings are limited to one chunk.
+    let kernel_va = unsafe { MmMapIoSpace(pa, len, _MEMORY_CACHING_TYPE::MmNonCached) } as u64;
+    let mut mapping = CpuMapping {
         view: CpuView {
             address: kernel_va,
-            len: allocation.size,
-            generation: mapped.host_id,
+            len,
+            generation: chunks.first().map_or(0, |chunk| chunk.host_id),
         },
-        map_ch,
-        cookie,
-        host_id: mapped.host_id,
+        chunks,
         kernel_va,
         aperture_offset,
-    })
+    };
+    if kernel_va == 0 {
+        let _ = cpu_unmap_for(io, allocation.memory, &mut mapping);
+        return Err(Error::NoMemory);
+    }
+    Ok(mapping)
 }
 
 fn cpu_unmap_for(io: &Io<'_>, memory: u32, mapping: &mut CpuMapping) -> Result<(), Error> {
@@ -1222,47 +1288,13 @@ fn cpu_unmap_for(io: &Io<'_>, memory: u32, mapping: &mut CpuMapping) -> Result<(
         unsafe { MmUnmapIoSpace(mapping.kernel_va as *mut c_void, mapping.view.len) };
         mapping.kernel_va = 0;
     }
-    if mapping.map_ch == 0 {
-        return Ok(());
-    }
     let mut ok = true;
-    if mapping.host_id != 0 {
-        if nvrm::release_host_map_within(
-            io.passive,
-            io.adapter,
-            mapping.map_ch,
-            mapping.host_id,
-            TIMEOUT_MS,
-        )
-        .is_ok()
-        {
-            mapping.host_id = 0;
-        } else {
+    // A failed step leaves that chunk's fd and later steps intact for retry,
+    // but does not prevent teardown of any other chunk.
+    for chunk in mapping.chunks.iter_mut() {
+        if release_cpu_chunk(io, memory, chunk).is_err() {
             ok = false;
         }
-    }
-    let block = rc::nvos34(io.client.root, nd::H_DEVICE, memory, mapping.cookie);
-    let mut response = [0u8; REPLY_MAX];
-    if io
-        .exchange(
-            io.client.ctl,
-            rc::nv_cmd(rc::ESC_RM_UNMAP_MEMORY, rc::NVOS34_BYTES as u32),
-            &block,
-            &[],
-            &mut response,
-        )
-        .ok()
-        .and_then(|n| response.get(..n))
-        .is_none_or(|reply| rc::rm_reply(reply, rc::NVOS34_STATUS_AT).is_err())
-    {
-        ok = false;
-    } else {
-        mapping.cookie = 0;
-    }
-    if io.close_file(mapping.map_ch).is_ok() {
-        mapping.map_ch = 0;
-    } else {
-        ok = false;
     }
     if ok {
         Ok(())
@@ -1271,14 +1303,16 @@ fn cpu_unmap_for(io: &Io<'_>, memory: u32, mapping: &mut CpuMapping) -> Result<(
     }
 }
 
-/// Run a synchronous content operation over the allocation's real CPU bytes.
-/// The NVOS33/window view is created for the operation when no aperture view
-/// already exists, and every view is destroyed before the RM mapping is dropped.
-pub unsafe fn with_cpu_bytes(
+/// Run a synchronous content operation over a range of the allocation's real
+/// CPU bytes. Dynamic placements need not be contiguous, so temporary mappings
+/// are made and released one page-rounded, bounded chunk at a time.
+pub unsafe fn with_cpu_range(
     passive: PassiveLevel,
     adapter: &AdapterContext,
     id: u32,
-    f: impl FnOnce(*mut u8, u64) -> bool,
+    offset: u64,
+    length: u64,
+    mut f: impl FnMut(u64, *mut u8, u64) -> bool,
 ) -> Result<bool, Error> {
     let _guard = lock(passive)?;
     let client = STATE.lock().client()?;
@@ -1287,9 +1321,17 @@ pub unsafe fn with_cpu_bytes(
         adapter,
         client,
     };
-    let (snapshot, existing) = {
+    let (snapshot, existing, pending) = {
         let state = STATE.lock();
         let a = state.allocation(id)?;
+        let pending = a
+            .cpu
+            .as_ref()
+            .is_some_and(|cpu| cpu.aperture_offset.is_none());
+        let existing = a.cpu.as_ref().and_then(|cpu| {
+            (cpu.aperture_offset.is_some() && (a.system_memory != 0 || cpu.kernel_va != 0))
+                .then_some(cpu.view)
+        });
         (
             Allocation {
                 id: a.id,
@@ -1304,16 +1346,76 @@ pub unsafe fn with_cpu_bytes(
                 resident: None,
                 poisoned: a.poisoned,
             },
-            a.cpu.as_ref().map(|cpu| cpu.view),
+            existing,
+            pending,
         )
     };
-    if let Some(view) = existing {
-        return Ok(f(view.address as *mut u8, view.len));
+    let end = offset.checked_add(length).ok_or(Error::Invalid)?;
+    if end > snapshot.size {
+        return Err(Error::Invalid);
     }
-    let mut mapping = cpu_map(&io, &snapshot, None, None)?;
-    let copied = f(mapping.view.address as *mut u8, mapping.view.len);
-    cpu_unmap_for(&io, snapshot.memory, &mut mapping)?;
-    Ok(copied)
+    if length == 0 {
+        return Ok(true);
+    }
+    if pending {
+        // A previous temporary teardown failed after its guest view was removed.
+        // Retry the retained host state before making another mapping.
+        let mut mapping = STATE
+            .lock()
+            .allocation_mut(id)?
+            .cpu
+            .take()
+            .ok_or(Error::Invalid)?;
+        if let Err(error) = cpu_unmap_for(&io, snapshot.memory, &mut mapping) {
+            STATE.lock().allocation_mut(id)?.cpu = Some(mapping);
+            return Err(error);
+        }
+    } else if STATE.lock().allocation(id)?.cpu.is_some() && existing.is_none() {
+        return Err(Error::Busy);
+    }
+    if let Some(view) = existing {
+        let address = view.address.checked_add(offset).ok_or(Error::Invalid)?;
+        return Ok(f(0, address as *mut u8, length));
+    }
+    if snapshot.system_memory != 0 {
+        if snapshot.system_kernel_va == 0 {
+            return Err(Error::Unsupported);
+        }
+        let address = snapshot
+            .system_kernel_va
+            .checked_add(offset)
+            .ok_or(Error::Invalid)?;
+        return Ok(f(0, address as *mut u8, length));
+    }
+
+    let mut completed = 0u64;
+    while completed < length {
+        let request_offset = offset + completed;
+        let map_offset = request_offset & !(nm::PAGE_BYTES - 1);
+        let page_offset = request_offset - map_offset;
+        let chunk_len = (length - completed).min(nvrm::MAX_MAP_BYTES - page_offset);
+        let request_end = request_offset + chunk_len;
+        let map_end = request_end
+            .checked_add(nm::PAGE_BYTES - 1)
+            .map(|end| end & !(nm::PAGE_BYTES - 1))
+            .unwrap_or(snapshot.size)
+            .min(snapshot.size);
+        let mut mapping = cpu_map(&io, &snapshot, map_offset, map_end - map_offset, None, None)?;
+        // SAFETY: page_offset is within the page-rounded mapping made above.
+        let address = (mapping.view.address as *mut u8).add(page_offset as usize);
+        let accepted = f(completed, address, chunk_len);
+        if let Err(error) = cpu_unmap_for(&io, snapshot.memory, &mut mapping) {
+            // Keep partially released host state reachable for a later retry or
+            // transport teardown; never silently drop a live mapping.
+            STATE.lock().allocation_mut(id)?.cpu = Some(mapping);
+            return Err(error);
+        }
+        if !accepted {
+            return Ok(false);
+        }
+        completed += chunk_len;
+    }
+    Ok(true)
 }
 
 /// Map a native CPU-host-aperture request.  pSystemMem is already the direct
@@ -1350,7 +1452,14 @@ pub fn map_aperture(
             poisoned: a.poisoned,
         }
     };
-    let mut mapping = cpu_map(&io, &snapshot, Some(aperture_offset), Some(expected_gpa))?;
+    let mut mapping = cpu_map(
+        &io,
+        &snapshot,
+        0,
+        snapshot.size,
+        Some(aperture_offset),
+        Some(expected_gpa),
+    )?;
     let view = mapping.view;
     let mut state = STATE.lock();
     let allocation = state.allocation_mut(id)?;

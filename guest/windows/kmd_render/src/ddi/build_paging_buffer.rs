@@ -2405,22 +2405,22 @@ unsafe fn native_transfer(
     let window = unsafe { mdl_system_va(passive, mdl) }.ok_or(())?;
     let system = window.slice_at_page(transfer.MdlOffset, size).ok_or(())?;
     let copied = unsafe {
-        crate::virtio::native_memory::with_cpu_bytes(
+        crate::virtio::native_memory::with_cpu_range(
             passive,
             adapter,
             allocation.native_id,
-            |native, len| {
-                if offset.checked_add(size).is_none_or(|end| end > len) {
-                    return false;
-                }
-                let (Ok(offset), Ok(size)) = (usize::try_from(offset), usize::try_from(size))
+            offset,
+            size,
+            |relative, native, len| {
+                let (Ok(relative), Ok(len)) = (usize::try_from(relative), usize::try_from(len))
                 else {
                     return false;
                 };
+                let system = system.add(relative);
                 if to_native {
-                    core::ptr::copy_nonoverlapping(system, native.add(offset), size);
+                    core::ptr::copy_nonoverlapping(system, native, len);
                 } else {
-                    core::ptr::copy_nonoverlapping(native.add(offset), system, size);
+                    core::ptr::copy_nonoverlapping(native, system, len);
                 }
                 true
             },
@@ -2448,15 +2448,17 @@ unsafe fn native_fill(
         return Err(());
     }
     let filled = unsafe {
-        crate::virtio::native_memory::with_cpu_bytes(
+        crate::virtio::native_memory::with_cpu_range(
             passive,
             adapter,
             allocation.native_id,
-            |native, len| {
-                if size > len {
+            0,
+            size,
+            |_, native, len| {
+                let Ok(len) = usize::try_from(len) else {
                     return false;
-                }
-                fill_pattern(native, size as usize, fill.FillPattern);
+                };
+                fill_pattern(native, len, fill.FillPattern);
                 true
             },
         )
@@ -2484,19 +2486,17 @@ unsafe fn native_virtual_fill(
         return Err(());
     }
     let filled = unsafe {
-        crate::virtio::native_memory::with_cpu_bytes(
+        crate::virtio::native_memory::with_cpu_range(
             passive,
             adapter,
             allocation.native_id,
-            |native, len| {
-                if offset.checked_add(size).is_none_or(|end| end > len) {
-                    return false;
-                }
-                let (Ok(offset), Ok(size)) = (usize::try_from(offset), usize::try_from(size))
-                else {
+            offset,
+            size,
+            |_, native, len| {
+                let Ok(len) = usize::try_from(len) else {
                     return false;
                 };
-                fill_pattern(native.add(offset), size, fill.FillPattern);
+                fill_pattern(native, len, fill.FillPattern);
                 true
             },
         )
@@ -2541,40 +2541,39 @@ unsafe fn native_virtual_transfer(
         .resolve(passive, system_va, size)
         .ok_or(())?;
     let copied = unsafe {
-        crate::virtio::native_memory::with_cpu_bytes(
+        crate::virtio::native_memory::with_cpu_range(
             passive,
             adapter,
             allocation.native_id,
-            |native, len| {
-                if offset.checked_add(size).is_none_or(|end| end > len) {
+            offset,
+            size,
+            |relative, native, len| {
+                let Some(system_address) = system_va.checked_add(relative) else {
                     return false;
-                }
+                };
+                let page_index = (system_va & 0xFFF)
+                    .checked_add(relative)
+                    .map(|offset| offset >> 12)
+                    .and_then(|index| usize::try_from(index).ok());
+                let Some(pages) = page_index.and_then(|index| pages.get(index..)) else {
+                    return false;
+                };
                 for_each_paging_system_run(
                     passive,
-                    &pages,
-                    system_va,
-                    size,
+                    pages,
+                    system_address,
+                    len,
                     |system, run_offset, run_size| {
-                        let Some(native_offset) = offset.checked_add(run_offset) else {
-                            return false;
-                        };
-                        let (Ok(native_offset), Ok(run_size)) =
-                            (usize::try_from(native_offset), usize::try_from(run_size))
+                        let (Ok(run_offset), Ok(run_size)) =
+                            (usize::try_from(run_offset), usize::try_from(run_size))
                         else {
                             return false;
                         };
+                        let native = native.add(run_offset);
                         if to_system {
-                            core::ptr::copy_nonoverlapping(
-                                native.add(native_offset),
-                                system,
-                                run_size,
-                            );
+                            core::ptr::copy_nonoverlapping(native, system, run_size);
                         } else {
-                            core::ptr::copy_nonoverlapping(
-                                system,
-                                native.add(native_offset),
-                                run_size,
-                            );
+                            core::ptr::copy_nonoverlapping(system, native, run_size);
                         }
                         true
                     },
