@@ -2300,8 +2300,22 @@ unsafe fn native_update_leaf(
 ) -> Result<(), ()> {
     use helios_kmd_logic::native_memory as native;
 
+    let fail = |why: u32| {
+        crate::diag::record_named_bytes(b"NvPgLeafWhy", why);
+    };
     if update.pPageTableEntries.is_null() || update.NumPageTableEntries == 0 {
+        fail(1);
         return Err(());
+    }
+    // VidMm's own (system/paging) process maps native allocations to fill or
+    // transfer them through a GPU VA. Native fills/transfers run through the
+    // allocation's CPU mapping instead (`native_virtual_fill` etc.) and the
+    // system process has no RM VA space: nothing to map. Failing here was a
+    // 0x10E (VIDEO_MEMORY_MANAGEMENT_INTERNAL, 0xB) on the first page-in.
+    // SAFETY: dxgkrnl's hKmdProcess from CreateProcess, or null.
+    if unsafe { crate::device::ProcessContext::is_system_handle(update.hProcess as usize) } {
+        crate::diag::record_named_bytes(b"NvPgLeafSys", 1);
+        return Ok(());
     }
     let count = update.NumPageTableEntries as usize;
     let mut pieces = Vec::new();
@@ -2314,6 +2328,7 @@ unsafe fn native_update_leaf(
         let bits = unsafe { pte.__bindgen_anon_1.__bindgen_anon_1 };
         if bits.Zero() != 0 {
             // Sparse zero was not advertised.
+            fail(2);
             return Err(());
         }
         if bits.Valid() == 0 {
@@ -2323,9 +2338,17 @@ unsafe fn native_update_leaf(
         if repeat && count != 1 {
             // Repeating one placement cannot describe the sequential allocation
             // offsets promised for a native multi-page update.
+            fail(3);
             return Err(());
         }
-        if bits.Segment() as u32 != allocation.native_segment {
+        // System-memory backed native allocations are placed in the aperture
+        // segment (create_native_one); device-local ones in their memory segment.
+        let segment = bits.Segment() as u32;
+        let aperture = crate::ddi::gpummu::APERTURE_SEGMENT_ID;
+        if segment != allocation.native_segment
+            && !(allocation.native_segment == 0 && segment == aperture)
+        {
+            fail(0x100 | segment);
             return Err(());
         }
         let page_address = unsafe { pte.__bindgen_anon_2.PageAddress };
@@ -2352,6 +2375,7 @@ unsafe fn native_update_leaf(
             .paging_pte_shadow
             .update_leaf(update, allocation.native_segment == 0)
     } {
+        fail(4);
         return Err(());
     }
     crate::virtio::native_memory::update_leaf(
@@ -2363,7 +2387,7 @@ unsafe fn native_update_leaf(
         update.AllocationOffsetInBytes,
         &pieces,
     )
-    .map_err(|_| ())
+    .map_err(|error| fail(0x200 | (error.ntstatus() as u32 & 0xff)))
 }
 
 unsafe fn native_transfer(

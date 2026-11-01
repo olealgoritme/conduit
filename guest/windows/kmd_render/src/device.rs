@@ -558,12 +558,27 @@ pub struct ProcessContext {
     /// Kept nonzero-sized so `Box::into_raw` is a distinct opaque handle even
     /// before native channel state is requested.
     _opaque: u32,
+    /// dxgkrnl's system process (VidMm paging, kernel contexts): it never owns
+    /// native (NVIDIA UMD) RM VA spaces.
+    system: bool,
     /// Empty until the first native CreateHwContext. Host calls are made only
     /// after taking the value out of this lock.
     native: crate::sync::SpinLock<crate::virtio::native_channel::NativeProcessState>,
 }
 
 impl ProcessContext {
+    /// Whether `hKmdProcess` is dxgkrnl's system process. Null counts as system.
+    ///
+    /// # Safety
+    /// `h` is null or a handle `dxgkddi_create_process` returned and dxgkrnl
+    /// has not destroyed.
+    pub(crate) unsafe fn is_system_handle(h: usize) -> bool {
+        if h == 0 {
+            return true;
+        }
+        // SAFETY: per the contract.
+        unsafe { (*(h as *const ProcessContext)).system }
+    }
     pub(crate) fn native_state(
         &self,
     ) -> &crate::sync::SpinLock<crate::virtio::native_channel::NativeProcessState> {
@@ -896,8 +911,11 @@ pub unsafe extern "C" fn dxgkddi_create_process(
     // SAFETY: Dxgkrnl passes our adapter context and a valid args struct.
     let args = unsafe { &mut *args };
     // The handle is an opaque token to dxgkrnl; native channel state is lazy.
+    // SAFETY: plain bitfield read of the flags union's struct arm.
+    let system = unsafe { args.Flags.__bindgen_anon_1.__bindgen_anon_1.SystemProcess() } != 0;
     let ctx = Box::new(ProcessContext {
         _opaque: 0,
+        system,
         native: crate::sync::SpinLock::new(
             crate::virtio::native_channel::NativeProcessState::Empty,
         ),
