@@ -272,8 +272,15 @@ impl Io<'_> {
         )?;
         let reply = rc::parse_ioctl_reply(response.get(..n).ok_or(Error::Host)?)
             .map_err(|_| Error::Host)?;
-        rc::rm_reply(response.get(..n).ok_or(Error::Host)?, rc::NVOS64_STATUS_AT)
-            .map_err(|_| Error::Host)?;
+        rc::rm_reply(response.get(..n).ok_or(Error::Host)?, rc::NVOS64_STATUS_AT).map_err(
+            |error| {
+                // NvRmAlCls: the refused class; NvRmAlSt: NV_STATUS, 0x8000_0000|errno
+                // for a host refusal, 0xffff_ffff for a malformed reply.
+                crate::diag::record_named_bytes(b"NvRmAlCls", class);
+                crate::diag::record_named_bytes(b"NvRmAlSt", rm_error_code(error));
+                Error::Host
+            },
+        )?;
         Ok(reply.nested.to_vec())
     }
 
@@ -751,6 +758,14 @@ pub fn create(
     })
 }
 
+fn rm_error_code(error: rc::RmError) -> u32 {
+    match error {
+        rc::RmError::Status(status) => status,
+        rc::RmError::Host(errno) => 0x8000_0000 | errno,
+        rc::RmError::Malformed => 0xffff_ffff,
+    }
+}
+
 fn map_fixed(
     io: &Io<'_>,
     memory: u32,
@@ -762,7 +777,12 @@ fn map_fixed(
 ) -> Result<(), Error> {
     nm::validate_piece(piece, allocation_size).map_err(|_| Error::Invalid)?;
     let params = cc::virtual_params(io.client.root, space, Some(piece.va), piece.len);
-    io.rm_alloc(nd::H_DEVICE, virt, cc::NV50_MEMORY_VIRTUAL, &params)?;
+    io.rm_alloc(nd::H_DEVICE, virt, cc::NV50_MEMORY_VIRTUAL, &params)
+        .inspect_err(|_| {
+            // The refused fixed VA (4-KiB page number) and length in pages.
+            crate::diag::record_named_bytes(b"NvMapVaPg", (piece.va >> 12) as u32);
+            crate::diag::record_named_bytes(b"NvMapLenPg", (piece.len >> 12) as u32);
+        })?;
     let flags = if system_backed {
         cc::MAP_FLAGS_SYSMEM
     } else {
@@ -788,7 +808,10 @@ fn map_fixed(
     let got = match mapped {
         Ok(n) => (|| {
             let reply = response.get(..n).ok_or(Error::Host)?;
-            let reply = rc::rm_reply(reply, cc::NVOS46_STATUS_AT).map_err(|_| Error::Host)?;
+            let reply = rc::rm_reply(reply, cc::NVOS46_STATUS_AT).map_err(|error| {
+                crate::diag::record_named_bytes(b"NvRmMapSt", rm_error_code(error));
+                Error::Host
+            })?;
             cc::map_dma_va(reply.data).ok_or(Error::Host)
         })(),
         Err(error) => Err(error),
