@@ -3311,7 +3311,10 @@ unsafe fn create_native_one(
             .and_then(|table| table.bar_seg_id())
             .unwrap_or(aperture)
     };
-    let supported = 1u32 << (segment - 1);
+    // These allocations are CpuVisible. WDDM requires every CPU-accessible
+    // allocation in a non-CPU-accessible memory segment (the BAR) to also list
+    // an aperture segment, as `vidmm_placement` does for the default path.
+    let supported = (1u32 << (segment - 1)) | (1u32 << (aperture - 1));
     crate::diag::record_named_bytes(b"NvAlSeg", segment);
     info.SupportedWriteSegmentSet = supported;
     unsafe {
