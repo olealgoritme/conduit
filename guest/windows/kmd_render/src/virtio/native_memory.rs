@@ -424,7 +424,7 @@ fn ensure_space(io: &Io<'_>, process: usize) -> Result<u32, Error> {
         nd::H_DEVICE,
         space,
         cc::FERMI_VASPACE_A,
-        &cc::vaspace_params(),
+        &cc::vaspace_params_vidmm(),
     )?;
     STATE.lock().spaces.push((process, space));
     Ok(space)
@@ -1605,6 +1605,73 @@ pub fn destroy(passive: PassiveLevel, adapter: &AdapterContext, id: u32) -> Resu
     };
     unlock_pins(&mut allocation.pins);
     Ok(())
+}
+
+/// `DxgkDdiDestroyProcess`: release every RM virtual object the process still
+/// maps and its VA space. Process contexts are keyed by address, so a later
+/// process can reuse the key: left behind, the dead process's fixed-VA objects
+/// made RM refuse the new process's identical VidMm VAs (the D3D11 UMD's GPFIFO
+/// at 0x4000000, NV_ERR_INSUFFICIENT_RESOURCES). Returns how many mappings
+/// could not be released (they stay recorded and the space is kept).
+pub fn release_process(passive: PassiveLevel, adapter: &AdapterContext, process: usize) -> u32 {
+    if process == 0 {
+        return 0;
+    }
+    let Ok(_guard) = lock(passive) else {
+        return 1;
+    };
+    let Ok(client) = STATE.lock().client() else {
+        // No native client: nothing was ever mapped for anyone.
+        let mut state = STATE.lock();
+        state.spaces.retain(|(owner, _)| *owner != process);
+        state.idle_spaces.retain(|p| *p != process);
+        return 0;
+    };
+    let io = Io {
+        passive,
+        adapter,
+        client,
+    };
+    let owned: Vec<(u32, u32, HostMapping)> = {
+        let state = STATE.lock();
+        let mut owned = Vec::new();
+        for allocation in state.allocations.iter() {
+            for mapping in allocation.mappings.iter().filter(|m| m.process == process) {
+                if owned.try_reserve(1).is_err() {
+                    return 1;
+                }
+                owned.push((allocation.id, allocation.memory, *mapping));
+            }
+        }
+        owned
+    };
+    let mut kept = 0;
+    for (id, memory, mapping) in owned {
+        if unmap_fixed(&io, memory, mapping).is_ok() {
+            if let Ok(allocation) = STATE.lock().allocation_mut(id) {
+                allocation.mappings.retain(|live| live.virt != mapping.virt);
+            }
+        } else {
+            kept += 1;
+        }
+    }
+    if kept == 0 {
+        let space = STATE
+            .lock()
+            .spaces
+            .iter()
+            .find(|(owner, _)| *owner == process)
+            .map(|(_, space)| *space);
+        if let Some(space) = space {
+            if io.rm_free(nd::H_DEVICE, space).is_ok() {
+                STATE.lock().spaces.retain(|(owner, _)| *owner != process);
+            } else {
+                kept += 1;
+            }
+        }
+        STATE.lock().idle_spaces.retain(|p| *p != process);
+    }
+    kept
 }
 
 /// Drop only guest-owned state after the transport already destroyed every RM

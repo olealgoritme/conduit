@@ -922,7 +922,53 @@ pub unsafe extern "C" fn dxgkddi_create_process(
     });
     // Hand the process handle back to Dxgkrnl; reclaimed in destroy_process.
     args.hKmdProcess = Box::into_raw(ctx) as HANDLE;
+    if crate::ddi::wddm_surface::nvidia_selected() {
+        // SAFETY: dxgkrnl passes back the adapter context it was given.
+        if let Some(adapter) = unsafe { (miniport_device_context as *const AdapterContext).as_ref() } {
+            reserve_nvidia_va(adapter, args.hDxgkProcess, system);
+        }
+    }
     STATUS_SUCCESS
+}
+
+/// The GPU VA NVIDIA's 610.88 KMD reserves from VidMm in every process
+/// (`DxgkCbReserveGpuVirtualAddressRange` at CreateProcess, from the L3
+/// capture): VidMm never hands these out, so RM's own mappings (confined to
+/// [4 GiB, 4.5 GiB) by `VASPACE_FLAGS_VA_INTERNAL_LIMIT`) cannot collide with
+/// a VidMm-assigned allocation VA. Without them RM's context buffers took VAs
+/// VidMm later gave the D3D11 UMD's GPFIFO (NV_ERR_INSUFFICIENT_RESOURCES).
+/// `NvVaRsvSt` records a refused reservation's status.
+fn reserve_nvidia_va(adapter: &AdapterContext, process: HANDLE, system: bool) {
+    const ALIGN: u32 = 0x2000_0000;
+    // (base, size, AllowUserModeMapping)
+    let ranges: &[(u64, u64, u32)] = if system {
+        &[(0x2000_0000, 0x2000_0000, 0)]
+    } else {
+        &[(0x2000_0000, 0xe000_0000, 1), (0x1_0000_0000, 0x1_0000_0000, 0)]
+    };
+    let Some(dxgkrnl) = adapter.dxgkrnl_opt() else {
+        crate::diag::record_named_bytes(b"NvVaRsvSt", 0xffff_fffe);
+        return;
+    };
+    let Some(reserve) = dxgkrnl.DxgkCbReserveGpuVirtualAddressRange else {
+        crate::diag::record_named_bytes(b"NvVaRsvSt", 0xffff_ffff);
+        return;
+    };
+    for &(base, size, user) in ranges {
+        // SAFETY: all-zero is a valid DXGKARGCB_RESERVEGPUVIRTUALADDRESSRANGE.
+        let mut range: crate::dxgk::DXGKARGCB_RESERVEGPUVIRTUALADDRESSRANGE =
+            unsafe { core::mem::zeroed() };
+        range.hDxgkProcess = process;
+        range.SizeInBytes = size;
+        range.Alignment = ALIGN;
+        range.BaseAddress = base;
+        range.__bindgen_anon_1.Flags = user;
+        // SAFETY: the live adapter's callback table, PASSIVE (CreateProcess).
+        let status = unsafe { reserve(dxgkrnl.DeviceHandle, &mut range) };
+        if status < 0 {
+            crate::diag::record_named_bytes(b"NvVaRsvSt", status as u32);
+        }
+    }
 }
 
 /// `DxgkDdiDestroyProcess` — free the per-process state from CreateProcess.
@@ -948,6 +994,13 @@ pub unsafe extern "C" fn dxgkddi_destroy_process(
                 // object those raw pointers name instead of freeing it early.
                 core::mem::forget(h_process);
                 return STATUS_DEVICE_BUSY;
+            }
+            // Its RM virtual objects and VA space go too (NvPrRelKept counts
+            // mappings RM would not release).
+            let kept =
+                crate::virtio::native_memory::release_process(passive, adapter, h_process as usize);
+            if kept != 0 {
+                crate::diag::record_named_bytes(b"NvPrRelKept", kept);
             }
         }
         // The process's RM gate (`docs/rm-fence-marker.md`) goes with it: waits that
