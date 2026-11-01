@@ -44,6 +44,7 @@ pub(crate) mod guest_blob;
 pub(crate) mod copy_queue;
 pub(crate) mod gpummu;
 pub(crate) mod hpd;
+pub(crate) mod hws;
 pub(crate) mod interrupt;
 mod lifecycle;
 pub(crate) mod mode_list;

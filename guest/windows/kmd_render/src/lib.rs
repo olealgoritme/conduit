@@ -170,12 +170,16 @@ fn build_ddi_table() -> DRIVER_INITIALIZATION_DATA {
     data.DxgkDdiQueryDependentEngineGroup = Some(ddi::dxgkddi_query_dependent_engine_group);
     data.DxgkDdiQueryEngineStatus = Some(ddi::traced::query_engine_status);
     data.DxgkDdiResetEngine = Some(ddi::traced::reset_engine);
-    data.DxgkDdiCreateHwContext = Some(ddi::dxgkddi_create_hw_context);
-    data.DxgkDdiDestroyHwContext = Some(ddi::dxgkddi_destroy_hw_context);
-    data.DxgkDdiCreateHwQueue = Some(ddi::dxgkddi_create_hw_queue);
-    data.DxgkDdiDestroyHwQueue = Some(ddi::dxgkddi_destroy_hw_queue);
-    data.DxgkDdiSubmitCommandToHwQueue = Some(ddi::dxgkddi_submit_command_to_hw_queue);
-    data.DxgkDdiSwitchToHwContextList = Some(ddi::dxgkddi_switch_to_hw_context_list);
+    if crate::ddi::wddm_surface::nvidia_selected() {
+        register_nvidia_hws(&mut data);
+    } else {
+        data.DxgkDdiCreateHwContext = Some(ddi::dxgkddi_create_hw_context);
+        data.DxgkDdiDestroyHwContext = Some(ddi::dxgkddi_destroy_hw_context);
+        data.DxgkDdiCreateHwQueue = Some(ddi::dxgkddi_create_hw_queue);
+        data.DxgkDdiDestroyHwQueue = Some(ddi::dxgkddi_destroy_hw_queue);
+        data.DxgkDdiSubmitCommandToHwQueue = Some(ddi::dxgkddi_submit_command_to_hw_queue);
+        data.DxgkDdiSwitchToHwContextList = Some(ddi::dxgkddi_switch_to_hw_context_list);
+    }
     data.DxgkDdiPresentToHwQueue = Some(ddi::dxgkddi_present_to_hw_queue);
     data.DxgkDdiCancelCommand = Some(ddi::dxgkddi_cancel_command);
     data.DxgkDdiCalibrateGpuClock = Some(ddi::dxgkddi_calibrate_gpu_clock);
@@ -228,4 +232,28 @@ fn build_ddi_table() -> DRIVER_INITIALIZATION_DATA {
     data.DxgkDdiQueryCurrentFence = Some(ddi::dxgkddi_query_current_fence);
 
     data
+}
+
+/// The NVIDIA personality's WDDM 2.7 hardware-scheduling DDIs (`ddi::hws`), the
+/// set NVIDIA's 610.88 KMD registers: context-based (`CreateContext` hands the
+/// hHwContext to `CreateHwQueue`), so `CreateHwContext`, `DestroyHwContext` and
+/// `SwitchToHwContextList` stay NULL. `DestroyContext` keeps the shared entry,
+/// which tears a native TSG down first.
+fn register_nvidia_hws(data: &mut DRIVER_INITIALIZATION_DATA) {
+    use ddi::hws;
+    data.DxgkDdiCreateContext = Some(ddi::traced::hws_create_context);
+    data.DxgkDdiCreateHwQueue = Some(hws::dxgkddi_create_hw_queue);
+    data.DxgkDdiDestroyHwQueue = Some(hws::dxgkddi_destroy_hw_queue);
+    data.DxgkDdiSubmitCommandToHwQueue = Some(hws::dxgkddi_submit_command_to_hw_queue);
+    data.DxgkDdiSetupPriorityBands = Some(hws::dxgkddi_setup_priority_bands);
+    data.DxgkDdiSetSchedulingLogBuffer = Some(hws::dxgkddi_set_scheduling_log_buffer);
+    data.DxgkDdiSetContextSchedulingProperties =
+        Some(hws::dxgkddi_set_context_scheduling_properties);
+    data.DxgkDdiSuspendContext = Some(hws::dxgkddi_suspend_context);
+    data.DxgkDdiResumeContext = Some(hws::dxgkddi_resume_context);
+    data.DxgkDdiResetHwEngine = Some(hws::dxgkddi_reset_hw_engine);
+    data.DxgkDdiResumeHwEngine = Some(hws::dxgkddi_resume_hw_engine);
+    data.DxgkDdiValidateSubmitCommand = Some(hws::dxgkddi_validate_submit_command);
+    data.DxgkDdiSignalMonitoredFence = Some(hws::dxgkddi_signal_monitored_fence);
+    data.DxgkDdiNotifyContextPriorityChange = Some(hws::dxgkddi_notify_context_priority_change);
 }

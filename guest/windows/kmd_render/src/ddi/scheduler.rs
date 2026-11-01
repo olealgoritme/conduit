@@ -181,9 +181,6 @@ pub unsafe extern "C" fn dxgkddi_create_hw_context(
     let Some(device) = (unsafe { DeviceHandleRef::from_raw(h_device) }) else {
         return STATUS_INVALID_PARAMETER;
     };
-    let Some(adapter) = device.adapter() else {
-        return STATUS_INVALID_PARAMETER;
-    };
     let private = if args.PrivateDriverDataSize == 0 {
         &[][..]
     } else {
@@ -211,17 +208,10 @@ pub unsafe extern "C" fn dxgkddi_create_hw_context(
         ) {
             return native_status(error.into());
         }
-        let Some(owner) = crate::virtio::gpu::DeviceOwner::new(h_device as usize) else {
-            return STATUS_INVALID_PARAMETER;
-        };
-        let process = device.native_process_ptr();
-        let Some(process) = (unsafe { process.as_mut() }) else {
-            return STATUS_INVALID_PARAMETER;
-        };
-        let passive = unsafe { crate::irql::PassiveLevel::assume() };
-        match NativeContext::create(passive, adapter, process, owner) {
-            Ok(context) => Some(Box::new(context)),
-            Err(error) => return native_status(error),
+        // SAFETY: CreateHwContext is PASSIVE_LEVEL; `h_device` is live.
+        match unsafe { create_native_context(h_device, &device) } {
+            Ok(context) => Some(context),
+            Err(status) => return status,
         }
     } else {
         // Existing default: non-native D3D contexts on node 0 engine 0 keep
@@ -239,6 +229,41 @@ pub unsafe extern "C" fn dxgkddi_create_hw_context(
     });
     args.hHwContext = Box::into_raw(ctx) as HANDLE;
     STATUS_SUCCESS
+}
+
+/// Build the native Blackwell TSG + context share for a validated NVDA-private
+/// context. Shared by `CreateHwContext` (default table) and the NVIDIA
+/// personality's `CreateContext` (`ddi::hws`).
+///
+/// # Safety
+/// PASSIVE_LEVEL; `h_device` is the live hDevice `device` was built from.
+pub(crate) unsafe fn create_native_context(
+    h_device: IN_CONST_HANDLE,
+    device: &DeviceHandleRef<'_>,
+) -> Result<Box<NativeContext>, NTSTATUS> {
+    let Some(adapter) = device.adapter() else {
+        return Err(STATUS_INVALID_PARAMETER);
+    };
+    let Some(owner) = crate::virtio::gpu::DeviceOwner::new(h_device as usize) else {
+        return Err(STATUS_INVALID_PARAMETER);
+    };
+    let process = device.native_process_ptr();
+    let Some(process) = (unsafe { process.as_mut() }) else {
+        return Err(STATUS_INVALID_PARAMETER);
+    };
+    let passive = unsafe { crate::irql::PassiveLevel::assume() };
+    match NativeContext::create(passive, adapter, process, owner) {
+        Ok(context) => Ok(Box::new(context)),
+        Err(error) => Err(native_status(error)),
+    }
+}
+
+/// Tear down a native TSG (DestroyHwContext / NVIDIA-mode DestroyContext).
+pub(crate) fn destroy_native_context(
+    passive: crate::irql::PassiveLevel,
+    native: &mut NativeContext,
+) -> Result<(), NTSTATUS> {
+    native.destroy(passive).map_err(native_status)
 }
 
 pub unsafe extern "C" fn dxgkddi_destroy_hw_context(h_hw_context: IN_CONST_HANDLE) -> NTSTATUS {
@@ -278,7 +303,21 @@ pub unsafe extern "C" fn dxgkddi_create_hw_queue(
         crate::diag::record_named_bytes(b"HwQRef", 1);
         return STATUS_NOT_SUPPORTED;
     };
-    let args = unsafe { &mut *args };
+    // SAFETY: dxgkrnl's live args; the context outlives its queues.
+    unsafe { create_native_queue(context.adapter, native_context, &mut *args) }
+}
+
+/// Build a native queue on `native_context` and hand its boxed handle back in
+/// `args.hHwQueue`. Shared by both DDI tables.
+///
+/// # Safety
+/// PASSIVE_LEVEL; `adapter` is the live adapter the context belongs to, and
+/// `native_context` outlives the queue (WDDM destroys queues first).
+pub(crate) unsafe fn create_native_queue(
+    adapter_ptr: *mut AdapterContext,
+    native_context: &NativeContext,
+    args: &mut DXGKARG_CREATEHWQUEUE,
+) -> NTSTATUS {
     if args.pPrivateDriverData.is_null() {
         return STATUS_INVALID_PARAMETER;
     }
@@ -298,7 +337,7 @@ pub unsafe extern "C" fn dxgkddi_create_hw_queue(
     if args.hHwQueueProgressFence == 0 {
         return STATUS_NOT_SUPPORTED;
     }
-    let Some(adapter) = (unsafe { context.adapter.as_ref() }) else {
+    let Some(adapter) = (unsafe { adapter_ptr.as_ref() }) else {
         return STATUS_INVALID_PARAMETER;
     };
     let owner = native_context.owner();
@@ -339,13 +378,23 @@ pub unsafe extern "C" fn dxgkddi_create_hw_queue(
     let queue = Box::new(HwQueue {
         handle: HwHandle {
             tag: HW_TAG_QUEUE,
-            adapter: context.adapter,
+            adapter: adapter_ptr,
             native: None,
         },
         native,
     });
     args.hHwQueue = Box::into_raw(queue) as HANDLE;
     STATUS_SUCCESS
+}
+
+/// The native queue behind a queue handle this driver minted, or `None`.
+///
+/// # Safety
+/// `h` is null or a handle this driver returned from a CreateHwQueue that has
+/// not been destroyed.
+pub(crate) unsafe fn native_queue_of(h: IN_CONST_HANDLE) -> Option<&'static NativeQueue> {
+    // SAFETY: per the contract.
+    unsafe { hw_queue_handle(h) }.map(|queue| &queue.native)
 }
 
 pub unsafe extern "C" fn dxgkddi_destroy_hw_queue(h_hw_queue: IN_CONST_HANDLE) -> NTSTATUS {

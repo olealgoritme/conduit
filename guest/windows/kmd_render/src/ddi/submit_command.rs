@@ -316,6 +316,8 @@ pub(crate) fn publish_nvrm_counters() {
     );
     // NVIDIA's own UMD personality (`NvUmd`): NVDA census, RM controls and bring-up.
     crate::virtio::nvda::publish_counters();
+    // NVIDIA personality's hardware scheduling (`Hws*`); nothing in the default one.
+    crate::ddi::hws::publish_counters();
     // The KMD's own RM client (`KmdRmClient`): `Rm*`, written only once it has run.
     crate::virtio::rm_client::publish_counters();
     // The KMD's flip of a foreign allocation (`ForeignFlip`): `Ff*`, written only once the
@@ -959,6 +961,21 @@ pub(crate) unsafe fn signal_dma_completed(
         guard.set_completed_fence(node, fence);
     }
     status
+}
+
+/// `DXGK_INTERRUPT_MONITORED_FENCE_SIGNALED` for `node` (engine 0), see
+/// [`notify_at_dirql`]: dxgkrnl re-reads the monitored fences waited on for that
+/// node. Used only by the NVIDIA personality's HW queues (`ddi::hws`). No
+/// ordering state, so no notification lock. Callable at <= DIRQL.
+pub(crate) unsafe fn signal_monitored_fence(dxgkrnl: &DXGKRNL_INTERFACE, node: u32) -> NTSTATUS {
+    let mut interrupt = unsafe { core::mem::zeroed::<DXGKARGCB_NOTIFY_INTERRUPT_DATA>() };
+    interrupt.InterruptType = _DXGK_INTERRUPT_TYPE::DXGK_INTERRUPT_MONITORED_FENCE_SIGNALED;
+    // SAFETY: MonitoredFenceSignaled is the arm for this interrupt type.
+    let signaled = unsafe { interrupt.__bindgen_anon_1.MonitoredFenceSignaled.as_mut() };
+    signaled.NodeOrdinal = node;
+    signaled.EngineOrdinal = 0;
+    // SAFETY: fully-initialized packet, live for the call.
+    unsafe { notify_at_dirql(dxgkrnl, &mut interrupt) }
 }
 
 /// Synthesize a `DXGK_INTERRUPT_CRTC_VSYNC` for the display half's single target

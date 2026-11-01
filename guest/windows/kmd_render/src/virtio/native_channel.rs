@@ -583,7 +583,8 @@ impl QueueParts {
 /// One native queue.  The hot submission path touches only `userd`, `usermode`,
 /// `token`, `ring_bytes`, and `gp_put`; everything else is PASSIVE teardown
 /// state.  The progress-fence addresses are OS-supplied GPU-write storage and
-/// are deliberately never written here.
+/// are never written here; the NVIDIA personality's progress poll
+/// (`ddi::hws`) only READS the CPU view, to tell dxgkrnl when it moved.
 pub(crate) struct NativeQueue {
     adapter: *mut AdapterContext,
     context: *mut NativeContext,
@@ -591,7 +592,7 @@ pub(crate) struct NativeQueue {
     parts: QueueParts,
     ring_bytes: u32,
     gp_put: SpinLock<u32>,
-    _progress_fence_cpu: u64,
+    progress_fence_cpu: u64,
     _progress_fence_gpu: u64,
 }
 
@@ -646,9 +647,22 @@ impl NativeQueue {
             parts,
             ring_bytes: queue.ring_bytes,
             gp_put: SpinLock::new(0),
-            _progress_fence_cpu: progress_cpu,
+            progress_fence_cpu: progress_cpu,
             _progress_fence_gpu: progress_gpu,
         })
+    }
+
+    /// Read the progress fence's current value through the kernel CPU view
+    /// dxgkrnl supplied at CreateHwQueue (`HwQueueProgressFenceCPUVirtualAddress`,
+    /// documented as a kernel-mode VA). Any IRQL; one volatile 64-bit load.
+    pub(crate) fn read_progress(&self) -> u64 {
+        if self.progress_fence_cpu == 0 || self.progress_fence_cpu % 8 != 0 {
+            return 0;
+        }
+        // SAFETY: nonzero (validated at creation) and 8-aligned (checked above),
+        // and live until DestroyHwQueue returns; the poll unregisters a queue
+        // before destroying it.
+        unsafe { (self.progress_fence_cpu as *const u64).read_volatile() }
     }
 
     pub(crate) fn token(&self) -> Token {

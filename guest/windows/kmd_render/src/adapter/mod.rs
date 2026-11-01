@@ -818,6 +818,10 @@ pub struct AdapterContext {
     /// failed: the worker's plain timed waits only) whose callback sets `hpd_hr_fired` and
     /// signals `hpd_event`. Deleted with `vsync_ex_timer` at RemoveDevice.
     pub hpd_hr_timer: AtomicUsize,
+    /// NVIDIA personality only (`ddi::hws`): the high-resolution `PEX_TIMER` of the
+    /// interim HW-queue progress poll (0 = default personality, or allocation
+    /// failed). Deleted with `vsync_ex_timer` at RemoveDevice.
+    pub hws_poll_timer: AtomicUsize,
     pub hpd_hr_fired: AtomicU32,
     pub vsync_wd_on: AtomicU32,
     /// Interrupt-time deadline (100 ns units) of the one-shot tick currently
@@ -1406,6 +1410,7 @@ impl AdapterContext {
             vsync_ex_timer: AtomicUsize::new(0),
             vsync_wd_timer: AtomicUsize::new(0),
             hpd_hr_timer: AtomicUsize::new(0),
+            hws_poll_timer: AtomicUsize::new(0),
             hpd_hr_fired: AtomicU32::new(0),
             vsync_wd_on: AtomicU32::new(0),
             vsync_deadline_100ns: AtomicU64::new(0),

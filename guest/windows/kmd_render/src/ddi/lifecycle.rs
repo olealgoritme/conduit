@@ -727,6 +727,10 @@ pub unsafe extern "C" fn dxgkddi_start_device(
 
     start_stage(3);
 
+    // NVIDIA personality only: the hardware-scheduling handshake NVIDIA's KMD makes
+    // at StartDevice (`NvHwsEn`). A no-op in the default personality.
+    crate::ddi::hws::query_hwsch_at_start(adapter);
+
     // This generation's identities (section 25): the image salt, the allocation serial and the
     // NVRM epoch (low 32 bits each). After a `pnputil /restart-device` all three must differ from
     // the previous image's, or a client / allocation that survived it is not seen as stale.

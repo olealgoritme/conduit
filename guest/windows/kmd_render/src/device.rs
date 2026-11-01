@@ -141,6 +141,16 @@ pub struct ContextContext {
     /// a pending record.
     flush_pending: crate::sync::SpinLock<Option<helios_kmd_logic::flush_trace::PendingFlush>>,
     flush_pending_flag: AtomicU32,
+    /// `DXGKARG_CREATECONTEXT.NodeOrdinal`, kept for the NVIDIA personality's
+    /// HW queues (their progress interrupts name the node). Unread otherwise.
+    node_ordinal: u32,
+    /// NVIDIA personality only (`ddi::hws`): the native Blackwell TSG behind a
+    /// context created with NVDA private data. `None` for every other context,
+    /// and always `None` in the default personality.
+    native: Option<alloc::boxed::Box<crate::virtio::native_channel::NativeContext>>,
+    /// NVIDIA personality only: what the WDDM 2.7 scheduling DDIs stored for
+    /// this context (`ddi::hws`). Plain atomics; untouched otherwise.
+    hws: crate::ddi::hws::ContextSched,
 }
 
 /// Typed borrowed view of a scheduler context handle.
@@ -184,6 +194,27 @@ impl<'a> ContextHandleRef<'a> {
             self.context.execution_stream.load(Ordering::Acquire),
         )
         .unwrap_or(0)
+    }
+
+    /// NVIDIA personality: the native TSG of an NVDA-private context.
+    pub(crate) fn native(&self) -> Option<&'a crate::virtio::native_channel::NativeContext> {
+        self.context.native.as_deref()
+    }
+
+    /// `DXGKARG_CREATECONTEXT.NodeOrdinal` of this context.
+    pub fn node_ordinal(&self) -> u32 {
+        self.context.node_ordinal
+    }
+
+    /// The raw adapter back-pointer, for a HW queue that stores it.
+    pub fn adapter_ptr(&self) -> *mut AdapterContext {
+        unsafe { self.context.device.as_ref() }
+            .map_or(core::ptr::null_mut(), |device| device.adapter)
+    }
+
+    /// NVIDIA personality: the scheduling state `ddi::hws` stores.
+    pub(crate) fn hws(&self) -> &'a crate::ddi::hws::ContextSched {
+        &self.context.hws
     }
 
     pub fn belongs_to_device(&self, device: HANDLE) -> bool {
@@ -681,6 +712,21 @@ pub unsafe extern "C" fn dxgkddi_create_context(
     h_device: *mut c_void,
     create_context: *mut DXGKARG_CREATECONTEXT,
 ) -> NTSTATUS {
+    // SAFETY: forwarded unchanged; `create_context_with` null-checks both.
+    unsafe { create_context_with(h_device, create_context, None) }
+}
+
+/// The body of [`dxgkddi_create_context`], with the NVIDIA personality's native
+/// TSG (`ddi::hws`) attached when it built one. `native` is always `None` on the
+/// default path, which this keeps byte-for-byte as it was.
+///
+/// # Safety
+/// As `DxgkDdiCreateContext`.
+pub(crate) unsafe fn create_context_with(
+    h_device: *mut c_void,
+    create_context: *mut DXGKARG_CREATECONTEXT,
+    native: Option<Box<crate::virtio::native_channel::NativeContext>>,
+) -> NTSTATUS {
     crate::diag::record(0x0800_0001);
     if h_device.is_null() || create_context.is_null() {
         return STATUS_INVALID_PARAMETER;
@@ -710,6 +756,9 @@ pub unsafe extern "C" fn dxgkddi_create_context(
         execution_stream: AtomicU64::new(0),
         flush_pending: crate::sync::SpinLock::new(None),
         flush_pending_flag: AtomicU32::new(0),
+        node_ordinal: args.NodeOrdinal,
+        native,
+        hws: crate::ddi::hws::ContextSched::new(),
     });
     args.hContext = Box::into_raw(ctx) as HANDLE;
     // `GdiAccel`: GDI contexts are counted and remembered (their submissions name their job by
@@ -740,6 +789,20 @@ pub unsafe extern "C" fn dxgkddi_create_context(
 pub unsafe extern "C" fn dxgkddi_destroy_context(h_context: *mut c_void) -> NTSTATUS {
     crate::diag::record(0x0800_0002);
     if !h_context.is_null() {
+        // NVIDIA personality: a native TSG goes first, and a failed teardown
+        // keeps the whole context for a retry rather than leaking live RM state
+        // behind freed bookkeeping. Every queue on it is gone by WDDM contract.
+        // Default path: `native` is always `None` and nothing here runs.
+        // SAFETY: dxgkrnl passes the live hContext CreateContext returned.
+        let context = unsafe { &mut *(h_context as *mut ContextContext) };
+        if let Some(native) = context.native.as_mut() {
+            // SAFETY: `DxgkDdiDestroyContext` is PASSIVE_LEVEL.
+            let passive = unsafe { crate::irql::PassiveLevel::assume() };
+            if let Err(status) = crate::ddi::hws::destroy_native_context(passive, native) {
+                return status;
+            }
+            context.native = None;
+        }
         // The context's RM gate (`virtio/gpu/rm_gates.rs`) goes with it, as a process's
         // gates go at DestroyProcess. One load when no gate is open anywhere.
         if crate::virtio::gpu::rm_gates_open() {

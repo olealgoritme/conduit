@@ -84,6 +84,12 @@ pub(crate) fn select_at_driver_entry() {
     NVIDIA_SELECTED.store(mode != 0, core::sync::atomic::Ordering::Release);
 }
 
+/// Whether DriverEntry selected the NVIDIA UMD personality. Fixed for the
+/// image's lifetime; the DDI table and every NVIDIA-only feature key off it.
+pub(crate) fn nvidia_selected() -> bool {
+    NVIDIA_SELECTED.load(core::sync::atomic::Ordering::Acquire)
+}
+
 /// The level every site reads.
 pub(crate) fn surface() -> WddmSurface {
     if NVIDIA_SELECTED.load(core::sync::atomic::Ordering::Acquire) {
