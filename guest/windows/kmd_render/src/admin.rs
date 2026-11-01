@@ -21,6 +21,7 @@ const DO_BUFFERED_IO: u32 = 0x0000_0004;
 const DO_DEVICE_INITIALIZING: u32 = 0x0000_0080;
 const IRP_MJ_CREATE: usize = 0x00;
 const IRP_MJ_CLOSE: usize = 0x02;
+const IRP_MJ_CLEANUP: usize = 0x12;
 const IRP_MJ_DEVICE_CONTROL: usize = 0x0e;
 
 const DEVICE_NAME: &[u16] = &[
@@ -37,6 +38,7 @@ static DRIVER: AtomicPtr<DRIVER_OBJECT> = AtomicPtr::new(core::ptr::null_mut());
 // address round-trips through `usize`.
 static PREV_CREATE: AtomicUsize = AtomicUsize::new(0);
 static PREV_CLOSE: AtomicUsize = AtomicUsize::new(0);
+static PREV_CLEANUP: AtomicUsize = AtomicUsize::new(0);
 static PREV_CONTROL: AtomicUsize = AtomicUsize::new(0);
 
 fn dispatch_addr(f: PDRIVER_DISPATCH) -> usize {
@@ -79,26 +81,38 @@ pub unsafe fn install_dispatch(driver: PDRIVER_OBJECT) {
         return;
     }
     DRIVER.store(driver, Ordering::Release);
-    // SAFETY: DriverEntry supplies the live DRIVER_OBJECT. The three indices are
+    unsafe { hook_slots(driver) };
+}
+
+/// Put our dispatch routines in front of whatever the slots hold now,
+/// remembering that as the routine to chain to. A slot that is already ours
+/// keeps its saved predecessor (no self-chaining).
+unsafe fn hook_slots(driver: PDRIVER_OBJECT) {
+    fn hook(
+        slot: &mut PDRIVER_DISPATCH,
+        prev: &AtomicUsize,
+        ours: unsafe extern "C" fn(PDEVICE_OBJECT, PIRP) -> NTSTATUS,
+    ) {
+        let current = dispatch_addr(*slot);
+        if current != ours as usize {
+            prev.store(current, Ordering::Release);
+            *slot = Some(ours);
+        }
+    }
+    // SAFETY: the live DRIVER_OBJECT of this driver; the three indices are
     // WDM's fixed MajorFunction slots and the table is at least 0x1c entries.
     unsafe {
-        PREV_CREATE.store(
-            dispatch_addr((*driver).MajorFunction[IRP_MJ_CREATE]),
-            Ordering::Release,
-        );
-        PREV_CLOSE.store(
-            dispatch_addr((*driver).MajorFunction[IRP_MJ_CLOSE]),
-            Ordering::Release,
-        );
-        PREV_CONTROL.store(
-            dispatch_addr((*driver).MajorFunction[IRP_MJ_DEVICE_CONTROL]),
-            Ordering::Release,
-        );
-        (*driver).MajorFunction[IRP_MJ_CREATE] = Some(dispatch_create);
-        (*driver).MajorFunction[IRP_MJ_CLOSE] = Some(dispatch_close);
-        (*driver).MajorFunction[IRP_MJ_DEVICE_CONTROL] = Some(dispatch_device_control);
+        let table = &mut (*driver).MajorFunction;
+        hook(&mut table[IRP_MJ_CREATE], &PREV_CREATE, dispatch_create);
+        hook(&mut table[IRP_MJ_CLOSE], &PREV_CLOSE, dispatch_close);
+        // Closing a handle sends CLEANUP before CLOSE; dxgkrnl's handler
+        // dereferences the device extension this device does not have
+        // (bugcheck 0x3B in DpiDispatchCleanupAndClose).
+        hook(&mut table[IRP_MJ_CLEANUP], &PREV_CLEANUP, dispatch_cleanup);
+        hook(&mut table[IRP_MJ_DEVICE_CONTROL], &PREV_CONTROL, dispatch_device_control);
     }
 }
+
 
 /// Add one adapter reference, creating the singleton on the first NVIDIA-
 /// personality AddDevice. PASSIVE_LEVEL; PnP serializes AddDevice/RemoveDevice.
@@ -247,6 +261,23 @@ unsafe extern "C" fn dispatch_create(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTA
     };
     leave();
     complete(irp, status, 0)
+}
+
+unsafe extern "C" fn dispatch_cleanup(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
+    if device != DEVICE.load(Ordering::Acquire) {
+        let previous = previous_dispatch(&PREV_CLEANUP);
+        return if let Some(previous) = previous {
+            unsafe { previous(device, irp) }
+        } else {
+            STATUS_INVALID_DEVICE_REQUEST
+        };
+    }
+    if irp.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    // Nothing is queued per handle; cleanup always succeeds, even while the
+    // device is stopping, so a handle can always be closed.
+    complete(irp, STATUS_SUCCESS, 0)
 }
 
 unsafe extern "C" fn dispatch_close(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
