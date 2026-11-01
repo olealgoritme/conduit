@@ -124,6 +124,70 @@ pub fn parse_context_private(
     Ok(ContextPrivate { node_ordinal })
 }
 
+/// The NVIDIA personality's node count (NVIDIA's 610.88 KMD reports 16).
+pub const HWS_NODE_COUNT: u32 = 16;
+
+/// An NVDA-private `DxgkDdiCreateContext` in the NVIDIA personality (WDDM 2.7
+/// hardware scheduling: dxgkrnl passes the UMD's CreateContextVirtual blob to
+/// CreateContext, and later names that context as `hHwContext` of
+/// CreateHwQueue).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HwsContextPrivate {
+    pub node_ordinal: u32,
+    /// Header word +0x0c: 5 for the CUDA loader; other UMDs (D3D11, Vulkan)
+    /// are not pinned, only recorded.
+    pub client_hint: u32,
+    /// Whether this KMD can back the context with a native TSG today.
+    pub native: bool,
+}
+
+/// Nodes whose contexts get a native graphics-runlist TSG today: 0 (3D) and
+/// 4 (the copy node the 610.88 CUDA loader creates its context on). Every
+/// other node's context is created without channel state and refuses queues.
+pub const fn hws_native_node(node_ordinal: u32) -> bool {
+    node_ordinal == 0 || node_ordinal == 4
+}
+
+/// Parse the NVDA header of a CreateContext in the NVIDIA personality. Unlike
+/// [`parse_context_private`] (the CreateHwContext CUDA path) any client hint is
+/// accepted and every reported node is legal; `kmd_flags` are the KMD-side
+/// `DXGK_CREATECONTEXTFLAGS`, which must carry VirtualAddressing and
+/// HwQueueSupported.
+pub fn parse_hws_context_private(
+    buf: &[u8],
+    node_ordinal: u32,
+    engine_affinity: u32,
+    kmd_flags: u32,
+) -> Result<HwsContextPrivate, PrivateError> {
+    if buf.len() != CONTEXT_PRIVATE_BYTES {
+        return Err(PrivateError::Size);
+    }
+    if get32(buf, 0) != Some(NVDA_MAGIC) {
+        return Err(PrivateError::Magic);
+    }
+    if get32(buf, 4) != Some(NVDA_CONTEXT_VERSION) {
+        return Err(PrivateError::Version);
+    }
+    if get32(buf, CONTEXT_DECLARED_SIZE_AT) != Some(CONTEXT_PRIVATE_BYTES as u32) {
+        return Err(PrivateError::Size);
+    }
+    if node_ordinal >= HWS_NODE_COUNT {
+        return Err(PrivateError::Node);
+    }
+    if engine_affinity != CUDA_ENGINE_AFFINITY {
+        return Err(PrivateError::EngineAffinity);
+    }
+    if !crate::hws::is_hw_queue_context(kmd_flags) {
+        return Err(PrivateError::Flags);
+    }
+    let client_hint = get32(buf, CONTEXT_CLIENT_HINT_AT).ok_or(PrivateError::Size)?;
+    Ok(HwsContextPrivate {
+        node_ordinal,
+        client_hint,
+        native: hws_native_node(node_ordinal),
+    })
+}
+
 /// Recognise only the native format, allowing the existing non-NVDA context
 /// path to keep its old behaviour without treating arbitrary private data as a
 /// CUDA request.
@@ -336,6 +400,42 @@ mod tests {
         );
         assert!(is_context_private(&context()));
         assert!(!is_context_private(&context()[..3199]));
+    }
+
+    #[test]
+    fn hws_context_accepts_any_client_and_all_sixteen_nodes() {
+        let mut b = context();
+        b[12..16].copy_from_slice(&2u32.to_le_bytes());
+        for node in 0..HWS_NODE_COUNT {
+            let p = parse_hws_context_private(&b, node, 1, 0x14).unwrap();
+            assert_eq!(p.node_ordinal, node);
+            assert_eq!(p.client_hint, 2);
+            assert_eq!(p.native, node == 0 || node == 4);
+        }
+        assert_eq!(
+            parse_hws_context_private(&b, 16, 1, 0x14),
+            Err(PrivateError::Node)
+        );
+        assert_eq!(
+            parse_hws_context_private(&b, 0, 2, 0x14),
+            Err(PrivateError::EngineAffinity)
+        );
+        // KMD flags: VirtualAddressing (4) and HwQueueSupported (0x10) both needed.
+        assert_eq!(
+            parse_hws_context_private(&b, 0, 1, 0x10),
+            Err(PrivateError::Flags)
+        );
+        assert!(parse_hws_context_private(&b, 0, 1, 0x34).is_ok());
+        let mut bad = context();
+        bad[4] ^= 1;
+        assert_eq!(
+            parse_hws_context_private(&bad, 0, 1, 0x14),
+            Err(PrivateError::Version)
+        );
+        assert_eq!(
+            parse_hws_context_private(&context()[..3199], 0, 1, 0x14),
+            Err(PrivateError::Size)
+        );
     }
 
     #[test]
