@@ -2378,8 +2378,20 @@ unsafe fn native_update_leaf(
         }
         // System-memory backed native allocations are placed in the aperture
         // segment (create_native_one); device-local ones in their memory segment.
+        // The mapping target is always the allocation's RM memory at
+        // AllocationOffsetInBytes; VidMm's placement only says where it keeps
+        // its own copy. It may page a device-local allocation into the
+        // aperture (its supported set lists it, as WDDM requires for CPU-visible
+        // allocations): the PTE then names system memory (segment 0) or the
+        // aperture. Refusing that failed every NVIDIA D3D11 page-in.
         let segment = bits.Segment() as u32;
-        if !native_segment_matches(allocation, segment) {
+        if segment != allocation.native_segment {
+            crate::diag::record_named_bytes(b"NvPgLeafSeg", segment);
+        }
+        if !native_segment_matches(allocation, segment)
+            && segment != 0
+            && segment != crate::ddi::gpummu::APERTURE_SEGMENT_ID
+        {
             fail(0x100 | segment);
             return Err(());
         }
