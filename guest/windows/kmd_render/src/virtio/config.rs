@@ -40,13 +40,19 @@ impl DxgkConfigAccess {
 /// offset 0 and keeps the type for nothing we use, so report the virtio-gpu id
 /// (`0x1050`) for those IDs and leave every other read, including the KMD's own
 /// capability scans, untouched.
+///
+/// The transport also refuses any vendor but `0x1AF4`, so the RTX 5090
+/// personality (`10DE:2B85`) reports the virtio vendor too.
 fn known_device_id(vendor_device: u32) -> u32 {
-    const CONDUIT_IDS: [u32; 3] = [0x106D, 0x1069, 0x2B85];
+    const VIRTIO_VENDOR: u32 = 0x1AF4;
+    const NVIDIA_VENDOR: u32 = 0x10DE;
     const VIRTIO_GPU_ID: u32 = 0x1050;
-    if CONDUIT_IDS.contains(&(vendor_device >> 16)) {
-        (VIRTIO_GPU_ID << 16) | (vendor_device & 0xFFFF)
-    } else {
-        vendor_device
+    let vendor = vendor_device & 0xFFFF;
+    match (vendor, vendor_device >> 16) {
+        (VIRTIO_VENDOR, 0x106D | 0x1069) | (NVIDIA_VENDOR, 0x2B85) => {
+            (VIRTIO_GPU_ID << 16) | VIRTIO_VENDOR
+        }
+        _ => vendor_device,
     }
 }
 
