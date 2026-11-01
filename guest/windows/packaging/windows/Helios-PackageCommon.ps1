@@ -462,8 +462,14 @@ function Get-HeliosDriverStorePath {
     $classKey = Get-HeliosDisplayClassKey $instanceId
     $registered = @((Get-Item -LiteralPath $classKey).GetValue("UserModeDriverName", $null))
     $path = @($registered | Where-Object { $_ -and [IO.Path]::IsPathRooted($_) } | Select-Object -First 1)
-    if ($path.Count -eq 1 -and (Test-Path -LiteralPath $path[0] -PathType Leaf)) {
-        return Split-Path -Parent $path[0]
+    # The NVIDIA personality registers nvldumdx.dll before it is staged, so
+    # only the registered file's DriverStore directory has to exist here.
+    if ($path.Count -eq 1) {
+        $directory = Split-Path -Parent $path[0]
+        if ((Test-Path -LiteralPath $directory -PathType Container) -and
+            $directory -match '\\DriverStore\\FileRepository\\') {
+            return $directory
+        }
     }
     throw "The active Helios UMD registration does not name a file in the active DriverStore."
 }
