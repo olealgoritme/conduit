@@ -432,7 +432,7 @@ function Get-HeliosNvidiaRequiredFiles {
     return @(
         "nvldumdx.dll", "nvldumd.dll", "nvoglv64.dll", "nvoglv32.dll",
         "nvcuda64.dll", "nvcuda32.dll", "nvdxgdmal64.dll", "nvdxgdmal32.dll",
-        "nvapi64.dll", "nvapi64_impl.dll", "nvapi.dll", "nvapi_impl.dll",
+        "nvapi64.dll", "nvapi64_impl.dll", "nvapi.dll", "nvapi_impl.dll", "nvcuda_loader64.dll",
         "nv-vk64.json", "nv-vk32.json", "nvlddmkm.sys"
     )
 }
@@ -494,5 +494,15 @@ function Install-HeliosNvidiaUmd([string]$Package) {
     Assert-HeliosPeArchitecture (Join-Path $destination "nvoglv32.dll") "x86"
     Assert-HeliosPeArchitecture (Join-Path $destination "nvcuda64.dll") "x64"
     Assert-HeliosPeArchitecture (Join-Path $destination "nvcuda32.dll") "x86"
+    # NVIDIA's CUDA loader accepts an adapter only when its kernel image (or,
+    # as a fallback, Services\nvlddmkm\ImagePath) is named nvlddmkm.sys, and
+    # loads nvcuda64.dll from that folder. Point the INF's demand-start alias
+    # service (never started) at the staged copy beside the UMDs.
+    $repository = Split-Path -Leaf $destination
+    $imagePath = "\SystemRoot\System32\DriverStore\FileRepository\$repository\nvlddmkm.sys"
+    Set-ItemProperty -LiteralPath "HKLM:\SYSTEM\CurrentControlSet\Services\nvlddmkm" -Name ImagePath -Value $imagePath -Type ExpandString
+    # The CUDA loader opens System32\nvcuda.dll; NVIDIA's own INF installs
+    # nvcuda_loader64.dll there under that name.
+    Copy-Item -LiteralPath (Join-Path $destination "nvcuda_loader64.dll") -Destination (Join-Path $env:SystemRoot "System32\nvcuda.dll") -Force
     return [pscustomobject]@{ Source = $source; Destination = $destination }
 }
