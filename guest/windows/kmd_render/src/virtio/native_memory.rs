@@ -934,7 +934,12 @@ pub fn update_leaf(
             .map_err(|_| Error::Overlap)?
             .pieces;
     }
-    nm::coalesce(&mut final_pieces);
+    // No coalescing across updates: every existing piece is one live RM virtual
+    // object. VidMm fills a large allocation one page table (2 MiB of VA) per
+    // call; merging the new piece into the previous call's neighbour remapped
+    // the merged range while the neighbour's object still held its part, and RM
+    // refused the fixed VA (NV_ERR_INSUFFICIENT_RESOURCES).
+    final_pieces.sort_unstable_by_key(|piece| piece.va);
 
     // GPU VAs are per process: only this process's other mappings can collide.
     for other in STATE.lock().allocations.iter().filter(|a| a.id != id) {
