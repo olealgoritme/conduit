@@ -504,5 +504,16 @@ function Install-HeliosNvidiaUmd([string]$Package) {
     # The CUDA loader opens System32\nvcuda.dll; NVIDIA's own INF installs
     # nvcuda_loader64.dll there under that name.
     Copy-Item -LiteralPath (Join-Path $destination "nvcuda_loader64.dll") -Destination (Join-Path $env:SystemRoot "System32\nvcuda.dll") -Force
+    # NVIDIA's UMDs and CUDA load NVAPI from System32/SysWOW64. The Helios
+    # package puts DXVK-NVAPI there for DLSS on NVK; keep it as *.dxvk.dll and
+    # install NVIDIA's own for this personality.
+    foreach ($pair in @(@("System32", "nvapi64.dll"), @("SysWOW64", "nvapi.dll"))) {
+        $target = Join-Path (Join-Path $env:SystemRoot $pair[0]) $pair[1]
+        if ((Test-Path -LiteralPath $target) -and
+            -not ((Get-Item -LiteralPath $target).VersionInfo.CompanyName -match "NVIDIA")) {
+            Copy-Item -LiteralPath $target -Destination ($target -replace '\.dll$', '.dxvk.dll') -Force
+        }
+        Copy-Item -LiteralPath (Join-Path $destination $pair[1]) -Destination $target -Force
+    }
     return [pscustomobject]@{ Source = $source; Destination = $destination }
 }
