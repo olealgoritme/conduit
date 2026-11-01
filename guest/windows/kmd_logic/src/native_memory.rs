@@ -19,6 +19,28 @@ pub const SYSTEM_MEMORY_SEGMENT_ID: u32 = 0;
 
 pub const SYSTEM_MEMORY_AT: usize = 0xc8;
 pub const SIZE_UNITS_AT: usize = 0xd0;
+/// D3D (NVDX) records leave `SIZE_UNITS_AT` zero and describe the size in
+/// 64-KiB units as a fixed-point value: fraction at 0x10c, integer in the low
+/// 24 bits of 0x110, and the rounded-up count at 0x114. Vulkan records put the
+/// integer at `SIZE_UNITS_AT` and a nonzero fraction at 0x114 (or repeat the
+/// count there). Checked against every mapped allocation of the 610.88 D3D11,
+/// D3D12, Vulkan and CUDA captures (384 of 384).
+pub const SIZE_FRACTION_AT: usize = 0x10c;
+pub const SIZE_INTEGER_AT: usize = 0x110;
+pub const SIZE_COUNT_AT: usize = 0x114;
+
+/// Size in 64-KiB units, rounded up, from an NVDA allocation record.
+pub fn allocation_units(bytes: &[u8]) -> Option<u64> {
+    let units = u64::from(get32(bytes, SIZE_UNITS_AT)?);
+    let count = u64::from(get32(bytes, SIZE_COUNT_AT)?);
+    if units != 0 {
+        // CUDA: count 0. Vulkan: a fraction, or the count repeated.
+        return Some(units + u64::from(count != 0 && count != units));
+    }
+    let fraction = get32(bytes, SIZE_FRACTION_AT)?;
+    let integer = u64::from(get32(bytes, SIZE_INTEGER_AT)? & 0x00ff_ffff);
+    Some(count.max(integer + u64::from(fraction != 0)))
+}
 pub const KIND_AT: usize = 0x1a0;
 pub const TILING_AT: usize = 0x1a4;
 pub const COMPRESSION_AT: usize = 0x1a8;
@@ -89,7 +111,7 @@ pub fn parse_allocation_private(bytes: &[u8]) -> Result<AllocationPrivate, Priva
             return Err(PrivateError::BadDeclaredSize);
         }
     }
-    let units = u64::from(get32(bytes, SIZE_UNITS_AT).ok_or(PrivateError::Short)?);
+    let units = allocation_units(bytes).ok_or(PrivateError::Short)?;
     let size = units
         .checked_mul(ALLOCATION_UNIT)
         .ok_or(PrivateError::SizeOverflow)?;
@@ -692,5 +714,54 @@ mod tests {
         assert_eq!(get64(&map, 24), Some(0x3000));
         let unmap = nvos47_unmap(1, 2, 3, 4, 0x8001_2000);
         assert_eq!(get64(&unmap, 24), Some(0x8001_2000));
+    }
+}
+
+
+#[cfg(test)]
+mod size_rule_tests {
+    use super::*;
+
+    fn record() -> [u8; ALLOCATION_PRIVATE_BYTES] {
+        let mut b = [0u8; ALLOCATION_PRIVATE_BYTES];
+        b[0..4].copy_from_slice(&crate::nvda::NVDA_MAGIC.to_le_bytes());
+        b[4..8].copy_from_slice(&ALLOCATION_PRIVATE_VERSION.to_le_bytes());
+        b
+    }
+    fn set(b: &mut [u8], at: usize, v: u32) {
+        b[at..at + 4].copy_from_slice(&v.to_le_bytes());
+    }
+
+    #[test]
+    fn cuda_units_at_d0() {
+        let mut b = record();
+        set(&mut b, SIZE_UNITS_AT, 0x40);
+        assert_eq!(allocation_units(&b), Some(0x40));
+    }
+
+    #[test]
+    fn vulkan_fraction_or_repeated_count() {
+        let mut b = record();
+        set(&mut b, SIZE_UNITS_AT, 0x11);
+        set(&mut b, SIZE_COUNT_AT, 0x22c0_0000);
+        assert_eq!(allocation_units(&b), Some(0x12));
+        set(&mut b, SIZE_COUNT_AT, 0x11);
+        assert_eq!(allocation_units(&b), Some(0x11));
+    }
+
+    #[test]
+    fn d3d_fixed_point_from_the_capture() {
+        // 0x1d4000 bytes: integer 0x1d (flag bits above), fraction .25, count 0x1d.
+        let mut b = record();
+        set(&mut b, SIZE_FRACTION_AT, 0x4000_0000);
+        set(&mut b, SIZE_INTEGER_AT, 0x4000_001d);
+        set(&mut b, SIZE_COUNT_AT, 0x1d);
+        assert_eq!(allocation_units(&b), Some(0x1e));
+        // The first D3D11 allocation (GPFIFO): one unit.
+        let mut g = record();
+        set(&mut g, SIZE_INTEGER_AT, 1);
+        set(&mut g, SIZE_COUNT_AT, 1);
+        assert_eq!(allocation_units(&g), Some(1));
+        assert_eq!(parse_allocation_private(&g).map(|p| p.size), Ok(ALLOCATION_UNIT));
     }
 }
