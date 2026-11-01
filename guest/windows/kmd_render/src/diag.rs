@@ -1776,6 +1776,28 @@ pub mod knobs {
 
 /// Read a service-key REG_DWORD knob, or `default` if absent.
 pub fn read_config_dword(name: KnobName, default: u32) -> u32 {
+    read_service_dword(SERVICE_NAME.as_ptr(), name, default)
+}
+
+/// `"helios_kmd_render\Parameters\0"` as UTF-16. INF AddReg may only write
+/// service values under `Parameters` (infverif 1323).
+static SERVICE_PARAMETERS: [u16; 29] = {
+    let s = b"helios_kmd_render\\Parameters\0";
+    let mut out = [0u16; 29];
+    let mut i = 0;
+    while i < 29 {
+        out[i] = s[i] as u16;
+        i += 1;
+    }
+    out
+};
+
+/// [`read_config_dword`] for a value under the service's `Parameters` subkey.
+pub fn read_parameters_dword(name: KnobName, default: u32) -> u32 {
+    read_service_dword(SERVICE_PARAMETERS.as_ptr(), name, default)
+}
+
+fn read_service_dword(path: *const u16, name: KnobName, default: u32) -> u32 {
     let name = name.0;
     hot::note_bytes(name);
     let mut name_buf = [0u16; 16];
@@ -1802,7 +1824,7 @@ pub fn read_config_dword(name: KnobName, default: u32) -> u32 {
     unsafe {
         let _ = wdk_sys::ntddk::RtlQueryRegistryValues(
             RTL_REGISTRY_SERVICES,
-            SERVICE_NAME.as_ptr(),
+            path,
             table.as_mut_ptr(),
             core::ptr::null_mut(),
             core::ptr::null_mut(),

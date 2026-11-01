@@ -121,8 +121,8 @@ ServiceBinary  = %13%\helios_kmd_render.sys
 AddReg         = Helios_NVIDIA_Service_AddReg
 
 [Helios_NVIDIA_Service_AddReg]
-HKR,,SingleDeviceInstall,%REG_DWORD%,1
-HKR,,NvUmd,%REG_DWORD%,2
+HKR,Parameters,SingleDeviceInstall,%REG_DWORD%,1
+HKR,Parameters,NvUmd,%REG_DWORD%,2
 
 [Helios_NVIDIA_DeviceSettings]
 HKR,, UserModeDriverName,       %REG_MULTI_SZ%, %13%\nvldumdx.dll,%13%\nvldumdx.dll,%13%\nvldumdx.dll,%13%\nvldumdx.dll

@@ -49,7 +49,14 @@ static REGISTER_FD_REFUSED: AtomicU32 = AtomicU32::new(0);
 fn persona() -> nd::Persona {
     let value = KNOB.load(Ordering::Relaxed);
     if value == KNOB_UNREAD {
-        let read = crate::diag::read_config_dword(crate::diag::knobs::NVIDIA_UMD, 0);
+        // A service-root knob overrides; otherwise the NVIDIA INF's
+        // Parameters\NvUmd (infverif allows service AddReg only there).
+        let root = crate::diag::read_config_dword(crate::diag::knobs::NVIDIA_UMD, u32::MAX);
+        let read = if root == u32::MAX {
+            crate::diag::read_parameters_dword(crate::diag::knobs::NVIDIA_UMD, 0)
+        } else {
+            root
+        };
         KNOB.store(read, Ordering::Relaxed);
         crate::diag::record_named_bytes(b"NvUmdMode", read);
         return nd::Persona::from_knob(read);
