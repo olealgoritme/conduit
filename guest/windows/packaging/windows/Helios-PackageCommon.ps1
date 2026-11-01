@@ -474,6 +474,121 @@ function Get-HeliosDriverStorePath {
     throw "The active Helios UMD registration does not name a file in the active DriverStore."
 }
 
+# Copy the device-key (HKR) values NVIDIA's own INF writes for the RTX 5090
+# (PCI\VEN_10DE&DEV_2B85) into this adapter's software key: DXCoreAttributes,
+# DriverSupportModules, UserModeDriverGUID, Vulkan/OpenCL names and the rest
+# NVIDIA's UMDs read through D3DKMT QUERYREGISTRY. %13% becomes the folder the
+# UMDs were staged in. Only HKR lines are applied; nothing else in the INF.
+function Import-HeliosNvidiaDeviceRegistry([string]$InfPath, [string]$ClassKey, [string]$DriverStore) {
+    $raw = Get-Content -LiteralPath $InfPath
+    $lines = New-Object System.Collections.Generic.List[string]
+    $pending = ""
+    foreach ($line in $raw) {
+        $text = $line
+        $inQuote = $false
+        for ($i = 0; $i -lt $text.Length; $i++) {
+            if ($text[$i] -eq '"') { $inQuote = -not $inQuote }
+            elseif ($text[$i] -eq ';' -and -not $inQuote) { $text = $text.Substring(0, $i); break }
+        }
+        $text = $text.Trim()
+        if ($text.EndsWith("\")) { $pending += $text.Substring(0, $text.Length - 1); continue }
+        $lines.Add($pending + $text); $pending = ""
+    }
+    $sections = @{}
+    $current = $null
+    foreach ($line in $lines) {
+        if ($line -match '^\[(.+)\]$') { $current = $Matches[1].ToLowerInvariant(); $sections[$current] = New-Object System.Collections.Generic.List[string]; continue }
+        if ($current -and $line) { $sections[$current].Add($line) }
+    }
+    $strings = @{}
+    foreach ($line in $sections["strings"]) {
+        if ($line -match '^([^=]+?)\s*=\s*(.*)$') { $strings[$Matches[1].Trim().ToLowerInvariant()] = $Matches[2].Trim().Trim('"') }
+    }
+    function Split-Fields([string]$text) {
+        $fields = @(); $cur = ""; $q = $false
+        foreach ($ch in $text.ToCharArray()) {
+            if ($ch -eq '"') { $q = -not $q; $cur += $ch }
+            elseif ($ch -eq ',' -and -not $q) { $fields += $cur.Trim(); $cur = "" }
+            else { $cur += $ch }
+        }
+        $fields += $cur.Trim()
+        return ,$fields
+    }
+    function Expand-Field([string]$text) {
+        $value = $text.Trim()
+        if ($value.StartsWith('"') -and $value.EndsWith('"') -and $value.Length -ge 2) { $value = $value.Substring(1, $value.Length - 2) }
+        return [regex]::Replace($value, '%([^%]+)%', {
+            param($m)
+            $name = $m.Groups[1].Value
+            if ($name -eq "13") { return $DriverStore }
+            $key = $name.ToLowerInvariant()
+            if ($strings.ContainsKey($key)) { return $strings[$key] }
+            return $m.Value
+        })
+    }
+    $install = $null
+    foreach ($name in $sections.Keys) {
+        foreach ($line in $sections[$name]) {
+            if ($line -match '=\s*([^,\s]+)\s*,\s*PCI\\VEN_10DE&DEV_2B85\s*$') { $install = $Matches[1].ToLowerInvariant(); break }
+        }
+        if ($install) { break }
+    }
+    if (-not $install) { throw "No PCI\VEN_10DE&DEV_2B85 install section in $InfPath." }
+    $addRegs = @()
+    foreach ($line in $sections[$install]) {
+        if ($line -match '^AddReg\s*=\s*(.+)$') { $addRegs += ($Matches[1] -split ',') | ForEach-Object { $_.Trim().ToLowerInvariant() } }
+    }
+    $count = 0
+    foreach ($section in $addRegs) {
+        foreach ($line in $sections[$section]) {
+            $f = Split-Fields $line
+            if ($f.Count -lt 4 -or $f[0] -ne "HKR") { continue }
+            $subkey = Expand-Field $f[1]
+            $valueName = Expand-Field $f[2]
+            $flagText = Expand-Field $f[3]
+            $flags = if ($flagText -match '^0x') { [Convert]::ToUInt32($flagText.Substring(2), 16) } elseif ($flagText) { [uint32]$flagText } else { 0 }
+            if ($flags -band 0x14) { continue }   # DELVAL / KEYONLY: nothing to write
+            $data = @($f | Select-Object -Skip 4 | ForEach-Object { Expand-Field $_ })
+            $key = if ($subkey) { Join-Path $ClassKey $subkey } else { $ClassKey }
+            if (-not (Test-Path -LiteralPath $key)) { New-Item -Path $key -Force | Out-Null }
+            $type = $flags -band 0xFFFF0001
+            $append = ($flags -band 0x8) -ne 0
+            switch ($type) {
+                0x00010001 {
+                    $text = if ($data.Count) { $data[0] } else { "0" }
+                    $value = if ($text -match '^0x') { [Convert]::ToUInt32($text.Substring(2), 16) } else { [uint32]$text }
+                    New-ItemProperty -LiteralPath $key -Name $valueName -Value $value -PropertyType DWord -Force | Out-Null
+                }
+                0x00010000 {
+                    $values = @($data | Where-Object { $_ -ne "" })
+                    if ($append) {
+                        $old = @((Get-Item -LiteralPath $key).GetValue($valueName, @()))
+                        $values = @($old + ($values | Where-Object { $old -notcontains $_ }))
+                    }
+                    New-ItemProperty -LiteralPath $key -Name $valueName -Value ([string[]]$values) -PropertyType MultiString -Force | Out-Null
+                }
+                0x00020000 { New-ItemProperty -LiteralPath $key -Name $valueName -Value ($data -join ",") -PropertyType ExpandString -Force | Out-Null }
+                0x00000001 {
+                    $bytes = [byte[]]@($data | Where-Object { $_ -ne "" } | ForEach-Object { [Convert]::ToByte($_, 16) })
+                    New-ItemProperty -LiteralPath $key -Name $valueName -Value $bytes -PropertyType Binary -Force | Out-Null
+                }
+                0x00000000 {
+                    if ($append) {
+                        $old = @((Get-Item -LiteralPath $key).GetValue($valueName, @()))
+                        $values = @($old + ($data | Where-Object { $_ -ne "" -and $old -notcontains $_ }))
+                        New-ItemProperty -LiteralPath $key -Name $valueName -Value ([string[]]$values) -PropertyType MultiString -Force | Out-Null
+                    } else {
+                        New-ItemProperty -LiteralPath $key -Name $valueName -Value ($data -join ",") -PropertyType String -Force | Out-Null
+                    }
+                }
+                default { continue }
+            }
+            $count++
+        }
+    }
+    return $count
+}
+
 function Install-HeliosNvidiaUmd([string]$Package) {
     $source = Resolve-HeliosNvidiaPackage $Package
     $destination = Get-HeliosDriverStorePath
@@ -515,5 +630,11 @@ function Install-HeliosNvidiaUmd([string]$Package) {
         }
         Copy-Item -LiteralPath (Join-Path $destination $pair[1]) -Destination $target -Force
     }
-    return [pscustomobject]@{ Source = $source; Destination = $destination }
+    $inf = Get-ChildItem -LiteralPath $source -Filter "nv_disp*.inf" -File -ErrorAction SilentlyContinue | Select-Object -First 1
+    $imported = 0
+    if ($inf) {
+        $classKey = Get-HeliosDisplayClassKey (Get-HeliosDeviceInstanceId)
+        $imported = Import-HeliosNvidiaDeviceRegistry $inf.FullName $classKey $destination
+    }
+    return [pscustomobject]@{ Source = $source; Destination = $destination; RegistryValues = $imported }
 }
