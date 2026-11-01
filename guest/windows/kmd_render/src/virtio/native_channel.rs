@@ -468,6 +468,15 @@ impl NativeContext {
         let epoch = native.epoch;
         restore_process(process, native);
         result?;
+        // Diagnosis: is 0x4000000 still free after the TSG and ctxshare exist?
+        crate::diag::record_named_bytes(
+            b"NvProbeCtx",
+            super::native_memory::probe_process_space(
+                passive,
+                adapter,
+                process as *const ProcessContext as usize,
+            ),
+        );
         Ok(Self {
             adapter: adapter as *const AdapterContext as *mut AdapterContext,
             process,
@@ -718,6 +727,18 @@ impl NativeQueue {
             crate::diag::record_named_bytes(b"NvQGpPut", put);
             crate::diag::record_named_bytes(b"NvQFence", self.read_progress() as u32);
             crate::diag::record_named_bytes(b"NvQToken", self.parts.token);
+            // The channel's error notifier (NvNotification at ctl+0): info32 at
+            // +8, info16|status<<16 at +12. Nonzero status = RM put it in error.
+            // SAFETY: the same live control view.
+            let (info32, word) = unsafe {
+                let ctl = self.parts.ctl.va;
+                (
+                    ((ctl + 8) as *const u32).read_volatile(),
+                    ((ctl + 12) as *const u32).read_volatile(),
+                )
+            };
+            crate::diag::record_named_bytes(b"NvQErrInfo", info32);
+            crate::diag::record_named_bytes(b"NvQErrSt", word);
         }
         let Some(adapter) = (unsafe { self.adapter.as_ref() }) else {
             return Ok(());

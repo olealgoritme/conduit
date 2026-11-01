@@ -429,7 +429,50 @@ fn ensure_space(io: &Io<'_>, process: usize) -> Result<u32, Error> {
     STATE.lock().spaces.push((process, space));
     crate::diag::record_named_bytes(b"NvSpaceProc", process as u32);
     crate::diag::record_named_bytes(b"NvSpaceH", space);
+    crate::diag::record_named_bytes(b"NvProbeNew", probe_space(io, space));
     Ok(space)
+}
+
+/// Diagnosis: can a fixed 64-KiB virtual object be placed at 0x4000000 (the
+/// D3D11 UMD's GPFIFO VA) in `space` right now? 0 = yes (and freed again),
+/// otherwise the RM status / error code.
+fn probe_space(io: &Io<'_>, space: u32) -> u32 {
+    let Ok(virt) = STATE.lock().mint() else {
+        return 0xffff_fffd;
+    };
+    let params = cc::virtual_params(io.client.root, space, Some(0x400_0000), 0x1_0000);
+    match io.rm_alloc(nd::H_DEVICE, virt, cc::NV50_MEMORY_VIRTUAL, &params) {
+        Ok(_) => {
+            let _ = io.rm_free(nd::H_DEVICE, virt);
+            0
+        }
+        Err(_) => 1,
+    }
+}
+
+/// [`probe_space`] on `process`'s space (diagnosis, after context creation).
+pub fn probe_process_space(passive: PassiveLevel, adapter: &AdapterContext, process: usize) -> u32 {
+    let Ok(_guard) = lock(passive) else {
+        return 0xffff_fffe;
+    };
+    let Ok(client) = STATE.lock().client() else {
+        return 0xffff_ffff;
+    };
+    let io = Io {
+        passive,
+        adapter,
+        client,
+    };
+    let space = STATE
+        .lock()
+        .spaces
+        .iter()
+        .find(|(owner, _)| *owner == process)
+        .map(|(_, space)| *space);
+    match space {
+        Some(space) => probe_space(&io, space),
+        None => 0xffff_fffc,
+    }
 }
 
 /// Validate a UMD GPFIFO allocation before it becomes a hardware queue. The
