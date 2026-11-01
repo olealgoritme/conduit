@@ -106,7 +106,8 @@ fn build_ddi_table() -> DRIVER_INITIALIZATION_DATA {
     // bits and `GetNodeMetadata.GpuMmuSupported` in `query_adapter_info.rs` — which
     // is why all four now read the one `SURFACE` value. The struct ABI we bindgen is
     // the 26100/WDDM-3.2 shape regardless of the level reported here.
-    data.Version = crate::ddi::wddm_surface::SURFACE.ddi_interface_version();
+    crate::ddi::wddm_surface::select_at_driver_entry();
+    data.Version = crate::ddi::wddm_surface::surface().ddi_interface_version();
 
     // ── PnP / power lifecycle (Phase 1, real) ──────────────────────────────
     data.DxgkDdiAddDevice = Some(ddi::dxgkddi_add_device);
