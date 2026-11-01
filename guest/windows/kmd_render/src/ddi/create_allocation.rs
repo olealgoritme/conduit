@@ -3296,18 +3296,30 @@ unsafe fn create_native_one(
     info.HintedBank.__bindgen_anon_1.Value = 0;
     info.AllocationPriority = D3DDDI_ALLOCATIONPRIORITY_NORMAL;
     info.pAllocationUsageHint = core::ptr::null_mut();
-    let supported = if created.system_memory == 0 {
-        1u32 << created.segment
+    // Segment sets are 1-based bitmasks (bit 0 = segment 1). Device-local RM
+    // memory sits in the BAR segment the adapter reports; system-memory backed
+    // allocations in the aperture segment. The old `1 << segment` named a
+    // segment that does not exist (and system memory got an empty set), so
+    // VidMm refused the allocation after CreateAllocation/OpenAllocation
+    // succeeded: the first NVIDIA D3D11 allocation failed INVALID_PARAMETER.
+    let aperture = crate::ddi::gpummu::APERTURE_SEGMENT_ID;
+    let segment = if created.system_memory != 0 {
+        aperture
     } else {
-        0
+        adapter
+            .segment_table()
+            .and_then(|table| table.bar_seg_id())
+            .unwrap_or(aperture)
     };
+    let supported = 1u32 << (segment - 1);
+    crate::diag::record_named_bytes(b"NvAlSeg", segment);
     info.SupportedWriteSegmentSet = supported;
     unsafe {
         info.__bindgen_anon_1.Alignment = PAGE as UINT;
         info.PreferredSegment
             .__bindgen_anon_1
             .__bindgen_anon_1
-            .set_SegmentId0(created.segment);
+            .set_SegmentId0(segment);
         info.__bindgen_anon_2.SupportedReadSegmentSet = supported;
         info.__bindgen_anon_3.MaximumRenamingListLength = 0;
         info.__bindgen_anon_3.PhysicalAdapterIndex = 0;
