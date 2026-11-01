@@ -34,7 +34,7 @@ def main():
             r'^ProviderName = .*': f'ProviderName = "{values["HELIOS_PUBLISHER"]}"',
             r'^DeviceDesc   = .*': f'DeviceDesc   = "{product}"',
             r'^DiskName     = .*': f'DiskName     = "{product} Driver Package"',
-            r'^HKR,, HardwareInformation.AdapterString, .*':
+            r'^HKR,, HardwareInformation.AdapterString, (?!.*%NvidiaDeviceDesc%).*':
                 'HKR,, HardwareInformation.AdapterString, %REG_SZ%, %DeviceDesc%',
         }
     }
