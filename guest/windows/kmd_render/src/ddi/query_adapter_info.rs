@@ -81,6 +81,14 @@ pub unsafe extern "C" fn dxgkddi_query_adapter_info(
         _DXGK_QUERYADAPTERINFOTYPE::DXGKQAITYPE_ADAPTERPERFDATA
             if crate::ddi::wddm_surface::nvidia_selected() =>
         unsafe { query_zeroed::<DXGK_ADAPTER_PERFDATA>(args) },
+        // NVIDIA personality only. With hardware scheduling on, AddAdapter fails
+        // STATUS_NOT_SUPPORTED (DxgKrnl-Admin 549, StartAdapter_AddAdapterFailed)
+        // without it. NVIDIA's KMD answers: all nodes, its paging node, dxgkrnl's
+        // DeviceHandle, GpuMmuSupported|MovePagingSupported. The paging node here
+        // stays the one DRIVERCAPS reports (0) until paging moves to a copy node.
+        _DXGK_QUERYADAPTERINFOTYPE::DXGKQAITYPE_PHYSICALADAPTERCAPS
+            if crate::ddi::wddm_surface::nvidia_selected() =>
+        unsafe { query_physical_adapter_caps(adapter, args) },
         // Everything else stays unsupported until backed by real implementation
         // (checklist rule: "unknown must stay unadvertised"). Notably dxgkrnl
         // steady-state-polls NODEPERFDATA (0x18) and ADAPTERPERFDATA (0x19) to
@@ -551,6 +559,28 @@ unsafe fn query_zeroed<T>(args: &DXGKARG_QUERYADAPTERINFO) -> NTSTATUS {
 
     // SAFETY: pOutputData points to a writable object of the requested type.
     unsafe { core::ptr::write_bytes(args.pOutputData as *mut u8, 0, args.OutputDataSize as usize) };
+    STATUS_SUCCESS
+}
+
+unsafe fn query_physical_adapter_caps(
+    adapter: &AdapterContext,
+    args: &DXGKARG_QUERYADAPTERINFO,
+) -> NTSTATUS {
+    if (args.OutputDataSize as usize) < size_of::<DXGK_PHYSICALADAPTERCAPS>() {
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+    let Ok(dxg) = adapter.dxgkrnl() else {
+        return STATUS_DEVICE_NOT_READY;
+    };
+    // SAFETY: pOutputData points to a writable DXGK_PHYSICALADAPTERCAPS.
+    unsafe { core::ptr::write_bytes(args.pOutputData as *mut u8, 0, args.OutputDataSize as usize) };
+    let caps = unsafe { &mut *(args.pOutputData as *mut DXGK_PHYSICALADAPTERCAPS) };
+    caps.NumExecutionNodes = helios_kmd_logic::hws::NVIDIA_NODES.len() as u16;
+    caps.PagingNodeIndex = 0;
+    caps.DxgkPhysicalAdapterHandle = dxg.DeviceHandle;
+    // SAFETY: plain bitfield setters on the flags union's struct arm.
+    unsafe { caps.Flags.__bindgen_anon_1.__bindgen_anon_1.set_GpuMmuSupported(1) };
+    crate::diag::record_named_bytes(b"NvPhysCaps", u32::from(caps.NumExecutionNodes));
     STATUS_SUCCESS
 }
 
