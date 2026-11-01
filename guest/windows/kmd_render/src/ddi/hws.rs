@@ -42,6 +42,7 @@
 //!   EARLY for RenderGdi / PresentBlt kernel submissions (TODO: defer to the
 //!   DMA completion of that buffer).
 
+use alloc::boxed::Box;
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
@@ -61,6 +62,49 @@ static CTX_NATIVE_FAIL: AtomicU32 = AtomicU32::new(0);
 static CTX_NVDA_BAD: AtomicU32 = AtomicU32::new(0);
 static QUEUES: AtomicU32 = AtomicU32::new(0);
 static QUEUE_FAIL: AtomicU32 = AtomicU32::new(0);
+static SOFT_QUEUES: AtomicU32 = AtomicU32::new(0);
+static SOFT_SUBMITS: AtomicU32 = AtomicU32::new(0);
+
+/// A HW queue on a context without native channel state: dxgkrnl's own system /
+/// paging contexts (HWS creates queues for them during AddAdapter, and fails the
+/// adapter STATUS_NOT_SUPPORTED if that is refused), and NVDA contexts on nodes
+/// with no backing yet. Their DMA buffers carry no GPU work this KMD must run
+/// (paging operations already complete inside BuildPagingBuffer), so a
+/// submission completes at once: the progress fence is written and the node's
+/// monitored-fence interrupt raised, as the legacy path completes its DMA.
+const HW_TAG_SOFT_QUEUE: u32 = 0x5357_5148; // "HQWS"
+
+#[repr(C)]
+struct SoftQueue {
+    tag: u32,
+    node: u32,
+    adapter: *mut AdapterContext,
+    fence_cpu: *mut u64,
+}
+
+/// # Safety
+/// `h` is a queue handle this driver minted (native or soft), or null.
+unsafe fn soft_queue(h: IN_CONST_HANDLE) -> Option<&'static SoftQueue> {
+    if h.is_null() {
+        return None;
+    }
+    // SAFETY: both queue kinds start with a u32 tag (`#[repr(C)]`).
+    let tag = unsafe { *(h as *const u32) };
+    (tag == HW_TAG_SOFT_QUEUE).then(|| unsafe { &*(h as *const SoftQueue) })
+}
+
+fn write_fence(cpu: *mut u64, value: u64) {
+    if cpu.is_null() || (cpu as usize) & 7 != 0 {
+        return;
+    }
+    // SAFETY: dxgkrnl's progress-fence CPU mapping, valid for the queue's life;
+    // it only ever moves forward.
+    unsafe {
+        if core::ptr::read_volatile(cpu) < value {
+            core::ptr::write_volatile(cpu, value);
+        }
+    }
+}
 static QUEUE_FULL: AtomicU32 = AtomicU32::new(0);
 static SUBMITS: AtomicU32 = AtomicU32::new(0);
 static SUBMIT_FAIL: AtomicU32 = AtomicU32::new(0);
@@ -88,6 +132,8 @@ pub(crate) fn publish_counters() {
     crate::diag::record_named_bytes(b"HwsCtxNvFail", r(&CTX_NATIVE_FAIL));
     crate::diag::record_named_bytes(b"HwsCtxBad", r(&CTX_NVDA_BAD));
     crate::diag::record_named_bytes(b"HwsQueue", r(&QUEUES));
+    crate::diag::record_named_bytes(b"HwsSoftQ", r(&SOFT_QUEUES));
+    crate::diag::record_named_bytes(b"HwsSoftSub", r(&SOFT_SUBMITS));
     crate::diag::record_named_bytes(b"HwsQueueFail", r(&QUEUE_FAIL));
     crate::diag::record_named_bytes(b"HwsQFull", r(&QUEUE_FULL));
     crate::diag::record_named_bytes(b"HwsSubmit", r(&SUBMITS));
@@ -449,12 +495,19 @@ pub unsafe extern "C" fn dxgkddi_create_hw_queue(
     let Some(context) = (unsafe { ContextHandleRef::from_raw(h_hw_context as HANDLE) }) else {
         return STATUS_INVALID_PARAMETER;
     };
-    let Some(native) = context.native() else {
-        QUEUE_FAIL.fetch_add(1, Ordering::Relaxed);
-        return STATUS_NOT_SUPPORTED;
-    };
     // SAFETY: dxgkrnl's live args; the context outlives its queues.
     let args = unsafe { &mut *args };
+    let Some(native) = context.native() else {
+        let queue = Box::new(SoftQueue {
+            tag: HW_TAG_SOFT_QUEUE,
+            node: context.node_ordinal(),
+            adapter: context.adapter_ptr(),
+            fence_cpu: args.HwQueueProgressFenceCPUVirtualAddress as *mut u64,
+        });
+        args.hHwQueue = Box::into_raw(queue) as HANDLE;
+        SOFT_QUEUES.fetch_add(1, Ordering::Relaxed);
+        return STATUS_SUCCESS;
+    };
     let status = unsafe { super::scheduler::create_native_queue(context.adapter_ptr(), native, args) };
     if status != STATUS_SUCCESS {
         QUEUE_FAIL.fetch_add(1, Ordering::Relaxed);
@@ -476,6 +529,11 @@ pub unsafe extern "C" fn dxgkddi_create_hw_queue(
 }
 
 pub unsafe extern "C" fn dxgkddi_destroy_hw_queue(h_hw_queue: IN_CONST_HANDLE) -> NTSTATUS {
+    if unsafe { soft_queue(h_hw_queue) }.is_some() {
+        // SAFETY: minted by Box::into_raw in CreateHwQueue; freed once here.
+        drop(unsafe { Box::from_raw(h_hw_queue as *mut SoftQueue) });
+        return STATUS_SUCCESS;
+    }
     // SAFETY: a handle this driver minted, or null (both handled).
     let key = unsafe { super::scheduler::native_queue_of(h_hw_queue) }
         .map_or(0, |queue| queue as *const NativeQueue as usize);
@@ -495,6 +553,27 @@ pub unsafe extern "C" fn dxgkddi_submit_command_to_hw_queue(
     h_adapter: IN_CONST_HANDLE,
     args: IN_CONST_PDXGKARG_SUBMITCOMMANDTOHWQUEUE,
 ) -> NTSTATUS {
+    if h_adapter.is_null() || args.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    // SAFETY: dxgkrnl's live args.
+    let submit = unsafe { &*args };
+    if let Some(queue) = unsafe { soft_queue(submit.hHwQueue) } {
+        if queue.adapter != h_adapter as *mut AdapterContext {
+            return STATUS_INVALID_PARAMETER;
+        }
+        let cpu = if submit.HwQueueProgressFenceCpuVa.is_null() {
+            queue.fence_cpu
+        } else {
+            submit.HwQueueProgressFenceCpuVa as *mut u64
+        };
+        write_fence(cpu, submit.HwQueueProgressFenceId);
+        SOFT_SUBMITS.fetch_add(1, Ordering::Relaxed);
+        // SAFETY: our adapter (checked above).
+        let adapter = unsafe { &*(h_adapter as *const AdapterContext) };
+        signal_nodes(adapter, node_bit(queue.node));
+        return STATUS_SUCCESS;
+    }
     // SAFETY: forwarded unchanged; it validates the handle and args.
     let status = unsafe { super::scheduler::dxgkddi_submit_command_to_hw_queue(h_adapter, args) };
     if status != STATUS_SUCCESS {
