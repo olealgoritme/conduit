@@ -2350,6 +2350,12 @@ unsafe fn native_update_leaf(
     // SAFETY: dxgkrnl's hKmdProcess from CreateProcess, or null.
     if unsafe { crate::device::ProcessContext::is_system_handle(update.hProcess as usize) } {
         crate::diag::record_named_bytes(b"NvPgLeafSys", 1);
+        // Its system-memory pages are still recorded: VidMm's virtual transfers
+        // name them by this paging-process VA (`native_virtual_transfer`
+        // resolves them here; without them every transfer was refused).
+        if !unsafe { adapter.paging_pte_shadow.update_leaf(update, true) } {
+            fail(5);
+        }
         return Ok(());
     }
     let count = update.NumPageTableEntries as usize;
