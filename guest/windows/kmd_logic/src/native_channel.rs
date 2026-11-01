@@ -15,6 +15,12 @@ pub const QUEUE_PRIVATE_BYTES: usize = 180;
 pub const SUBMIT_PRIVATE_BYTES: usize = 536;
 
 pub const CUDA_RING_BYTES: u32 = 0x2000;
+/// The 610.88 D3D11 UMD's GPFIFO ring (8192 entries).
+pub const D3D_RING_BYTES: u32 = 0x10000;
+/// GPFIFO rings accepted from a queue record: a power of two from the CUDA
+/// loader's 1024 entries up to 128Ki entries.
+pub const MIN_RING_BYTES: u32 = CUDA_RING_BYTES;
+pub const MAX_RING_BYTES: u32 = 0x10_0000;
 pub const GP_ENTRY_BYTES: u32 = 8;
 pub const CUDA_ENGINE_AFFINITY: u32 = 1;
 pub const CUDA_CONTEXT_FLAGS: u32 = 0x14;
@@ -226,7 +232,9 @@ pub fn parse_queue_private(buf: &[u8]) -> Result<QueuePrivate, PrivateError> {
         ring_bytes: get32(buf, QUEUE_RING_BYTES_AT).ok_or(PrivateError::Size)?,
         allocation: get32(buf, QUEUE_ALLOCATION_AT).ok_or(PrivateError::Size)?,
     };
-    if queue.ring_bytes != CUDA_RING_BYTES {
+    if !queue.ring_bytes.is_power_of_two()
+        || !(MIN_RING_BYTES..=MAX_RING_BYTES).contains(&queue.ring_bytes)
+    {
         return Err(PrivateError::RingBytes);
     }
     if queue.gpfifo_va == 0
@@ -245,10 +253,10 @@ pub fn parse_queue_private(buf: &[u8]) -> Result<QueuePrivate, PrivateError> {
 }
 
 pub fn validate_queue_flags(flags: u32) -> Result<(), PrivateError> {
+    // UserModeSubmission is the CUDA loader's; 610.88's D3D11 queues carry none
+    // of it (0, DisableGpuTimeout, NoBroadcastSignal/Wait in the captures) and
+    // submit through SubmitCommandToHwQueue.
     if flags & !QUEUE_FLAGS_KNOWN != 0 || flags & QUEUE_FLAG_NATIVE_PROGRESS_FENCE != 0 {
-        return Err(PrivateError::QueueFlags);
-    }
-    if flags & QUEUE_FLAG_USER_MODE_SUBMISSION == 0 {
         return Err(PrivateError::QueueFlags);
     }
     Ok(())
@@ -455,8 +463,32 @@ mod tests {
         bad[0x20..0x24].copy_from_slice(&0x1000u32.to_le_bytes());
         assert_eq!(parse_queue_private(&bad), Err(PrivateError::RingBytes));
         let mut bad = queue();
+        bad[0x20..0x24].copy_from_slice(&0x3000u32.to_le_bytes());
+        assert_eq!(parse_queue_private(&bad), Err(PrivateError::RingBytes));
+        let mut bad = queue();
+        bad[0x20..0x24].copy_from_slice(&(MAX_RING_BYTES * 2).to_le_bytes());
+        assert_eq!(parse_queue_private(&bad), Err(PrivateError::RingBytes));
+        let mut bad = queue();
         bad[0x24..0x28].copy_from_slice(&0u32.to_le_bytes());
         assert_eq!(parse_queue_private(&bad), Err(PrivateError::Allocation));
+    }
+
+    #[test]
+    fn queue_format_accepts_the_captured_d3d11_record() {
+        // 610.88 nvwgf2umx CreateHwQueue input (d3d11test capture).
+        let mut b = vec![0u8; QUEUE_PRIVATE_BYTES];
+        b[0..4].copy_from_slice(&NVDA_MAGIC.to_le_bytes());
+        b[4..8].copy_from_slice(&0x0001_0000u32.to_le_bytes());
+        b[8..12].copy_from_slice(&0xb4u32.to_le_bytes());
+        b[12..16].copy_from_slice(b"XDVN");
+        b[0x10..0x14].copy_from_slice(&0x900u32.to_le_bytes());
+        put64(&mut b, 0x18, 0x0400_0000);
+        b[0x20..0x24].copy_from_slice(&D3D_RING_BYTES.to_le_bytes());
+        b[0x24..0x28].copy_from_slice(&0x4000_0680u32.to_le_bytes());
+        let q = parse_queue_private(&b).unwrap();
+        assert_eq!(q.gpfifo_va, 0x0400_0000);
+        assert_eq!(q.entries(), 8192);
+        assert_eq!(q.allocation, 0x4000_0680);
     }
 
     #[test]
@@ -508,7 +540,9 @@ mod tests {
     #[test]
     fn queue_and_progress_flags_do_not_claim_unsupported_semantics() {
         assert_eq!(validate_queue_flags(0x10), Ok(()));
-        assert_eq!(validate_queue_flags(0), Err(PrivateError::QueueFlags));
+        for captured_d3d11 in [0, 1, 2, 6] {
+            assert_eq!(validate_queue_flags(captured_d3d11), Ok(()));
+        }
         assert_eq!(validate_queue_flags(0x30), Err(PrivateError::QueueFlags));
         assert_eq!(validate_progress_fence(0x1000, 0x2000), Ok(()));
         assert_eq!(
