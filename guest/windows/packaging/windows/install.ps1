@@ -19,7 +19,7 @@ pnputil /add-driver (Join-Path $here 'helios_kmd_render.inf') /install
 $instanceId = Get-HeliosDeviceInstanceId
 if ($instanceId -match '^PCI\\VEN_10DE&DEV_2B85') {
     $stage = Install-HeliosNvidiaUmd $NvidiaPackage
-    Write-Host "NVIDIA UMDs staged in $($stage.Destination)"
+    Write-Host "NVIDIA UMDs $([math]::Floor($stage.Release / 100)).$(($stage.Release % 100).ToString('D2')) staged in $($stage.Destination)"
 }
 $k = 'HKLM:\SOFTWARE\Helios'
 if (-not (Test-Path $k)) { New-Item -Path $k | Out-Null }

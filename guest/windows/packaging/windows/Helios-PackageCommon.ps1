@@ -457,6 +457,27 @@ function Resolve-HeliosNvidiaPackage([string]$Path) {
     throw "NVIDIA 610.88 (32.0.16.1088) was not found in DriverStore. Pass -NvidiaPackage with the extracted Display.Driver directory."
 }
 
+# NVIDIA's release number from a file version of its package, without the dot:
+# 32.0.16.1088 -> 61088 (610.88), 32.0.15.6094 -> 56094 (560.94). The last
+# digit of the third field and the four of the fourth.
+function ConvertTo-HeliosNvidiaRelease([string]$FileVersion) {
+    $parts = $FileVersion.Trim().Split('.')
+    if ($parts.Count -ne 4 -or ($parts | Where-Object { $_ -notmatch '^\d+$' })) {
+        throw "Not an NVIDIA driver file version: '$FileVersion'."
+    }
+    $digits = $parts[2] + $parts[3].PadLeft(4, '0')
+    return [uint32]$digits.Substring($digits.Length - 5)
+}
+
+# The KMD reports this release to the host at every start of the NVIDIA
+# personality; the host refuses a release its RM is not (NvUmdVersion in
+# docs/WINDOWS-KNOBS.md). Written under the service's Parameters key.
+function Set-HeliosNvidiaUmdRelease([uint32]$Release) {
+    $key = "HKLM:\SYSTEM\CurrentControlSet\Services\helios_kmd_render\Parameters"
+    if (-not (Test-Path -LiteralPath $key)) { New-Item -Path $key | Out-Null }
+    Set-ItemProperty -LiteralPath $key -Name NvUmdVersion -Value $Release -Type DWord
+}
+
 function Get-HeliosDriverStorePath {
     $instanceId = Get-HeliosDeviceInstanceId
     $classKey = Get-HeliosDisplayClassKey $instanceId
@@ -636,5 +657,9 @@ function Install-HeliosNvidiaUmd([string]$Package) {
         $classKey = Get-HeliosDisplayClassKey (Get-HeliosDeviceInstanceId)
         $imported = Import-HeliosNvidiaDeviceRegistry $inf.FullName $classKey $destination
     }
-    return [pscustomobject]@{ Source = $source; Destination = $destination; RegistryValues = $imported }
+    # The release the KMD reports to the host, from the staged kernel image's
+    # file version (the UMDs carry the same one).
+    $release = ConvertTo-HeliosNvidiaRelease (Get-Item -LiteralPath (Join-Path $destination "nvlddmkm.sys")).VersionInfo.FileVersion
+    Set-HeliosNvidiaUmdRelease $release
+    return [pscustomobject]@{ Source = $source; Destination = $destination; RegistryValues = $imported; Release = $release }
 }
