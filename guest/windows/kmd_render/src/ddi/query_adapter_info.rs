@@ -293,18 +293,6 @@ unsafe fn query_driver_caps(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTE
     );
     let support_per_engine_tdr: BOOLEAN = 1;
     out.set(caps_offset!(SupportPerEngineTDR), support_per_engine_tdr);
-    // NvHybrid=1 (NVIDIA personality, testing only): report HybridDiscrete as
-    // the 610.88 adapter does (ADAPTERTYPE 0x31B). With it NVIDIA's D3D11 UMD
-    // keeps its copies off the GR channel's subchannel 4 (whose copy engine
-    // raises PBDMA DEVICE here) and d3d11test passes, but dxgkrnl refuses the
-    // adapter when it starts at boot (StartAdapter_AddAdapterFailed); a start
-    // after logon is accepted.
-    if nvidia_umd_enabled()
-        && crate::diag::read_config_dword(crate::diag::KnobName::new(b"NvHybrid"), 0) == 1
-    {
-        let hybrid_discrete: BOOLEAN = 1;
-        out.set(caps_offset!(HybridDiscrete), hybrid_discrete);
-    }
 
     // Required WDDM 1.2+ render-only caps. Bit positions verified field-by-field
     // against WDK 10.0.26100 `shared/d3dkmddi.h` (2026-06-18). `__bindgen_anon_1`
