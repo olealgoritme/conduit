@@ -517,6 +517,40 @@ pub fn apply_local(
                 *last = 0;
             }
         }
+        0x0100_0021 | 0x0100_0088 => {
+            // Vulkan ICD requests with a GPU-VA-like value at +0x20 (0x0088: and 5 at
+            // +0x30). 0x0021 is polled until it succeeds: refused, vkCreateDevice spun
+            // on it forever. The 610.88 capture answers both with a bare 0x30-byte
+            // success.
+            exact(buf, if header.function == 0x0100_0021 { 0x38 } else { 0x34 })?;
+            put32(buf, NVDA_SIZE_AT, NVDA_COMMON_HEADER_BYTES as u32);
+            put32(buf, NVDA_RESULT_AT, 1);
+            put32(buf, NVDA_RESULT2_AT, 1);
+        }
+        0x0100_007c => {
+            // Vulkan ICD query (1 at +0x20); the capture answers a 0x30-byte reply
+            // with 1 in the 64-bit word at +0x30.
+            exact(buf, 0x38)?;
+            put32(buf, NVDA_SIZE_AT, NVDA_COMMON_HEADER_BYTES as u32);
+            put32(buf, NVDA_RESULT_AT, 1);
+            put32(buf, NVDA_RESULT2_AT, 1);
+            put32(buf, 0x30, 1);
+            put32(buf, 0x34, 0);
+        }
+        0x0100_0001 => {
+            // 0xc0-byte driver identity query (field mask at +0x20). The 610.88
+            // capture answers the driver version as 61088 at +0x30, the branch
+            // string at +0x40 and the adapter name at +0x80, size unchanged.
+            exact(buf, 0xc0)?;
+            put32(buf, NVDA_RESULT_AT, 1);
+            put32(buf, NVDA_RESULT2_AT, 1);
+            for at in (0x30..0xc0).step_by(4) {
+                put32(buf, at, 0);
+            }
+            put32(buf, 0x30, NVDA_DRIVER_VERSION);
+            buf[0x40..0x40 + NVDA_DRIVER_BRANCH.len()].copy_from_slice(NVDA_DRIVER_BRANCH);
+            buf[0x80..0x80 + NVDA_ADAPTER_NAME.len()].copy_from_slice(NVDA_ADAPTER_NAME);
+        }
         0x0100_0124 => {
             // Device-scoped 0x48-byte request the D3D11 UMD makes when a swap
             // chain is created and destroyed (+0x30 = 1 or 0, two process
@@ -629,6 +663,12 @@ impl From<u32> for Persona {
 }
 
 /// NVDA 0x01000077: the address of a block in the caller's address space.
+/// Driver identity `0x01000001` reports: the NVIDIA UMD build these replies were
+/// captured with (610.88), its branch string and the adapter name.
+pub const NVDA_DRIVER_VERSION: u32 = 61088;
+pub const NVDA_DRIVER_BRANCH: &[u8] = b"r610_85-151";
+pub const NVDA_ADAPTER_NAME: &[u8] = b"NVIDIA GeForce RTX 5090";
+
 pub const NVDA_FN_USER_SHARED: u32 = 0x0100_0077;
 pub const NVDA_FN_USER_SHARED_BYTES: usize = 0x3c;
 
@@ -1387,6 +1427,30 @@ mod tests {
         assert_eq!(apply_local(&mut other, 0, 0), Ok(LocalOutcome::Applied));
         assert!(other[0x40..0xac].iter().all(|b| *b == 0));
         assert!(!is_head0_query(&other));
+    }
+
+    #[test]
+    fn vulkan_device_queries_match_the_capture() {
+        for (function, len) in [(0x0100_0021, 0x38), (0x0100_0088, 0x34), (0x0100_007c, 0x38)] {
+            let mut buf = local_request(function, len);
+            test_put32(&mut buf, 0x20, 0x140c_3200);
+            assert_eq!(apply_local(&mut buf, 0, 0), Ok(LocalOutcome::Applied));
+            assert_eq!(&buf[0x08..0x0c], &0x30u32.to_le_bytes());
+            assert_eq!(&buf[0x14..0x18], &1u32.to_le_bytes());
+            assert_eq!(&buf[0x2c..0x30], &1u32.to_le_bytes());
+            assert_eq!(&buf[0x20..0x24], &0x140c_3200u32.to_le_bytes());
+            if function == 0x0100_007c {
+                assert_eq!(&buf[0x30..0x38], &[1, 0, 0, 0, 0, 0, 0, 0]);
+            }
+            let mut short = local_request(function, len - 1);
+            assert_eq!(apply_local(&mut short, 0, 0), Err(LocalError::Invalid));
+        }
+        let mut id = local_request(0x0100_0001, 0xc0);
+        assert_eq!(apply_local(&mut id, 0, 0), Ok(LocalOutcome::Applied));
+        assert_eq!(&id[0x08..0x0c], &0xc0u32.to_le_bytes());
+        assert_eq!(&id[0x30..0x34], &61088u32.to_le_bytes());
+        assert_eq!(&id[0x40..0x4c], b"r610_85-151\0");
+        assert_eq!(&id[0x80..0x98], b"NVIDIA GeForce RTX 5090\0");
     }
 
     #[test]
