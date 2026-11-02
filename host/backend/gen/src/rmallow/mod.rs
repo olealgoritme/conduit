@@ -32,9 +32,12 @@ pub mod v535_129_03;
 pub mod v565_77_00;
 pub mod v580_178_04;
 pub mod v595_104_02;
+pub mod v595_112_07;
+pub mod v595_44_11;
 pub mod v595_44_13;
 pub mod v595_44_14;
 pub mod v595_44_15;
+pub mod v595_44_16;
 pub mod v595_45_04;
 pub mod v595_58_03;
 pub mod v595_71_05;
@@ -46,6 +49,7 @@ pub mod v610_43_02;
 pub mod v610_43_03;
 pub mod v610_57_04;
 pub mod v615_71_09;
+pub mod v615_71_10;
 pub mod v615_78_08;
 
 use crate::version::DriverVersion;
@@ -260,6 +264,14 @@ static PROFILES: &[Profile] = &[
         gss: || v580_178_04::GSS,
     },
     Profile {
+        version: DriverVersion::new(595, 44, 11),
+        ctrl: || v595_44_11::CTRL,
+        class: || v595_44_11::CLASS,
+        deprec: || v595_44_11::DEPREC,
+        catch_all: || v595_44_11::CATCH_ALL,
+        gss: || v595_44_11::GSS,
+    },
+    Profile {
         version: DriverVersion::new(595, 44, 13),
         ctrl: || v595_44_13::CTRL,
         class: || v595_44_13::CLASS,
@@ -282,6 +294,14 @@ static PROFILES: &[Profile] = &[
         deprec: || v595_44_15::DEPREC,
         catch_all: || v595_44_15::CATCH_ALL,
         gss: || v595_44_15::GSS,
+    },
+    Profile {
+        version: DriverVersion::new(595, 44, 16),
+        ctrl: || v595_44_16::CTRL,
+        class: || v595_44_16::CLASS,
+        deprec: || v595_44_16::DEPREC,
+        catch_all: || v595_44_16::CATCH_ALL,
+        gss: || v595_44_16::GSS,
     },
     Profile {
         version: DriverVersion::new(595, 45, 4),
@@ -348,6 +368,14 @@ static PROFILES: &[Profile] = &[
         gss: || v595_104_02::GSS,
     },
     Profile {
+        version: DriverVersion::new(595, 112, 7),
+        ctrl: || v595_112_07::CTRL,
+        class: || v595_112_07::CLASS,
+        deprec: || v595_112_07::DEPREC,
+        catch_all: || v595_112_07::CATCH_ALL,
+        gss: || v595_112_07::GSS,
+    },
+    Profile {
         version: DriverVersion::new(610, 43, 2),
         ctrl: || v610_43_02::CTRL,
         class: || v610_43_02::CLASS,
@@ -378,6 +406,14 @@ static PROFILES: &[Profile] = &[
         deprec: || v615_71_09::DEPREC,
         catch_all: || v615_71_09::CATCH_ALL,
         gss: || v615_71_09::GSS,
+    },
+    Profile {
+        version: DriverVersion::new(615, 71, 10),
+        ctrl: || v615_71_10::CTRL,
+        class: || v615_71_10::CLASS,
+        deprec: || v615_71_10::DEPREC,
+        catch_all: || v615_71_10::CATCH_ALL,
+        gss: || v615_71_10::GSS,
     },
     Profile {
         version: DriverVersion::new(615, 78, 8),
