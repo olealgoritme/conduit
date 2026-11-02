@@ -152,6 +152,33 @@ pub struct ClientMap {
     pub objects_len: u8,
 }
 
+/// Record `object` (a native allocation's RM memory) as nameable in `objects`
+/// (the first `*len` entries). `false` when it is 0, already there, or the list
+/// is full.
+pub fn note_object(objects: &mut [u32; 64], len: &mut u8, object: u32) -> bool {
+    let n = usize::from(*len).min(objects.len());
+    if object == 0 || objects[..n].contains(&object) || n == objects.len() {
+        return false;
+    }
+    objects[n] = object;
+    *len = (n + 1) as u8;
+    true
+}
+
+/// Remove `object` again (its allocation was destroyed): a freed handle must not
+/// stay nameable, and the list must not fill up with them. The last entry takes
+/// its place.
+pub fn forget_object(objects: &mut [u32; 64], len: &mut u8, object: u32) -> bool {
+    let n = usize::from(*len).min(objects.len());
+    let Some(i) = objects[..n].iter().position(|&o| o == object && o != 0) else {
+        return false;
+    };
+    objects[i] = objects[n - 1];
+    objects[n - 1] = 0;
+    *len = (n - 1) as u8;
+    true
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HandleError {
     Client(u32),
@@ -695,6 +722,36 @@ pub fn is_head0_query(buf: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn destroyed_memory_is_no_longer_nameable_and_frees_its_slot() {
+        let mut objects = [0u32; 64];
+        let mut len = 0u8;
+        assert!(note_object(&mut objects, &mut len, 0x4e57_1000));
+        assert!(note_object(&mut objects, &mut len, 0x4e57_1001));
+        assert!(!note_object(&mut objects, &mut len, 0x4e57_1000));
+        assert!(!note_object(&mut objects, &mut len, 0));
+        assert!(forget_object(&mut objects, &mut len, 0x4e57_1000));
+        assert!(!forget_object(&mut objects, &mut len, 0x4e57_1000));
+        assert_eq!((len, objects[0], objects[1]), (1, 0x4e57_1001, 0));
+        let map = ClientMap {
+            root: 1,
+            device: 2,
+            subdevice: 3,
+            objects,
+            objects_len: len,
+        };
+        assert_eq!(translate_handles(0, 0x4e57_1000, &map), Err(HandleError::Object(0x4e57_1000)));
+        assert_eq!(translate_handles(0, 0x4e57_1001, &map), Ok((1, 0x4e57_1001)));
+        // A full list takes a new object again once one was forgotten.
+        for i in 0..63 {
+            assert!(note_object(&mut objects, &mut len, 0x100 + i));
+        }
+        assert!(!note_object(&mut objects, &mut len, 0x999));
+        assert!(forget_object(&mut objects, &mut len, 0x100));
+        assert!(note_object(&mut objects, &mut len, 0x999));
+        assert!(!forget_object(&mut objects, &mut len, 0));
+    }
+
     extern crate std;
 
     use super::*;

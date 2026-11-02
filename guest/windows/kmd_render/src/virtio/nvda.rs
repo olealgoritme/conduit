@@ -143,14 +143,11 @@ impl Session {
     }
 
     fn note_memory(&mut self, memory: u32) {
-        if memory == 0 || self.objects[..usize::from(self.objects_len)].contains(&memory) {
-            return;
-        }
-        let index = usize::from(self.objects_len);
-        if let Some(slot) = self.objects.get_mut(index) {
-            *slot = memory;
-            self.objects_len += 1;
-        }
+        nd::note_object(&mut self.objects, &mut self.objects_len, memory);
+    }
+
+    fn forget_memory(&mut self, memory: u32) {
+        nd::forget_object(&mut self.objects, &mut self.objects_len, memory);
     }
 
     fn next(&self) -> Option<Step> {
@@ -770,6 +767,11 @@ pub fn escape(
 /// Register one real object returned by native allocation for later RM controls.
 pub fn note_memory(memory: u32) {
     SESSION.lock().note_memory(memory);
+}
+
+/// The allocation behind `memory` was destroyed: its handle is no longer nameable.
+pub fn forget_memory(memory: u32) {
+    SESSION.lock().forget_memory(memory);
 }
 
 extern "system" {
