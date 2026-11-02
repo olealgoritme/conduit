@@ -253,12 +253,19 @@ pub fn is_nvgl_record(bytes: &[u8]) -> bool {
 }
 
 /// A Vulkan record's size as the 610.88 KMD rounds it: (64-KiB units, the fraction
-/// at +0xcc rounded up to 1/16 unit); from 2 MiB on, a fraction rounds to a whole
-/// unit (0x3f units + 0xc0000000 -> 0x40 units).
+/// at +0xcc rounded up to 1/16 unit; for an image kind (+0x10 bit 3) up to a whole
+/// unit); from 2 MiB on, a fraction rounds to a whole unit (0x3f units +
+/// 0xc0000000 -> 0x40 units). An untyped record (+0x10 = 0) has no fraction: its
+/// +0xcc is not size and stays as the UMD wrote it.
 fn nvgl_size(bytes: &[u8]) -> Option<(u32, u32)> {
     let units = get32(bytes, SIZE_UNITS_AT)?;
+    let kind = get32(bytes, 0x10)?;
+    if kind == 0 {
+        return Some((units, 0));
+    }
     let fraction = get32(bytes, 0xcc)?;
-    let rounded = u64::from(fraction).div_ceil(0x1000_0000) * 0x1000_0000;
+    let step: u64 = if kind & NVGL_KIND_IMAGE != 0 { 1 << 32 } else { 0x1000_0000 };
+    let rounded = u64::from(fraction).div_ceil(step) * step;
     let (mut units, mut fraction) = if rounded > u64::from(u32::MAX) {
         (units.checked_add(1)?, 0)
     } else {
@@ -271,13 +278,22 @@ fn nvgl_size(bytes: &[u8]) -> Option<(u32, u32)> {
     Some((units, fraction))
 }
 
-pub const NVGL_WRITEBACK_FIELDS: usize = 19;
+/// +0x10 bit 3 of an NVGL record: an image (the swap-chain images and the
+/// vktest 16x8 image of the capture), with its width at +0x30 and its bytes per
+/// pixel in the 16-bit word at +0x6e.
+const NVGL_KIND_IMAGE: u32 = 0x8;
 
-/// Fields of a Vulkan (`NVGL`) record the 610.88 KMD writes (every NVGL record of
-/// the vktest capture): the same frame as a D3D record's, with its own size
-/// fields (+0xcc/+0xd0/+0xd4/+0xd8), +0x8c = 0x7810, +0xc0 | 0x4000 and the
-/// page/placement bits in +0xe0 and +0x10c. Writing the CUDA-shaped handles here
-/// instead broke vkCreateDevice (the ICD freed its first allocations and crashed).
+pub const NVGL_WRITEBACK_FIELDS: usize = 18;
+
+/// Fields of a Vulkan (`NVGL`) record the 610.88 KMD writes (all 75 NVGL records
+/// of the vktest capture): the same frame as a D3D record's, with its own size
+/// fields (+0xcc/+0xd0/+0xd4/+0xd8), +0x8c = 0x7810, +0xc0 | 0x4000, the
+/// page/placement bits in +0xe0 and +0x10c, and +0xc8: 0x10000000 for a typed
+/// buffer, an image's row pitch in the same 2^-32-of-64-KiB fixed point (width x
+/// bytes per pixel, << 16), the UMD's own value for an untyped record. +0xdc is
+/// the UMD's input and is left alone (0x20000000 / 0x20040000 there are kept).
+/// Writing the CUDA-shaped handles here instead broke vkCreateDevice (the ICD
+/// freed its first allocations and crashed).
 pub fn nvgl_writeback(input: &[u8]) -> Option<[(usize, u32); NVGL_WRITEBACK_FIELDS]> {
     let kind = get32(input, 0x10)?;
     let bc = get32(input, 0xbc)?;
@@ -285,13 +301,15 @@ pub fn nvgl_writeback(input: &[u8]) -> Option<[(usize, u32); NVGL_WRITEBACK_FIEL
     let last = (units + u32::from(fraction != 0)).saturating_sub(1);
     let typed = kind != 0;
     let wide = kind & 0x20_0000 != 0;
-    // Page bits: 0x280 for the narrow kind; for the wide kind 0x80 / 0x100 / 0x180
-    // by size (1 unit / 8 units or +0xbc bit 16 / 2 MiB and up).
+    let image = kind & NVGL_KIND_IMAGE != 0;
+    // Page bits: 0x280 for the narrow kind; for the wide kind 0x180 from 2 MiB,
+    // 0x100 from 8 units, for an image, or with +0xbc bits 30 and 24 both set
+    // (0xc10d0000; 0xc00d0000 and 0x01100000 stay 0x80), else 0x80.
     let page = if typed && !wide {
         0x280
     } else if wide && units >= 0x20 {
         0x180
-    } else if wide && (units >= 8 || bc & 0x1_0000 != 0) {
+    } else if wide && (units >= 8 || image || bc & 0x4100_0000 == 0x4100_0000) {
         0x100
     } else {
         0x80
@@ -306,18 +324,27 @@ pub fn nvgl_writeback(input: &[u8]) -> Option<[(usize, u32); NVGL_WRITEBACK_FIEL
         x108 |= 0x8_0000;
         x120 |= 0x8_0000;
     }
+    let c8 = if image {
+        let width = get32(input, 0x30)?;
+        let bytes_per_pixel = get32(input, 0x6c)? >> 16;
+        width.wrapping_mul(bytes_per_pixel) << 16
+    } else if typed {
+        0x1000_0000
+    } else {
+        get32(input, 0xc8)?
+    };
+    let cc = if typed { fraction } else { get32(input, 0xcc)? };
     Some([
         (0x38, 1),
         (0x3c, 1),
         (0x40, 1),
         (0x8c, 0x7810),
         (0xc0, get32(input, 0xc0)? | 0x4000),
-        (0xc8, if typed { 0x1000_0000 } else { get32(input, 0xc8)? }),
-        (0xcc, fraction),
+        (0xc8, c8),
+        (0xcc, cc),
         (0xd0, units),
         (0xd4, fraction.wrapping_sub(0x1_0000)),
         (0xd8, last),
-        (0xdc, 0),
         (0xe0, e0),
         (0xf4, 0xffff_0000),
         (0xf8, 0xffff_ffff),
@@ -327,6 +354,25 @@ pub fn nvgl_writeback(input: &[u8]) -> Option<[(usize, u32); NVGL_WRITEBACK_FIEL
         (0x120, x120),
         (0x1ac, 0x6_0000),
     ])
+}
+
+/// The allocation alignment NVIDIA's 610.88 KMD gives a Vulkan record, from the
+/// page bits its writeback reports at +0xe0: 64 KiB for 0x100 (64-KiB pages),
+/// 2 MiB for 0x180 (2-MiB pages); `None` (4 KiB) otherwise. In the vktest
+/// capture every VA VidMm handed out for a 0x100 record was 64-KiB aligned and
+/// every one for a 0x180 record 2-MiB aligned, while 0x80 records landed on
+/// 4-KiB boundaries.
+pub fn nvgl_alignment(input: &[u8]) -> Option<u32> {
+    if !is_nvgl_record(input) {
+        return None;
+    }
+    let fields = nvgl_writeback(input)?;
+    let e0 = fields.iter().find(|(at, _)| *at == 0xe0)?.1;
+    match e0 & 0x180 {
+        0x100 => Some(0x1_0000),
+        0x180 => Some(0x20_0000),
+        _ => None,
+    }
 }
 
 /// Fields of a D3D record the KMD writes, as the 610.88 KMD does (every D3D11
@@ -1206,6 +1252,84 @@ mod nvgl_tests {
         let p = parse_allocation_private(&r).unwrap();
         assert_eq!(p.system_memory, 0);
         assert_eq!(p.size, ALLOCATION_UNIT);
+    }
+
+    /// Writeback of `rec` over its input bytes, as the UMD reads it back.
+    fn after(rec: &[u8; ALLOCATION_PRIVATE_BYTES]) -> [u8; ALLOCATION_PRIVATE_BYTES] {
+        let mut out = *rec;
+        for (at, value) in nvgl_writeback(rec).unwrap() {
+            put32(&mut out, at, value).unwrap();
+        }
+        out
+    }
+
+    #[test]
+    fn vulkan_image_records_match_the_capture() {
+        // vktest seq 5130: 640x480 swap-chain image, kind 0x02200808, 0x14 units.
+        let swap = record(&[(0x10, 0x0220_0808), (0x18, 8), (0x20, 0x8211), (0x24, 3), (0x28, 7), (0x30, 0x280), (0x34, 0x1e0), (0x38, 1), (0x68, 0x01e0_0000), (0x6c, 0x4_0000), (0x70, 0x3_0000), (0x74, 0x3_0000), (0x78, 0x1_0000), (0x90, 0x1_0000), (0xbc, 0xc000_0000), (0xc0, 0x0280_0200), (0xc4, 0x01e0_0000), (0xd0, 0x14), (0xdc, 0x2004_0000), (0xe0, 2), (0xec, 0x1_0000)]);
+        let a = after(&swap);
+        for (at, want) in [(0xc0, 0x0280_4200), (0xc8, 0x0a00_0000), (0xcc, 0), (0xd0, 0x14), (0xd4, 0xffff_0000), (0xd8, 0x13), (0xdc, 0x2004_0000), (0xe0, 0x102)] {
+            assert_eq!(get32(&a, at), Some(want), "swap +{at:#x}");
+        }
+        // Seq 2457: 16x8 image, kind 0x00200808, 512 bytes (0x02000000 at +0xcc)
+        // rounded up to one whole unit.
+        let small = record(&[(0x10, 0x0020_0808), (0x14, 0x4_0000), (0x20, 0x201), (0x28, 0x5a), (0x30, 0x10), (0x34, 8), (0x68, 0x8_0000), (0x6c, 0x4_0000), (0x70, 0x3_0000), (0x74, 0x3_0000), (0x78, 0x1_0000), (0x90, 0x1_0000), (0xb8, 0x2_0000), (0xbc, 0xc000_0000), (0xc0, 0x10_0200), (0xc4, 0x8_0000), (0xcc, 0x0200_0000), (0xdc, 0x4_0000), (0xe0, 2), (0xec, 0x1_0000)]);
+        let a = after(&small);
+        for (at, want) in [(0xc0, 0x10_4200), (0xc8, 0x40_0000), (0xcc, 0), (0xd0, 1), (0xd4, 0xffff_0000), (0xd8, 0), (0xdc, 0x4_0000), (0xe0, 0x102)] {
+            assert_eq!(get32(&a, at), Some(want), "small +{at:#x}");
+        }
+    }
+
+    #[test]
+    fn untyped_vulkan_record_keeps_its_cc_word() {
+        // Seq 2153: kind 0, 1 unit, +0xcc = 1 is not a size fraction.
+        let r = record(&[(0x14, 0x4_0000), (0x20, 0x200), (0x30, 0x1_0000), (0x34, 1), (0x68, 0x1_0000), (0x6c, 0x1_0000), (0xbc, 0xc000_0000), (0xc0, 0x200), (0xc4, 0x1_0001), (0xcc, 1), (0xd0, 1), (0xe0, 0x800), (0xec, 0x1_0000)]);
+        let a = after(&r);
+        for (at, want) in [(0xc0, 0x4200), (0xc8, 0), (0xcc, 1), (0xd0, 1), (0xd4, 0xffff_0000), (0xd8, 0), (0xe0, 0x880)] {
+            assert_eq!(get32(&a, at), Some(want), "+{at:#x}");
+        }
+    }
+
+    #[test]
+    fn vulkan_dc_word_is_the_umds() {
+        // Seq 3509: kind 0x02200800, 1 unit, +0xdc = 0x20000000 survives.
+        let r = record(&[(0x10, 0x0220_0800), (0xbc, 0xc00d_0000), (0xd0, 1), (0xdc, 0x2000_0000)]);
+        assert_eq!(get32(&after(&r), 0xdc), Some(0x2000_0000));
+        assert!(nvgl_writeback(&r).unwrap().iter().all(|(at, _)| *at != 0xdc));
+    }
+
+    #[test]
+    fn vulkan_page_bits_follow_bc_bits_30_and_24() {
+        // Capture: 0xc00d0000 with 1 unit -> 0x80 (3 records), 0xc10d0000 with
+        // 1/4/0x10 units -> 0x100 (9 records), 0x01100000 (kind 0x02200000) -> 0x80.
+        let plain = record(&[(0x10, 0x0220_0800), (0xbc, 0xc00d_0000), (0xd0, 1)]);
+        assert_eq!(get32(&after(&plain), 0xe0), Some(0x80));
+        let plain_fraction = record(&[(0x10, 0x0220_0800), (0xbc, 0xc00d_0000), (0xcc, 0x40_0000)]);
+        assert_eq!(get32(&after(&plain_fraction), 0xe0), Some(0x80));
+        for units in [1, 4, 0x10] {
+            let big_pages = record(&[(0x10, 0x0220_0800), (0xbc, 0xc10d_0000), (0xd0, units)]);
+            assert_eq!(get32(&after(&big_pages), 0xe0), Some(0x100), "{units} units");
+        }
+        let first = record(&[(0x10, 0x0220_0000), (0xbc, 0x110_0000), (0xd0, 1)]);
+        assert_eq!(get32(&after(&first), 0xe0), Some(0x80));
+    }
+
+    #[test]
+    fn vulkan_alignment_follows_the_page_bits() {
+        // Capture: 0xc10d0000 records (0x100) at 64-KiB VAs, 0x20-unit records
+        // (0x180) at 2-MiB VAs, 0xc00d0000 one-unit records (0x80) at 4-KiB VAs.
+        let big = record(&[(0x10, 0x0220_0800), (0xbc, 0xc10d_0000), (0xd0, 4)]);
+        assert_eq!(nvgl_alignment(&big), Some(0x1_0000));
+        let huge = record(&[(0x10, 0x0220_0000), (0xbc, 0x400d_0000), (0xd0, 0x20)]);
+        assert_eq!(nvgl_alignment(&huge), Some(0x20_0000));
+        let small = record(&[(0x10, 0x0220_0800), (0xbc, 0xc00d_0000), (0xd0, 1)]);
+        assert_eq!(nvgl_alignment(&small), None);
+        // The narrow kind's 0x280 is not a large-page record.
+        let narrow = record(&[(0x10, 0x0200_0000), (0xd0, 0x40)]);
+        assert_eq!(nvgl_alignment(&narrow), None);
+        let mut d3d = big;
+        put32(&mut d3d, RECORD_TAG_AT, 0x4e56_4458).unwrap();
+        assert_eq!(nvgl_alignment(&d3d), None);
     }
 
     #[test]

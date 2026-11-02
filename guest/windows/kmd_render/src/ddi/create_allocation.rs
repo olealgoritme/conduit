@@ -3202,6 +3202,20 @@ pub(crate) unsafe fn native_ring_backing(
 /// Create one native 610.88 allocation.  This is deliberately entered before
 /// the Helios/Venus parser: the 586-byte NVDA record is a different ABI and no
 /// GEM, blob, or Venus identity is manufactured for it.
+/// `NvAlignLg`: native Vulkan allocations given a 64-KiB or 2-MiB alignment.
+static NV_ALIGN_LARGE: AtomicU32 = AtomicU32::new(0);
+
+/// NvAlignOff=1 (test knob): every native allocation keeps 4-KiB alignment.
+fn nvgl_alignment_off() -> bool {
+    static OFF: AtomicU32 = AtomicU32::new(u32::MAX);
+    let mut off = OFF.load(Ordering::Relaxed);
+    if off == u32::MAX {
+        off = crate::diag::read_config_dword(crate::diag::KnobName::new(b"NvAlignOff"), 0);
+        OFF.store(off, Ordering::Relaxed);
+    }
+    off == 1
+}
+
 unsafe fn create_native_one(
     passive: PassiveLevel,
     adapter: &AdapterContext,
@@ -3240,6 +3254,14 @@ unsafe fn create_native_one(
         _ => STATUS_INVALID_PARAMETER,
     })?;
     let shared = native::is_shared_record(bytes);
+    // Large-page Vulkan records get NVIDIA's 64-KiB / 2-MiB alignment (read from
+    // the input record, before `create` writes the writeback over it). The test
+    // knob NvAlignOff=1 keeps every native allocation at 4 KiB.
+    let large_page_alignment = if private.system_memory == 0 && !nvgl_alignment_off() {
+        native::nvgl_alignment(bytes)
+    } else {
+        None
+    };
     let created = crate::virtio::native_memory::create(passive, adapter, &private, bytes)
         .map_err(|error| {
             // Which native-memory error refused it (Error discriminant + 1), and where.
@@ -3341,7 +3363,11 @@ unsafe fn create_native_one(
     crate::diag::record_named_bytes(b"NvAlSeg", segment);
     info.SupportedWriteSegmentSet = supported;
     unsafe {
-        info.__bindgen_anon_1.Alignment = PAGE as UINT;
+        info.__bindgen_anon_1.Alignment = large_page_alignment.unwrap_or(PAGE as u32) as UINT;
+        if large_page_alignment.is_some() {
+            let n = NV_ALIGN_LARGE.fetch_add(1, Ordering::Relaxed) + 1;
+            crate::diag::record_named_bytes(b"NvAlignLg", n);
+        }
         info.PreferredSegment
             .__bindgen_anon_1
             .__bindgen_anon_1
