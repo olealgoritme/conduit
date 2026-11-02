@@ -145,6 +145,11 @@ pub enum MsgType {
     /// Used by the native Windows WDDM CPU aperture, where placement is not
     /// optional and an RM-chosen alternative would be incorrect.
     MmapAt = 35,
+    /// Guest → host: the release of NVIDIA's own user-mode drivers the guest
+    /// was installed with, which must be the host RM's ([`UmdVersion`]). A
+    /// backend that does not know the message answers `InvalidMsgType`, which
+    /// a guest reads as "not checked".
+    UmdVersion = 36,
 }
 
 impl MsgType {
@@ -173,6 +178,7 @@ impl MsgType {
             30 => Self::GpuCmd,
             31 => Self::RmResourceImport,
             35 => Self::MmapAt,
+            36 => Self::UmdVersion,
             _ => return None,
         })
     }
@@ -754,6 +760,98 @@ pub struct RmResourceImport {
     pub flags: u32,
     /// 0.
     pub reserved: u32,
+}
+
+/// [`UmdVersion::kind`]: NVIDIA's Windows user-mode drivers, numbered the way
+/// their own package is (`610.88` for file version `32.0.16.1088`).
+pub const UMD_KIND_NVIDIA_WINDOWS: u32 = 1;
+
+/// Request payload for `MsgType::UmdVersion`, following a `MsgHeader` (whose
+/// `handle` is 0). 16 bytes.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct UmdVersion {
+    /// [`UMD_KIND_NVIDIA_WINDOWS`].
+    pub kind: u32,
+    /// `610` of `610.88`.
+    pub major: u32,
+    /// `88` of `610.88`.
+    pub minor: u32,
+    /// 0.
+    pub reserved: u32,
+}
+
+/// [`UmdVersionReply::verdict`]: the UMDs are the release paired with the
+/// host RM (or the one the host pins).
+pub const UMD_VERDICT_MATCH: u32 = 0;
+/// [`UmdVersionReply::verdict`]: they are not. The backend refuses every RM
+/// call from this guest until the next report matches.
+pub const UMD_VERDICT_MISMATCH: u32 = 1;
+/// [`UmdVersionReply::verdict`]: the host cannot tell (no host release known,
+/// or the check is switched off on the host).
+pub const UMD_VERDICT_UNCHECKED: u32 = 2;
+/// [`UmdVersionReply::verdict`]: no pair is known for the host release, and
+/// the UMDs are at least from its branch (`610` for `610.57.04`).
+pub const UMD_VERDICT_BRANCH: u32 = 3;
+
+/// Response payload for `MsgType::UmdVersion`, following a `MsgHeader` with
+/// status 0. 16 bytes.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct UmdVersionReply {
+    /// `UMD_VERDICT_*`.
+    pub verdict: u32,
+    /// The host RM release, `610.57.04` as 610, 57, 4; zeros when unknown.
+    pub host_major: u32,
+    pub host_minor: u32,
+    pub host_patch: u32,
+}
+
+impl UmdVersion {
+    /// Decode from the bytes after the header. `None` if too short.
+    pub fn from_bytes(b: &[u8]) -> Option<Self> {
+        let w = |at: usize| Some(u32::from_le_bytes(b.get(at..at + 4)?.try_into().ok()?));
+        Some(Self {
+            kind: w(0)?,
+            major: w(4)?,
+            minor: w(8)?,
+            reserved: w(12)?,
+        })
+    }
+
+    pub fn to_bytes(&self) -> [u8; 16] {
+        words16([self.kind, self.major, self.minor, self.reserved])
+    }
+}
+
+impl UmdVersionReply {
+    /// Decode from the bytes after the header. `None` if too short.
+    pub fn from_bytes(b: &[u8]) -> Option<Self> {
+        let w = |at: usize| Some(u32::from_le_bytes(b.get(at..at + 4)?.try_into().ok()?));
+        Some(Self {
+            verdict: w(0)?,
+            host_major: w(4)?,
+            host_minor: w(8)?,
+            host_patch: w(12)?,
+        })
+    }
+
+    pub fn to_bytes(&self) -> [u8; 16] {
+        words16([
+            self.verdict,
+            self.host_major,
+            self.host_minor,
+            self.host_patch,
+        ])
+    }
+}
+
+fn words16(w: [u32; 4]) -> [u8; 16] {
+    let mut o = [0u8; 16];
+    for (i, v) in w.into_iter().enumerate() {
+        o[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    o
 }
 
 /// [`RmResourceImportReply::flags`]: `modifier` is known.
@@ -1405,6 +1503,8 @@ const _: () = {
     assert!(size_of::<IoctlResp>() == 12);
     assert!(size_of::<MmapReq>() == 24);
     assert!(size_of::<MmapAtReq>() == 32);
+    assert!(size_of::<UmdVersion>() == 16);
+    assert!(size_of::<UmdVersionReply>() == 16);
     assert!(size_of::<MmapResp>() == 24);
     assert!(size_of::<MunmapReq>() == 8);
     assert!(size_of::<FileEntry>() == 8);
@@ -1634,6 +1734,9 @@ mod tests {
         assert_eq!(MsgType::from_u32(34), Some(MsgType::DisplayModeList));
         assert_eq!(MsgType::MmapAt as u32, 35);
         assert_eq!(MsgType::from_u32(35), Some(MsgType::MmapAt));
+        assert_eq!(MsgType::UmdVersion as u32, 36);
+        assert_eq!(MsgType::from_u32(36), Some(MsgType::UmdVersion));
+        assert_eq!(MsgType::from_u32(37), None);
         let modes = [(5120, 1440), (1920, 1080)];
         let mut buf = [0u8; 64];
         assert_eq!(
