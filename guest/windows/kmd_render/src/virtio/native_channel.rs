@@ -1220,10 +1220,16 @@ fn grce_engine(io: Io<'_>, client: &NativeClient) -> Option<u32> {
     let mut partners = [0u8; 144];
     partners[0..4].copy_from_slice(&1u32.to_le_bytes()); // NV2080_ENGINE_TYPE_GR0
     partners[4..8].copy_from_slice(&cp::Gen::Gb202.classes().gpfifo.to_le_bytes());
-    if io
-        .control(client, nd::H_SUBDEVICE, 0x2080_0147, &mut partners)
-        .is_ok()
-    {
+    let asked = io.control(client, nd::H_SUBDEVICE, 0x2080_0147, &mut partners);
+    // NvChGrPartQ: 0x100 + error kind when the query failed, else the count.
+    crate::diag::record_named_bytes(
+        b"NvChGrPartQ",
+        match asked {
+            Ok(()) => u32::from_le_bytes([partners[12], partners[13], partners[14], partners[15]]),
+            Err(error) => 0x100 | error as u32,
+        },
+    );
+    if asked.is_ok() {
         let count = u32::from_le_bytes([partners[12], partners[13], partners[14], partners[15]]);
         if count >= 1 {
             let first = u32::from_le_bytes([partners[16], partners[17], partners[18], partners[19]]);
