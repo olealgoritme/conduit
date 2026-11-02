@@ -1706,7 +1706,60 @@ pub fn patch_gpu_bytes(
 /// operation.  Invalid PTEs unmap.  A changed live mapping is refused until the
 /// parent marks that address space idle; unmapping and fresh mapping remain
 /// synchronous, so a following FLUSH_TLB has no deferred work.
+/// Where the last `update_leaf` stopped (`leaf_stage`): counted per stage on an
+/// error (`NvLf<stage>`), and a watch event (op 11, detail = stage; 0xff = no
+/// change needed, 0xfe = mapped) for watched pages.
+static LEAF_STAGE: AtomicU32 = AtomicU32::new(0);
+
+/// `NvLfPad`: leaf-update pages past the end of the RM memory (VidMm's padding),
+/// skipped; `NvLfPadOff` / `NvLfPadSz` the last one's offset and the memory size
+/// (4-KiB pages).
+fn note_padding(offset: u64, size: u64) {
+    static N: AtomicU32 = AtomicU32::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+    if n == 1 || n % 256 == 0 {
+        crate::diag::record_named_bytes(b"NvLfPad", n);
+        crate::diag::record_named_bytes(b"NvLfPadOff", (offset >> 12) as u32);
+        crate::diag::record_named_bytes(b"NvLfPadSz", (size >> 12) as u32);
+    }
+}
+
+fn leaf_stage(stage: u32) {
+    LEAF_STAGE.store(stage, Ordering::Relaxed);
+}
+
 pub fn update_leaf(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    id: u32,
+    process: usize,
+    first_va: u64,
+    allocation_offset: u64,
+    pieces: &[Option<nm::MappingPiece>],
+) -> Result<(), Error> {
+    leaf_stage(1);
+    let result = update_leaf_inner(passive, adapter, id, process, first_va, allocation_offset, pieces);
+    let stage = LEAF_STAGE.load(Ordering::Relaxed);
+    let len = pieces.len() as u64 * nm::PAGE_BYTES;
+    match result {
+        Ok(()) => watch::event(first_va, len, 11, stage, process),
+        Err(error) => {
+            watch::event(first_va, len, 11, stage, process);
+            static COUNTS: [AtomicU32; 16] = [const { AtomicU32::new(0) }; 16];
+            let k = (stage as usize).min(15);
+            let n = COUNTS[k].fetch_add(1, Ordering::Relaxed) + 1;
+            let digit = if k < 10 { b'0' + k as u8 } else { b'a' + k as u8 - 10 };
+            crate::diag::record_named_bytes(&[b'N', b'v', b'L', b'f', digit], n);
+            crate::diag::record_named_bytes(b"NvLfErr", (stage << 8) | error as u32);
+            crate::diag::record_named_bytes(b"NvLfVa", (first_va >> 12) as u32);
+            crate::diag::record_named_bytes(b"NvLfOff", (allocation_offset >> 12) as u32);
+        }
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn update_leaf_inner(
     passive: PassiveLevel,
     adapter: &AdapterContext,
     id: u32,
@@ -1722,6 +1775,7 @@ pub fn update_leaf(
         adapter,
         client,
     };
+    leaf_stage(2);
     let (memory, size, system_backed, old) = {
         let state = STATE.lock();
         let allocation = state.allocation(id)?;
@@ -1735,7 +1789,9 @@ pub fn update_leaf(
             allocation.mappings.clone(),
         )
     };
+    leaf_stage(3);
     let space = ensure_space(&io, process)?;
+    leaf_stage(4);
     let count = pieces.len() as u64;
     let len = count.checked_mul(nm::PAGE_BYTES).ok_or(Error::Invalid)?;
     if count == 0 || first_va & (nm::PAGE_BYTES - 1) != 0 {
@@ -1754,7 +1810,17 @@ pub fn update_leaf(
             if *piece != expected {
                 return Err(Error::Invalid);
             }
+            // VidMm maps an allocation's VA range in its own granularity: the
+            // pages past the RM memory's end are its padding, which nothing
+            // reads. Map what exists; refusing the whole update left offset 0
+            // unmapped too (CE writes faulted at the allocation's first page).
+            if piece.memory_end().is_none_or(|end| end > size) {
+                note_padding(piece.memory_offset, size);
+                continue;
+            }
+            leaf_stage(5);
             nm::validate_piece(*piece, size).map_err(|_| Error::Invalid)?;
+            leaf_stage(4);
             new.push(*piece);
         }
     }
@@ -1766,8 +1832,10 @@ pub fn update_leaf(
         .filter(|m| m.process == process)
         .collect();
     let old_pieces: Vec<nm::MappingPiece> = old_process.iter().map(|m| m.piece).collect();
+    leaf_stage(6);
     let unmapped =
         nm::replace_range(&old_pieces, first_va, len, None, size).map_err(|_| Error::Invalid)?;
+    leaf_stage(7);
     let mut final_pieces = unmapped.pieces;
     for piece in new.iter().copied() {
         final_pieces = nm::replace_range(&final_pieces, piece.va, piece.len, Some(piece), size)
@@ -1786,7 +1854,9 @@ pub fn update_leaf(
     // a foreign range still holds at these VAs is gone from VidMm's view, so it
     // goes from RM's too (RM refused the new fixed mapping over the stale one:
     // NV_ERR_INVALID_ARGUMENT, and the GPU faulted on the unmapped range).
+    leaf_stage(8);
     evict_range(&io, space, process, first_va, len, Some(id))?;
+    leaf_stage(9);
 
     let affected_old: Vec<HostMapping> = old_process
         .iter()
@@ -1816,8 +1886,10 @@ pub fn update_leaf(
         .map(|m| m.piece)
         .eq(affected_new.iter().copied())
     {
+        leaf_stage(0xff);
         return Ok(());
     }
+    leaf_stage(10);
 
     // Replacing a live mapping: VidMm only changes an allocation's placement once
     // no GPU work that uses it is outstanding (it waits for the paging and
@@ -1840,12 +1912,14 @@ pub fn update_leaf(
     for piece in affected_new.iter().copied() {
         planned.push((piece, STATE.lock().mint()?));
     }
+    leaf_stage(11);
     for mapping in affected_old.iter().copied() {
         if unmap_fixed(&io, memory, mapping).is_err() {
             STATE.lock().allocation_mut(id)?.poisoned = true;
             return Err(Error::Poisoned);
         }
     }
+    leaf_stage(13);
 
     let mut made = Vec::new();
     for (piece, virt) in planned.iter().copied() {
@@ -1948,6 +2022,7 @@ pub fn update_leaf(
     allocation
         .mappings
         .sort_unstable_by_key(|mapping| (mapping.process, mapping.piece.va));
+    leaf_stage(0xfe);
     Ok(())
 }
 
