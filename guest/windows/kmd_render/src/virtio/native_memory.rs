@@ -234,8 +234,9 @@ struct State {
     client: Option<NativeClient>,
     allocations: Vec<Allocation>,
     spaces: Vec<(usize, u32)>,
-    /// Per-process space -> its low window (see [`LOW_WINDOW_BASE`]).
-    windows: Vec<(u32, u32)>,
+    /// Per-process space -> its windows: (space, window, first VA, end VA), see
+    /// [`LOW_WINDOW_BASE`] and [`HIGH_WINDOW_BASE`].
+    windows: Vec<(u32, u32, u64, u64)>,
     /// System pages of NON-native allocations (dxgkrnl's monitored fences and
     /// the like) mapped into a process's space (`update_foreign_leaf`).
     foreign: Vec<HostMapping>,
@@ -584,8 +585,29 @@ fn ensure_space(io: &Io<'_>, process: usize) -> Result<u32, Error> {
     {
         let mut state = STATE.lock();
         state.spaces.push((process, space));
-        let _ = state.windows.try_reserve(1);
-        state.windows.push((space, window));
+        let _ = state.windows.try_reserve(2);
+        state.windows.push((space, window, LOW_WINDOW_BASE, LOW_WINDOW_END));
+    }
+    // The same above the [4 GiB, 8 GiB) range the KMD reserves from VidMm: RM's own
+    // first-fit mappings stay inside that range instead of growing into VAs VidMm
+    // hands out (they reached 0x2_3200_0000, and every later fixed mapping there was
+    // refused with NO_MEMORY). Optional: without it, mappings fall back to fixed
+    // virtual objects.
+    if let Ok(high) = STATE.lock().mint() {
+        let params = cc::virtual_params(
+            io.client.root,
+            space,
+            Some(HIGH_WINDOW_BASE),
+            HIGH_WINDOW_END - HIGH_WINDOW_BASE,
+        );
+        match io.rm_alloc(nd::H_DEVICE, high, cc::NV50_MEMORY_VIRTUAL, &params) {
+            Ok(_) => {
+                let mut state = STATE.lock();
+                let _ = state.windows.try_reserve(1);
+                state.windows.push((space, high, HIGH_WINDOW_BASE, HIGH_WINDOW_END));
+            }
+            Err(error) => crate::diag::record_named_bytes(b"NvHighWin", error as u32 + 1),
+        }
     }
     crate::diag::record_named_bytes(b"NvSpaceProc", process as u32);
     crate::diag::record_named_bytes(b"NvSpaceH", space);
@@ -609,18 +631,33 @@ fn ensure_space(io: &Io<'_>, process: usize) -> Result<u32, Error> {
 /// (0x10000) and the UMDs' low VAs included.
 const LOW_WINDOW_BASE: u64 = 0x1_0000;
 const LOW_WINDOW_END: u64 = 0x1_0000_0000;
+/// The high window of a per-process space: [8 GiB, 16 TiB), every VidMm VA above
+/// the reserved [4 GiB, 8 GiB) (`NATIVE_VIRTUAL_ADDRESS_BIT_COUNT` = 44).
+const HIGH_WINDOW_BASE: u64 = 0x2_0000_0000;
+const HIGH_WINDOW_END: u64 = 1 << 44;
 
-fn window_of(space: u32) -> Option<u32> {
+/// The window of `space` that holds [va, end), if any.
+fn window_for(space: u32, va: u64, end: u64) -> Option<u32> {
     STATE
         .lock()
         .windows
         .iter()
-        .find(|(owner, _)| *owner == space)
-        .map(|(_, window)| *window)
+        .find(|(owner, _, base, limit)| *owner == space && va >= *base && end <= *limit)
+        .map(|(_, window, _, _)| *window)
+}
+
+fn windows_of(space: u32) -> Vec<u32> {
+    STATE
+        .lock()
+        .windows
+        .iter()
+        .filter(|(owner, _, _, _)| *owner == space)
+        .map(|(_, window, _, _)| *window)
+        .collect()
 }
 
 fn is_window(virt: u32) -> bool {
-    STATE.lock().windows.iter().any(|(_, window)| *window == virt)
+    STATE.lock().windows.iter().any(|(_, window, _, _)| *window == virt)
 }
 
 
@@ -1049,7 +1086,7 @@ fn map_fixed(
         LOCAL_4K_MAP_FLAGS
     };
     let end = piece.end().ok_or(Error::Invalid)?;
-    if let Some(window) = window_of(space).filter(|_| piece.va >= LOW_WINDOW_BASE && end <= LOW_WINDOW_END) {
+    if let Some(window) = window_for(space, piece.va, end) {
         return map_in_window(io, memory, window, flags, piece);
     }
     // System pages map with 4-KiB PTEs at VidMm's 4-KiB-aligned VAs: their virtual
@@ -2714,9 +2751,9 @@ pub fn release_process(passive: PassiveLevel, adapter: &AdapterContext, process:
             .find(|(owner, _)| *owner == process)
             .map(|(_, space)| *space);
         if let Some(space) = space {
-            if let Some(window) = window_of(space) {
+            for window in windows_of(space) {
                 if io.rm_free(nd::H_DEVICE, window).is_ok() {
-                    STATE.lock().windows.retain(|(owner, _)| *owner != space);
+                    STATE.lock().windows.retain(|(_, live, _, _)| *live != window);
                 }
             }
             if io.rm_free(nd::H_DEVICE, space).is_ok() {
