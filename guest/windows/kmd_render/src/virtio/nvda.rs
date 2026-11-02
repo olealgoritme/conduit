@@ -554,6 +554,67 @@ fn ensure_ready(passive: PassiveLevel, adapter: &AdapterContext) -> Result<Ready
     Err(Error::Malformed)
 }
 
+static HOST_VERSION: SpinLock<helios_kmd_logic::host_rm_version::Probe> =
+    SpinLock::new(helios_kmd_logic::host_rm_version::Probe::new());
+
+/// `"NvHostRmVersion\0"` as UTF-16 (`host_rm_version::VALUE_NAME`).
+const HOST_VERSION_NAME: [u16; 16] = {
+    let name = helios_kmd_logic::host_rm_version::VALUE_NAME.as_bytes();
+    let mut out = [0u16; 16];
+    let mut i = 0;
+    while i < name.len() {
+        out[i] = name[i] as u16;
+        i += 1;
+    }
+    out
+};
+
+/// Publish the host RM's version string as `NvHostRmVersion` (REG_SZ, service key) once per
+/// transport generation on the RTX personality, whatever `NvUmd` says: the installer compares
+/// it with an NVIDIA driver package before it stages NVIDIA's own UMDs, which is also when no
+/// NVIDIA UMD has brought the session up yet. A control-channel open, one `QUERY`, a close;
+/// nothing else of the host's RM is touched. Called from the registry mirror thread. PASSIVE.
+pub fn publish_host_version(passive: PassiveLevel, adapter: &AdapterContext) {
+    use helios_kmd_logic::host_rm_version as hv;
+    if !super::config::nvidia_personality() {
+        return;
+    }
+    let epoch = adapter.with_virtio(|v| v.nvrm_epoch()).unwrap_or(0);
+    if !HOST_VERSION.lock().begin(epoch) {
+        return;
+    }
+    let io = Io {
+        passive,
+        adapter,
+        epoch,
+    };
+    let mut probe = Session::new();
+    let ok = match io.open_file(rc::DEV_CTL) {
+        Ok(ctl) => {
+            probe.ctl = ctl;
+            let reply = io.version_query(&probe);
+            io.close_file(ctl);
+            match reply {
+                Ok(Out::Version(v)) => {
+                    let mut text = [0u16; hv::MAX_TEXT + 1];
+                    let bytes = hv::text(&v).and_then(|t| hv::utf16z(t, &mut text));
+                    match bytes {
+                        Some(bytes) => {
+                            crate::diag::record_named_string(&HOST_VERSION_NAME, &text, bytes);
+                            true
+                        }
+                        // The host answered without a usable string: asking again will not help.
+                        None => true,
+                    }
+                }
+                _ => false,
+            }
+        }
+        Err(_) => false,
+    };
+    HOST_VERSION.lock().finish(epoch, ok);
+}
+
 /// Return the shared native-memory client, installing its GPU_DEVICE VA space on
 /// first use. The client belongs to the KMD, never to the escaping process.
 pub fn memory_client(

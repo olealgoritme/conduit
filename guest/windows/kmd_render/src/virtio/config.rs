@@ -7,6 +7,7 @@
 //! ignore the `DeviceFunction` argument and always access our own device.
 
 use core::ffi::c_void;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use virtio_drivers::transport::pci::bus::{ConfigurationAccess, DeviceFunction};
 
@@ -43,6 +44,15 @@ impl DxgkConfigAccess {
 ///
 /// The transport also refuses any vendor but `0x1AF4`, so the RTX 5090
 /// personality (`10DE:2B85`) reports the virtio vendor too.
+/// Whether the device is the RTX 5090 personality (`10DE:2B85`), as the transport's read of
+/// the vendor/device word saw it (set before the transport exists, never cleared: the PCI
+/// identity of a device does not change while the driver is loaded).
+static NVIDIA_PERSONALITY: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn nvidia_personality() -> bool {
+    NVIDIA_PERSONALITY.load(Ordering::Relaxed)
+}
+
 fn known_device_id(vendor_device: u32) -> u32 {
     const VIRTIO_VENDOR: u32 = 0x1AF4;
     const NVIDIA_VENDOR: u32 = 0x10DE;
@@ -75,6 +85,9 @@ impl ConfigurationAccess for DxgkConfigAccess {
             }
         }
         if register_offset == 0 {
+            if val == 0x2B85_10DE {
+                NVIDIA_PERSONALITY.store(true, Ordering::Relaxed);
+            }
             val = known_device_id(val);
         }
         val
