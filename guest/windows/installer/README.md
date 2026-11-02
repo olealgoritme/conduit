@@ -61,7 +61,7 @@ speaks, and of the host driver's branch. Both come from the registry, under
 | Value | Type | Written by | Meaning |
 |---|---|---|---|
 | `Parameters\NvUmdVersion` | REG_SZ | the Helios INF (RTX personality) | NVIDIA Windows driver version the KMD speaks, e.g. `610.88` |
-| `NvUmdVersion` | REG_SZ | an administrator (optional) | overrides `Parameters\NvUmdVersion` |
+| `NvUmdVersion` | REG_SZ | an administrator (optional) | overrides `Parameters\NvUmdVersion`, for the installer and the KMD alike |
 | `NvHostRmVersion` | REG_SZ | the KMD, once per adapter start | the host RM's version, e.g. `610.57.04` |
 
 The package version is the INF's `DriverVer` in NVIDIA's short form
@@ -70,6 +70,13 @@ must equal `NvUmdVersion`; its branch (`610`) must equal the host RM's (NVIDIA
 numbers the Linux and Windows builds of one branch differently, so only the
 branch is common). `nvldumdx.dll` must carry a valid NVIDIA signature. Any
 mismatch stops the switch before anything is changed.
+
+The KMD reads the same `NvUmdVersion` (the override first) and reports it to
+the host at every adapter start; a host whose RM is not paired with that release
+refuses the adapter's start and its RM calls (see `docs/SECURITY.md`). Staging
+records no version of its own: what was staged is the release `NvUmdVersion`
+names. Both forms the check accepts, `610.88` and a driver file version such as
+`32.0.16.1088`, are read by the KMD too; the value must be a REG_SZ.
 
 **What is changed**, all recorded in `C:\ProgramData\Helios\nvidia-umd.json`
 and undone by `--helios-umd`, `Set-HeliosUmd.ps1 -Helios` and uninstall:
