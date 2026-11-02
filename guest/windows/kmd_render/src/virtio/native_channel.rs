@@ -205,7 +205,12 @@ impl Io<'_> {
             resp.get(..n).ok_or(NativeError::Transport)?,
             rc::NVOS64_STATUS_AT,
         )
-        .map_err(|_| NativeError::Rm)?;
+        .map_err(|error| {
+            // NvChAlCls/NvChAlSt: the class and RM status of a refused alloc.
+            crate::diag::record_named_bytes(b"NvChAlCls", class);
+            crate::diag::record_named_bytes(b"NvChAlSt", rm_error_code(error));
+            NativeError::Rm
+        })?;
         Ok(())
     }
 
@@ -250,7 +255,12 @@ impl Io<'_> {
             resp.get(..n).ok_or(NativeError::Transport)?,
             rc::NVOS54_STATUS_AT,
         )
-        .map_err(|_| NativeError::Rm)?;
+        .map_err(|error| {
+            // NvChCtlCmd/NvChCtlSt: the command and RM status of a refused control.
+            crate::diag::record_named_bytes(b"NvChCtlCmd", command);
+            crate::diag::record_named_bytes(b"NvChCtlSt", rm_error_code(error));
+            NativeError::Rm
+        })?;
         let count = reply.nested.len().min(params.len());
         params[..count].copy_from_slice(&reply.nested[..count]);
         if count != params.len() {
@@ -617,6 +627,8 @@ impl NativeQueue {
         let handles = ObjectHandles::mint()?;
         let mut native = take_process(process)?;
         if native.epoch != context.epoch || backing.va_space != native.vaspace {
+            crate::diag::record_named_bytes(b"NvQStep", 0x80);
+            crate::diag::record_named_bytes(b"NvQSpaces", backing.va_space ^ native.vaspace);
             restore_process(process, native);
             return Err(NativeError::Transport);
         }
@@ -776,6 +788,7 @@ fn create_queue_objects(
 ) -> Result<(), NativeError> {
     let handles = parts.handles.ok_or(NativeError::Invalid)?;
     let result = (|| {
+        crate::diag::record_named_bytes(b"NvQStep", 1);
         io.alloc(
             client,
             nd::H_DEVICE,
@@ -788,6 +801,7 @@ fn create_queue_objects(
             ),
         )?;
         parts.ctl_allocated = true;
+        crate::diag::record_named_bytes(b"NvQStep", 2);
         parts.ctl = cpu_map(
             io,
             client,
@@ -799,6 +813,7 @@ fn create_queue_objects(
         )?;
         zero(parts.ctl.va, cc::CTL_BYTES);
 
+        crate::diag::record_named_bytes(b"NvQStep", 3);
         io.alloc(
             client,
             nd::H_SUBDEVICE,
@@ -807,6 +822,7 @@ fn create_queue_objects(
             &cc::usermode_params(),
         )?;
         parts.usermode_allocated = true;
+        crate::diag::record_named_bytes(b"NvQStep", 4);
         parts.usermode = cpu_map(
             io,
             client,
@@ -817,6 +833,7 @@ fn create_queue_objects(
             _MEMORY_CACHING_TYPE::MmNonCached,
         )?;
 
+        crate::diag::record_named_bytes(b"NvQStep", 5);
         let channel = cc::channel_params(&cc::ChannelDesc {
             h_ctl: handles.at(3),
             gpfifo_va: queue.gpfifo_va,
@@ -833,6 +850,7 @@ fn create_queue_objects(
             &channel,
         )?;
         parts.channel_allocated = true;
+        crate::diag::record_named_bytes(b"NvQStep", 6);
         let mut bind = cc::bind_params(cc::ENGINE_GRAPHICS);
         io.control(client, handles.at(5), cc::CTRL_BIND, &mut bind)?;
         io.alloc(
@@ -842,6 +860,7 @@ fn create_queue_objects(
             BLACKWELL_COMPUTE_B,
             &[0u8; 16],
         )?;
+        crate::diag::record_named_bytes(b"NvQStep", 8);
         let mut index = cc::token_notif_index_params();
         io.control(
             client,
@@ -849,6 +868,7 @@ fn create_queue_objects(
             cc::CTRL_SET_WORK_SUBMIT_TOKEN_NOTIF_INDEX,
             &mut index,
         )?;
+        crate::diag::record_named_bytes(b"NvQStep", 9);
         let mut token = cc::token_params();
         io.control(
             client,
@@ -860,6 +880,7 @@ fn create_queue_objects(
             .filter(|token| token.0 != 0)
             .ok_or(NativeError::Transport)?
             .0;
+        crate::diag::record_named_bytes(b"NvQStep", 10);
         if scheduled
             .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
@@ -1011,6 +1032,14 @@ fn zero(base: u64, len: u64) {
         offset += 8;
     }
     full_barrier();
+}
+
+fn rm_error_code(error: rc::RmError) -> u32 {
+    match error {
+        rc::RmError::Status(status) => status,
+        rc::RmError::Host(errno) => 0x8000_0000 | errno,
+        rc::RmError::Malformed => 0xffff_ffff,
+    }
 }
 
 unsafe fn write32(address: u64, value: u32) {
