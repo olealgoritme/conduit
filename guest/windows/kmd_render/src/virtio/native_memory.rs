@@ -624,7 +624,9 @@ fn ensure_space(io: &Io<'_>, process: usize) -> Result<u32, Error> {
     // hands out (they reached 0x2_3200_0000, and every later fixed mapping there was
     // refused with NO_MEMORY). Optional: without it, mappings fall back to fixed
     // virtual objects.
-    if let Ok(high) = STATE.lock().mint() {
+    // The guard of `STATE.lock()` must end before the block, which locks STATE again.
+    let minted = STATE.lock().mint();
+    if let Ok(high) = minted {
         let params = cc::virtual_params(
             io.client.root,
             space,
@@ -644,7 +646,8 @@ fn ensure_space(io: &Io<'_>, process: usize) -> Result<u32, Error> {
     crate::diag::record_named_bytes(b"NvSpaceH", space);
     // Diagnosis: where RM puts a non-fixed 2-MiB virtual object now (in 64-KiB
     // units; 0xffffffff = refused), i.e. where its own mappings would go.
-    if let Ok(probe) = STATE.lock().mint() {
+    let minted = STATE.lock().mint();
+    if let Ok(probe) = minted {
         let params = cc::virtual_params(io.client.root, space, None, 0x20_0000);
         let at = match io.rm_alloc(nd::H_DEVICE, probe, cc::NV50_MEMORY_VIRTUAL, &params) {
             Ok(reply) => {
