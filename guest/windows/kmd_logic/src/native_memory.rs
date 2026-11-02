@@ -42,10 +42,15 @@ pub fn allocation_units(bytes: &[u8]) -> Option<u64> {
     let encoded = get32(bytes, SIZE_INTEGER_AT)?;
     let integer = u64::from(encoded & 0xffff);
     let remainder = encoded >> 24;
+    // D3D: the size is `count` units plus `remainder` x 256 bytes (a 124x228
+    // B8G8R8A8 staging texture: count 1, remainder 0xd0 = 118784 bytes; its
+    // third mip faulted past a one-unit allocation). The captured KMD's 0xd0
+    // output is that rounded up (0x1d + 0x40 -> 0x1e, 0x29 + 0xc0 -> 0x2a).
+    let fraction = u64::from(remainder != 0);
     // A record with only flag bits still describes an allocation (one page).
     Some(
-        count
-            .max(integer + u64::from(remainder != 0))
+        (count + if count != 0 { fraction } else { 0 })
+            .max(integer + fraction)
             .max(u64::from(encoded != 0)),
     )
 }
