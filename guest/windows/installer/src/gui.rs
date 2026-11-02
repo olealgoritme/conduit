@@ -16,7 +16,7 @@ use windows_sys::Win32::UI::Controls::*;
 use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
-use crate::{prepare_payload, start_worker, Event, Op};
+use crate::{prepare_payload, start_worker, Event, Op, UmdChoice};
 
 // ── Theme ───────────────────────────────────────────────────────────────────
 const BG: u32 = 0x001B1614; // COLORREF is 0x00BBGGRR
@@ -106,6 +106,7 @@ struct State {
     has_install: bool,
     updating: bool,
     automatic: bool,
+    umd: UmdChoice,
     worker: Option<Receiver<Event>>,
     running: bool,
     failed: bool,
@@ -667,7 +668,7 @@ fn start_operation(state: &mut State, op: Op) {
         temporary: state.payload_temporary,
         has_install: state.has_install,
     };
-    let receiver = start_worker(payload, op, state.automatic);
+    let receiver = start_worker(payload, op, state.automatic, state.umd.clone());
     state.worker = Some(receiver);
     unsafe {
         SetTimer(state.hwnd, 1, 50, None);
@@ -940,7 +941,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
     }
 }
 
-pub fn run(exe: &Path, automatic: bool) -> i32 {
+pub fn run(exe: &Path, automatic: bool, umd: UmdChoice) -> i32 {
     unsafe {
         SetProcessDPIAware();
     }
@@ -1012,6 +1013,7 @@ pub fn run(exe: &Path, automatic: bool) -> i32 {
                 has_install: false,
                 updating: false,
                 automatic,
+                umd,
                 worker: None,
                 running: false,
                 failed: false,
