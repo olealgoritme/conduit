@@ -26,6 +26,7 @@ pub mod external_memory;
 pub mod host_liveness;
 pub mod hws;
 pub mod native_channel;
+pub mod native_hang;
 pub mod native_memory;
 pub mod nvda;
 pub mod nvrm_clients;
