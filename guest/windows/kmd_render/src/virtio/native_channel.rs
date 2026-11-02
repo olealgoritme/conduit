@@ -674,6 +674,10 @@ impl NativeQueue {
         );
         restore_process(process, native);
         result?;
+        CE_BIND_ENABLED.store(
+            crate::diag::read_config_dword(crate::diag::KnobName::new(b"NvCeBindOn"), 0) == 1,
+            Ordering::Relaxed,
+        );
         // Last, so no early return can leave the page locked.
         let (fence_view, fence_mdl) = lock_fence_view(progress_cpu);
         crate::diag::record_named_bytes(b"NvQFenceLock", u32::from(fence_view != 0));
@@ -711,7 +715,12 @@ impl NativeQueue {
 
     /// Whether subchannel 4 still needs its SET_OBJECT (and attempts remain).
     pub(crate) fn wants_copy_binding(&self) -> bool {
-        !self.copy_bound.load(Ordering::Relaxed) && self.copy_tries.load(Ordering::Relaxed) < 64
+        // Off unless NvCeBindOn=1: NVK on RM runs copy methods on subchannel 4
+        // of its GR channel with a parameterless copy object and no SET_OBJECT,
+        // and every variant with an explicit binding still raised PBDMA DEVICE.
+        CE_BIND_ENABLED.load(Ordering::Relaxed)
+            && !self.copy_bound.load(Ordering::Relaxed)
+            && self.copy_tries.load(Ordering::Relaxed) < 64
     }
 
     /// The D3D UMDs drive the graphics copy engine on subchannel 4 without ever
@@ -1206,6 +1215,11 @@ fn zero(base: u64, len: u64) {
     }
     full_barrier();
 }
+
+/// `bind_copy_subchannel` enabled (service value NvCeBindOn=1, read at queue
+/// creation).
+pub(crate) static CE_BIND_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 
 /// The IRQL the last subchannel-4 binding attempt ran at (NvCeIrql).
 pub(crate) static CE_BIND_IRQL: AtomicU32 = AtomicU32::new(0xff);
