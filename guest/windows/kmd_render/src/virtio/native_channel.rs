@@ -537,12 +537,12 @@ impl NativeContext {
         let Some(adapter) = (unsafe { self.adapter.as_ref() }) else {
             return Err(NativeError::Transport);
         };
-        let Some(process) = (unsafe { self.process.as_mut() }) else {
+        let Some(process) = (unsafe { self.process.as_ref() }) else {
             return Err(NativeError::Transport);
         };
-        let native = take_process(process)?;
+        // A copy of the association: the slot stays usable by other threads.
+        let native = peek_process(passive, process)?;
         if native.epoch != self.epoch {
-            restore_process(process, native);
             return Err(NativeError::Transport);
         }
         let io = Io {
@@ -550,9 +550,7 @@ impl NativeContext {
             adapter,
             epoch: native.epoch,
         };
-        let result = f(io, &native.client);
-        restore_process(process, native);
-        result
+        f(io, &native.client)
     }
 
     pub(crate) fn owner(&self) -> DeviceOwner {
