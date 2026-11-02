@@ -293,7 +293,7 @@ pub struct SystemChunk {
 }
 
 impl SystemChunk {
-    pub const fn len(&self) -> u64 {
+    pub const fn bytes(&self) -> u64 {
         self.pages as u64 * nm::PAGE_BYTES
     }
 }
@@ -352,7 +352,7 @@ pub fn system_update_unchanged(
     chunks.iter().all(|chunk| {
         overlapping.iter().any(|m| {
             m.piece.va == chunk.va
-                && m.piece.len == chunk.len()
+                && m.piece.len == chunk.bytes()
                 && m.piece.memory_offset == chunk.memory_offset
                 && m.pfns.is_some_and(|shown| Some(shown) == pfns.get(chunk.first..chunk.first + chunk.pages))
         })

@@ -20,6 +20,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use helios_kmd_logic::ce_route as cr;
 use helios_kmd_logic::native_memory as nm;
+use helios_kmd_logic::native_perf as np;
 use helios_kmd_logic::native_teardown as nt;
 use helios_kmd_logic::nvda as nd;
 use helios_kmd_logic::rm_ce_channel as cc;
@@ -98,6 +99,118 @@ pub mod watch {
 }
 
 static NEXT_ID: AtomicU32 = AtomicU32::new(1);
+
+/// `NvPerfMem` (REG_DWORD, default 0): the memory-performance paths of
+/// `helios_kmd_logic::native_perf::PerfMem`, read once (PASSIVE) and mirrored to
+/// `NvPerfMemOn`. 0 keeps every old path.
+pub(crate) fn perf() -> np::PerfMem {
+    static VALUE: AtomicU32 = AtomicU32::new(u32::MAX);
+    let mut value = VALUE.load(Ordering::Relaxed);
+    if value == u32::MAX {
+        value = crate::diag::read_config_dword(crate::diag::KnobName::new(b"NvPerfMem"), 0);
+        if value == u32::MAX {
+            value = 0;
+        }
+        VALUE.store(value, Ordering::Relaxed);
+        crate::diag::record_named_bytes(b"NvPerfMemOn", value);
+    }
+    np::PerfMem(value)
+}
+
+/// `NvSysChunk` (REG_DWORD, default 0 = 128): pages per OS descriptor of a
+/// system-page leaf update (`native_perf::system_chunk_pages`).
+fn system_chunk_pages() -> usize {
+    static VALUE: AtomicU32 = AtomicU32::new(u32::MAX);
+    let mut value = VALUE.load(Ordering::Relaxed);
+    if value == u32::MAX {
+        value = crate::diag::read_config_dword(crate::diag::KnobName::new(b"NvSysChunk"), 0);
+        if value == u32::MAX {
+            value = 0;
+        }
+        VALUE.store(value, Ordering::Relaxed);
+    }
+    np::system_chunk_pages(value)
+}
+
+/// Host round trips of native-memory RM work (every `Io::send` and OS-descriptor
+/// registration). Leaf updates read the difference across one update; it also
+/// counts round trips other threads make meanwhile outside the I/O mutex (a
+/// concurrent `create`), so per-update figures are an upper bound.
+static ROUND_TRIPS: AtomicU32 = AtomicU32::new(0);
+
+fn round_trips() -> u32 {
+    ROUND_TRIPS.load(Ordering::Relaxed)
+}
+
+/// Leaf-update cost counters (`NvPm*`), published on the first update and every
+/// 64th: `NvPmUpd`/`NvPmRt`/`NvPmUs` video-memory updates, their round trips and
+/// microseconds, `NvPmMaxUs` the longest; `NvPmSys*` the same for system-page
+/// updates; `NvPmSkip` system-page updates that mapped what was mapped already.
+struct LeafCost {
+    updates: AtomicU32,
+    trips: AtomicU32,
+    micros: AtomicU32,
+    max_micros: AtomicU32,
+    names: [&'static [u8]; 4],
+}
+
+static LEAF_COST: LeafCost = LeafCost::new([b"NvPmUpd", b"NvPmRt", b"NvPmUs", b"NvPmMaxUs"]);
+static SYSTEM_COST: LeafCost =
+    LeafCost::new([b"NvPmSysUpd", b"NvPmSysRt", b"NvPmSysUs", b"NvPmSysMaxUs"]);
+static SKIPPED_UNCHANGED: AtomicU32 = AtomicU32::new(0);
+/// `NvPmBig` / `NvPmHuge`: video-memory mappings made with 64-KiB / 2-MiB pages;
+/// `NvPmLgFail`: large-page mappings RM refused (mapped again with 4 KiB);
+/// `NvPmHugeMem` / `NvPmHugeFail`: allocations given 2-MiB-page memory / refused it;
+/// `NvPmDefer`: RM operations that deferred their TLB invalidate; `NvPmTlbInv`:
+/// explicit invalidates after a deferred batch failed (`NvPmTlbErr`: refused).
+static MAPPED_BIG: AtomicU32 = AtomicU32::new(0);
+static MAPPED_HUGE: AtomicU32 = AtomicU32::new(0);
+static LARGE_REFUSED: AtomicU32 = AtomicU32::new(0);
+static HUGE_MEMORY: AtomicU32 = AtomicU32::new(0);
+static HUGE_REFUSED: AtomicU32 = AtomicU32::new(0);
+static DEFERRED: AtomicU32 = AtomicU32::new(0);
+static TLB_RESCUE: AtomicU32 = AtomicU32::new(0);
+static TLB_RESCUE_FAILED: AtomicU32 = AtomicU32::new(0);
+
+impl LeafCost {
+    const fn new(names: [&'static [u8]; 4]) -> Self {
+        Self {
+            updates: AtomicU32::new(0),
+            trips: AtomicU32::new(0),
+            micros: AtomicU32::new(0),
+            max_micros: AtomicU32::new(0),
+            names,
+        }
+    }
+
+    /// One update that started at `start` (100 ns) with `trips_before` round trips.
+    fn note(&self, start: u64, trips_before: u32) {
+        let micros =
+            np::ticks_to_us(crate::adapter::foreign_scanout::now_100ns().saturating_sub(start));
+        let trips = round_trips().wrapping_sub(trips_before);
+        let n = self.updates.fetch_add(1, Ordering::Relaxed) + 1;
+        let total_trips = self.trips.fetch_add(trips, Ordering::Relaxed).wrapping_add(trips);
+        let total_micros = self
+            .micros
+            .fetch_add(micros, Ordering::Relaxed)
+            .wrapping_add(micros);
+        let max = self.max_micros.fetch_max(micros, Ordering::Relaxed).max(micros);
+        if np::publish_due(n) {
+            crate::diag::record_named_bytes(self.names[0], n);
+            crate::diag::record_named_bytes(self.names[1], total_trips);
+            crate::diag::record_named_bytes(self.names[2], total_micros);
+            crate::diag::record_named_bytes(self.names[3], max);
+        }
+    }
+}
+
+/// Count `counter` and publish it under `name` on the publish cadence.
+fn bump(counter: &AtomicU32, name: &[u8]) {
+    let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+    if np::publish_due(n) {
+        crate::diag::record_named_bytes(name, n);
+    }
+}
 /// Replacements whose RM idle-channels quiesce was refused (`update_leaf`).
 static QUIESCE_REFUSED: AtomicU32 = AtomicU32::new(0);
 static IO_MUTEX: SpinLock<Option<&'static PassiveMutex>> = SpinLock::new(None);
@@ -211,6 +324,8 @@ struct Allocation {
     /// The host GEM handle of this memory on the native scanout DRM file
     /// (`native_scanout`), 0 until the allocation is first shown.
     scanout_gem: u32,
+    /// The RM memory has 2-MiB pages (NvPerfMem 0x10): mappings may use them.
+    huge: bool,
 }
 
 /// The record fields CreateAllocation wrote, re-applied at open.
@@ -345,6 +460,7 @@ pub(crate) struct Io<'a> {
 
 impl Io<'_> {
     pub(super) fn send(&self, req: &[u8], resp: &mut [u8]) -> Result<usize, Error> {
+        ROUND_TRIPS.fetch_add(1, Ordering::Relaxed);
         let mut seen = None;
         let n = nvrm::forward(
             self.passive,
@@ -868,6 +984,7 @@ fn alloc_system_descriptor(io: &Io<'_>, memory: u32, pfns: &[u64], size: u64) ->
     )
     .ok_or(Error::Invalid)?;
     let mut response = [0u8; REPLY_MAX];
+    ROUND_TRIPS.fetch_add(1, Ordering::Relaxed);
     let sent = nvrm::forward_kmd_registration(
         io.passive,
         io.adapter,
@@ -985,6 +1102,7 @@ pub fn create(
         client,
     };
     let pins = Vec::new();
+    let mut huge = false;
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     if id == 0 {
         return Err(Error::NoMemory);
@@ -1008,7 +1126,35 @@ pub fn create(
     } else {
         step(5);
         let params = local_params(client.root, private.size);
-        match io.rm_alloc(nd::H_DEVICE, memory, rc::NV01_MEMORY_LOCAL_USER, &params) {
+        // NvPerfMem 0x10: GPU-only memory of 2 MiB and more with 2-MiB pages, so
+        // its 2-MiB-aligned mappings can use huge PTEs; a refusal falls back to
+        // the big-page memory every other allocation gets.
+        let reply = if np::wants_huge_memory(
+            perf(),
+            np::is_gpu_only_record(private_bytes),
+            false,
+            private.size,
+        ) {
+            let mut huge_params = params;
+            let (attr, attr2) = np::huge_attrs(rc::SURFACE_ATTR, rc::SURFACE_ATTR2);
+            huge_params[24..28].copy_from_slice(&attr.to_le_bytes());
+            huge_params[28..32].copy_from_slice(&attr2.to_le_bytes());
+            huge_params[72..80].copy_from_slice(&np::HUGE_PAGE.to_le_bytes());
+            match io.rm_alloc(nd::H_DEVICE, memory, rc::NV01_MEMORY_LOCAL_USER, &huge_params) {
+                Ok(reply) => {
+                    huge = true;
+                    bump(&HUGE_MEMORY, b"NvPmHugeMem");
+                    Ok(reply)
+                }
+                Err(_) => {
+                    bump(&HUGE_REFUSED, b"NvPmHugeFail");
+                    io.rm_alloc(nd::H_DEVICE, memory, rc::NV01_MEMORY_LOCAL_USER, &params)
+                }
+            }
+        } else {
+            io.rm_alloc(nd::H_DEVICE, memory, rc::NV01_MEMORY_LOCAL_USER, &params)
+        };
+        match reply {
             Ok(reply) => {
                 let actual = rc::get64(&reply, 64).unwrap_or(private.size);
                 if actual < private.size
@@ -1096,6 +1242,7 @@ pub fn create(
         writeback: Some(writeback),
         surface,
         scanout_gem: 0,
+        huge,
     };
     // Publish under the mutex. A transport sweep that ran meanwhile (`forget`)
     // closed this client with the object in it: the record is dropped and its pins
@@ -1153,12 +1300,85 @@ fn map_fixed(
     virt: u32,
     piece: nm::MappingPiece,
 ) -> Result<u32, Error> {
-    nm::validate_piece(piece, allocation_size).map_err(|_| Error::Invalid)?;
-    let flags = if system_backed {
+    map_fixed_opts(io, memory, allocation_size, system_backed, space, virt, piece, false)
+}
+
+/// Whether the RM memory `memory` of a native allocation has 2-MiB pages. Takes
+/// STATE: never call it with a STATE guard alive.
+fn memory_is_huge(memory: u32) -> bool {
+    STATE
+        .lock()
+        .allocations
+        .iter()
+        .any(|a| a.memory == memory && a.huge)
+}
+
+/// [`map_fixed`] with the RM page size the piece allows (NvPerfMem 0x08 big,
+/// 0x10 huge pages for video memory; a large-page mapping RM refuses is made
+/// again with 4-KiB pages) and, with `defer`, the TLB invalidate left to a later
+/// operation of the same leaf update (NvPerfMem 0x20).
+#[allow(clippy::too_many_arguments)]
+fn map_fixed_opts(
+    io: &Io<'_>,
+    memory: u32,
+    allocation_size: u64,
+    system_backed: bool,
+    space: u32,
+    virt: u32,
+    piece: nm::MappingPiece,
+    defer: bool,
+) -> Result<u32, Error> {
+    let defer_flag = if defer { np::MAP_FLAGS_DEFER_TLB } else { 0 };
+    if !system_backed {
+        let perf = perf();
+        let huge = perf.huge_pages() && memory_is_huge(memory);
+        let page = np::map_page_size(piece, perf.big_pages(), huge);
+        if page != np::MAP_PAGE_4K {
+            let flags = np::with_page_size(LOCAL_4K_MAP_FLAGS, page) | defer_flag;
+            match map_fixed_flags(io, memory, allocation_size, false, space, virt, piece, flags) {
+                Ok(used) => {
+                    if page == np::MAP_PAGE_HUGE {
+                        bump(&MAPPED_HUGE, b"NvPmHuge");
+                    } else {
+                        bump(&MAPPED_BIG, b"NvPmBig");
+                    }
+                    if defer {
+                        bump(&DEFERRED, b"NvPmDefer");
+                    }
+                    return Ok(used);
+                }
+                // RM refused the page size (or the fixed virtual object): the
+                // 4-KiB mapping below is what every mapping was before.
+                Err(Error::Host) => bump(&LARGE_REFUSED, b"NvPmLgFail"),
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    let base = if system_backed {
         cc::MAP_FLAGS_SYSMEM
     } else {
         LOCAL_4K_MAP_FLAGS
     };
+    let flags = base | defer_flag;
+    let used = map_fixed_flags(io, memory, allocation_size, system_backed, space, virt, piece, flags)?;
+    if defer {
+        bump(&DEFERRED, b"NvPmDefer");
+    }
+    Ok(used)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn map_fixed_flags(
+    io: &Io<'_>,
+    memory: u32,
+    allocation_size: u64,
+    system_backed: bool,
+    space: u32,
+    virt: u32,
+    piece: nm::MappingPiece,
+    flags: u32,
+) -> Result<u32, Error> {
+    nm::validate_piece(piece, allocation_size).map_err(|_| Error::Invalid)?;
     let end = piece.end().ok_or(Error::Invalid)?;
     if let Some(window) = window_for(space, piece.va, end) {
         return map_in_window(io, memory, window, flags, piece);
@@ -1314,15 +1534,26 @@ fn map_in_window(
 }
 
 fn unmap_fixed(io: &Io<'_>, memory: u32, mapping: HostMapping) -> Result<(), Error> {
+    unmap_fixed_opts(io, memory, mapping, false)
+}
+
+/// [`unmap_fixed`]; with `defer` the TLB invalidate is left to a later operation
+/// of the same leaf update (NvPerfMem 0x20).
+fn unmap_fixed_opts(io: &Io<'_>, memory: u32, mapping: HostMapping, defer: bool) -> Result<(), Error> {
     watch::event(mapping.piece.va, mapping.piece.len, 10, 0, mapping.process);
     let memory = if mapping.desc != 0 { mapping.desc } else { memory };
-    let block = nm::nvos47_unmap(
+    let mut block = nm::nvos47_unmap(
         io.client.root,
         nd::H_DEVICE,
         mapping.virt,
         memory,
         mapping.piece.va,
     );
+    if defer {
+        block[np::NVOS47_FLAGS_AT..np::NVOS47_FLAGS_AT + 4]
+            .copy_from_slice(&np::UNMAP_FLAGS_DEFER_TLB.to_le_bytes());
+        bump(&DEFERRED, b"NvPmDefer");
+    }
     let mut response = [0u8; REPLY_MAX];
     let n = io.exchange(
         io.client.ctl,
@@ -1342,6 +1573,38 @@ fn unmap_fixed(io: &Io<'_>, memory: u32, mapping: HostMapping) -> Result<(), Err
         io.rm_free(nd::H_DEVICE, mapping.desc)?;
     }
     Ok(())
+}
+
+/// An explicit TLB invalidate of `space` (`NV0080_CTRL_CMD_DMA_INVALIDATE_TLB`),
+/// for a leaf update whose deferred operations were not followed by the one
+/// that invalidates (it failed). Best effort, counted (`NvPmTlbInv`, refusals
+/// `NvPmTlbErr`).
+fn invalidate_tlb(io: &Io<'_>, space: u32) {
+    let params = np::invalidate_tlb_params(space);
+    let block = rc::nvos54(
+        io.client.root,
+        nd::H_DEVICE,
+        np::CTRL_DMA_INVALIDATE_TLB,
+        params.len() as u32,
+    );
+    let mut response = [0u8; REPLY_MAX];
+    let sent = io.exchange(
+        io.client.ctl,
+        rc::nv_cmd(rc::ESC_RM_CONTROL, rc::NVOS54_BYTES as u32),
+        &block,
+        &params,
+        &mut response,
+    );
+    let ok = match sent {
+        Ok(n) => response
+            .get(..n)
+            .is_some_and(|reply| rc::rm_reply(reply, rc::NVOS54_STATUS_AT).is_ok()),
+        Err(_) => false,
+    };
+    bump(&TLB_RESCUE, b"NvPmTlbInv");
+    if !ok {
+        bump(&TLB_RESCUE_FAILED, b"NvPmTlbErr");
+    }
 }
 
 /// Write the record values CreateAllocation produced for native allocation
@@ -1613,7 +1876,86 @@ pub fn update_leaf_system(
         crate::diag::record_named_bytes(b"NvSysErr", error as u32);
         error
     };
-    update_leaf(passive, adapter, id, process, first_va, allocation_offset, &none)
+    let start = crate::adapter::foreign_scanout::now_100ns();
+    let trips = round_trips();
+    let chunk_pages = system_chunk_pages();
+    let perf = perf();
+    // NvPerfMem 0x40: VidMm rewrites a range with the pages that are mapped there
+    // already (a re-residency, a page-table rebuild): nothing to unmap or map.
+    if perf.skip_unchanged()
+        && system_mapping_unchanged(id, process, first_va, allocation_offset, pfns, chunk_pages)
+    {
+        bump(&SKIPPED_UNCHANGED, b"NvPmSkip");
+        return Ok(());
+    }
+    let result = update_leaf_system_inner(
+        passive,
+        adapter,
+        id,
+        process,
+        first_va,
+        allocation_offset,
+        pfns,
+        &none,
+        chunk_pages,
+        perf.tlb_defer(),
+        &why,
+    );
+    SYSTEM_COST.note(start, trips);
+    result
+}
+
+/// Whether the allocation's mappings in `process` over the update's range are
+/// exactly the system-page chunks the update would make (`native_perf`).
+fn system_mapping_unchanged(
+    id: u32,
+    process: usize,
+    first_va: u64,
+    allocation_offset: u64,
+    pfns: &[u64],
+    chunk_pages: usize,
+) -> bool {
+    let state = STATE.lock();
+    let Ok(allocation) = state.allocation(id) else {
+        return false;
+    };
+    if allocation.poisoned {
+        return false;
+    }
+    let mut live = Vec::new();
+    if live.try_reserve(allocation.mappings.len()).is_err() {
+        return false;
+    }
+    for m in allocation.mappings.iter().filter(|m| m.process == process) {
+        let shown = if m.desc != 0 {
+            match state.desc_pfns.iter().find(|(desc, _)| *desc == m.desc) {
+                Some((_, pages)) => Some(pages.as_slice()),
+                // A descriptor whose pages were not kept: cannot tell.
+                None => return false,
+            }
+        } else {
+            None
+        };
+        live.push(np::LiveMapping { piece: m.piece, pfns: shown });
+    }
+    np::system_update_unchanged(&live, first_va, allocation_offset, pfns, chunk_pages)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn update_leaf_system_inner(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    id: u32,
+    process: usize,
+    first_va: u64,
+    allocation_offset: u64,
+    pfns: &[u64],
+    none: &[Option<nm::MappingPiece>],
+    chunk_pages: usize,
+    defer_on: bool,
+    why: &dyn Fn(u32, Error) -> Error,
+) -> Result<(), Error> {
+    update_leaf_staged(passive, adapter, id, process, first_va, allocation_offset, none)
         .map_err(|error| why(1, error))?;
 
     let _guard = lock(passive)?;
@@ -1624,30 +1966,48 @@ pub fn update_leaf_system(
         client,
     };
     let space = ensure_space(&io, process)?;
-    // One OS descriptor per SYSTEM_CHUNK_PAGES: RM refused large ones (512 and
-    // 335 pages) with NV_ERR_INVALID_ADDRESS after pinning them (bpftrace:
-    // every pin succeeded), and the range stayed unmapped (ring fetch faults).
-    // A refused chunk still fails the update; the chunks mapped before it stay.
-    let chunk_pages = SYSTEM_CHUNK_PAGES.max(1);
+    // One OS descriptor per chunk (`NvSysChunk`, default 128 pages): RM refused
+    // large ones (512 and 335 pages) with NV_ERR_INVALID_ADDRESS after pinning
+    // them (bpftrace: every pin succeeded), and the range stayed unmapped (ring
+    // fetch faults). A refused chunk still fails the update; the chunks mapped
+    // before it stay. With NvPerfMem 0x20 every chunk's mapping but the last
+    // defers its TLB invalidate.
+    let chunks = np::system_chunks(first_va, allocation_offset, pfns.len(), chunk_pages);
     let mut first_error = None;
-    for (index, chunk) in pfns.chunks(chunk_pages).enumerate() {
-        let delta = (index * chunk_pages) as u64 * nm::PAGE_BYTES;
-        let va = first_va.checked_add(delta).ok_or(Error::Invalid)?;
-        let offset = allocation_offset.checked_add(delta).ok_or(Error::Invalid)?;
-        let chunk_len = chunk.len() as u64 * nm::PAGE_BYTES;
-        if let Err(error) = map_system_chunk(&io, id, process, space, va, offset, chunk, &why) {
-            note_failed_map(va, 2, error);
-            watch::event(va, chunk_len, 8, error as u32, process);
+    let mut deferred = false;
+    let mut last_ok = false;
+    for (index, chunk) in chunks.iter().enumerate() {
+        let defer = np::defer_tlb(defer_on, index, chunks.len());
+        let pages = pfns
+            .get(chunk.first..chunk.first + chunk.pages)
+            .ok_or(Error::Invalid)?;
+        let mapped = map_system_chunk(
+            &io,
+            id,
+            process,
+            space,
+            chunk.va,
+            chunk.memory_offset,
+            pages,
+            defer,
+            why,
+        );
+        last_ok = mapped.is_ok();
+        if let Err(error) = mapped {
+            note_failed_map(chunk.va, 2, error);
+            watch::event(chunk.va, chunk.bytes(), 8, error as u32, process);
             first_error.get_or_insert(error);
         } else {
-            watch::event(va, chunk_len, 7, 0, process);
+            deferred |= defer;
+            watch::event(chunk.va, chunk.bytes(), 7, 0, process);
         }
+    }
+    if deferred && !last_ok {
+        // The last chunk would have invalidated for the deferred ones.
+        invalidate_tlb(&io, space);
     }
     first_error.map_or(Ok(()), Err)
 }
-
-/// Pages per OS descriptor of `update_leaf_system`.
-const SYSTEM_CHUNK_PAGES: usize = 128;
 
 #[allow(clippy::too_many_arguments)]
 fn map_system_chunk(
@@ -1658,6 +2018,7 @@ fn map_system_chunk(
     va: u64,
     allocation_offset: u64,
     pfns: &[u64],
+    defer: bool,
     why: &dyn Fn(u32, Error) -> Error,
 ) -> Result<(), Error> {
     let len = (pfns.len() as u64)
@@ -1671,7 +2032,7 @@ fn map_system_chunk(
         memory_offset: 0,
         len,
     };
-    let used = match map_fixed(io, desc, len, true, space, virt, shown) {
+    let used = match map_fixed_opts(io, desc, len, true, space, virt, shown, defer) {
         Ok(used) => used,
         Err(error) => {
             let _ = io.rm_free(nd::H_DEVICE, desc);
@@ -1921,6 +2282,23 @@ pub fn update_leaf(
     allocation_offset: u64,
     pieces: &[Option<nm::MappingPiece>],
 ) -> Result<(), Error> {
+    let start = crate::adapter::foreign_scanout::now_100ns();
+    let trips = round_trips();
+    let result = update_leaf_staged(passive, adapter, id, process, first_va, allocation_offset, pieces);
+    LEAF_COST.note(start, trips);
+    result
+}
+
+/// [`update_leaf`] without the cost counters (`update_leaf_system` counts its own).
+fn update_leaf_staged(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    id: u32,
+    process: usize,
+    first_va: u64,
+    allocation_offset: u64,
+    pieces: &[Option<nm::MappingPiece>],
+) -> Result<(), Error> {
     leaf_stage(1);
     let result = update_leaf_inner(passive, adapter, id, process, first_va, allocation_offset, pieces);
     let stage = LEAF_STAGE.load(Ordering::Relaxed);
@@ -2097,17 +2475,32 @@ fn update_leaf_inner(
         planned.push((piece, STATE.lock().mint()?));
     }
     leaf_stage(11);
-    for mapping in affected_old.iter().copied() {
-        if unmap_fixed(&io, memory, mapping).is_err() {
+    // NvPerfMem 0x20: every unmap and map of this update but the last defers its
+    // TLB invalidate; the last one's invalidate covers them all. An update that
+    // fails after a deferred operation invalidates explicitly.
+    let defer_on = perf().tlb_defer();
+    let operations = affected_old.len() + planned.len();
+    let mut deferred = false;
+    for (index, mapping) in affected_old.iter().copied().enumerate() {
+        let defer = np::defer_tlb(defer_on, index, operations);
+        if unmap_fixed_opts(&io, memory, mapping, defer).is_err() {
+            if deferred {
+                invalidate_tlb(&io, space);
+            }
             STATE.lock().allocation_mut(id)?.poisoned = true;
             return Err(Error::Poisoned);
         }
+        deferred |= defer;
     }
     leaf_stage(13);
 
     let mut made = Vec::new();
-    for (piece, virt) in planned.iter().copied() {
-        let mapped = map_fixed(&io, memory, size, system_backed, space, virt, piece);
+    for (index, (piece, virt)) in planned.iter().copied().enumerate() {
+        let defer = np::defer_tlb(defer_on, affected_old.len() + index, operations);
+        let mapped = map_fixed_opts(&io, memory, size, system_backed, space, virt, piece, defer);
+        if mapped.is_ok() {
+            deferred |= defer;
+        }
         watch::event(
             piece.va,
             piece.len,
@@ -2171,6 +2564,9 @@ fn update_leaf_inner(
                 });
             }
             if !rollback_ok {
+                if deferred {
+                    invalidate_tlb(&io, space);
+                }
                 STATE.lock().allocation_mut(id)?.poisoned = true;
                 return Err(Error::Poisoned);
             }
@@ -2526,6 +2922,7 @@ pub unsafe fn with_cpu_range(
                 writeback: a.writeback,
                 surface: a.surface,
                 scanout_gem: 0,
+                huge: a.huge,
             },
             existing,
             pending,
@@ -2634,6 +3031,7 @@ pub fn map_aperture(
             writeback: a.writeback,
             surface: a.surface,
             scanout_gem: 0,
+            huge: a.huge,
         }
     };
     let mut mapping = cpu_map(
