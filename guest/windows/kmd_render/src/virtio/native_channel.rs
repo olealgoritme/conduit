@@ -34,6 +34,8 @@ use wdk_sys::{PHYSICAL_ADDRESS, _MEMORY_CACHING_TYPE};
 
 const TIMEOUT_MS: u64 = 2_500;
 const BLACKWELL_COMPUTE_B: u32 = 0xcec0;
+/// The GB20x 3D class (`clce97.h`).
+const BLACKWELL_B: u32 = 0xce97;
 const FIRST_NATIVE_HANDLE: u32 = 0x4e43_1000;
 const HANDLE_STRIDE: u32 = 16;
 
@@ -898,6 +900,23 @@ fn create_queue_objects(
             BLACKWELL_COMPUTE_B,
             &[0u8; 16],
         )?;
+        // The D3D UMDs drive the 3D class on subchannel 0 and the graphics copy
+        // engine on subchannel 4 (they never SET_OBJECT them; their pushbuffers
+        // assume both). RM maps a class's GR context buffers when its object is
+        // allocated (kgrctxMapCtxBuffers), so without a 3D object the 3D
+        // pipeline wrote through unset context addresses (Xid 31 at VA 0,
+        // HUBCLIENT_SCC_NB). Best effort: NvCh3dSt / NvChCeSt record RM's
+        // answer (0 = allocated).
+        let three_d = io.alloc(client, handles.at(5), handles.at(7), BLACKWELL_B, &[0u8; 16]);
+        crate::diag::record_named_bytes(b"NvCh3dSt", u32::from(three_d.is_err()));
+        let copy = io.alloc(
+            client,
+            handles.at(5),
+            handles.at(8),
+            cp::Gen::Gb202.classes().copy,
+            &cc::ce_object_params(0),
+        );
+        crate::diag::record_named_bytes(b"NvChCeSt", u32::from(copy.is_err()));
         crate::diag::record_named_bytes(b"NvQStep", 8);
         let mut index = cc::token_notif_index_params();
         io.control(
