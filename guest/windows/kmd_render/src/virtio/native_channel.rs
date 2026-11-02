@@ -1034,17 +1034,14 @@ fn create_queue_objects(
         // The copy object must be the graphics runlist's copy engine (GRCE):
         // engine type 0 let RM bind an async CE, and every method the UMD sent
         // to subchannel 4 raised PBDMA DEVICE (Xid 32, SET_RENDER_ENABLE_C).
-        // Without allocation parameters RM itself picks the copy engine
-        // partnered with this GR channel's runqueue (channel_descendant.c, the
-        // "GRCE case"); NVK on RM allocates its copy object the same way. Any
-        // engine type in the parameters bypasses that, and neither engine 0
-        // nor the first GRCE (COPY0) was the partner here: PBDMA DEVICE.
+        let grce = grce_engine(io, client).unwrap_or(0);
+        crate::diag::record_named_bytes(b"NvChGrce", grce);
         let copy = io.alloc(
             client,
             handles.at(5),
             handles.at(8),
             cp::Gen::Gb202.classes().copy,
-            &[],
+            &cc::ce_object_params(grce),
         );
         crate::diag::record_named_bytes(b"NvChCeSt", u32::from(copy.is_err()));
         crate::diag::record_named_bytes(b"NvQStep", 8);
@@ -1237,6 +1234,61 @@ pub(crate) static CE_BIND_IRQL: AtomicU32 = AtomicU32::new(0xff);
 static CE_BIND_OUTCOME: AtomicU32 = AtomicU32::new(0);
 static CE_BIND_SEEN: AtomicU32 = AtomicU32::new(0);
 static CE_BIND_DONE: AtomicU32 = AtomicU32::new(0);
+
+/// The first GRCE (graphics-runlist copy engine) RM lists, cached.
+static GRCE_ENGINE: AtomicU32 = AtomicU32::new(0);
+
+fn grce_engine(io: Io<'_>, client: &NativeClient) -> Option<u32> {
+    let known = GRCE_ENGINE.load(Ordering::Relaxed);
+    if known != 0 {
+        return Some(known);
+    }
+    // RM's own answer first: the copy engine partnered with GR0 on runqueue 0
+    // for this channel class (NV2080_CTRL_CMD_GPU_GET_ENGINE_PARTNERLIST, what
+    // RM itself uses for a CE object on a GR channel). The first GRCE in the
+    // caps list (COPY0) was not it: subchannel 4 still raised PBDMA DEVICE.
+    let mut partners = [0u8; 144];
+    partners[0..4].copy_from_slice(&1u32.to_le_bytes()); // NV2080_ENGINE_TYPE_GR0
+    partners[4..8].copy_from_slice(&cp::Gen::Gb202.classes().gpfifo.to_le_bytes());
+    let asked = io.control(client, nd::H_SUBDEVICE, 0x2080_0147, &mut partners);
+    // NvChGrPartQ: 0x100 + error kind when the query failed, else the count.
+    crate::diag::record_named_bytes(
+        b"NvChGrPartQ",
+        match asked {
+            Ok(()) => u32::from_le_bytes([partners[12], partners[13], partners[14], partners[15]]),
+            Err(error) => 0x100 | error as u32,
+        },
+    );
+    if asked.is_ok() {
+        let count = u32::from_le_bytes([partners[12], partners[13], partners[14], partners[15]]);
+        if count >= 1 {
+            let first = u32::from_le_bytes([partners[16], partners[17], partners[18], partners[19]]);
+            crate::diag::record_named_bytes(b"NvChGrPartn", first | (count << 16));
+            if first != 0 {
+                GRCE_ENGINE.store(first, Ordering::Relaxed);
+                return Some(first);
+            }
+        }
+    }
+    let mut list = Vec::new();
+    list.try_reserve_exact(cc::ENGINES_BYTES).ok()?;
+    list.resize(cc::ENGINES_BYTES, 0u8);
+    io.control(client, nd::H_SUBDEVICE, cc::CTRL_GET_ENGINES_V2, &mut list).ok()?;
+    let mut types = [0u32; cc::MAX_CAPS_QUERIES];
+    let n = cc::copy_engines(&list, &mut types);
+    for &t in types.get(..n).unwrap_or(&[]) {
+        let mut params = cc::ce_caps_params(t);
+        if io.control(client, nd::H_SUBDEVICE, cc::CTRL_CE_GET_CAPS_V2, &mut params).is_ok() {
+            if let Some(caps) = cc::parse_ce_caps(&params, t) {
+                if caps.is_grce() {
+                    GRCE_ENGINE.store(t, Ordering::Relaxed);
+                    return Some(t);
+                }
+            }
+        }
+    }
+    None
+}
 
 extern "C" {
     fn helios_lock_system_read_seh(va: *mut c_void, length: u32, mapped: *mut *mut c_void) -> *mut c_void;
