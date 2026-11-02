@@ -34,6 +34,22 @@ fn get32(buf: &[u8], at: usize) -> Option<u32> {
     Some(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
 }
 
+/// The node the ICD creates its copy context on.
+pub const COPY_CONTEXT_NODE: u32 = 3;
+/// The context header's tag at +0x0c: `NVGL`.
+const NVGL_TAG: u32 = 0x4e56_474c;
+
+/// Whether a CreateContext's private data is the ICD's copy context: node 3,
+/// an NVDA header of version 0x00010004 with the NVGL tag at +0x0c and its own
+/// size declared at +0x08 (0xdf1 bytes in the capture).
+pub fn is_copy_context(buf: &[u8], node_ordinal: u32) -> bool {
+    node_ordinal == COPY_CONTEXT_NODE
+        && get32(buf, 0) == Some(NVDA_MAGIC)
+        && get32(buf, 4) == Some(SUBMIT_VERSION)
+        && get32(buf, 8) == u32::try_from(buf.len()).ok()
+        && get32(buf, 0x0c) == Some(NVGL_TAG)
+}
+
 /// One GPFIFO entry: a pushbuffer segment of `dwords` method dwords at `va`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct GpEntry {
@@ -111,6 +127,94 @@ pub fn find_submission(buf: &[u8], command_length: u32) -> Option<Submission> {
                 && get32(buf, at + ENTRIES_OFFSET_AT) == Some(ENTRIES_AT as u32)
         })
         .find_map(|at| parse_submission(&buf[at..], command_length))
+}
+
+impl GpEntry {
+    /// The two GPFIFO dwords for this segment (main level, no sync).
+    pub const fn encode(self) -> (u32, u32) {
+        (
+            (self.va as u32) & !3,
+            ((self.va >> 32) as u32 & 0xff) | (self.dwords << 10),
+        )
+    }
+}
+
+/// The KMD's own copy channel for the copy context (`kmd_render`'s
+/// `CopyChannel`): one system-memory block, mapped for the GPU in the
+/// process's VA space and for the CPU in the kernel, holds the GPFIFO ring, a
+/// release segment per in-flight submission and the progress semaphore.
+pub mod ring {
+    /// The block.
+    pub const BYTES: u64 = 0x1_0000;
+    /// GPFIFO entries at offset 0.
+    pub const ENTRIES: u32 = 1024;
+    pub const GPFIFO_BYTES: u32 = ENTRIES * 8;
+    /// Release segments, one slot per submission (by sequence).
+    pub const RELEASE_AT: u64 = 0x2000;
+    pub const RELEASE_SLOT_BYTES: u64 = 32;
+    pub const RELEASE_SLOTS: u64 = 512;
+    /// The progress semaphore (64 bits): the last sequence the channel finished.
+    pub const SEMAPHORE_AT: u64 = RELEASE_AT + RELEASE_SLOT_BYTES * RELEASE_SLOTS;
+    /// Entries one submission may use: its segments and its release.
+    pub const MAX_SUBMIT_ENTRIES: u32 = super::MAX_ENTRIES as u32 + 1;
+    const _: () = assert!(SEMAPHORE_AT + 8 <= BYTES);
+    const _: () = assert!(GPFIFO_BYTES as u64 <= RELEASE_AT);
+    // Every submission takes at least two entries (a segment and its release),
+    // so fewer than RELEASE_SLOTS are in flight: a slot is free again before its
+    // sequence comes round.
+    const _: () = assert!(((ENTRIES - 1) as u64) / 2 < RELEASE_SLOTS);
+
+    /// The release slot's offset in the block for sequence `seq`.
+    pub const fn release_offset(seq: u64) -> u64 {
+        RELEASE_AT + (seq % RELEASE_SLOTS) * RELEASE_SLOT_BYTES
+    }
+
+    /// Free GPFIFO entries with the channel at `get` and the KMD at `put` (one
+    /// entry always stays empty: put == get means an empty ring).
+    pub const fn room(put: u32, get: u32) -> u32 {
+        let used = (put + ENTRIES - get % ENTRIES) % ENTRIES;
+        ENTRIES - 1 - used
+    }
+}
+
+/// LAUNCH_DMA for the KMD's release: a one-word semaphore release
+/// (SEMAPHORE_TYPE 1) with a 64-bit payload (SEMAPHORE_PAYLOAD_SIZE), flushed.
+pub const LAUNCH_RELEASE_64: u32 = (1 << 27) | (1 << 3) | (1 << 2);
+pub const RELEASE_DWORDS: usize = 7;
+
+/// The KMD's segment after a submission's own: the copy engine writes `value`
+/// (64 bits) to `semaphore_va` once everything before it on the channel is done.
+pub const fn release_segment(semaphore_va: u64, value: u64) -> [u32; RELEASE_DWORDS] {
+    [
+        // SET_SEMAPHORE_A..PAYLOAD_UPPER (0x240..0x24c) on subchannel 4.
+        0x2004_8090,
+        (semaphore_va >> 32) as u32,
+        semaphore_va as u32,
+        value as u32,
+        (value >> 32) as u32,
+        // LAUNCH_DMA (0x300) on subchannel 4.
+        0x2001_80c0,
+        LAUNCH_RELEASE_64,
+    ]
+}
+
+/// A copy-context job's gate in a WDDM pending entry (`kmd_render` puts it in
+/// the GDI gate field): bit 63 marks it, bits 48..56 name the channel slot, the
+/// low 48 bits the sequence.
+pub const GATE_TAG: u64 = 1 << 63;
+pub const GATE_CPU_SLOT: usize = 0xff;
+
+pub const fn gate(slot: usize, seq: u64) -> u64 {
+    GATE_TAG | ((slot as u64 & 0xff) << 48) | (seq & 0xffff_ffff_ffff)
+}
+
+/// `(slot, seq)` of a tagged gate, `None` for any other gate value.
+pub const fn gate_parts(gate: u64) -> Option<(usize, u64)> {
+    if gate & GATE_TAG == 0 {
+        None
+    } else {
+        Some((((gate >> 48) & 0xff) as usize, gate & 0xffff_ffff_ffff))
+    }
 }
 
 /// One operation of a copy-engine method stream.
@@ -400,6 +504,82 @@ mod tests {
         let mut out = Vec::new();
         let stats = decode(dwords, |op| out.push(op));
         (out, stats)
+    }
+
+    #[test]
+    fn the_captured_copy_context_header_is_recognised() {
+        // L3 capture seq 123474: NodeOrdinal 3, 3569 bytes.
+        let mut b = std::vec![0u8; 0xdf1];
+        b[..0x10].copy_from_slice(&[
+            0x41, 0x44, 0x56, 0x4e, 0x04, 0x00, 0x01, 0x00, 0xf1, 0x0d, 0x00, 0x00, 0x4c, 0x47,
+            0x56, 0x4e,
+        ]);
+        assert!(is_copy_context(&b, 3));
+        assert!(!is_copy_context(&b, 4));
+        assert!(!is_copy_context(&b[..0xdf0], 3));
+        let mut d3d = b.clone();
+        d3d[0x0c..0x10].copy_from_slice(&0x4e56_4458u32.to_le_bytes());
+        assert!(!is_copy_context(&d3d, 3));
+    }
+
+    #[test]
+    fn entries_encode_back_to_the_captured_dwords() {
+        // Seq 3606's last entry: 80 18 06 04 / 00 9d 04 00.
+        let entry = GpEntry::decode(0x0406_1880, 0x0004_9d00);
+        assert_eq!(
+            entry,
+            GpEntry {
+                va: 0x406_1880,
+                dwords: 295
+            }
+        );
+        assert_eq!(entry.encode(), (0x0406_1880, 0x0004_9c00));
+        assert_eq!(GpEntry::decode(entry.encode().0, entry.encode().1), entry);
+        let high = GpEntry {
+            va: 0x2_0000_1000,
+            dwords: 7,
+        };
+        assert_eq!(GpEntry::decode(high.encode().0, high.encode().1), high);
+    }
+
+    #[test]
+    fn the_kmd_release_decodes_as_a_64_bit_release() {
+        let seg = release_segment(0x1_2345_6000, 0x1_0000_0002);
+        let (got, stats) = ops(&seg);
+        assert_eq!(stats, DecodeStats::default());
+        assert_eq!(
+            got,
+            std::vec![Op::Release {
+                va: 0x1_2345_6000,
+                payload: 0x1_0000_0002,
+                wide: true,
+                four_word: false
+            }]
+        );
+    }
+
+    #[test]
+    fn ring_room_and_release_slots() {
+        assert_eq!(ring::room(0, 0), ring::ENTRIES - 1);
+        assert_eq!(ring::room(10, 0), ring::ENTRIES - 11);
+        assert_eq!(ring::room(5, 6), 0);
+        assert_eq!(ring::room(0, 1), 0);
+        assert_eq!(ring::room(3, 1000), ring::ENTRIES - 1 - 27);
+        assert_eq!(ring::release_offset(0), ring::RELEASE_AT);
+        assert_eq!(
+            ring::release_offset(513),
+            ring::RELEASE_AT + ring::RELEASE_SLOT_BYTES
+        );
+        assert!(ring::release_offset(511) + ring::RELEASE_SLOT_BYTES <= ring::SEMAPHORE_AT);
+    }
+
+    #[test]
+    fn gates_carry_slot_and_sequence() {
+        let g = gate(3, 0x1234);
+        assert_eq!(gate_parts(g), Some((3, 0x1234)));
+        assert_eq!(gate_parts(gate(GATE_CPU_SLOT, 9)), Some((GATE_CPU_SLOT, 9)));
+        // A GDI executor sequence is not a copy gate.
+        assert_eq!(gate_parts(17), None);
     }
 
     #[test]
