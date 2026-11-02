@@ -1615,6 +1615,15 @@ pub(crate) unsafe fn submit_virtual(
     } else {
         None
     };
+    // NVIDIA personality: the Vulkan ICD's copy-context work rides in the
+    // private data; the fence waits for the HPD worker to run it
+    // (`ddi::nv_copy`, the same gate field, tagged).
+    let gdi_seq = if gdi_seq.is_none() && !is_paging && hw_queue.is_none() {
+        // SAFETY: dxgkrnl's live args for this DMA buffer.
+        unsafe { crate::ddi::nv_copy::admit(adapter, submit) }
+    } else {
+        gdi_seq
+    };
     let SubmitAck::Accepted = note_and_maybe_signal(
         adapter,
         fence,
