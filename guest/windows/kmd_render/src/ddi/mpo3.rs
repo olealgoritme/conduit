@@ -60,13 +60,11 @@ pub(crate) const PART_VSYNC_ALWAYS: u32 = 64;
 /// target, cancel and `ControlInterrupt3` DDIs, `MaxHwQueuedFlips` when dxgkrnl enables
 /// the feature; MPO3 flips are queued by target time and retired by the vsync tick.
 pub(crate) const PART_HWFQ: u32 = 128;
-/// Off by default. With every part on (0x7f) the adapter starts and DWM stops
-/// rebuilding its swap chain, but it never flips again after one disabled-plane flip
-/// (no picture reaches the host) and composes at ~12.7 fps; without MPO3 DWM flips
-/// NVIDIA's memory to the host at 6-10 fps. NVIDIA's own KMD also implements
-/// `ControlInterrupt3` and the WDDM 3.x hardware flip queue (`SetFlipQueueLogBuffer`,
-/// `SetInterruptTargetPresentId`), which this does not.
-const DEFAULT_PARTS: u32 = 0;
+/// Default for the NVIDIA personality: the MPO3 DDIs and caps, the MPO3 vsync,
+/// immediate flips and the hardware flip queue (`ddi::hwfq`). With these DWM keeps its
+/// swap chain, dxgkrnl enables DXGK_FEATURE_HWFLIPQUEUE and a windowed D3D11 app
+/// presents at the refresh rate (300 frames in 1.26 s at 240 Hz). 0 turns MPO3 off.
+const DEFAULT_PARTS: u32 = PART_DDIS | PART_CAPS | PART_VSYNC | PART_IMMEDIATE | PART_HWFQ;
 
 /// Read the knob (DriverEntry, after the personality is chosen).
 pub(crate) fn select_at_driver_entry() -> u32 {
