@@ -332,7 +332,11 @@ pub fn parse_submit_private(
     previous_gp_put: u32,
     ring_bytes: u32,
 ) -> Result<SubmitPrivate, PrivateError> {
-    if !matches!(buf.len(), SUBMIT_PRIVATE_BYTES | D3D_SUBMIT_PRIVATE_BYTES)
+    // D3D records say 0x118 at +0x0c and may carry more after it: the copy
+    // queue's are 0x758 bytes (610.88 D3D11 UMD), the header and GP_PUT the same.
+    let d3d = buf.len() >= D3D_SUBMIT_PRIVATE_BYTES
+        && get32(buf, 0x0c) == Some(D3D_SUBMIT_PRIVATE_BYTES as u32);
+    if !(buf.len() == SUBMIT_PRIVATE_BYTES || d3d)
         || ring_bytes == 0
         || ring_bytes % GP_ENTRY_BYTES != 0
     {
@@ -492,6 +496,17 @@ mod tests {
         assert_eq!((submit.new_gp_put, submit.entries_advanced), (0x23, 3));
         assert_eq!(
             parse_submit_private(&b[..279], 0x20, D3D_RING_BYTES),
+            Err(PrivateError::Size)
+        );
+        // The copy queue's record: the same header, 0x758 bytes in all.
+        let mut long = b.clone();
+        long.resize(0x758, 0);
+        let submit = parse_submit_private(&long, 0x20, D3D_RING_BYTES).unwrap();
+        assert_eq!(submit.new_gp_put, 0x23);
+        // A long buffer without the D3D header size is not a record.
+        long[0x0c..0x10].copy_from_slice(&0x758u32.to_le_bytes());
+        assert_eq!(
+            parse_submit_private(&long, 0x20, D3D_RING_BYTES),
             Err(PrivateError::Size)
         );
     }

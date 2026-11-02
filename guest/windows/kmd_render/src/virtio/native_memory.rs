@@ -723,6 +723,15 @@ fn alloc_system_descriptor(io: &Io<'_>, memory: u32, pfns: &[u64], size: u64) ->
         };
         crate::diag::record_named_bytes(b"NvSysHost", code);
         crate::diag::record_named_bytes(b"NvSysPages", pfns.len() as u32);
+        // The refused page frames' range, and how many lie outside guest RAM
+        // as Windows reports it below 4 GiB / above (pfn >= 0x80000 and < 0x100000).
+        let lo = pfns.iter().copied().min().unwrap_or(0);
+        let hi = pfns.iter().copied().max().unwrap_or(0);
+        let hole = pfns.iter().filter(|&&p| (0x80000..0x100000).contains(&p)).count();
+        crate::diag::record_named_bytes(b"NvSysPfnLo", lo as u32);
+        crate::diag::record_named_bytes(b"NvSysPfnHi", hi as u32);
+        crate::diag::record_named_bytes(b"NvSysPfnHole", hole as u32);
+        crate::diag::record_named_bytes(b"NvSysPfn0", pfns.first().copied().unwrap_or(0) as u32);
         Error::Host
     })
 }
@@ -1065,6 +1074,174 @@ fn unmap_fixed(io: &Io<'_>, memory: u32, mapping: HostMapping) -> Result<(), Err
     Ok(())
 }
 
+/// How many mappings `evict_range` dropped (NvEvict) and how many of their
+/// outside remainders could not be shown again (NvEvictFail).
+static EVICTED: AtomicU32 = AtomicU32::new(0);
+static EVICT_FAILED: AtomicU32 = AtomicU32::new(0);
+
+/// Drop every mapping of `process` in `[first_va, first_va + len)` that VidMm's
+/// page table no longer shows there: foreign ranges and other allocations
+/// (`keep` excepted). The parts of a dropped mapping outside the range are
+/// mapped again (RM unmaps whole objects); one that cannot be stays unmapped,
+/// as if VidMm had not written it yet. Callers hold the RM lock.
+fn evict_range(
+    io: &Io<'_>,
+    space: u32,
+    process: usize,
+    first_va: u64,
+    len: u64,
+    keep: Option<u32>,
+) -> Result<(), Error> {
+    let end = first_va.checked_add(len).ok_or(Error::Invalid)?;
+    let hit = |m: &HostMapping| {
+        m.process == process && nm::ranges_overlap(m.piece.va, m.piece.len, first_va, len)
+    };
+    struct Victim {
+        id: u32,
+        memory: u32,
+        size: u64,
+        system_backed: bool,
+        mapping: HostMapping,
+        pfns: Option<Vec<u64>>,
+    }
+    let (foreign, victims) = {
+        let mut state = STATE.lock();
+        let mut foreign = Vec::new();
+        if state.foreign.iter().any(|m| hit(m)) {
+            foreign.try_reserve(state.foreign.len()).map_err(|_| Error::NoMemory)?;
+            foreign.extend(state.foreign.iter().copied().filter(|m| hit(m)));
+            state.foreign.retain(|m| !hit(m));
+        }
+        let mut found = Vec::new();
+        for allocation in state.allocations.iter().filter(|a| Some(a.id) != keep) {
+            for mapping in allocation.mappings.iter().copied().filter(|m| hit(m)) {
+                found.try_reserve(1).map_err(|_| Error::NoMemory)?;
+                found.push((allocation.id, allocation.memory, allocation.size, allocation.system_memory != 0, mapping));
+            }
+        }
+        let mut victims = Vec::new();
+        victims.try_reserve(found.len()).map_err(|_| Error::NoMemory)?;
+        for (id, memory, size, system_backed, mapping) in found {
+            let pfns = if mapping.desc != 0 {
+                state
+                    .desc_pfns
+                    .iter()
+                    .find(|(desc, _)| *desc == mapping.desc)
+                    .and_then(|(_, pfns)| {
+                        let mut copy = Vec::new();
+                        copy.try_reserve_exact(pfns.len()).ok()?;
+                        copy.extend_from_slice(pfns);
+                        Some(copy)
+                    })
+            } else {
+                None
+            };
+            victims.push(Victim { id, memory, size, system_backed, mapping, pfns });
+        }
+        for allocation in state.allocations.iter_mut().filter(|a| Some(a.id) != keep) {
+            allocation.mappings.retain(|m| !hit(m));
+        }
+        (foreign, victims)
+    };
+    if foreign.is_empty() && victims.is_empty() {
+        return Ok(());
+    }
+    let n = EVICTED.fetch_add((foreign.len() + victims.len()) as u32, Ordering::Relaxed)
+        + (foreign.len() + victims.len()) as u32;
+    crate::diag::record_named_bytes(b"NvEvict", n);
+    for mapping in foreign {
+        let _ = unmap_fixed(io, 0, mapping);
+    }
+    let failed = || {
+        let n = EVICT_FAILED.fetch_add(1, Ordering::Relaxed) + 1;
+        crate::diag::record_named_bytes(b"NvEvictFail", n);
+    };
+    for victim in victims {
+        let m = victim.mapping;
+        if unmap_fixed(io, victim.memory, m).is_err() {
+            if let Ok(allocation) = STATE.lock().allocation_mut(victim.id) {
+                allocation.poisoned = true;
+            }
+            failed();
+            continue;
+        }
+        let Some(m_end) = m.piece.end() else {
+            continue;
+        };
+        let mut rest = [None, None];
+        if m.piece.va < first_va {
+            rest[0] = Some((m.piece.va, first_va - m.piece.va));
+        }
+        if m_end > end {
+            rest[1] = Some((end, m_end - end));
+        }
+        for (va, bytes) in rest.into_iter().flatten() {
+            let delta = va - m.piece.va;
+            let piece = nm::MappingPiece {
+                va,
+                memory_offset: m.piece.memory_offset + delta,
+                len: bytes,
+            };
+            let shown = (|| -> Result<HostMapping, Error> {
+                let virt = STATE.lock().mint()?;
+                if m.desc == 0 {
+                    let used = map_fixed(io, victim.memory, victim.size, victim.system_backed, space, virt, piece)?;
+                    return Ok(HostMapping { process, piece, virt: used, desc: 0 });
+                }
+                let pfns = victim.pfns.as_ref().ok_or(Error::Invalid)?;
+                let first = (delta / nm::PAGE_BYTES) as usize;
+                let count = (bytes / nm::PAGE_BYTES) as usize;
+                let sub = pfns.get(first..first + count).ok_or(Error::Invalid)?;
+                let desc = STATE.lock().mint()?;
+                alloc_system_descriptor(io, desc, sub, bytes)?;
+                let inner = nm::MappingPiece { va, memory_offset: 0, len: bytes };
+                let used = match map_fixed(io, desc, bytes, true, space, virt, inner) {
+                    Ok(used) => used,
+                    Err(error) => {
+                        let _ = io.rm_free(nd::H_DEVICE, desc);
+                        return Err(error);
+                    }
+                };
+                let mut kept = Vec::new();
+                if kept.try_reserve_exact(sub.len()).is_ok() {
+                    kept.extend_from_slice(sub);
+                    let mut state = STATE.lock();
+                    if state.desc_pfns.try_reserve(1).is_ok() {
+                        state.desc_pfns.push((desc, kept));
+                    }
+                }
+                Ok(HostMapping { process, piece, virt: used, desc })
+            })();
+            let Ok(shown) = shown else {
+                failed();
+                continue;
+            };
+            let recorded = {
+                let mut state = STATE.lock();
+                match state.allocation_mut(victim.id) {
+                    Ok(allocation) => {
+                        if allocation.mappings.try_reserve(1).is_ok() {
+                            allocation.mappings.push(shown);
+                            allocation
+                                .mappings
+                                .sort_unstable_by_key(|mapping| (mapping.process, mapping.piece.va));
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    Err(_) => false,
+                }
+            };
+            if !recorded {
+                let _ = unmap_fixed(io, victim.memory, shown);
+                failed();
+            }
+        }
+    }
+    Ok(())
+}
+
 /// A leaf update whose PTEs place a device-local native allocation in SYSTEM
 /// pages. VidMm keeps CPU-accessed allocations there (the UMD's Lock2 view is
 /// those pages), so the GPU must see the same pages, not the allocation's RM
@@ -1201,6 +1378,8 @@ pub fn update_foreign_leaf(
         return Ok(());
     }
     let space = ensure_space(&io, process)?;
+    // Native allocations VidMm no longer shows here (see `update_leaf`).
+    evict_range(&io, space, process, first_va, len, None)?;
     let desc = STATE.lock().mint()?;
     alloc_system_descriptor(&io, desc, pfns, len)?;
     let virt = STATE.lock().mint()?;
@@ -1395,13 +1574,11 @@ pub fn update_leaf(
     final_pieces.sort_unstable_by_key(|piece| piece.va);
 
     // GPU VAs are per process: only this process's other mappings can collide.
-    for other in STATE.lock().allocations.iter().filter(|a| a.id != id) {
-        if other.mappings.iter().any(|m| {
-            m.process == process && nm::ranges_overlap(m.piece.va, m.piece.len, first_va, len)
-        }) {
-            return Err(Error::Overlap);
-        }
-    }
+    // The page table VidMm writes is the truth: whatever another allocation or
+    // a foreign range still holds at these VAs is gone from VidMm's view, so it
+    // goes from RM's too (RM refused the new fixed mapping over the stale one:
+    // NV_ERR_INVALID_ARGUMENT, and the GPU faulted on the unmapped range).
+    evict_range(&io, space, process, first_va, len, Some(id))?;
 
     let affected_old: Vec<HostMapping> = old_process
         .iter()
