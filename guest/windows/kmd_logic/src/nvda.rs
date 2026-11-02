@@ -467,6 +467,39 @@ pub fn apply_local(
             put32(buf, 0x30, 0x1c95_a71e ^ (h_device as u32));
             put32(buf, 0x34, 0);
         }
+        0x0100_0069 | 0x0100_0107 => {
+            // Vulkan ICD queries the 610.88 capture answers with a bare 0x30-byte
+            // success (0x0107: also 1 at +0x9c).
+            put32(buf, NVDA_SIZE_AT, NVDA_COMMON_HEADER_BYTES as u32);
+            put32(buf, NVDA_RESULT_AT, 1);
+            put32(buf, NVDA_RESULT2_AT, 1);
+            if header.function == 0x0100_0107 {
+                exact(buf, 0xa8)?;
+                put32(buf, 0x9c, 1);
+            }
+        }
+        0x0100_00a4 => {
+            // Answered by NVIDIA's KMD with result 1 and -26 in the second result word.
+            put32(buf, NVDA_SIZE_AT, NVDA_COMMON_HEADER_BYTES as u32);
+            put32(buf, NVDA_RESULT_AT, 1);
+            put32(buf, NVDA_RESULT2_AT, (-26i32) as u32);
+        }
+        0x0100_00a7 => {
+            // 0x9c0-byte display description: 1 at +0x34, the mode at +0x40/+0x44
+            // and again at +0xcc/+0xd0, 1 at +0xb8 and +0xbc (the KMD fills in
+            // the real mode, `set_display_info_mode`).
+            exact(buf, 0x9c0)?;
+            put32(buf, NVDA_SIZE_AT, NVDA_COMMON_HEADER_BYTES as u32);
+            put32(buf, NVDA_RESULT_AT, 1);
+            put32(buf, NVDA_RESULT2_AT, 1);
+            for at in (0x30..0x9c0).step_by(4) {
+                put32(buf, at, 0);
+            }
+            put32(buf, 0x34, 1);
+            put32(buf, 0xb8, 1);
+            put32(buf, 0xbc, 1);
+            set_display_info_mode(buf, 1024, 768);
+        }
         0x0100_0116 => {
             // 0x39-byte request the D3D11 UMD makes while it sets up a swap chain
             // (DWM's primary every retry). The 610.88 capture answers a 0x30-byte
@@ -514,6 +547,41 @@ pub fn apply_local(
             put32(buf, NVDA_RESULT_AT, 1);
             put32(buf, NVDA_RESULT2_AT, 1);
         }
+        function
+            if is_rm_control_function(function)
+                && parse_rm_control(buf).is_ok_and(|c| c.h_object == PSEUDO_DISPLAY_COMMON) =>
+        {
+            // NV0073 controls on the display-common object (pseudo handle 0xff0a0000)
+            // that NVIDIA's KMD answers itself; the guest's RM client has no such
+            // object (the host owns the display). As the 610.88 capture answers them.
+            let cmd = rc::get32(buf, RM_CMD_AT).unwrap_or(0);
+            let p = RM_PARAMS_AT;
+            match cmd {
+                NV0073_CTRL_CMD_SYSTEM_GET_CAPS => {
+                    put8(buf, p, 0x81);
+                    put8(buf, p + 1, 0x2c);
+                }
+                NV0073_CTRL_CMD_SYSTEM_GET_NUM_HEADS => {
+                    // {subDeviceInstance, flags, numHeads}: 4 heads, 1 with flags.
+                    let flags = rc::get32(buf, p + 4).unwrap_or(0);
+                    put32(buf, p + 8, if flags == 0 { 4 } else { 1 });
+                }
+                NV0073_CTRL_CMD_SYSTEM_GET_ACTIVE => {
+                    // Per head (+4): head 0 is the active one (+0xd).
+                    let head = rc::get32(buf, p + 4).unwrap_or(u32::MAX);
+                    put8(buf, p + 0xd, u8::from(head == 0));
+                }
+                NV0073_CTRL_CMD_SYSTEM_GET_RASTER => {
+                    // Head 0's raster; the KMD fills in the real mode (`set_raster`).
+                    set_raster(buf, 1024, 768, 60);
+                }
+                _ => {
+                    put32(buf, RM_STATUS_AT, NV_ERR_NOT_SUPPORTED);
+                }
+            }
+            put32(buf, NVDA_RESULT_AT, 1);
+            put32(buf, NVDA_RESULT2_AT, 1);
+        }
         function if is_rm_control_function(function) => {
             // 0x0500002b and every other RM control remain real host-RM work.
             return Ok(LocalOutcome::ForwardRmControl);
@@ -558,6 +626,59 @@ impl From<u32> for Persona {
     fn from(value: u32) -> Self {
         Self::from_knob(value)
     }
+}
+
+/// NVDA 0x01000077: the address of a block in the caller's address space.
+pub const NVDA_FN_USER_SHARED: u32 = 0x0100_0077;
+pub const NVDA_FN_USER_SHARED_BYTES: usize = 0x3c;
+
+/// The 0x01000077 reply: 0x30 bytes, result 1, the 64-bit address at +0x34.
+pub fn answer_user_shared(buf: &mut [u8], address: u64) {
+    put32(buf, NVDA_SIZE_AT, NVDA_COMMON_HEADER_BYTES as u32);
+    put32(buf, NVDA_RESULT_AT, 1);
+    put32(buf, NVDA_RESULT2_AT, 1);
+    put32(buf, 0x30, 0);
+    put32(buf, 0x34, address as u32);
+    put32(buf, 0x38, (address >> 32) as u32);
+}
+
+/// NV04_DISPLAY_COMMON (class 0x73) in UMD RM controls.
+pub const PSEUDO_DISPLAY_COMMON: u32 = 0xff0a_0000;
+pub const NV0073_CTRL_CMD_SYSTEM_GET_CAPS: u32 = 0x0073_0101;
+pub const NV0073_CTRL_CMD_SYSTEM_GET_NUM_HEADS: u32 = 0x0073_0102;
+pub const NV0073_CTRL_CMD_SYSTEM_GET_ACTIVE: u32 = 0x0073_010c;
+pub const NV0073_CTRL_CMD_SYSTEM_GET_RASTER: u32 = 0x0073_011a;
+const NV_ERR_NOT_SUPPORTED: u32 = 0x56;
+
+/// The raster in an NV0073 0x73011a reply (params at +0x44): display id +0, width +4,
+/// height +8, totals +0xc/+0x10 (the capture's 1344x806 for 1024x768), refresh +0x18.
+pub fn set_raster(buf: &mut [u8], width: u32, height: u32, refresh_hz: u32) {
+    let p = RM_PARAMS_AT;
+    put32(buf, p + 0x04, width);
+    put32(buf, p + 0x08, height);
+    put32(buf, p + 0x0c, width / 16 * 21);
+    put32(buf, p + 0x10, height + height / 20);
+    put32(buf, p + 0x18, refresh_hz);
+}
+
+/// Whether `buf` is an NV0073 raster query on the display-common object.
+pub fn is_raster_query(buf: &[u8]) -> bool {
+    parse_rm_control(buf).is_ok_and(|c| {
+        c.h_object == PSEUDO_DISPLAY_COMMON && c.cmd == NV0073_CTRL_CMD_SYSTEM_GET_RASTER
+    })
+}
+
+/// The mode in a `0x010000a7` display description.
+pub fn set_display_info_mode(buf: &mut [u8], width: u32, height: u32) {
+    put32(buf, 0x40, width);
+    put32(buf, 0x44, height);
+    put32(buf, 0xcc, width);
+    put32(buf, 0xd0, height);
+}
+
+/// Whether `buf` is a `0x010000a7` display description.
+pub fn is_display_info(buf: &[u8]) -> bool {
+    rc::get32(buf, NVDA_FUNCTION_AT) == Some(0x0100_00a7)
 }
 
 /// Head 0's mode in a `0x0200000c` reply: width +0x40, height +0x44, refresh +0x4c.
@@ -1214,6 +1335,41 @@ mod tests {
         assert_eq!(apply_local(&mut short, 0, 0), Err(LocalError::Invalid));
     }
 
+    fn display_control(cmd: u32, params: usize) -> Vec<u8> {
+        let mut buf = vec![0u8; RM_PARAMS_AT + params];
+        test_put32(&mut buf, 0, NVDA_MAGIC);
+        test_put32(&mut buf, 4, NVDA_VERSION);
+        let len = buf.len() as u32;
+        test_put32(&mut buf, NVDA_SIZE_AT, len);
+        test_put32(&mut buf, NVDA_TAG_AT, 0x4e56_474c);
+        test_put32(&mut buf, NVDA_FUNCTION_AT, 0x0500_002b);
+        test_put32(&mut buf, RM_H_OBJECT_AT, PSEUDO_DISPLAY_COMMON);
+        test_put32(&mut buf, RM_CMD_AT, cmd);
+        test_put32(&mut buf, RM_PARAMS_SIZE_AT, params as u32);
+        buf
+    }
+
+    #[test]
+    fn display_common_controls_match_the_capture() {
+        let mut caps = display_control(NV0073_CTRL_CMD_SYSTEM_GET_CAPS, 2);
+        assert_eq!(apply_local(&mut caps, 0, 0), Ok(LocalOutcome::Applied));
+        assert_eq!(&caps[0x44..0x46], &[0x81, 0x2c]);
+        let mut heads = display_control(NV0073_CTRL_CMD_SYSTEM_GET_NUM_HEADS, 0xc);
+        assert_eq!(apply_local(&mut heads, 0, 0), Ok(LocalOutcome::Applied));
+        assert_eq!(&heads[0x4c..0x50], &4u32.to_le_bytes());
+        let mut active = display_control(NV0073_CTRL_CMD_SYSTEM_GET_ACTIVE, 0x10);
+        assert_eq!(apply_local(&mut active, 0, 0), Ok(LocalOutcome::Applied));
+        assert_eq!(active[0x44 + 0xd], 1);
+        let mut raster = display_control(NV0073_CTRL_CMD_SYSTEM_GET_RASTER, 0x1c);
+        test_put32(&mut raster, 0x44, 0x100);
+        assert_eq!(apply_local(&mut raster, 0, 0), Ok(LocalOutcome::Applied));
+        assert!(is_raster_query(&raster));
+        assert_eq!(&raster[0x44..0x60], &[
+            0, 1, 0, 0, 0, 4, 0, 0, 0, 3, 0, 0, 0x40, 5, 0, 0, 0x26, 3, 0, 0, 0, 0, 0, 0, 60, 0, 0, 0
+        ]);
+        assert_eq!(&raster[0x2c..0x30], &1u32.to_le_bytes());
+    }
+
     #[test]
     fn head_query_0200000c_matches_the_capture() {
         let mut buf = local_request(0x0200_000c, 0xac);
@@ -1231,6 +1387,14 @@ mod tests {
         assert_eq!(apply_local(&mut other, 0, 0), Ok(LocalOutcome::Applied));
         assert!(other[0x40..0xac].iter().all(|b| *b == 0));
         assert!(!is_head0_query(&other));
+    }
+
+    #[test]
+    fn user_shared_reply_matches_the_capture() {
+        let mut buf = local_request(NVDA_FN_USER_SHARED, NVDA_FN_USER_SHARED_BYTES);
+        answer_user_shared(&mut buf, 0x1b0_b7f5_9000);
+        assert_eq!(&buf[0x08..0x0c], &0x30u32.to_le_bytes());
+        assert_eq!(&buf[0x30..0x3c], &[0, 0, 0, 0, 0, 0x90, 0xf5, 0xb7, 0xb0, 1, 0, 0]);
     }
 
     #[test]

@@ -33,6 +33,11 @@ pub const SIZE_COUNT_AT: usize = 0x114;
 
 /// Size in 64-KiB units, rounded up, from an NVDA allocation record.
 pub fn allocation_units(bytes: &[u8]) -> Option<u64> {
+    if is_nvgl_record(bytes) {
+        // Vulkan: 64-KiB units at 0xd0 and a 1/16-unit fraction at 0xcc.
+        let (units, _) = nvgl_size(bytes)?;
+        return Some(u64::from(units).max(1));
+    }
     let units = u64::from(get32(bytes, SIZE_UNITS_AT)?);
     let count = u64::from(get32(bytes, SIZE_COUNT_AT)?);
     if units != 0 {
@@ -136,7 +141,14 @@ pub fn parse_allocation_private(bytes: &[u8]) -> Result<AllocationPrivate, Priva
     if size >= GPU_ADDRESS_LIMIT {
         return Err(PrivateError::SizeOverflow);
     }
-    let system_memory = get64(bytes, SYSTEM_MEMORY_AT).ok_or(PrivateError::Short)?;
+    // Vulkan (`NVGL`) records use +0xc8/+0xcc for their size (+0xcc the fraction,
+    // which read as the high half made a 0x0040000000000000 "system address" the
+    // KMD then failed to pin): they carry no system-memory pointer there.
+    let system_memory = if is_nvgl_record(bytes) {
+        0
+    } else {
+        get64(bytes, SYSTEM_MEMORY_AT).ok_or(PrivateError::Short)?
+    };
     if system_memory != 0 && system_memory & (PAGE_BYTES - 1) != 0 {
         return Err(PrivateError::SystemMemoryAlignment);
     }
@@ -229,7 +241,92 @@ pub const SHARED_BIND_BIT: u32 = 1 << 1;
 /// Whether an NVDA allocation record is the D3D11/D3D12 UMDs' (its size is
 /// in the fixed-point fields at 0x10c..0x114, not in 64-KiB units at 0xd0).
 pub fn is_d3d_record(bytes: &[u8]) -> bool {
-    get32(bytes, SIZE_UNITS_AT) == Some(0)
+    get32(bytes, SIZE_UNITS_AT) == Some(0) && !is_nvgl_record(bytes)
+}
+
+/// The Vulkan ICD's records carry the tag `NVGL` ("LGVN" at +0x0c).
+pub const RECORD_TAG_AT: usize = 0x0c;
+pub const RECORD_TAG_NVGL: u32 = u32::from_le_bytes(*b"LGVN");
+
+pub fn is_nvgl_record(bytes: &[u8]) -> bool {
+    get32(bytes, RECORD_TAG_AT) == Some(RECORD_TAG_NVGL)
+}
+
+/// A Vulkan record's size as the 610.88 KMD rounds it: (64-KiB units, the fraction
+/// at +0xcc rounded up to 1/16 unit); from 2 MiB on, a fraction rounds to a whole
+/// unit (0x3f units + 0xc0000000 -> 0x40 units).
+fn nvgl_size(bytes: &[u8]) -> Option<(u32, u32)> {
+    let units = get32(bytes, SIZE_UNITS_AT)?;
+    let fraction = get32(bytes, 0xcc)?;
+    let rounded = u64::from(fraction).div_ceil(0x1000_0000) * 0x1000_0000;
+    let (mut units, mut fraction) = if rounded > u64::from(u32::MAX) {
+        (units.checked_add(1)?, 0)
+    } else {
+        (units, rounded as u32)
+    };
+    if units >= 0x20 && fraction != 0 {
+        units = units.checked_add(1)?;
+        fraction = 0;
+    }
+    Some((units, fraction))
+}
+
+pub const NVGL_WRITEBACK_FIELDS: usize = 19;
+
+/// Fields of a Vulkan (`NVGL`) record the 610.88 KMD writes (every NVGL record of
+/// the vktest capture): the same frame as a D3D record's, with its own size
+/// fields (+0xcc/+0xd0/+0xd4/+0xd8), +0x8c = 0x7810, +0xc0 | 0x4000 and the
+/// page/placement bits in +0xe0 and +0x10c. Writing the CUDA-shaped handles here
+/// instead broke vkCreateDevice (the ICD freed its first allocations and crashed).
+pub fn nvgl_writeback(input: &[u8]) -> Option<[(usize, u32); NVGL_WRITEBACK_FIELDS]> {
+    let kind = get32(input, 0x10)?;
+    let bc = get32(input, 0xbc)?;
+    let (units, fraction) = nvgl_size(input)?;
+    let last = (units + u32::from(fraction != 0)).saturating_sub(1);
+    let typed = kind != 0;
+    let wide = kind & 0x20_0000 != 0;
+    // Page bits: 0x280 for the narrow kind; for the wide kind 0x80 / 0x100 / 0x180
+    // by size (1 unit / 8 units or +0xbc bit 16 / 2 MiB and up).
+    let page = if typed && !wide {
+        0x280
+    } else if wide && units >= 0x20 {
+        0x180
+    } else if wide && (units >= 8 || bc & 0x1_0000 != 0) {
+        0x100
+    } else {
+        0x80
+    };
+    let e0 = get32(input, 0xe0)? | page;
+    let mut x10c = get32(input, 0x10c)?;
+    if typed {
+        x10c = 0x1000_0000 | if wide && units >= 0x20 { 0x10 } else { 0 };
+    }
+    let (mut x108, mut x120) = (get32(input, 0x108)?, get32(input, 0x120)?);
+    if kind == 0x0220_0000 {
+        x108 |= 0x8_0000;
+        x120 |= 0x8_0000;
+    }
+    Some([
+        (0x38, 1),
+        (0x3c, 1),
+        (0x40, 1),
+        (0x8c, 0x7810),
+        (0xc0, get32(input, 0xc0)? | 0x4000),
+        (0xc8, if typed { 0x1000_0000 } else { get32(input, 0xc8)? }),
+        (0xcc, fraction),
+        (0xd0, units),
+        (0xd4, fraction.wrapping_sub(0x1_0000)),
+        (0xd8, last),
+        (0xdc, 0),
+        (0xe0, e0),
+        (0xf4, 0xffff_0000),
+        (0xf8, 0xffff_ffff),
+        (0xfc, 0xffff),
+        (0x108, x108),
+        (0x10c, x10c),
+        (0x120, x120),
+        (0x1ac, 0x6_0000),
+    ])
 }
 
 /// Fields of a D3D record the KMD writes, as the 610.88 KMD does (every D3D11
@@ -1054,5 +1151,71 @@ mod surface_tests {
         let mut b = record(5120, 1440, 4, 320, 12);
         put32(&mut b, SIZE_UNITS_AT, 480).unwrap();
         assert_eq!(d3d_surface(&b), None);
+    }
+}
+
+#[cfg(test)]
+mod nvgl_tests {
+    use super::*;
+
+    fn record(fields: &[(usize, u32)]) -> [u8; ALLOCATION_PRIVATE_BYTES] {
+        let mut b = [0u8; ALLOCATION_PRIVATE_BYTES];
+        b[0..4].copy_from_slice(&crate::nvda::NVDA_MAGIC.to_le_bytes());
+        put32(&mut b, RECORD_TAG_AT, RECORD_TAG_NVGL).unwrap();
+        for (o, v) in fields {
+            put32(&mut b, *o, *v).unwrap();
+        }
+        b
+    }
+
+    fn get(fields: &[(usize, u32)], at: usize) -> u32 {
+        fields.iter().find(|(o, _)| *o == at).map(|(_, v)| *v).unwrap()
+    }
+
+    #[test]
+    fn first_vulkan_allocation_matches_the_capture() {
+        let r = record(&[(0x10, 0x0220_0000), (0x14, 0x4_0000), (0x38, 1), (0xbc, 0x110_0000), (0xc0, 0x208), (0xd0, 1), (0xec, 0x1_0000), (0x108, 0x10_0000), (0x118, 1), (0x120, 0x10_0000)]);
+        assert!(is_nvgl_record(&r) && !is_d3d_record(&r));
+        assert_eq!(allocation_units(&r), Some(1));
+        let w = nvgl_writeback(&r).unwrap();
+        for (at, want) in [(0x3c, 1), (0x8c, 0x7810), (0xc0, 0x4208), (0xc8, 0x1000_0000), (0xd0, 1), (0xd4, 0xffff_0000), (0xd8, 0), (0xe0, 0x80), (0x108, 0x18_0000), (0x10c, 0x1000_0000), (0x120, 0x18_0000), (0x1ac, 0x6_0000)] {
+            assert_eq!(get(&w, at), want, "+{at:#x}");
+        }
+    }
+
+    #[test]
+    fn vulkan_sizes_round_like_the_capture() {
+        for (cc, d0, cc_out, d0_out, d4, d8) in [
+            (0x0040_0000u32, 0u32, 0x1000_0000u32, 0u32, 0x0fff_0000u32, 0u32),
+            (0x22c0_0000, 0x11, 0x3000_0000, 0x11, 0x2fff_0000, 0x11),
+            (0x8000_0000, 3, 0x8000_0000, 3, 0x7fff_0000, 3),
+            (0xc000_0000, 0x3f, 0, 0x40, 0xffff_0000, 0x3f),
+            (0, 8, 0, 8, 0xffff_0000, 7),
+        ] {
+            let r = record(&[(0x10, 0x0220_0800), (0xcc, cc), (0xd0, d0)]);
+            let w = nvgl_writeback(&r).unwrap();
+            assert_eq!((get(&w, 0xcc), get(&w, 0xd0), get(&w, 0xd4), get(&w, 0xd8)), (cc_out, d0_out, d4, d8));
+        }
+    }
+
+    #[test]
+    fn vulkan_fraction_is_not_a_system_address() {
+        let mut r = record(&[(0x10, 0x0220_0800), (0xcc, 0x40_0000)]);
+        r[4..8].copy_from_slice(&ALLOCATION_PRIVATE_VERSION.to_le_bytes());
+        r[8..12].copy_from_slice(&(ALLOCATION_PRIVATE_BYTES as u32).to_le_bytes());
+        let p = parse_allocation_private(&r).unwrap();
+        assert_eq!(p.system_memory, 0);
+        assert_eq!(p.size, ALLOCATION_UNIT);
+    }
+
+    #[test]
+    fn vulkan_page_bits_match_the_capture() {
+        let narrow = record(&[(0x10, 0x0200_0000), (0xd0, 8), (0xe0, 0x4000)]);
+        assert_eq!(get(&nvgl_writeback(&narrow).unwrap(), 0xe0), 0x4280);
+        let big = record(&[(0x10, 0x0220_0800), (0xd0, 0x20)]);
+        let w = nvgl_writeback(&big).unwrap();
+        assert_eq!((get(&w, 0xe0), get(&w, 0x10c)), (0x180, 0x1000_0010));
+        let mid = record(&[(0x10, 0x0220_0800), (0xd0, 8)]);
+        assert_eq!(get(&nvgl_writeback(&mid).unwrap(), 0xe0), 0x100);
     }
 }

@@ -602,13 +602,20 @@ pub fn escape(
     // Pure local replies never initialize the KMD RM client and never touch the
     // transport. This also returns shortened 0x30 replies directly, while the
     // backing buffer still has its original (larger) length.
+    if header.function == nd::NVDA_FN_USER_SHARED && buf.len() == nd::NVDA_FN_USER_SHARED_BYTES {
+        return user_shared_block(buf);
+    }
     match nd::apply_local(buf, h_device, h_context) {
         Ok(nd::LocalOutcome::Applied) => {
             // The Vulkan ICD's per-head query: head 0 is the mode this adapter scans out.
+            let (width, height) = adapter.scanout_extent();
+            let hz = ((adapter.effective_refresh_mhz() + 500) / 1000).max(1);
             if nd::is_head0_query(buf) {
-                let (width, height) = adapter.scanout_extent();
-                let hz = (adapter.effective_refresh_mhz() + 500) / 1000;
-                nd::set_head_mode(buf, width, height, hz.max(1));
+                nd::set_head_mode(buf, width, height, hz);
+            } else if nd::is_raster_query(buf) {
+                nd::set_raster(buf, width, height, hz);
+            } else if nd::is_display_info(buf) {
+                nd::set_display_info_mode(buf, width, height);
             }
             return STATUS_SUCCESS;
         }
@@ -702,4 +709,48 @@ pub fn escape(
 /// Register one real object returned by native allocation for later RM controls.
 pub fn note_memory(memory: u32) {
     SESSION.lock().note_memory(memory);
+}
+
+extern "system" {
+    fn ZwAllocateVirtualMemory(
+        process: wdk_sys::HANDLE,
+        base: *mut *mut core::ffi::c_void,
+        zero_bits: usize,
+        size: *mut usize,
+        allocation_type: u32,
+        protect: u32,
+    ) -> NTSTATUS;
+}
+
+const MEM_COMMIT: u32 = 0x1000;
+const MEM_RESERVE: u32 = 0x2000;
+const PAGE_READWRITE: u32 = 0x04;
+const USER_SHARED_BYTES: usize = 0x1_0000;
+
+/// NVDA 0x01000077 (Vulkan ICD, adapter scope): NVIDIA's KMD answers a user-space
+/// address of a block it maps into the caller (the capture: 0x1b0b7f59000); the ICD
+/// keeps it and reads it while it creates a device (a count at +0x60), and crashed
+/// on the null it had without an answer. A zeroed block of the caller's own memory
+/// stands in: allocated in the calling process (an escape runs in its context),
+/// released by the OS with the process, nothing for the KMD to track.
+fn user_shared_block(buf: &mut [u8]) -> NTSTATUS {
+    let mut base: *mut core::ffi::c_void = core::ptr::null_mut();
+    let mut size = USER_SHARED_BYTES;
+    // SAFETY: NtCurrentProcess() (-1) in the caller's context; out-pointers are locals.
+    let status = unsafe {
+        ZwAllocateVirtualMemory(
+            usize::MAX as wdk_sys::HANDLE,
+            &mut base,
+            0,
+            &mut size,
+            MEM_COMMIT | MEM_RESERVE,
+            PAGE_READWRITE,
+        )
+    };
+    if status < 0 || base.is_null() {
+        crate::diag::record_named_bytes(b"NvUserShErr", status as u32);
+        return STATUS_INVALID_PARAMETER;
+    }
+    nd::answer_user_shared(buf, base as u64);
+    STATUS_SUCCESS
 }

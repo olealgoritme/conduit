@@ -216,6 +216,8 @@ enum Writeback {
     Native(nm::PrivateWriteback),
     /// D3D11/D3D12 records: the 610.88 KMD's field set (`nm::d3d_writeback`).
     D3d([(usize, u32); nm::D3D_WRITEBACK_FIELDS]),
+    /// Vulkan (`NVGL`) records: `nm::nvgl_writeback`.
+    Nvgl([(usize, u32); nm::NVGL_WRITEBACK_FIELDS]),
 }
 
 impl Writeback {
@@ -223,6 +225,7 @@ impl Writeback {
         match self {
             Self::Native(w) => nm::writeback_allocation_private(bytes, w),
             Self::D3d(fields) => nm::apply_fields(bytes, fields),
+            Self::Nvgl(fields) => nm::apply_fields(bytes, fields),
         }
     }
 }
@@ -957,6 +960,12 @@ pub fn create(
         let units = u32::try_from(private.size / nm::ALLOCATION_UNIT).unwrap_or(u32::MAX);
         match nm::d3d_writeback(private_bytes, units) {
             Some(fields) => Writeback::D3d(fields),
+            None => Writeback::Native(writeback),
+        }
+    } else if nm::is_nvgl_record(private_bytes) {
+        // Vulkan records: the 610.88 KMD's NVGL field set, not CUDA's handles.
+        match nm::nvgl_writeback(private_bytes) {
+            Some(fields) => Writeback::Nvgl(fields),
             None => Writeback::Native(writeback),
         }
     } else {
