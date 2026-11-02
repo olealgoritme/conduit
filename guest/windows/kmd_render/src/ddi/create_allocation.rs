@@ -3311,10 +3311,20 @@ unsafe fn create_native_one(
             .and_then(|table| table.bar_seg_id())
             .unwrap_or(aperture)
     };
-    // These allocations are CpuVisible. WDDM requires every CPU-accessible
-    // allocation in a non-CPU-accessible memory segment (the BAR) to also list
-    // an aperture segment, as `vidmm_placement` does for the default path.
-    let supported = (1u32 << (segment - 1)) | (1u32 << (aperture - 1));
+    // Device-local RM memory is listed only in the BAR segment. With the
+    // aperture also listed, VidMm placed it in system pages (leaf PTEs with
+    // segment 0) and never called MapCpuHostAperture, so the UMD's Lock2 view
+    // was VidMm's system copy while the GPU mapping is always the RM memory.
+    // The BAR segment is a CPU-host-aperture segment: CPU access then goes
+    // through MapCpuHostAperture, which maps the RM memory itself (native
+    // `map_aperture`), as on NVIDIA's KMD (2070 MapCpuHostAperture calls on
+    // segment 2 in the capture). System-memory backed allocations stay in the
+    // aperture.
+    let supported = if created.system_memory != 0 {
+        1u32 << (aperture - 1)
+    } else {
+        1u32 << (segment - 1)
+    };
     crate::diag::record_named_bytes(b"NvAlSeg", segment);
     info.SupportedWriteSegmentSet = supported;
     unsafe {

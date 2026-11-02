@@ -726,7 +726,8 @@ impl NativeQueue {
     pub(crate) fn destroy(&mut self, passive: PassiveLevel) -> Result<(), NativeError> {
         // Where the GPU got to (NvQGpGet/NvQGpPut from USERD, NvQFence the
         // progress fence), recorded for the last queue torn down.
-        if self.parts.ctl.va != 0 {
+        if self.parts.ctl.va != 0 && *self.gp_put.lock() != 0 {
+            // Only queues that submitted: the values describe a real submission.
             // SAFETY: the queue's live control view; USERD GP_GET/GP_PUT are
             // four bytes each inside it.
             let (get, put) = unsafe {
