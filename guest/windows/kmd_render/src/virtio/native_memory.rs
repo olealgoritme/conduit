@@ -1092,6 +1092,16 @@ fn evict_range(
     len: u64,
     keep: Option<u32>,
 ) -> Result<(), Error> {
+    // NvEvictOff=1 (test knob): leave other mappings alone, as before eviction.
+    static EVICT_OFF: AtomicU32 = AtomicU32::new(u32::MAX);
+    let mut off = EVICT_OFF.load(Ordering::Relaxed);
+    if off == u32::MAX {
+        off = crate::diag::read_config_dword(crate::diag::KnobName::new(b"NvEvictOff"), 0);
+        EVICT_OFF.store(off, Ordering::Relaxed);
+    }
+    if off == 1 {
+        return Ok(());
+    }
     let end = first_va.checked_add(len).ok_or(Error::Invalid)?;
     let hit = |m: &HostMapping| {
         m.process == process && nm::ranges_overlap(m.piece.va, m.piece.len, first_va, len)
