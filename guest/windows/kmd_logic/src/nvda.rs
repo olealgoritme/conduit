@@ -433,6 +433,23 @@ pub fn apply_local(
             put32(buf, NVDA_RESULT_AT, 1);
             put32(buf, NVDA_RESULT2_AT, 1);
         }
+        0x0100_0116 => {
+            // 0x39-byte request the D3D11 UMD makes while it sets up a swap chain
+            // (DWM's primary every retry). The 610.88 capture answers a 0x30-byte
+            // reply, result 1 at both result words and 1 at +0x34. Refused
+            // (NOT_IMPLEMENTED), DWM went on to a SetDisplayMode that failed.
+            exact(buf, 0x39)?;
+            put32(buf, NVDA_SIZE_AT, NVDA_COMMON_HEADER_BYTES as u32);
+            put32(buf, NVDA_RESULT_AT, 1);
+            put32(buf, NVDA_RESULT2_AT, 1);
+            for at in (0x30..0x38).step_by(4) {
+                put32(buf, at, 0);
+            }
+            put32(buf, 0x34, 1);
+            if let Some(last) = buf.get_mut(0x38) {
+                *last = 0;
+            }
+        }
         0x0100_0124 => {
             // Device-scoped 0x48-byte request the D3D11 UMD makes when a swap
             // chain is created and destroyed (+0x30 = 1 or 0, two process
@@ -1148,6 +1165,18 @@ mod tests {
         assert!(buf[0x30..0x48].iter().all(|b| *b == 0));
         assert_eq!(&buf[0x20..0x24], &before[0x20..0x24]);
         let mut short = local_request(0x0100_0124, 0x47);
+        assert_eq!(apply_local(&mut short, 0, 0), Err(LocalError::Invalid));
+    }
+
+    #[test]
+    fn swapchain_0116_matches_the_capture() {
+        let mut buf = local_request(0x0100_0116, 0x39);
+        assert_eq!(apply_local(&mut buf, 0, 0), Ok(LocalOutcome::Applied));
+        assert_eq!(&buf[0x08..0x0c], &0x30u32.to_le_bytes());
+        assert_eq!(&buf[0x14..0x18], &1u32.to_le_bytes());
+        assert_eq!(&buf[0x2c..0x30], &1u32.to_le_bytes());
+        assert_eq!(&buf[0x30..0x39], &[0, 0, 0, 0, 1, 0, 0, 0, 0]);
+        let mut short = local_request(0x0100_0116, 0x38);
         assert_eq!(apply_local(&mut short, 0, 0), Err(LocalError::Invalid));
     }
 
