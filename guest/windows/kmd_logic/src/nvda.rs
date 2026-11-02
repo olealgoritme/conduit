@@ -371,10 +371,11 @@ pub fn apply_local(
             put32(buf, 0x38, 1);
         }
         0x0700_0016 => {
+            // Both cudatest captures answer 0x100 at +0x34 (byte +0x35 = 1).
             exact(buf, 0x38)?;
             put32(buf, NVDA_RESULT_AT, 1);
             put32(buf, NVDA_RESULT2_AT, 1);
-            put32(buf, 0x34, 1);
+            put32(buf, 0x34, 0x100);
         }
         0x0100_0113 => {
             exact(buf, 0x45)?;
@@ -1192,7 +1193,7 @@ mod tests {
             0x38,
             0,
             0,
-            &[(NVDA_RESULT_AT, 1), (NVDA_RESULT2_AT, 1), (0x34, 1)],
+            &[(NVDA_RESULT_AT, 1), (NVDA_RESULT2_AT, 1), (0x34, 0x100)],
             &[],
         );
         check_local_reply(
