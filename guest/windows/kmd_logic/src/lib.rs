@@ -30,6 +30,7 @@ pub mod hw_flip_queue;
 pub mod native_channel;
 pub mod native_hang;
 pub mod native_memory;
+pub mod native_perf;
 pub mod native_teardown;
 pub mod nvda;
 pub mod nvrm_clients;
