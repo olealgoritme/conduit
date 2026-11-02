@@ -241,6 +241,14 @@ fn build_ddi_table() -> DRIVER_INITIALIZATION_DATA {
                 Some(ddi::mpo3::check_multi_plane_overlay_support3);
             data.DxgkDdiSetVidPnSourceAddressWithMultiPlaneOverlay3 =
                 Some(ddi::mpo3::set_vidpn_source_address_with_multi_plane_overlay3);
+            if ddi::mpo3::part(ddi::mpo3::PART_HWFQ) {
+                data.DxgkDdiSetFlipQueueLogBuffer = Some(ddi::hwfq::set_flip_queue_log_buffer);
+                data.DxgkDdiUpdateFlipQueueLog = Some(ddi::hwfq::update_flip_queue_log);
+                data.DxgkDdiSetInterruptTargetPresentId =
+                    Some(ddi::hwfq::set_interrupt_target_present_id);
+                data.DxgkDdiCancelFlips = Some(ddi::hwfq::cancel_flips);
+                data.DxgkDdiControlInterrupt3 = Some(ddi::hwfq::control_interrupt3);
+            }
             if ddi::mpo3::part(ddi::mpo3::PART_LEGACY) {
                 data.DxgkDdiSetVidPnSourceAddressWithMultiPlaneOverlay =
                     Some(ddi::mpo3::set_vidpn_source_address_with_multi_plane_overlay);

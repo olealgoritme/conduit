@@ -24,6 +24,7 @@ pub mod edid;
 pub mod event_ready;
 pub mod external_memory;
 pub mod hws;
+pub mod hw_flip_queue;
 pub mod native_channel;
 pub mod native_memory;
 pub mod nvda;

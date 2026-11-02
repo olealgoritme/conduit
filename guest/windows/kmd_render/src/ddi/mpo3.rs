@@ -56,6 +56,10 @@ pub(crate) const PART_LEGACY: u32 = 32;
 /// it off 3.4 s after boot and never on again, and DWM's wait for vblank fell back to
 /// an ~80 ms timer (12.7 fps composition).
 pub(crate) const PART_VSYNC_ALWAYS: u32 = 64;
+/// Bit 7: the WDDM 3.x hardware flip queue (`ddi::hwfq`): flip queue log, interrupt
+/// target, cancel and `ControlInterrupt3` DDIs, `MaxHwQueuedFlips` when dxgkrnl enables
+/// the feature; MPO3 flips are queued by target time and retired by the vsync tick.
+pub(crate) const PART_HWFQ: u32 = 128;
 /// Off by default. With every part on (0x7f) the adapter starts and DWM stops
 /// rebuilding its swap chain, but it never flips again after one disabled-plane flip
 /// (no picture reaches the host) and composes at ~12.7 fps; without MPO3 DWM flips
@@ -171,6 +175,20 @@ pub unsafe extern "C" fn set_vidpn_source_address_with_multi_plane_overlay3(
     let Some(plane) = plane0 else {
         return STATUS_INVALID_PARAMETER;
     };
+    if crate::ddi::hwfq::enabled() {
+        let mut retry = false;
+        // SAFETY: `plane` is dxgkrnl's plane 0 for this call.
+        let status = unsafe {
+            crate::ddi::hwfq::submit(adapter, plane, args.TargetFlipTime, args.Duration, &mut retry)
+        };
+        if retry {
+            // SAFETY: plain bitfield union write.
+            unsafe {
+                args.OutputFlags.__bindgen_anon_1.__bindgen_anon_1.set_HwFlipQueueDrainNeeded(1)
+            };
+        }
+        return status;
+    }
     // SAFETY: plain bitfield union reads.
     let flags = unsafe { plane.InputFlags.__bindgen_anon_1.__bindgen_anon_1 };
     if flags.Enabled() == 0 || plane.ContextCount == 0 || plane.ppContextData.is_null() {

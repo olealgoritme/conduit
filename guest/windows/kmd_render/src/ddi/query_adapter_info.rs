@@ -503,6 +503,12 @@ unsafe fn query_driver_caps(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTE
         if part(PART_QUEUE) {
             out.set(caps_offset!(MaxQueuedMultiPlaneOverlayFlipVSync), max_queued_flip_on_vsync);
         }
+        // `MaxHwQueuedFlips` (`ddi::hwfq`): only when dxgkrnl enabled DXGK_FEATURE_HWFLIPQUEUE.
+        let hw_queued = crate::ddi::hwfq::max_hw_queued_flips();
+        if hw_queued > 1 {
+            out.set(caps_offset!(MaxHwQueuedFlips), hw_queued as UINT);
+        }
+        crate::diag::record_named_bytes(b"HfqCap", hw_queued);
     }
     // Same reason as `FlipCapV`: what was ADVERTISED, so a knob that read as its
     // default cannot be mistaken for a knob that had no effect.

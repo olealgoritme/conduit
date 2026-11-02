@@ -1084,6 +1084,24 @@ unsafe fn service_vsync_tick(adapter: &AdapterContext) {
         tick_time_100ns,
         &step,
     );
+    // The hardware flip queue (`ddi::hwfq`) advances on every tick, also while the
+    // vsync interrupt is off; the gate only decides whether dxgkrnl is told.
+    if crate::ddi::hwfq::enabled() {
+        if let Some(dxgkrnl) = adapter.dxgkrnl_opt() {
+            let deliver = adapter.vsync_enabled.load(Ordering::Acquire) != 0;
+            crate::ddi::hwfq::tick(dxgkrnl, crate::ddi::vidpn::CHILD_UID, deliver);
+        }
+        // A flip shown at DIRQL only published its allocation: the PASSIVE worker
+        // programs the host scanout.
+        if adapter.pending_vidpn_allocation.load(Ordering::Acquire) != 0 {
+            adapter.signal_hpd();
+        }
+        adapter
+            .vsync_last_100ns
+            .store(tick_time_100ns, Ordering::Relaxed);
+        adapter.vsync_count.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
     // ControlInterrupt may close only the delivery gate at DIRQL. Keep the
     // one-shot heartbeat free-running while disabled so a later enable needs no
     // illegal timer operation and resumes on the next nominal retrace.

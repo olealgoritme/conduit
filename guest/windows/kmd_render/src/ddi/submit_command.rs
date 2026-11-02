@@ -988,6 +988,10 @@ pub(crate) unsafe fn signal_crtc_vsync(
     physical_address: i64,
     target_id: u32,
 ) -> NTSTATUS {
+    // With the hardware flip queue the tick raises the MPO3 vsync itself (`ddi::hwfq`).
+    if crate::ddi::hwfq::enabled() {
+        return STATUS_SUCCESS;
+    }
     if crate::ddi::mpo3::active() {
         return unsafe { signal_crtc_vsync_mpo3(dxgkrnl, target_id) };
     }

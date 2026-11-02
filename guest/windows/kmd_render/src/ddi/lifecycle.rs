@@ -737,6 +737,11 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     // NVIDIA personality only: the hardware-scheduling handshake NVIDIA's KMD makes
     // at StartDevice (`NvHwsEn`). A no-op in the default personality.
     crate::ddi::hws::query_hwsch_at_start(adapter);
+    // The hardware flip queue handshake (`ddi::hwfq`, `NvMpo3` bit 7), as NVIDIA's KMD.
+    if let Some(dxgkrnl) = adapter.dxgkrnl_opt() {
+        crate::ddi::hwfq::reset();
+        crate::ddi::hwfq::query_feature_at_start(dxgkrnl);
+    }
 
     // This generation's identities (section 25): the image salt, the allocation serial and the
     // NVRM epoch (low 32 bits each). After a `pnputil /restart-device` all three must differ from

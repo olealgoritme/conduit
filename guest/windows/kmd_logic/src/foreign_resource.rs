@@ -4899,8 +4899,10 @@ mod shared_format_tests {
                 let name = p.file_name().unwrap().to_string_lossy().into_owned();
                 let text = std::fs::read_to_string(&p).unwrap();
                 // The NVIDIA personality's MPO3 path and its gated wiring.
-                const MPO3_FILES: [&str; 6] = [
+                const MPO3_FILES: [&str; 8] = [
                     "mpo3.rs",
+                    "hwfq.rs",
+                    "kobj.rs",
                     "lib.rs",
                     "query_adapter_info.rs",
                     "submit_command.rs",
@@ -4908,7 +4910,7 @@ mod shared_format_tests {
                     "mod.rs",
                 ];
                 if MPO3_FILES.contains(&name.as_str())
-                    && (name == "mpo3.rs" || text.contains("mpo3::"))
+                    && (name == "mpo3.rs" || text.contains("mpo3::") || text.contains("hwfq::"))
                 {
                     continue;
                 }
