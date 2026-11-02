@@ -17,6 +17,8 @@ pub const NVDA_MAX_BYTES: usize = 1024 * 1024;
 
 pub const NVDA_SIZE_AT: usize = 0x08;
 pub const NVDA_TAG_AT: usize = 0x0c;
+/// The tag (`**VN`) of CUDA's and NVAPI's escapes and of CUDA allocation records.
+pub const NVDA_TAG_NV: u32 = 0x4e56_2a2a;
 pub const NVDA_FUNCTION_AT: usize = 0x10;
 pub const NVDA_RESULT_AT: usize = 0x14;
 pub const NVDA_RESULT2_AT: usize = 0x2c;
@@ -396,10 +398,11 @@ pub fn apply_local(
             put32(buf, 0x38, 1);
         }
         0x0700_0016 => {
+            // Both cudatest captures answer 0x100 at +0x34 (byte +0x35 = 1).
             exact(buf, 0x38)?;
             put32(buf, NVDA_RESULT_AT, 1);
             put32(buf, NVDA_RESULT2_AT, 1);
-            put32(buf, 0x34, 1);
+            put32(buf, 0x34, 0x100);
         }
         0x0100_0113 => {
             exact(buf, 0x45)?;
@@ -1340,7 +1343,7 @@ mod tests {
             0x38,
             0,
             0,
-            &[(NVDA_RESULT_AT, 1), (NVDA_RESULT2_AT, 1), (0x34, 1)],
+            &[(NVDA_RESULT_AT, 1), (NVDA_RESULT2_AT, 1), (0x34, 0x100)],
             &[],
         );
         check_local_reply(

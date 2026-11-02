@@ -3262,6 +3262,9 @@ unsafe fn create_native_one(
     } else {
         None
     };
+    // CUDA's memory over its own user pages (D3DKMT pSystemMem): VidMm backs it
+    // with those pages, the GPU reaches them through the system-page mappings.
+    let user_memory = native::is_cuda_system_memory(bytes);
     let created = crate::virtio::native_memory::create(passive, adapter, &private, bytes)
         .map_err(|error| {
             // Which native-memory error refused it (Error discriminant + 1), and where.
@@ -3348,7 +3351,7 @@ unsafe fn create_native_one(
     // VidMm refused the allocation after CreateAllocation/OpenAllocation
     // succeeded: the first NVIDIA D3D11 allocation failed INVALID_PARAMETER.
     let aperture = crate::ddi::gpummu::APERTURE_SEGMENT_ID;
-    let segment = if created.system_memory != 0 {
+    let segment = if created.system_memory != 0 || user_memory {
         aperture
     } else {
         adapter
@@ -3378,7 +3381,7 @@ unsafe fn create_native_one(
         // pSystemMem is VidMm's existing cached system backing, so Lock2 uses
         // that exact user VA.  Device-local memory is CPU visible through the
         // NVOS33/window aperture path, without a WB cache alias.
-        let flags = if created.system_memory != 0 {
+        let flags = if created.system_memory != 0 || user_memory {
             0x0000_0015 // CpuVisible | Cached | ExistingSysMem
         } else if shared {
             // dxgkrnl refuses a shareable CpuVisible allocation unless its
