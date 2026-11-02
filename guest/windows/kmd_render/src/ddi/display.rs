@@ -4037,6 +4037,20 @@ unsafe fn program_vidpn_source_inner(
         crate::diag::record_named_bytes(b"VpSA", source_address_n);
     }
 
+    // NVIDIA UMD personality: DWM's primaries are native RM allocations with no Venus
+    // resource. Shown by a host flip of their RM memory (`native_scanout`); the flip
+    // completes whatever the host answers.
+    if let Some((native_id, primary_address)) =
+        unsafe { crate::ddi::create_allocation::native_scanout_id(adapter, h_alloc) }
+    {
+        crate::virtio::native_scanout::program(
+            adapter,
+            native_id,
+            primary_address,
+            adapter.scanout_extent(),
+        );
+        return Ok(ScanoutOutcome::Programmed);
+    }
     let source =
         match unsafe { crate::ddi::create_allocation::scanout_alloc_info(adapter, h_alloc) } {
             Some(source) => source,

@@ -24,6 +24,7 @@ pub mod hal;
 pub mod msi;
 pub mod native_channel;
 pub mod native_memory;
+pub mod native_scanout;
 pub mod nvda;
 pub mod nvrm;
 pub mod nvrm_harden;

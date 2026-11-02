@@ -586,6 +586,67 @@ pub fn nvos47_unmap(
     )
 }
 
+/// The picture a D3D allocation record describes, as the 610.88 UMD lays it
+/// out: `+0x30` width and `+0x34` height in texels, and for a 2D block-linear
+/// surface `+0x12a` log2 GOBs per block in y, `+0x132` the row pitch in 64-byte
+/// GOBs and `+0x136` the height in blocks. DWM's 5120x1440 primary answers 4,
+/// 320 (20480 bytes) and 12, a 50x50 texture 2, 4 and 2: always enough blocks
+/// for the height, and 480 x 64 KiB, exactly what the record sizes, for the
+/// primary. A record with no GOB pitch is not a block-linear 2D surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct D3dSurface {
+    pub width: u32,
+    pub height: u32,
+    pub log2_gobs_y: u32,
+    /// Row pitch in bytes.
+    pub pitch: u32,
+}
+
+pub const SURFACE_WIDTH_AT: usize = 0x30;
+pub const SURFACE_HEIGHT_AT: usize = 0x34;
+pub const SURFACE_LOG2_Y_AT: usize = 0x128;
+pub const SURFACE_PITCH_GOBS_AT: usize = 0x130;
+pub const SURFACE_BLOCKS_Y_AT: usize = 0x134;
+const GOB_BYTES: u32 = 64;
+const GOB_ROWS: u32 = 8;
+/// The deepest 2D block a DRM modifier names (32 GOBs).
+const MAX_LOG2_GOBS_Y: u32 = 5;
+
+pub fn d3d_surface(bytes: &[u8]) -> Option<D3dSurface> {
+    if !is_d3d_record(bytes) {
+        return None;
+    }
+    let width = get32(bytes, SURFACE_WIDTH_AT)?;
+    let height = get32(bytes, SURFACE_HEIGHT_AT)?;
+    let log2_gobs_y = get32(bytes, SURFACE_LOG2_Y_AT)? >> 16;
+    let pitch_gobs = get32(bytes, SURFACE_PITCH_GOBS_AT)? >> 16;
+    let blocks_y = get32(bytes, SURFACE_BLOCKS_Y_AT)? >> 16;
+    if width == 0 || height == 0 || pitch_gobs == 0 || blocks_y == 0 {
+        return None;
+    }
+    if log2_gobs_y > MAX_LOG2_GOBS_Y {
+        return None;
+    }
+    let pitch = pitch_gobs.checked_mul(GOB_BYTES)?;
+    let rows = blocks_y.checked_mul(GOB_ROWS << log2_gobs_y)?;
+    if rows < height {
+        return None;
+    }
+    Some(D3dSurface {
+        width,
+        height,
+        log2_gobs_y,
+        pitch,
+    })
+}
+
+/// Bytes a block-linear [`D3dSurface`] spans: pitch x height rounded up to whole blocks.
+pub fn d3d_surface_bytes(s: &D3dSurface) -> u64 {
+    let block_rows = u64::from(GOB_ROWS << s.log2_gobs_y);
+    let rows = u64::from(s.height).div_ceil(block_rows) * block_rows;
+    rows * u64::from(s.pitch)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -950,5 +1011,48 @@ mod size_rule_tests {
             set(&mut b, SIZE_COUNT_AT, count);
             assert_eq!(allocation_units(&b), Some(units), "{encoded:#x}");
         }
+    }
+}
+
+#[cfg(test)]
+mod surface_tests {
+    use super::*;
+
+    fn record(w: u32, h: u32, log2y: u32, pitch_gobs: u32, blocks_y: u32) -> [u8; ALLOCATION_PRIVATE_BYTES] {
+        let mut b = [0u8; ALLOCATION_PRIVATE_BYTES];
+        b[0..4].copy_from_slice(&crate::nvda::NVDA_MAGIC.to_le_bytes());
+        put32(&mut b, SURFACE_WIDTH_AT, w).unwrap();
+        put32(&mut b, SURFACE_HEIGHT_AT, h).unwrap();
+        put32(&mut b, SURFACE_LOG2_Y_AT, log2y << 16).unwrap();
+        put32(&mut b, SURFACE_PITCH_GOBS_AT, pitch_gobs << 16).unwrap();
+        put32(&mut b, SURFACE_BLOCKS_Y_AT, blocks_y << 16).unwrap();
+        b
+    }
+
+    #[test]
+    fn dwm_primary_is_block_linear_16_gobs() {
+        // 610.88 DWM primary: +0x128 0x40000, +0x130 0x1400000, +0x134 0xc0000, 480 units.
+        let s = d3d_surface(&record(5120, 1440, 4, 320, 12)).unwrap();
+        assert_eq!(s, D3dSurface { width: 5120, height: 1440, log2_gobs_y: 4, pitch: 20480 });
+        assert_eq!(d3d_surface_bytes(&s), 480 * ALLOCATION_UNIT);
+    }
+
+    #[test]
+    fn small_texture_uses_shallow_blocks() {
+        // 50x50 B8G8R8A8: +0x128 0x20000, +0x130 0x40000, +0x134 0x20000.
+        let s = d3d_surface(&record(50, 50, 2, 4, 2)).unwrap();
+        assert_eq!((s.log2_gobs_y, s.pitch), (2, 256));
+    }
+
+    #[test]
+    fn pitch_records_and_short_blocks_are_not_surfaces() {
+        assert_eq!(d3d_surface(&record(4096, 1, 0, 0, 0)), None);
+        // 12 blocks of 8 GOBs (768 rows) cannot hold 1440 rows.
+        assert_eq!(d3d_surface(&record(5120, 1440, 3, 320, 12)), None);
+        assert_eq!(d3d_surface(&record(5120, 1440, 6, 320, 12)), None);
+        // A CUDA/Vulkan record (0xd0 units) is not D3D.
+        let mut b = record(5120, 1440, 4, 320, 12);
+        put32(&mut b, SIZE_UNITS_AT, 480).unwrap();
+        assert_eq!(d3d_surface(&b), None);
     }
 }

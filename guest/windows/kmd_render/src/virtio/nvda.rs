@@ -102,6 +102,7 @@ struct Session {
     gpu: u32,
     root: u32,
     minor: u32,
+    gpu_id: u32,
     version: [u8; rc::VERSION_STR_BYTES],
     objects: [u32; 64],
     objects_len: u8,
@@ -119,6 +120,7 @@ impl Session {
             gpu: 0,
             root: 0,
             minor: 0,
+            gpu_id: 0,
             version: [0; rc::VERSION_STR_BYTES],
             objects: [0; 64],
             objects_len: 0,
@@ -161,6 +163,7 @@ impl Session {
             (Step::VersionQuery, Out::Version(v)) => self.version = v,
             (Step::CardInfo, Out::Card(c)) => {
                 self.minor = c.minor;
+                self.gpu_id = c.gpu_id;
             }
             (Step::AllocRoot, Out::Handle(h)) => self.root = h,
             (Step::OpenGpu, Out::Handle(h)) => self.gpu = h,
@@ -459,6 +462,7 @@ struct Ready {
     gpu: u32,
     root: u32,
     minor: u32,
+    gpu_id: u32,
     map: nd::ClientMap,
 }
 
@@ -469,6 +473,7 @@ fn ready(session: &Session) -> Ready {
         gpu: session.gpu,
         root: session.root,
         minor: session.minor,
+        gpu_id: session.gpu_id,
         map: session.map(),
     }
 }
@@ -563,6 +568,7 @@ pub fn memory_client(
         gpu: ready.gpu,
         root: ready.root,
         minor: ready.minor,
+        gpu_id: ready.gpu_id,
     };
     match super::native_memory::install_client(passive, adapter, client) {
         Ok(()) => Ok(client),

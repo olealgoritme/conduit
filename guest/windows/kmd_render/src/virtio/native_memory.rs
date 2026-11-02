@@ -134,6 +134,8 @@ pub struct NativeClient {
     pub gpu: u32,
     pub root: u32,
     pub minor: u32,
+    /// RM's GPU id (`CARD_INFO`), which picks the GPU's DRM node.
+    pub gpu_id: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -200,6 +202,11 @@ struct Allocation {
     /// the record the KMD's OpenAllocation writes (create's copy is dropped),
     /// so the same values are written again at open (`writeback_open`).
     writeback: Option<Writeback>,
+    /// The 2D picture the D3D record describes (`nm::d3d_surface`), if any.
+    surface: Option<nm::D3dSurface>,
+    /// The host GEM handle of this memory on the native scanout DRM file
+    /// (`native_scanout`), 0 until the allocation is first shown.
+    scanout_gem: u32,
 }
 
 /// The record fields CreateAllocation wrote, re-applied at open.
@@ -299,14 +306,14 @@ fn lock(passive: PassiveLevel) -> Result<PassiveMutexGuard<'static>, Error> {
     mutex(passive)?.lock(passive).ok_or(Error::Busy)
 }
 
-struct Io<'a> {
-    passive: PassiveLevel,
-    adapter: &'a AdapterContext,
-    client: NativeClient,
+pub(crate) struct Io<'a> {
+    pub(super) passive: PassiveLevel,
+    pub(super) adapter: &'a AdapterContext,
+    pub(super) client: NativeClient,
 }
 
 impl Io<'_> {
-    fn send(&self, req: &[u8], resp: &mut [u8]) -> Result<usize, Error> {
+    pub(super) fn send(&self, req: &[u8], resp: &mut [u8]) -> Result<usize, Error> {
         let mut seen = None;
         let n = nvrm::forward(
             self.passive,
@@ -327,7 +334,7 @@ impl Io<'_> {
         Ok(n)
     }
 
-    fn exchange(
+    pub(super) fn exchange(
         &self,
         file: u32,
         cmd: u32,
@@ -390,7 +397,7 @@ impl Io<'_> {
             .map_err(|_| Error::Host)
     }
 
-    fn open_file(&self, device_type: u32) -> Result<u32, Error> {
+    pub(super) fn open_file(&self, device_type: u32) -> Result<u32, Error> {
         let mut request = [0u8; 32];
         let n = rc::build_open(&mut request, device_type).ok_or(Error::Invalid)?;
         let mut response = [0u8; 64];
@@ -398,7 +405,7 @@ impl Io<'_> {
         rc::parse_open_reply(response.get(..len).ok_or(Error::Host)?).ok_or(Error::Host)
     }
 
-    fn close_file(&self, handle: u32) -> Result<(), Error> {
+    pub(super) fn close_file(&self, handle: u32) -> Result<(), Error> {
         if handle == 0 {
             return Ok(());
         }
@@ -943,6 +950,9 @@ pub fn create(
     step(7);
     // D3D records keep their inputs (0x8c, 0x10c..0x120) and get the D3D field
     // set; the size in 64-KiB units is what the UMD reserves VA for.
+    // The picture fields are inputs; read them before the writeback below sets
+    // +0xd0 (after which the record no longer reads as a D3D one).
+    let surface = nm::d3d_surface(private_bytes);
     let writeback = if nm::is_d3d_record(private_bytes) {
         let units = u32::try_from(private.size / nm::ALLOCATION_UNIT).unwrap_or(u32::MAX);
         match nm::d3d_writeback(private_bytes, units) {
@@ -980,6 +990,8 @@ pub fn create(
         resident: None,
         poisoned: false,
         writeback: Some(writeback),
+        surface,
+        scanout_gem: 0,
     };
     {
         let mut state = STATE.lock();
@@ -1216,6 +1228,58 @@ fn unmap_fixed(io: &Io<'_>, memory: u32, mapping: HostMapping) -> Result<(), Err
 /// `id` into `bytes` (an NVDA record dxgkrnl passes to OpenAllocation). The
 /// UMD reads sizes and handles from it: without them the D3D12 UMD reserved a
 /// zero-size VA range (INVALID_PARAMETER) and removed its device.
+/// What `native_scanout` needs to show an allocation: its RM memory, size,
+/// 2D picture and the GEM handle it was given before (0 = none yet).
+#[derive(Clone, Copy, Debug)]
+pub struct ScanoutSource {
+    pub memory: u32,
+    pub size: u64,
+    pub surface: nm::D3dSurface,
+    pub gem: u32,
+    pub system_backed: bool,
+}
+
+pub fn scanout_source(id: u32) -> Result<ScanoutSource, Error> {
+    let state = STATE.lock();
+    let a = state.allocation(id)?;
+    let surface = a.surface.ok_or(Error::Unsupported)?;
+    Ok(ScanoutSource {
+        memory: a.memory,
+        size: a.size,
+        surface,
+        gem: a.scanout_gem,
+        system_backed: a.system_memory != 0,
+    })
+}
+
+/// The width and height of an allocation's 2D picture (DescribeAllocation).
+pub fn surface_extent(id: u32) -> Option<(u32, u32)> {
+    let state = STATE.lock();
+    let s = state.allocation(id).ok()?.surface?;
+    Some((s.width, s.height))
+}
+
+pub fn set_scanout_gem(id: u32, gem: u32) -> Result<(), Error> {
+    STATE.lock().allocation_mut(id)?.scanout_gem = gem;
+    Ok(())
+}
+
+/// Run `f` with the native-memory I/O (the PASSIVE mutex held, the KMD client).
+pub(crate) fn with_io<R>(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    f: impl FnOnce(&Io<'_>) -> Result<R, Error>,
+) -> Result<R, Error> {
+    let _guard = lock(passive)?;
+    let client = STATE.lock().client()?;
+    let io = Io {
+        passive,
+        adapter,
+        client,
+    };
+    f(&io)
+}
+
 pub fn writeback_open(id: u32, bytes: &mut [u8]) -> Result<(), Error> {
     let writeback = STATE.lock().allocation(id)?.writeback.ok_or(Error::Invalid)?;
     writeback.apply(bytes).map_err(|_| Error::Invalid)
@@ -2340,6 +2404,8 @@ pub unsafe fn with_cpu_range(
                 resident: None,
                 poisoned: a.poisoned,
                 writeback: a.writeback,
+                surface: a.surface,
+                scanout_gem: 0,
             },
             existing,
             pending,
@@ -2446,6 +2512,8 @@ pub fn map_aperture(
             resident: None,
             poisoned: a.poisoned,
             writeback: a.writeback,
+            surface: a.surface,
+            scanout_gem: 0,
         }
     };
     let mut mapping = cpu_map(
@@ -2522,17 +2590,22 @@ pub fn destroy(passive: PassiveLevel, adapter: &AdapterContext, id: u32) -> Resu
         adapter,
         client,
     };
-    let (memory, mappings, has_cpu) = {
+    let (memory, mappings, has_cpu, gem) = {
         let state = STATE.lock();
         let allocation = state.allocation(id)?;
         (
             allocation.memory,
             allocation.mappings.clone(),
             allocation.cpu.is_some(),
+            allocation.scanout_gem,
         )
     };
     if has_cpu {
         return Err(Error::Busy);
+    }
+    if gem != 0 {
+        super::native_scanout::release_gem(&io, gem);
+        STATE.lock().allocation_mut(id)?.scanout_gem = 0;
     }
     for mapping in mappings {
         unmap_fixed(&io, memory, mapping)?;

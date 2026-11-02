@@ -851,11 +851,32 @@ unsafe fn take_open_ctx(h: HANDLE) -> Option<Box<OpenAllocationContext>> {
 /// As [`resolve_alloc`].
 unsafe fn describe_alloc_info(h: HANDLE) -> Option<DescribeInfo> {
     let ctx = unsafe { resolve_alloc(h) }?;
+    // A native (NVDA) allocation describes the picture its record names: DWM's
+    // primaries on NVIDIA's UMD are the mode's size, as NVIDIA's KMD answers.
+    if ctx.native_id != 0 {
+        if let Some((width, height)) = crate::virtio::native_memory::surface_extent(ctx.native_id) {
+            return Some(DescribeInfo {
+                width,
+                height,
+                format: 0,
+            });
+        }
+    }
     Some(DescribeInfo {
         width: ctx.width,
         height: ctx.height,
         format: ctx.format,
     })
+}
+
+/// The native-memory id and the address Windows paired with a `SetVidPnSourceAddress`
+/// handle that is a native (NVDA) allocation of the current transport generation.
+///
+/// # Safety
+/// Same contract as [`scanout_alloc_info`].
+pub(crate) unsafe fn native_scanout_id(adapter: &AdapterContext, h: HANDLE) -> Option<(u32, u64)> {
+    let ctx = unsafe { resolve_current_alloc(adapter, h) }?;
+    (ctx.native_id != 0).then(|| (ctx.native_id, ctx.vidpn_primary_address.load(Ordering::Acquire)))
 }
 
 /// Resolve a paging-op `hAllocation` (the handle this driver returned from
