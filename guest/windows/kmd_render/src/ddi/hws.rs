@@ -82,6 +82,8 @@ static HWS_QUERY_STATUS: AtomicU32 = AtomicU32::new(0);
 static CTX_NATIVE: AtomicU32 = AtomicU32::new(0);
 static CTX_NATIVE_FAIL: AtomicU32 = AtomicU32::new(0);
 static CTX_NVDA_BAD: AtomicU32 = AtomicU32::new(0);
+/// NVDA-private contexts without HW queues (dxgkrnl-scheduled, `HwsCtxSched`).
+static CTX_NVDA_SCHED: AtomicU32 = AtomicU32::new(0);
 static QUEUES: AtomicU32 = AtomicU32::new(0);
 static QUEUE_FAIL: AtomicU32 = AtomicU32::new(0);
 static SOFT_QUEUES: AtomicU32 = AtomicU32::new(0);
@@ -254,6 +256,7 @@ pub(crate) fn publish_counters() {
     crate::diag::record_named_bytes(b"HwsCtxNv", r(&CTX_NATIVE));
     crate::diag::record_named_bytes(b"HwsCtxNvFail", r(&CTX_NATIVE_FAIL));
     crate::diag::record_named_bytes(b"HwsCtxBad", r(&CTX_NVDA_BAD));
+    crate::diag::record_named_bytes(b"HwsCtxSched", r(&CTX_NVDA_SCHED));
     crate::diag::record_named_bytes(b"HwsQueue", r(&QUEUES));
     crate::diag::record_named_bytes(b"HwsSoftQ", r(&SOFT_QUEUES));
     crate::diag::record_named_bytes(b"HwsSoftSub", r(&SOFT_SUBMITS));
@@ -838,8 +841,21 @@ pub unsafe extern "C" fn dxgkddi_create_context(
         }
     };
     if !native_format::is_context_private(private) {
+        // A context with another NVDA header (the Vulkan ICD's node-3 copy
+        // context, 0xdf1 bytes, no HW queues) is scheduled by dxgkrnl through
+        // SubmitCommand; its 0x35c-byte submit records need the captured
+        // DmaBufferPrivateDataSize, or dxgkrnl refuses every SubmitCommand on
+        // it with INVALID_PARAMETER.
+        let nvda = native_format::is_nvda_context_header(private);
         // SAFETY: forwarded unchanged.
-        return unsafe { crate::device::create_context_with(h_device, create_context, None, false) };
+        let status =
+            unsafe { crate::device::create_context_with(h_device, create_context, None, nvda) };
+        if status == STATUS_SUCCESS && nvda {
+            CTX_NVDA_SCHED.fetch_add(1, Ordering::Relaxed);
+            // SAFETY: still dxgkrnl's live args.
+            set_nvda_context_info(unsafe { &mut *create_context });
+        }
+        return status;
     }
     // SAFETY: Value is the plain UINT arm of DXGK_CREATECONTEXTFLAGS.
     let flags = unsafe { args.Flags.__bindgen_anon_1.Value };
@@ -890,13 +906,18 @@ pub unsafe extern "C" fn dxgkddi_create_context(
         CTX_NATIVE.fetch_add(1, Ordering::Relaxed);
     }
     // SAFETY: still dxgkrnl's live args.
-    let args = unsafe { &mut *create_context };
+    set_nvda_context_info(unsafe { &mut *create_context });
+    STATUS_SUCCESS
+}
+
+/// The `DXGK_CONTEXTINFO` NVIDIA's 610.88 KMD answers for every NVDA-private
+/// context, HW-queue or not.
+fn set_nvda_context_info(args: &mut DXGKARG_CREATECONTEXT) {
     let info = logic::NVDA_CONTEXT_INFO;
     args.ContextInfo.DmaBufferSize = info.dma_buffer_size;
     args.ContextInfo.DmaBufferSegmentSet = info.dma_buffer_segment_set;
     args.ContextInfo.DmaBufferPrivateDataSize = info.dma_buffer_private_data_size;
     args.ContextInfo.Caps.__bindgen_anon_1.Value = info.caps;
-    STATUS_SUCCESS
 }
 
 /// DestroyContext's native half (`device::dxgkddi_destroy_context`).

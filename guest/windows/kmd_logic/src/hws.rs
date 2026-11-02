@@ -295,6 +295,7 @@ pub const COUNTERS: &[&str] = &[
     "HwsCtxNv",
     "HwsCtxNvFail",
     "HwsCtxBad",
+    "HwsCtxSched",
     "HwsQueue",
     "HwsSoftQ",
     "HwsSoftSub",

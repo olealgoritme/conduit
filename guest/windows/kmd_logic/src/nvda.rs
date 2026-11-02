@@ -471,7 +471,13 @@ pub fn apply_local(
             let head = rc::get32(buf, 0x34).unwrap_or(u32::MAX);
             put32(buf, NVDA_SIZE_AT, NVDA_COMMON_HEADER_BYTES as u32);
             put32(buf, NVDA_RESULT_AT, 1);
-            put32(buf, NVDA_RESULT2_AT, 1);
+            // Heads 1..3 answer -14 in the second result word (capture seq
+            // 933-935, 1411-1413); the ICD then skips its 0x01000069 query for them.
+            put32(
+                buf,
+                NVDA_RESULT2_AT,
+                if head == 0 { 1 } else { HEAD_ABSENT_RESULT2 },
+            );
             for at in (0x40..0xac).step_by(4) {
                 put32(buf, at, 0);
             }
@@ -485,12 +491,13 @@ pub fn apply_local(
         }
         0x0100_0057 => {
             // 0x38-byte request the Vulkan ICD makes after creating its device. The
-            // capture answers a 0x30-byte reply, result 1, and a nonzero 32-bit value
-            // at +0x30 that differs per run (an identifier).
+            // capture (seq 937, 1808) answers a 0x30-byte reply, result 1, 0 in the
+            // second result word and a nonzero 32-bit value at +0x30 that differs
+            // per run (an identifier).
             exact(buf, 0x38)?;
             put32(buf, NVDA_SIZE_AT, NVDA_COMMON_HEADER_BYTES as u32);
             put32(buf, NVDA_RESULT_AT, 1);
-            put32(buf, NVDA_RESULT2_AT, 1);
+            put32(buf, NVDA_RESULT2_AT, 0);
             put32(buf, 0x30, 0x1c95_a71e ^ (h_device as u32));
             put32(buf, 0x34, 0);
         }
@@ -545,12 +552,18 @@ pub fn apply_local(
             }
         }
         0x0100_0021 | 0x0100_0088 => {
-            // Vulkan ICD requests with a GPU-VA-like value at +0x20 (0x0088: and 5 at
-            // +0x30). 0x0021 is polled until it succeeds: refused, vkCreateDevice spun
-            // on it forever. The 610.88 capture answers both with a bare 0x30-byte
-            // success.
-            exact(buf, if header.function == 0x0100_0021 { 0x38 } else { 0x34 })?;
-            put32(buf, NVDA_SIZE_AT, NVDA_COMMON_HEADER_BYTES as u32);
+            // Vulkan ICD requests with a 32-bit token at +0x20 (0x0088: and 5 at
+            // +0x30). 0x0021 is polled while the ICD waits for GPU work (the capture
+            // polls it 228 times over the run); refused, vkCreateDevice spun on it
+            // forever. The 610.88 capture answers both with result 1 in both result
+            // words; 0x0088's reply shrinks to 0x30 bytes, 0x0021's keeps its 0x38
+            // (capture seq 2440, 1992).
+            if header.function == 0x0100_0021 {
+                exact(buf, 0x38)?;
+            } else {
+                exact(buf, 0x34)?;
+                put32(buf, NVDA_SIZE_AT, NVDA_COMMON_HEADER_BYTES as u32);
+            }
             put32(buf, NVDA_RESULT_AT, 1);
             put32(buf, NVDA_RESULT2_AT, 1);
         }
@@ -577,6 +590,40 @@ pub fn apply_local(
             put32(buf, 0x30, NVDA_DRIVER_VERSION);
             buf[0x40..0x40 + NVDA_DRIVER_BRANCH.len()].copy_from_slice(NVDA_DRIVER_BRANCH);
             buf[0x80..0x80 + NVDA_ADAPTER_NAME.len()].copy_from_slice(NVDA_ADAPTER_NAME);
+        }
+        0x0100_010e => {
+            // Adapter-scoped 0x34-byte NVAPI query (Escape Flags 8, no hDevice).
+            // The 610.88 capture (vktest seq 3789, 3812) keeps the size and answers
+            // result 1 in both result words and 0x100 at +0x30.
+            exact(buf, 0x34)?;
+            put32(buf, NVDA_RESULT_AT, 1);
+            put32(buf, NVDA_RESULT2_AT, 1);
+            put32(buf, 0x30, 0x100);
+        }
+        0x0200_001d => {
+            // 0x34-byte device- and context-scoped query the D3D12 UMD makes once
+            // per present (the Vulkan ICD's swap chain presents through it). The
+            // capture answers a 0x30-byte reply, result 1 in both result words and
+            // a word at +0x30: 1 for the first five presents (seq 5797...), 0x20
+            // for three, then 0x100. This answers the first frames' 1.
+            exact(buf, 0x34)?;
+            context(h_device, h_context)?;
+            put32(buf, NVDA_SIZE_AT, NVDA_COMMON_HEADER_BYTES as u32);
+            put32(buf, NVDA_RESULT_AT, 1);
+            put32(buf, NVDA_RESULT2_AT, 1);
+            put32(buf, 0x30, 1);
+        }
+        0x0200_0031 => {
+            // 0x34-byte device-scoped request the D3D12 UMD makes at teardown
+            // (+0x30 a value from the UMD). The capture (seq 19409) answers a bare
+            // 0x30-byte success; the request word stays.
+            exact(buf, 0x34)?;
+            if h_device == 0 {
+                return Err(LocalError::Invalid);
+            }
+            put32(buf, NVDA_SIZE_AT, NVDA_COMMON_HEADER_BYTES as u32);
+            put32(buf, NVDA_RESULT_AT, 1);
+            put32(buf, NVDA_RESULT2_AT, 1);
         }
         0x0100_0124 => {
             // Device-scoped 0x48-byte request the D3D11 UMD makes when a swap
@@ -605,6 +652,31 @@ pub fn apply_local(
             // channel group and has no client handle here; the control is an L2
             // promotion hint. Answered as the 610.88 capture shows (result 1
             // in both result words, params untouched), not forwarded.
+            put32(buf, NVDA_RESULT_AT, 1);
+            put32(buf, NVDA_RESULT2_AT, 1);
+        }
+        function
+            if is_rm_control_function(function)
+                && parse_rm_control(buf).is_ok_and(|c| {
+                    c.cmd == NV906F_CTRL_CMD_GET_CLASS_ENGINEID
+                        && c.h_object == PSEUDO_GRAPHICS_CONTEXT
+                        && c.params.len() == 0x10
+                        && class_engine_of(rc::get32(c.params, 0).unwrap_or(0)).is_some()
+                }) =>
+        {
+            // NV906F GET_CLASS_ENGINEID on the escape context's channel (pseudo
+            // 0xff040000) for the class objects NVIDIA's KMD puts on every graphics
+            // channel (pseudo handles 0xff1fe0xx), asked by the Vulkan ICD before
+            // its first queue submission. As the 610.88 capture answers them (seq
+            // 1989-1991, 2327-2329): params {hObject, classEngineID = classID,
+            // classID, engineID 1 (GRAPHICS)}, RM status 0, result 1 in both result
+            // words. Refused, the ICD fell back to NV0090 SET_LG_SECTOR_PROMOTION.
+            let p = RM_PARAMS_AT;
+            let class = class_engine_of(rc::get32(buf, p).unwrap_or(0)).unwrap_or(0);
+            put32(buf, p + 4, class);
+            put32(buf, p + 8, class);
+            put32(buf, p + 0xc, NV2080_ENGINE_TYPE_GRAPHICS);
+            put32(buf, RM_STATUS_AT, 0);
             put32(buf, NVDA_RESULT_AT, 1);
             put32(buf, NVDA_RESULT2_AT, 1);
         }
@@ -707,6 +779,27 @@ pub fn answer_user_shared(buf: &mut [u8], address: u64) {
     put32(buf, 0x30, 0);
     put32(buf, 0x34, address as u32);
     put32(buf, 0x38, (address >> 32) as u32);
+}
+
+/// The second result word of a `0x0200000c` head query for a head without a display.
+pub const HEAD_ABSENT_RESULT2: u32 = 0xffff_fff2;
+
+pub const NV906F_CTRL_CMD_GET_CLASS_ENGINEID: u32 = 0x906f_0101;
+pub const NV2080_ENGINE_TYPE_GRAPHICS: u32 = 1;
+/// Pseudo handles of the class objects on a graphics channel, as the Vulkan ICD
+/// names them in GET_CLASS_ENGINEID, and their classes (610.88 capture, RTX 5090).
+pub const CHANNEL_CLASS_OBJECTS: [(u32, u32); 3] = [
+    (0xff1f_e026, 0xce97), // BLACKWELL_B (3D)
+    (0xff1f_e02c, 0x902d), // FERMI_TWOD_A
+    (0xff1f_e01a, 0xcd40), // BLACKWELL_INLINE_TO_MEMORY_A
+];
+
+/// The class of a channel class-object pseudo handle, `None` if it is not one.
+pub fn class_engine_of(h_object: u32) -> Option<u32> {
+    CHANNEL_CLASS_OBJECTS
+        .iter()
+        .find(|(handle, _)| *handle == h_object)
+        .map(|(_, class)| *class)
 }
 
 /// NV04_DISPLAY_COMMON (class 0x73) in UMD RM controls.
@@ -1479,11 +1572,23 @@ mod tests {
         assert_eq!(buf[0x88], 1);
         assert_eq!(buf[0x9d], 1);
         assert!(is_head0_query(&buf));
-        let mut other = local_request(0x0200_000c, 0xac);
-        test_put32(&mut other, 0x34, 2);
-        assert_eq!(apply_local(&mut other, 0, 0), Ok(LocalOutcome::Applied));
-        assert!(other[0x40..0xac].iter().all(|b| *b == 0));
-        assert!(!is_head0_query(&other));
+        assert_eq!(&buf[0x2c..0x30], &1u32.to_le_bytes());
+        // Capture seq 933-935: heads 1..3 answer result 1 and -14 (0xfffffff2).
+        for head in 1..4u32 {
+            let mut other = local_request(0x0200_000c, 0xac);
+            for at in (0x14..0xac).step_by(4) {
+                test_put32(&mut other, at, 0);
+            }
+            test_put32(&mut other, 0x34, head);
+            test_put32(&mut other, 0x38, 1);
+            assert_eq!(apply_local(&mut other, 0, 0), Ok(LocalOutcome::Applied));
+            assert_eq!(&other[0x08..0x0c], &0x30u32.to_le_bytes());
+            assert_eq!(&other[0x14..0x18], &1u32.to_le_bytes());
+            assert_eq!(&other[0x2c..0x30], &[0xf2, 0xff, 0xff, 0xff]);
+            assert_eq!(&other[0x30..0x3c], &[0, 0, 0, 0, head as u8, 0, 0, 0, 1, 0, 0, 0]);
+            assert!(other[0x40..0xac].iter().all(|b| *b == 0));
+            assert!(!is_head0_query(&other));
+        }
     }
 
     #[test]
@@ -1492,7 +1597,9 @@ mod tests {
             let mut buf = local_request(function, len);
             test_put32(&mut buf, 0x20, 0x140c_3200);
             assert_eq!(apply_local(&mut buf, 0, 0), Ok(LocalOutcome::Applied));
-            assert_eq!(&buf[0x08..0x0c], &0x30u32.to_le_bytes());
+            // Capture seq 2440: 0x0021's reply keeps its 0x38-byte size.
+            let size = if function == 0x0100_0021 { 0x38u32 } else { 0x30 };
+            assert_eq!(&buf[0x08..0x0c], &size.to_le_bytes());
             assert_eq!(&buf[0x14..0x18], &1u32.to_le_bytes());
             assert_eq!(&buf[0x2c..0x30], &1u32.to_le_bytes());
             assert_eq!(&buf[0x20..0x24], &0x140c_3200u32.to_le_bytes());
@@ -1523,7 +1630,85 @@ mod tests {
         let mut buf = local_request(0x0100_0057, 0x38);
         assert_eq!(apply_local(&mut buf, 0x40000500, 0), Ok(LocalOutcome::Applied));
         assert_eq!(&buf[0x08..0x0c], &0x30u32.to_le_bytes());
+        // Capture seq 937/1808: result 1, second result word 0.
+        assert_eq!(&buf[0x14..0x18], &1u32.to_le_bytes());
+        assert_eq!(&buf[0x2c..0x30], &0u32.to_le_bytes());
         assert_ne!(&buf[0x30..0x34], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn present_path_queries_match_the_capture() {
+        // vktest capture seq 3789: 0x0100010e keeps its size, 0x100 at +0x30.
+        let mut nvapi = local_request(0x0100_010e, 0x34);
+        let before = nvapi.clone();
+        assert_eq!(apply_local(&mut nvapi, 0, 0), Ok(LocalOutcome::Applied));
+        assert_eq!(&nvapi[0x08..0x0c], &0x34u32.to_le_bytes());
+        assert_eq!(&nvapi[0x14..0x18], &1u32.to_le_bytes());
+        assert_eq!(&nvapi[0x2c..0x34], &[1, 0, 0, 0, 0, 1, 0, 0]);
+        assert_eq!(&nvapi[..0x14], &before[..0x14]);
+        assert_eq!(&nvapi[0x18..0x2c], &before[0x18..0x2c]);
+        // Seq 5797: 0x0200001d, 0x30-byte reply, 1 at +0x30; needs device and context.
+        let mut present = local_request(0x0200_001d, 0x34);
+        assert_eq!(apply_local(&mut present, 0x40006500, 0x400077c0), Ok(LocalOutcome::Applied));
+        assert_eq!(&present[0x08..0x0c], &0x30u32.to_le_bytes());
+        assert_eq!(&present[0x14..0x18], &1u32.to_le_bytes());
+        assert_eq!(&present[0x2c..0x34], &[1, 0, 0, 0, 1, 0, 0, 0]);
+        let mut unscoped = local_request(0x0200_001d, 0x34);
+        assert_eq!(apply_local(&mut unscoped, 0x40006500, 0), Err(LocalError::Invalid));
+        // Seq 19409: 0x02000031 bare 0x30-byte success, request word +0x30 kept.
+        let mut teardown = local_request(0x0200_0031, 0x34);
+        test_put32(&mut teardown, 0x30, 0x354c);
+        assert_eq!(apply_local(&mut teardown, 0x40006500, 0), Ok(LocalOutcome::Applied));
+        assert_eq!(&teardown[0x08..0x0c], &0x30u32.to_le_bytes());
+        assert_eq!(&teardown[0x2c..0x34], &[1, 0, 0, 0, 0x4c, 0x35, 0, 0]);
+        for function in [0x0100_010e, 0x0200_001d, 0x0200_0031] {
+            let mut short = local_request(function, 0x33);
+            assert_eq!(apply_local(&mut short, 1, 1), Err(LocalError::Invalid));
+        }
+    }
+
+    fn class_engine_request(h_object: u32) -> Vec<u8> {
+        // Capture seq 1989 request bytes: NVGL 0x0500002b, 0x54 bytes, hClient 0,
+        // hObject 0xff040000, cmd 0x906f0101, 0x10 parameter bytes.
+        let mut buf = vec![0u8; 0x54];
+        test_put32(&mut buf, 0, NVDA_MAGIC);
+        test_put32(&mut buf, 4, NVDA_VERSION);
+        test_put32(&mut buf, NVDA_SIZE_AT, 0x54);
+        test_put32(&mut buf, NVDA_TAG_AT, 0x4e56_474c);
+        test_put32(&mut buf, NVDA_FUNCTION_AT, 0x0500_002b);
+        test_put32(&mut buf, RM_H_OBJECT_AT, PSEUDO_GRAPHICS_CONTEXT);
+        test_put32(&mut buf, RM_CMD_AT, NV906F_CTRL_CMD_GET_CLASS_ENGINEID);
+        test_put32(&mut buf, RM_PARAMS_SIZE_AT, 0x10);
+        test_put32(&mut buf, RM_PARAMS_AT, h_object);
+        buf
+    }
+
+    #[test]
+    fn class_engine_ids_match_the_capture() {
+        // Capture seq 1989-1991 after bytes +0x40..+0x54.
+        for (h_object, after) in [
+            (0xff1f_e026u32, [0x26, 0xe0, 0x1f, 0xff, 0x97, 0xce, 0, 0, 0x97, 0xce, 0, 0, 1, 0, 0, 0]),
+            (0xff1f_e02c, [0x2c, 0xe0, 0x1f, 0xff, 0x2d, 0x90, 0, 0, 0x2d, 0x90, 0, 0, 1, 0, 0, 0]),
+            (0xff1f_e01a, [0x1a, 0xe0, 0x1f, 0xff, 0x40, 0xcd, 0, 0, 0x40, 0xcd, 0, 0, 1, 0, 0, 0]),
+        ] {
+            let mut buf = class_engine_request(h_object);
+            let before = buf.clone();
+            assert_eq!(apply_local(&mut buf, 0, 0), Ok(LocalOutcome::Applied));
+            assert_eq!(&buf[0x44..0x54], &after);
+            assert_eq!(&buf[0x40..0x44], &[0, 0, 0, 0]);
+            assert_eq!(&buf[0x14..0x18], &1u32.to_le_bytes());
+            assert_eq!(&buf[0x2c..0x30], &1u32.to_le_bytes());
+            for at in (0..0x44).filter(|a| !(0x14..0x18).contains(a) && !(0x2c..0x30).contains(a)) {
+                assert_eq!(buf[at], before[at], "byte {at:#x}");
+            }
+        }
+        // An unknown object, a short parameter block or another object stays
+        // on the forwarding path.
+        let mut unknown = class_engine_request(0xff1f_e030);
+        assert_eq!(apply_local(&mut unknown, 0, 0), Ok(LocalOutcome::ForwardRmControl));
+        let mut channel = class_engine_request(0xff1f_e026);
+        test_put32(&mut channel, RM_H_OBJECT_AT, PSEUDO_SUBDEVICE);
+        assert_eq!(apply_local(&mut channel, 0, 0), Ok(LocalOutcome::ForwardRmControl));
     }
 
     #[test]
