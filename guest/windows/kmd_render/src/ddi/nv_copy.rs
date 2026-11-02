@@ -3,34 +3,47 @@
 //! Its `SubmitCommand`s carry the work in the private data: GPFIFO entries of
 //! copy-engine pushbuffer segments (pitch copies from the ICD's staging heap
 //! into descriptor heaps and the shader code heap, and the semaphore releases
-//! the ICD waits for). NVIDIA's KMD runs them on its own copy channel. Here
-//! `SubmitCommandVirtual` (DISPATCH) queues them as a job ([`admit`]) and the
-//! HPD worker (PASSIVE, [`service`]) runs them on the CPU through
-//! `native_memory::patch_gpu_bytes`, which reads and writes exactly the pages
-//! the process's GPU VAs map (VidMm's system pages or the RM memory). The
-//! submission's DMA fence waits for its job: [`admit`]'s value goes into the
-//! WDDM pending entry's GDI gate, tagged [`GATE_TAG`] ([`gate_ready`]).
+//! the ICD waits for). NVIDIA's KMD runs them on a copy channel of its own, and
+//! so does this KMD: CreateContext of such a context builds a
+//! `native_channel::CopyChannel` in the process's VA space ([`create_channel`]),
+//! `SubmitCommandVirtual` (DISPATCH, [`admit`]) appends the entries and the
+//! KMD's release of the submission's sequence to its ring and rings the
+//! doorbell, and the submission's DMA fence waits until the channel's progress
+//! semaphore reaches that sequence: [`admit`]'s value goes into the WDDM
+//! pending entry's GDI gate, tagged (`nv_copy::gate`, [`gate_ready`]). The HWS
+//! poll (`ddi::hws::poll_tick`, [`poll`]) watches the semaphore while work is
+//! outstanding, asks for the completion DPC when it moves, and recovers a
+//! faulted or hung channel (`native_hang::Watch`: report, then after the grace
+//! the channel is dead and its outstanding sequences complete).
 //!
-//! Counters (`NvCc*`): `NvCcAdm` jobs admitted, `NvCcRun` run, `NvCcCopy` /
-//! `NvCcBytes` copies and bytes, `NvCcRel` semaphore releases, `NvCcUns` /
-//! `NvCcUnsV` launches not implemented and the last one's LAUNCH_DMA value,
-//! `NvCcIgn` methods ignored, `NvCcTrunc` segments cut short, `NvCcFail` /
-//! `NvCcFailVa` failed reads or writes and the last VA (>> 8), `NvCcNoRec`
-//! NVDA-context submissions without a record, `NvCcFull` jobs refused (table
-//! full; their fence does not wait).
+//! `NvCcCpu=1` (test knob, read at CreateContext): when the channel could not be
+//! built, is dead or its ring is full, the HPD worker runs the work on the CPU
+//! instead ([`service`], through `native_memory::patch_gpu_bytes`).
+//!
+//! Counters: channel path `NvCcxMade` / `NvCcxMkFail` channels built / not
+//! built, `NvCcxSub` submissions, `NvCcxDone` sequences seen complete,
+//! `NvCcxBusy` ring full, `NvCcxNone` submissions with no usable channel and no
+//! fallback (their work does not run), `NvCcxFault` / `NvCcxHang` reports,
+//! `NvCcxForced` channels completed by the KMD; CPU fallback `NvCcAdm` jobs
+//! admitted, `NvCcRun` run, `NvCcCopy` / `NvCcBytes` copies and bytes,
+//! `NvCcRel` releases, `NvCcUns` / `NvCcUnsV` launches not implemented and the
+//! last LAUNCH_DMA value, `NvCcIgn` methods ignored, `NvCcTrunc` segments cut
+//! short, `NvCcFail` / `NvCcFailVa` failed accesses and the last VA (>> 8),
+//! `NvCcFull` jobs refused (table full); both `NvCcNoRec` NVDA-context
+//! submissions without a record.
 
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
+use helios_kmd_logic::native_hang as hang;
 use helios_kmd_logic::nv_copy as logic;
 
 use crate::adapter::AdapterContext;
 use crate::dxgk::*;
 use crate::irql::PassiveLevel;
 use crate::sync::SpinLock;
-
-/// Marks a WDDM pending entry's GDI gate as a copy-context job sequence.
-pub(crate) const GATE_TAG: u64 = 1 << 63;
+use crate::virtio::native_channel::CopyChannel;
 
 /// Jobs waiting for the worker at once.
 const SLOTS: usize = 64;
@@ -39,6 +52,8 @@ const JOBS_PER_PASS: u32 = 16;
 /// Largest line and line count a copy may ask for.
 const MAX_LINE_BYTES: u32 = 16 << 20;
 const MAX_LINES: u32 = 1 << 16;
+/// Copy contexts with a channel at once.
+const CHANNELS_MAX: usize = 32;
 
 #[derive(Clone, Copy)]
 struct Job {
@@ -50,6 +65,43 @@ struct Job {
 static JOBS: SpinLock<[Option<Job>; SLOTS]> = SpinLock::new([None; SLOTS]);
 static NEXT: AtomicU64 = AtomicU64::new(1);
 static COMPLETED: AtomicU64 = AtomicU64::new(0);
+
+/// One copy context's channel. `channel` is a leaked `Box<CopyChannel>`, freed
+/// by [`destroy_context`] after the slot is emptied under the lock (so nothing
+/// holding the lock can see it freed).
+#[derive(Clone, Copy)]
+struct ChannelSlot {
+    context: usize,
+    channel: usize,
+    submitted: u64,
+    seen: u64,
+    /// Everything up to this completes without the GPU (a dead channel).
+    forced: u64,
+    watch: hang::Watch,
+}
+
+const NO_CHANNEL: ChannelSlot = ChannelSlot {
+    context: 0,
+    channel: 0,
+    submitted: 0,
+    seen: 0,
+    forced: 0,
+    watch: hang::Watch::new(),
+};
+
+static CHANNELS: SpinLock<[ChannelSlot; CHANNELS_MAX]> = SpinLock::new([NO_CHANNEL; CHANNELS_MAX]);
+/// `NvCcCpu`: the CPU fallback is enabled.
+static CPU_FALLBACK: AtomicU32 = AtomicU32::new(0);
+
+static MADE: AtomicU32 = AtomicU32::new(0);
+static MAKE_FAILED: AtomicU32 = AtomicU32::new(0);
+static SUBMITTED: AtomicU32 = AtomicU32::new(0);
+static DONE: AtomicU32 = AtomicU32::new(0);
+static BUSY: AtomicU32 = AtomicU32::new(0);
+static NONE: AtomicU32 = AtomicU32::new(0);
+static FAULTS: AtomicU32 = AtomicU32::new(0);
+static HANGS: AtomicU32 = AtomicU32::new(0);
+static FORCED: AtomicU32 = AtomicU32::new(0);
 
 static ADMITTED: AtomicU32 = AtomicU32::new(0);
 static RUN: AtomicU32 = AtomicU32::new(0);
@@ -65,21 +117,102 @@ static FAILED_VA: AtomicU32 = AtomicU32::new(0);
 static NO_RECORD: AtomicU32 = AtomicU32::new(0);
 static FULL: AtomicU32 = AtomicU32::new(0);
 
-/// Whether a WDDM pending entry's GDI gate is satisfied: a copy-context job
-/// ([`GATE_TAG`]) once the worker has run it, any other value is the GDI
-/// executor's sequence.
+/// Whether a WDDM pending entry's GDI gate is satisfied: a copy-context
+/// sequence once its channel's semaphore (or the CPU fallback) reached it, any
+/// other value is the GDI executor's sequence. Any IRQL up to DISPATCH.
 pub(crate) fn gate_ready(gate: u64) -> bool {
-    if gate & GATE_TAG != 0 {
-        COMPLETED.load(Ordering::Acquire) >= gate & !GATE_TAG
-    } else {
-        crate::ddi::gdi_exec::seq_ready(gate)
+    let Some((slot, seq)) = logic::gate_parts(gate) else {
+        return crate::ddi::gdi_exec::seq_ready(gate);
+    };
+    if slot == logic::GATE_CPU_SLOT {
+        return COMPLETED.load(Ordering::Acquire) >= seq;
     }
+    let channels = CHANNELS.lock();
+    let Some(entry) = channels.get(slot).filter(|entry| entry.channel != 0) else {
+        // The context is gone: nothing can complete it any more.
+        return true;
+    };
+    // SAFETY: a slot's channel lives until `destroy_context` emptied the slot
+    // under this lock.
+    let channel = unsafe { &*(entry.channel as *const CopyChannel) };
+    entry.forced >= seq || channel.progress() >= seq
+}
+
+/// CreateContext (PASSIVE) of an NVDA context: build the channel for the
+/// Vulkan ICD's copy context (`nv_copy::is_copy_context`).
+///
+/// # Safety
+/// `h_device` is the live hDevice of the CreateContext, `h_context` the
+/// hContext it returns.
+pub(crate) unsafe fn create_channel(h_device: *mut core::ffi::c_void, h_context: usize) {
+    let passive = unsafe { PassiveLevel::assume() };
+    let knob = crate::diag::read_config_dword(crate::diag::KnobName::new(b"NvCcCpu"), 0);
+    CPU_FALLBACK.store(u32::from(knob == 1), Ordering::Relaxed);
+    let made = (|| {
+        let device = unsafe { crate::device::DeviceHandleRef::from_raw(h_device) }?;
+        let adapter = device.adapter()?;
+        let owner = crate::virtio::gpu::DeviceOwner::new(h_device as usize)?;
+        let process = unsafe { device.native_process_ptr().as_mut() }?;
+        CopyChannel::create(passive, adapter, process, owner).ok()
+    })();
+    let Some(channel) = made else {
+        let n = MAKE_FAILED.fetch_add(1, Ordering::Relaxed) + 1;
+        crate::diag::record_named_bytes(b"NvCcxMkFail", n);
+        return;
+    };
+    let raw = Box::into_raw(Box::new(channel));
+    let placed = {
+        let mut channels = CHANNELS.lock();
+        match channels.iter_mut().find(|entry| entry.channel == 0) {
+            Some(entry) => {
+                *entry = ChannelSlot {
+                    context: h_context,
+                    channel: raw as usize,
+                    ..NO_CHANNEL
+                };
+                true
+            }
+            None => false,
+        }
+    };
+    if !placed {
+        // SAFETY: the box made above, never shared.
+        let mut channel = unsafe { Box::from_raw(raw) };
+        let _ = channel.destroy(passive);
+        let n = MAKE_FAILED.fetch_add(1, Ordering::Relaxed) + 1;
+        crate::diag::record_named_bytes(b"NvCcxMkFail", n);
+        return;
+    }
+    let n = MADE.fetch_add(1, Ordering::Relaxed) + 1;
+    crate::diag::record_named_bytes(b"NvCcxMade", n);
+}
+
+/// DestroyContext (PASSIVE): free the context's channel, if it has one.
+pub(crate) fn destroy_context(h_context: usize) {
+    if h_context == 0 {
+        return;
+    }
+    let taken = {
+        let mut channels = CHANNELS.lock();
+        channels
+            .iter_mut()
+            .find(|entry| entry.channel != 0 && entry.context == h_context)
+            .map(|entry| core::mem::replace(entry, NO_CHANNEL))
+    };
+    let Some(entry) = taken else {
+        return;
+    };
+    // SAFETY: DestroyContext is PASSIVE.
+    let passive = unsafe { PassiveLevel::assume() };
+    // SAFETY: the slot held the only reference and is empty now.
+    let mut channel = unsafe { Box::from_raw(entry.channel as *mut CopyChannel) };
+    let _ = channel.destroy(passive);
+    publish_channel();
 }
 
 /// `SubmitCommandVirtual` (DISPATCH): a submission on an NVDA context without
-/// native channel state that carries the ICD's copy record becomes a job.
-/// `Some(gate)` makes its DMA fence wait for the job; `None` leaves the
-/// submission as it was (not such a submission, or no free slot).
+/// native channel state that carries the ICD's copy record. `Some(gate)` makes
+/// its DMA fence wait for the work; `None` leaves the submission as it was.
 ///
 /// # Safety
 /// `submit` is dxgkrnl's live argument block for this call.
@@ -93,6 +226,16 @@ pub(crate) unsafe fn admit(
         return None;
     }
     let process = context.creator_process()?;
+    let h_context = submit.hContext as usize;
+    // Only the copy context's submissions are touched: a context with a channel,
+    // or any NVDA context's record when the CPU fallback is on.
+    let has_channel = CHANNELS
+        .lock()
+        .iter()
+        .any(|entry| entry.channel != 0 && entry.context == h_context);
+    if !has_channel && CPU_FALLBACK.load(Ordering::Relaxed) == 0 {
+        return None;
+    }
     if submit.pDmaBufferPrivateData.is_null() || submit.DmaBufferPrivateDataSize == 0 {
         return None;
     }
@@ -108,6 +251,41 @@ pub(crate) unsafe fn admit(
         return None;
     };
     if submission.count == 0 {
+        return None;
+    }
+    let on_channel = {
+        let mut channels = CHANNELS.lock();
+        let found = channels
+            .iter_mut()
+            .enumerate()
+            .find(|(_, entry)| entry.channel != 0 && entry.context == h_context);
+        match found {
+            Some((slot, entry)) => {
+                // SAFETY: as in `gate_ready`.
+                let channel = unsafe { &*(entry.channel as *const CopyChannel) };
+                let seq = entry.submitted + 1;
+                match channel.submit(submission.entries(), seq) {
+                    Ok(()) => {
+                        entry.submitted = seq;
+                        Some(logic::gate(slot, seq))
+                    }
+                    Err(crate::virtio::native_channel::NativeError::Busy) => {
+                        BUSY.fetch_add(1, Ordering::Relaxed);
+                        None
+                    }
+                    Err(_) => None,
+                }
+            }
+            None => None,
+        }
+    };
+    if let Some(gate) = on_channel {
+        SUBMITTED.fetch_add(1, Ordering::Relaxed);
+        crate::ddi::hws::kick_poll(adapter);
+        return Some(gate);
+    }
+    if CPU_FALLBACK.load(Ordering::Relaxed) == 0 {
+        NONE.fetch_add(1, Ordering::Relaxed);
         return None;
     }
     let seq = {
@@ -131,12 +309,82 @@ pub(crate) unsafe fn admit(
     };
     ADMITTED.fetch_add(1, Ordering::Relaxed);
     adapter.signal_hpd_for(helios_kmd_logic::hpd_wake::cause::OTHER);
-    Some(seq | GATE_TAG)
+    Some(logic::gate(logic::GATE_CPU_SLOT, seq))
 }
 
-/// The HPD worker (PASSIVE): run the admitted jobs in order, each fence's DPC
-/// asked for as its job completes.
+/// One HWS poll tick (DISPATCH): `(outstanding, progressed)` over the copy
+/// channels. A channel whose semaphore moved asks for the completion DPC; a
+/// faulted or hung one is reported, and after the grace marked dead with its
+/// outstanding sequences completed.
+pub(crate) fn poll(adapter: &AdapterContext, now: u64, hang_timeout: Option<u64>) -> (bool, bool) {
+    let mut outstanding = false;
+    let mut progressed = false;
+    {
+        let mut channels = CHANNELS.lock();
+        for entry in channels.iter_mut().filter(|entry| entry.channel != 0) {
+            // SAFETY: as in `gate_ready`.
+            let channel = unsafe { &*(entry.channel as *const CopyChannel) };
+            let value = channel.progress();
+            if value > entry.seen {
+                DONE.fetch_add((value - entry.seen) as u32, Ordering::Relaxed);
+                entry.seen = value;
+                progressed = true;
+            }
+            let busy = entry.submitted > entry.seen.max(entry.forced);
+            let sample = hang::Sample {
+                now,
+                outstanding: busy,
+                progress: value,
+                gp_get: channel.gp_get(),
+                error: channel.channel_error(),
+            };
+            match entry.watch.tick(sample, hang_timeout) {
+                hang::Action::None => {}
+                hang::Action::Report(cause) => {
+                    let counter = match cause {
+                        hang::Cause::Fault(_) => &FAULTS,
+                        hang::Cause::Hang => &HANGS,
+                    };
+                    counter.fetch_add(1, Ordering::Relaxed);
+                }
+                hang::Action::ForceComplete(_) => {
+                    FORCED.fetch_add(1, Ordering::Relaxed);
+                    channel.mark_dead();
+                    entry.forced = entry.submitted;
+                    progressed = true;
+                }
+            }
+            outstanding |= entry.submitted > entry.seen.max(entry.forced) || entry.watch.in_grace();
+        }
+    }
+    if progressed {
+        crate::ddi::interrupt::request_wddm_completion_dpc(adapter);
+    }
+    (outstanding, progressed)
+}
+
+fn publish_channel() {
+    let r = |c: &AtomicU32| c.load(Ordering::Relaxed);
+    crate::diag::record_named_bytes(b"NvCcxMade", r(&MADE));
+    crate::diag::record_named_bytes(b"NvCcxMkFail", r(&MAKE_FAILED));
+    crate::diag::record_named_bytes(b"NvCcxSub", r(&SUBMITTED));
+    crate::diag::record_named_bytes(b"NvCcxDone", r(&DONE));
+    crate::diag::record_named_bytes(b"NvCcxBusy", r(&BUSY));
+    crate::diag::record_named_bytes(b"NvCcxNone", r(&NONE));
+    crate::diag::record_named_bytes(b"NvCcxFault", r(&FAULTS));
+    crate::diag::record_named_bytes(b"NvCcxHang", r(&HANGS));
+    crate::diag::record_named_bytes(b"NvCcxForced", r(&FORCED));
+    crate::diag::record_named_bytes(b"NvCcNoRec", r(&NO_RECORD));
+}
+
+/// The HPD worker (PASSIVE): run the CPU fallback's jobs in order, each fence's
+/// DPC asked for as its job completes; and mirror the channel counters.
 pub(crate) fn service(passive: PassiveLevel, adapter: &AdapterContext) {
+    static LAST_SUBMITTED: AtomicU32 = AtomicU32::new(0);
+    let submitted = SUBMITTED.load(Ordering::Relaxed);
+    if LAST_SUBMITTED.swap(submitted, Ordering::Relaxed) != submitted {
+        publish_channel();
+    }
     if ADMITTED.load(Ordering::Relaxed) == 0 {
         return;
     }

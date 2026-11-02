@@ -1184,6 +1184,306 @@ impl NativeQueue {
     }
 }
 
+/// The Vulkan ICD's node-3 copy context's own channel (`ddi::nv_copy`). The
+/// context submits with `SubmitCommand` and the work in its private data as
+/// GPFIFO entries (`helios_kmd_logic::nv_copy`); NVIDIA's KMD runs them on a
+/// copy channel of its own, and so does this one: a native TSG and GR-runlist
+/// channel in the process's VA space, built like a native queue's
+/// (`create_queue_objects`: the graphics copy engine on subchannel 4, the
+/// deferred-API object), over a KMD-owned system-memory block (`nv::ring`)
+/// that holds the GPFIFO ring, one release segment per submission and the
+/// progress semaphore the KMD's release segment writes.
+pub(crate) struct CopyChannel {
+    context: NativeContext,
+    parts: QueueParts,
+    /// The block's RM objects: memory at(0), its virtual allocation at(1).
+    block_handles: ObjectHandles,
+    block_allocated: bool,
+    block_virtual: bool,
+    block: CpuView,
+    block_gpu: u64,
+    gp_put: SpinLock<u32>,
+    dead: core::sync::atomic::AtomicBool,
+}
+
+impl CopyChannel {
+    /// PASSIVE (CreateContext of the copy context).
+    pub(crate) fn create(
+        passive: PassiveLevel,
+        adapter: &AdapterContext,
+        process: &mut ProcessContext,
+        owner: DeviceOwner,
+    ) -> Result<Self, NativeError> {
+        let block_handles = ObjectHandles::mint()?;
+        let context = NativeContext::create(passive, adapter, process, owner)?;
+        let mut channel = Self {
+            context,
+            parts: QueueParts::default(),
+            block_handles,
+            block_allocated: false,
+            block_virtual: false,
+            block: CpuView::default(),
+            block_gpu: 0,
+            gp_put: SpinLock::new(0),
+            dead: core::sync::atomic::AtomicBool::new(false),
+        };
+        // NvCcxErr: 0 built, else 0x100 | the error of the step that failed.
+        if let Err(error) = channel.build(passive, adapter) {
+            crate::diag::record_named_bytes(b"NvCcxErr", 0x100 | error as u32);
+            let _ = channel.destroy(passive);
+            return Err(error);
+        }
+        crate::diag::record_named_bytes(b"NvCcxErr", 0);
+        crate::diag::record_named_bytes(b"NvCcxVa", (channel.block_gpu >> 12) as u32);
+        crate::diag::record_named_bytes(b"NvCcxTok", channel.parts.token);
+        Ok(channel)
+    }
+
+    fn build(&mut self, passive: PassiveLevel, adapter: &AdapterContext) -> Result<(), NativeError> {
+        use helios_kmd_logic::nv_copy::ring;
+        let process = unsafe { self.context.process.as_ref() }.ok_or(NativeError::Invalid)?;
+        let native = peek_process(passive, process)?;
+        if native.epoch != self.context.epoch {
+            return Err(NativeError::Transport);
+        }
+        let io = Io {
+            passive,
+            adapter,
+            epoch: native.epoch,
+        };
+        let client = &native.client;
+        let memory = self.block_handles.at(0);
+        let virt = self.block_handles.at(1);
+        io.alloc(
+            client,
+            nd::H_DEVICE,
+            memory,
+            cc::NV01_MEMORY_SYSTEM,
+            &helios_kmd_logic::rm_sysmem::params(
+                client.root,
+                helios_kmd_logic::rm_sysmem::Cache::Cached,
+                ring::BYTES,
+            ),
+        )?;
+        self.block_allocated = true;
+        self.block = cpu_map(
+            io,
+            client,
+            nd::H_DEVICE,
+            memory,
+            cc::MapNode::Ctl,
+            ring::BYTES,
+            _MEMORY_CACHING_TYPE::MmCached,
+        )?;
+        zero(self.block.va, ring::BYTES);
+        // A 4-KiB-paged virtual allocation RM places itself (outside the VA
+        // windows the KMD keeps for VidMm's addresses) and the block mapped
+        // into it with 4-KiB system-memory PTEs.
+        io.alloc(
+            client,
+            nd::H_DEVICE,
+            virt,
+            cc::NV50_MEMORY_VIRTUAL,
+            &cc::virtual_params_4k(client.root, native.vaspace, None, ring::BYTES),
+        )?;
+        self.block_virtual = true;
+        let block = cc::nvos46(&cc::DmaMap {
+            root: client.root,
+            h_device: nd::H_DEVICE,
+            h_dma: virt,
+            h_memory: memory,
+            length: ring::BYTES,
+            flags: cc::MAP_FLAGS_SYSMEM,
+        });
+        let mut resp = [0u8; 256];
+        let n = io.exchange(
+            client.ctl,
+            rc::nv_cmd(cc::ESC_RM_MAP_MEMORY_DMA, cc::NVOS46_BYTES as u32),
+            &block,
+            &[],
+            &mut resp,
+        )?;
+        let reply = rc::rm_reply(resp.get(..n).ok_or(NativeError::Transport)?, cc::NVOS46_STATUS_AT)
+            .map_err(|error| {
+                crate::diag::record_named_bytes(b"NvCcxMapSt", rm_error_code(error));
+                NativeError::Rm
+            })?;
+        self.block_gpu = cc::map_dma_va(reply.data).ok_or(NativeError::Transport)?;
+        if self.block_gpu == 0 || self.block_gpu % 0x1000 != 0 {
+            return Err(NativeError::Invalid);
+        }
+        self.parts.handles = Some(ObjectHandles::mint()?);
+        let queue = nc::QueuePrivate {
+            word_10: 0,
+            word_1c: 0,
+            gpfifo_va: self.block_gpu,
+            ring_bytes: ring::GPFIFO_BYTES,
+            allocation: 0,
+        };
+        let result = create_queue_objects(
+            io,
+            client,
+            self.context.tsg,
+            self.context.ctxshare,
+            &self.context.scheduled,
+            &queue,
+            &mut self.parts,
+        );
+        file_leftovers(self.context.process_key(), native.epoch, &mut self.parts.left);
+        result
+    }
+
+    /// The process key native memory files the process's mappings under.
+    pub(crate) fn process_key(&self) -> usize {
+        self.context.process_key()
+    }
+
+    /// The last sequence the channel finished (its progress semaphore). Any IRQL.
+    pub(crate) fn progress(&self) -> u64 {
+        use helios_kmd_logic::nv_copy::ring;
+        if self.block.va == 0 {
+            return 0;
+        }
+        // SAFETY: the live, non-paged kernel view of the block; 8-aligned.
+        unsafe { ((self.block.va + ring::SEMAPHORE_AT) as *const u64).read_volatile() }
+    }
+
+    /// USERD GP_GET. Any IRQL; 0 unmapped.
+    pub(crate) fn gp_get(&self) -> u32 {
+        let ctl = self.parts.ctl.va;
+        if ctl == 0 {
+            return 0;
+        }
+        // SAFETY: as `NativeQueue::gp_get`.
+        unsafe { ((ctl + cc::USERD_OFFSET + u64::from(cp::USERD_GP_GET)) as *const u32).read_volatile() }
+    }
+
+    /// The channel's error notifier. Any IRQL.
+    pub(crate) fn channel_error(&self) -> Option<helios_kmd_logic::native_hang::ChannelError> {
+        use helios_kmd_logic::native_hang as nh;
+        let ctl = self.parts.ctl.va;
+        if ctl == 0 {
+            return None;
+        }
+        // SAFETY: as `NativeQueue::channel_error`.
+        let (info32, word) = unsafe {
+            (
+                ((ctl + nh::ERROR_INFO32_AT) as *const u32).read_volatile(),
+                ((ctl + nh::ERROR_WORD_AT) as *const u32).read_volatile(),
+            )
+        };
+        nh::channel_error(info32, word)
+    }
+
+    /// Recovered: nothing reaches the channel any more. Any IRQL.
+    pub(crate) fn mark_dead(&self) {
+        self.dead.store(true, Ordering::Release);
+        drop(self.gp_put.lock());
+    }
+
+    pub(crate) fn is_dead(&self) -> bool {
+        self.dead.load(Ordering::Acquire)
+    }
+
+    /// Append `entries` and the KMD's release of `seq` to the ring and ring the
+    /// doorbell. DISPATCH-safe: one spinlock, volatile stores into the KMD's
+    /// own views. `Busy` when the ring has no room (the GPU is behind).
+    pub(crate) fn submit(&self, entries: &[helios_kmd_logic::nv_copy::GpEntry], seq: u64) -> Result<(), NativeError> {
+        use helios_kmd_logic::nv_copy::{self as nv, ring};
+        let adapter = unsafe { self.context.adapter.as_ref() }.ok_or(NativeError::Transport)?;
+        let epoch = adapter.with_virtio(|v| v.nvrm_epoch()).unwrap_or(0);
+        if epoch == 0 || epoch != self.context.epoch {
+            return Err(NativeError::Transport);
+        }
+        let ctl = self.parts.ctl.va;
+        let doorbell = self.parts.usermode.va;
+        if ctl == 0 || doorbell == 0 || self.parts.token == 0 || self.block.va == 0 {
+            return Err(NativeError::Transport);
+        }
+        let mut put = self.gp_put.lock();
+        if self.dead.load(Ordering::Acquire) {
+            return Err(NativeError::Dead);
+        }
+        let need = entries.len() as u32 + 1;
+        if need > ring::MAX_SUBMIT_ENTRIES || ring::room(*put, self.gp_get()) < need {
+            return Err(NativeError::Busy);
+        }
+        // The release segment for this sequence.
+        let release_off = ring::release_offset(seq);
+        let release = nv::release_segment(self.block_gpu + ring::SEMAPHORE_AT, seq);
+        for (i, word) in release.iter().enumerate() {
+            // SAFETY: inside the block's kernel view (`release_offset` + 28 bytes).
+            unsafe { write32(self.block.va + release_off + 4 * i as u64, *word) };
+        }
+        let mut position = *put;
+        let release_entry = nv::GpEntry {
+            va: self.block_gpu + release_off,
+            dwords: nv::RELEASE_DWORDS as u32,
+        };
+        for entry in entries.iter().chain(core::iter::once(&release_entry)) {
+            let (lo, hi) = entry.encode();
+            let at = self.block.va + u64::from(position) * 8;
+            // SAFETY: `position` < ENTRIES, inside the ring at the block's start.
+            unsafe {
+                write32(at, lo);
+                write32(at + 4, hi);
+            }
+            position = (position + 1) % ring::ENTRIES;
+        }
+        full_barrier();
+        // SAFETY: as `NativeQueue::submit`: USERD GP_PUT, then the doorbell.
+        unsafe { write32(ctl + cc::USERD_OFFSET + u64::from(cp::USERD_GP_PUT), position) };
+        full_barrier();
+        unsafe { write32(doorbell + u64::from(cp::DOORBELL_OFFSET), self.parts.token) };
+        *put = position;
+        Ok(())
+    }
+
+    /// PASSIVE (DestroyContext): the channel, the block and the TSG. What RM
+    /// would not free is filed for DestroyProcess.
+    pub(crate) fn destroy(&mut self, passive: PassiveLevel) -> Result<(), NativeError> {
+        let (Some(adapter), Some(process)) =
+            (unsafe { self.context.adapter.as_ref() }, unsafe { self.context.process.as_ref() })
+        else {
+            return Ok(());
+        };
+        let native = match peek_process(passive, process) {
+            Ok(native) if native.epoch == self.context.epoch => native,
+            _ => {
+                self.parts.drop_views();
+                if self.block.va != 0 {
+                    // SAFETY: this exact MmMapIoSpace view, removed once.
+                    unsafe { MmUnmapIoSpace(self.block.va as *mut c_void, self.block.len) };
+                    self.block.va = 0;
+                }
+                return Ok(());
+            }
+        };
+        let io = Io {
+            passive,
+            adapter,
+            epoch: native.epoch,
+        };
+        let client = &native.client;
+        let _ = self.parts.destroy(io, client, self.context.tsg);
+        file_leftovers(self.context.process_key(), native.epoch, &mut self.parts.left);
+        let _ = cpu_unmap(io, client, &mut self.block);
+        if self.block_virtual {
+            self.block_virtual = false;
+            if io.free(client, nd::H_DEVICE, self.block_handles.at(1)).is_err() {
+                file_leftover(self.context.process_key(), native.epoch, nd::H_DEVICE, self.block_handles.at(1));
+            }
+        }
+        if self.block_allocated {
+            self.block_allocated = false;
+            if io.free(client, nd::H_DEVICE, self.block_handles.at(0)).is_err() {
+                file_leftover(self.context.process_key(), native.epoch, nd::H_DEVICE, self.block_handles.at(0));
+            }
+        }
+        self.context.destroy(passive)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 /// `NvChT<k>` / `NvChV<k>` / `NvChS<k>` (a 16-entry ring): each native channel's
 /// work-submit token (low bits = the host channel id an Xid names), its GPFIFO

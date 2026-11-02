@@ -535,10 +535,12 @@ pub(crate) fn poll_tick(adapter: &AdapterContext) {
     let mut timeout_nodes = 0u32;
     let now = crate::adapter::foreign_scanout::now_100ns();
     let hang_timeout = hang_timeout();
+    // The Vulkan ICD's copy channels (`ddi::nv_copy`), outside the registry lock.
+    let (copy_busy, copy_moved) = crate::ddi::nv_copy::poll(adapter, now, hang_timeout);
     let next = {
         let mut r = REGISTRY.lock();
-        let mut any_outstanding = false;
-        let mut progressed = false;
+        let mut any_outstanding = copy_busy;
+        let mut progressed = copy_moved;
         for slot in r.slots.iter_mut().filter(|slot| slot.queue != 0) {
             // SAFETY: a registered queue is live until DestroyHwQueue removed its
             // slot under this lock (see `Slot::queue`).
@@ -779,6 +781,21 @@ fn invalidate_context(adapter: &AdapterContext, handle: usize) {
     }
 }
 
+/// Make sure the poll runs (a copy-channel submission, `ddi::nv_copy`). Any IRQL
+/// up to DISPATCH.
+pub(crate) fn kick_poll(adapter: &AdapterContext) {
+    let arm_now = {
+        let mut r = REGISTRY.lock();
+        r.idle_ticks = 0;
+        let arm_now = !r.armed;
+        r.armed = true;
+        arm_now
+    };
+    if arm_now {
+        arm(adapter, -logic::POLL_PERIOD_100NS);
+    }
+}
+
 /// After a submit (or a kernel-side fence signal): record it, look once at the
 /// storage, and make sure the poll runs.
 fn after_submit(adapter: &AdapterContext, queue: usize, fence_id: Option<u64>, extra_nodes: u32) {
@@ -853,7 +870,13 @@ pub unsafe extern "C" fn dxgkddi_create_context(
         if status == STATUS_SUCCESS && nvda {
             CTX_NVDA_SCHED.fetch_add(1, Ordering::Relaxed);
             // SAFETY: still dxgkrnl's live args.
-            set_nvda_context_info(unsafe { &mut *create_context });
+            let args = unsafe { &mut *create_context };
+            set_nvda_context_info(args);
+            // The Vulkan ICD's copy context runs its work on a channel of its own.
+            if helios_kmd_logic::nv_copy::is_copy_context(private, args.NodeOrdinal) {
+                // SAFETY: PASSIVE; the live hDevice and the hContext just made.
+                unsafe { crate::ddi::nv_copy::create_channel(h_device, args.hContext as usize) };
+            }
         }
         return status;
     }
