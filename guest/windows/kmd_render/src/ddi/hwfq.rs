@@ -68,6 +68,30 @@ static TICKS: AtomicU32 = AtomicU32::new(0);
 static INTERRUPTS: AtomicU32 = AtomicU32::new(0);
 static CANCELS: AtomicU32 = AtomicU32::new(0);
 static LOGS: AtomicU32 = AtomicU32::new(0);
+static LOG_ENTRIES: AtomicU32 = AtomicU32::new(0);
+static TARGET: AtomicU32 = AtomicU32::new(0);
+static LAST_RET: AtomicU32 = AtomicU32::new(0);
+
+/// The counters as registry values; the mirror thread's pass (PASSIVE_LEVEL).
+pub(crate) fn publish() {
+    if !enabled() {
+        return;
+    }
+    for (name, counter) in [
+        (&b"HfqSub"[..], &SUBMITS),
+        (b"HfqNow", &SHOWN_NOW),
+        (b"HfqFull", &FULL),
+        (b"HfqTick", &TICKS),
+        (b"HfqInt", &INTERRUPTS),
+        (b"HfqCan", &CANCELS),
+        (b"HfqLog", &LOGS),
+        (b"HfqLogN", &LOG_ENTRIES),
+        (b"HfqTgt", &TARGET),
+        (b"HfqRet", &LAST_RET),
+    ] {
+        crate::diag::record_named_bytes(name, counter.load(Ordering::Relaxed));
+    }
+}
 
 /// The DIRQL DDIs and the tick (itself inside `DxgkCbSynchronizeExecution`) are already
 /// serialized by the interrupt lock; `SetFlipQueueLogBuffer` may come at a lower IRQL,
@@ -85,11 +109,11 @@ fn with<R>(f: impl FnOnce(&mut State) -> R) -> R {
     r
 }
 
-fn count(counter: &AtomicU32, name: &[u8]) {
-    let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
-    if n <= 4 || n % 256 == 0 {
-        crate::diag::record_named_bytes(name, n);
-    }
+/// DIRQL-safe: an atomic add only. The registry values are written by [`publish`]
+/// from the mirror thread at PASSIVE_LEVEL (`diag::record_named_bytes` takes locks and
+/// may write the registry, which changed the IRQL inside a DIRQL DDI: bugcheck 0x113/0x10).
+fn count(counter: &AtomicU32) {
+    counter.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Whether the hardware flip queue path is on (knob part, NVIDIA personality).
@@ -147,7 +171,7 @@ pub(crate) unsafe fn submit(
     duration: UINT,
     retry: &mut bool,
 ) -> NTSTATUS {
-    count(&SUBMITS, b"HfqSub");
+    count(&SUBMITS);
     // SAFETY: plain bitfield union reads.
     let flags = unsafe { plane.InputFlags.__bindgen_anon_1.__bindgen_anon_1 };
     let mut payload = None;
@@ -175,7 +199,7 @@ pub(crate) unsafe fn submit(
     });
     match outcome {
         fq::Submit::ShowNow(show) => {
-            count(&SHOWN_NOW, b"HfqNow");
+            count(&SHOWN_NOW);
             if let Some(show) = show {
                 return unsafe { program(adapter, &show) };
             }
@@ -184,7 +208,7 @@ pub(crate) unsafe fn submit(
         }
         fq::Submit::Queued => STATUS_SUCCESS,
         fq::Submit::Full => {
-            count(&FULL, b"HfqFull");
+            count(&FULL);
             *retry = true;
             STATUS_RETRY_DRAIN
         }
@@ -208,7 +232,7 @@ unsafe fn program(adapter: IN_CONST_HANDLE, show: &Show) -> NTSTATUS {
     legacy.Duration = show.duration;
     let status = unsafe { crate::ddi::traced::set_vidpn_source_address(adapter, &legacy) };
     if status != STATUS_SUCCESS {
-        crate::diag::record_named_bytes(b"HfqRet", status as u32);
+        LAST_RET.store(status as u32, Ordering::Relaxed);
     }
     status
 }
@@ -262,7 +286,7 @@ unsafe extern "C" fn tick_routine(context: *mut core::ffi::c_void) -> BOOLEAN {
         (result, s.adapter, s.queue.first_free())
     });
     if result.logged != 0 {
-        count(&TICKS, b"HfqTick");
+        count(&TICKS);
     }
     if let Some(show) = result.show {
         match show {
@@ -276,7 +300,7 @@ unsafe extern "C" fn tick_routine(context: *mut core::ffi::c_void) -> BOOLEAN {
     if !(result.interrupt && ctx.deliver) {
         return 1;
     }
-    count(&INTERRUPTS, b"HfqInt");
+    count(&INTERRUPTS);
     let mut info = unsafe { core::mem::zeroed::<DXGK_MULTIPLANE_OVERLAY_VSYNC_INFO3>() };
     info.LayerIndex = 0;
     info.FirstFreeFlipQueueLogEntryIndex = first_free;
@@ -333,8 +357,8 @@ pub unsafe extern "C" fn set_flip_queue_log_buffer(
     if args.LayerIndex != 0 {
         return STATUS_SUCCESS;
     }
-    count(&LOGS, b"HfqLog");
-    crate::diag::record_named_bytes(b"HfqLogN", args.NumberOfEntries);
+    count(&LOGS);
+    LOG_ENTRIES.store(args.NumberOfEntries, Ordering::Relaxed);
     let ctx = LogCtx {
         log: args.LogBufferAddress,
         entries: if args.LogBufferAddress.is_null() { 0 } else { args.NumberOfEntries },
@@ -387,7 +411,7 @@ pub unsafe extern "C" fn set_interrupt_target_present_id(
     };
     if args.LayerIndex == 0 {
         with(|s| s.queue.set_interrupt_target(args.InterruptTargetPresentId));
-        crate::diag::record_named_bytes(b"HfqTgt", args.InterruptTargetPresentId as u32);
+        TARGET.store(args.InterruptTargetPresentId as u32, Ordering::Relaxed);
     }
     STATUS_SUCCESS
 }
@@ -400,7 +424,7 @@ pub unsafe extern "C" fn cancel_flips(
     let Some(args) = (unsafe { args.as_mut() }) else {
         return STATUS_INVALID_PARAMETER;
     };
-    count(&CANCELS, b"HfqCan");
+    count(&CANCELS);
     for i in 0..args.PlaneCount as usize {
         // SAFETY: i < PlaneCount.
         let Some(plane) = (unsafe { (*args.ppPlanes.add(i)).as_mut() }) else {

@@ -100,11 +100,22 @@ pub(crate) fn take_completion() -> bool {
     REPORTED.swap(published, Ordering::AcqRel) != published
 }
 
-fn count(counter: &AtomicU32, name: &[u8]) {
-    let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
-    if n == 1 || n % 256 == 0 {
-        crate::diag::record_named_bytes(name, n);
+/// DIRQL-safe: an atomic add only; [`publish`] writes the values at PASSIVE_LEVEL.
+fn count(counter: &AtomicU32) {
+    counter.fetch_add(1, Ordering::Relaxed);
+}
+
+static LAST_RET: AtomicU32 = AtomicU32::new(0);
+
+/// The counters as registry values; the mirror thread's pass (PASSIVE_LEVEL).
+pub(crate) fn publish() {
+    if PARTS.load(Ordering::Relaxed) == 0 {
+        return;
     }
+    crate::diag::record_named_bytes(b"Mpo3Flip", FLIPS.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"Mpo3Off", OFF.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"Mpo3Chk", CHECKS.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"Mpo3Ret", LAST_RET.load(Ordering::Relaxed));
 }
 
 pub unsafe extern "C" fn get_multi_plane_overlay_caps(
@@ -146,7 +157,7 @@ pub unsafe extern "C" fn check_multi_plane_overlay_support3(
     if args.is_null() {
         return STATUS_INVALID_PARAMETER;
     }
-    count(&CHECKS, b"Mpo3Chk");
+    count(&CHECKS);
     // SAFETY: dxgkrnl passes a writable DXGKARG_CHECKMULTIPLANEOVERLAYSUPPORT3.
     let args = unsafe { &mut *args };
     args.Supported = BOOL::from(args.PlaneCount <= 1);
@@ -193,7 +204,7 @@ pub unsafe extern "C" fn set_vidpn_source_address_with_multi_plane_overlay3(
     let flags = unsafe { plane.InputFlags.__bindgen_anon_1.__bindgen_anon_1 };
     if flags.Enabled() == 0 || plane.ContextCount == 0 || plane.ppContextData.is_null() {
         // Nothing to scan out on this layer: the flip completes at the next vsync.
-        count(&OFF, b"Mpo3Off");
+        count(&OFF);
         note_published();
         return STATUS_SUCCESS;
     }
@@ -201,7 +212,7 @@ pub unsafe extern "C" fn set_vidpn_source_address_with_multi_plane_overlay3(
     let Some(context) = (unsafe { (*plane.ppContextData).as_ref() }) else {
         return STATUS_INVALID_PARAMETER;
     };
-    count(&FLIPS, b"Mpo3Flip");
+    count(&FLIPS);
     // SAFETY: an all-zero DXGKARG_SETVIDPNSOURCEADDRESS is a valid value (handles,
     // integers and a plain bitfield union).
     let mut legacy = unsafe { core::mem::zeroed::<DXGKARG_SETVIDPNSOURCEADDRESS>() };
@@ -219,7 +230,7 @@ pub unsafe extern "C" fn set_vidpn_source_address_with_multi_plane_overlay3(
     legacy.Duration = args.Duration;
     let status = unsafe { crate::ddi::traced::set_vidpn_source_address(adapter, &mut legacy) };
     if status != STATUS_SUCCESS {
-        crate::diag::record_named_bytes(b"Mpo3Ret", status as u32);
+        LAST_RET.store(status as u32, Ordering::Relaxed);
     }
     status
 }
@@ -239,11 +250,11 @@ unsafe fn flip_plane(
     duration: UINT,
 ) -> NTSTATUS {
     if !enabled || allocation.is_null() {
-        count(&OFF, b"Mpo3Off");
+        count(&OFF);
         note_published();
         return STATUS_SUCCESS;
     }
-    count(&FLIPS, b"Mpo3Flip");
+    count(&FLIPS);
     // SAFETY: an all-zero DXGKARG_SETVIDPNSOURCEADDRESS is a valid value.
     let mut legacy = unsafe { core::mem::zeroed::<DXGKARG_SETVIDPNSOURCEADDRESS>() };
     legacy.VidPnSourceId = source;
@@ -256,7 +267,7 @@ unsafe fn flip_plane(
     legacy.Duration = duration;
     let status = unsafe { crate::ddi::traced::set_vidpn_source_address(adapter, &legacy) };
     if status != STATUS_SUCCESS {
-        crate::diag::record_named_bytes(b"Mpo3Ret", status as u32);
+        LAST_RET.store(status as u32, Ordering::Relaxed);
     }
     status
 }
@@ -331,7 +342,7 @@ pub unsafe extern "C" fn check_multi_plane_overlay_support(
     let Some(args) = (unsafe { args.as_mut() }) else {
         return STATUS_INVALID_PARAMETER;
     };
-    count(&CHECKS, b"Mpo3Chk");
+    count(&CHECKS);
     args.Supported = BOOL::from(args.PlaneCount <= 1);
     STATUS_SUCCESS
 }
@@ -344,7 +355,7 @@ pub unsafe extern "C" fn check_multi_plane_overlay_support2(
     let Some(args) = (unsafe { args.as_mut() }) else {
         return STATUS_INVALID_PARAMETER;
     };
-    count(&CHECKS, b"Mpo3Chk");
+    count(&CHECKS);
     args.Supported = BOOL::from(args.PlaneCount <= 1);
     STATUS_SUCCESS
 }

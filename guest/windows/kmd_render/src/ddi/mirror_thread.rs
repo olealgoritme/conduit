@@ -384,6 +384,9 @@ fn run_pass(mask: u32) -> bool {
     // The hardware cursor's block (`Cur*`), when a count moved: the cursor DDIs ask for a pass
     // (at most once a second), since a mouse move wakes nothing else that would dump it.
     crate::ddi::hw_cursor::publish();
+    // The MPO3 / hardware flip queue counters (their DDIs run at DIRQL and only count).
+    crate::ddi::mpo3::publish();
+    crate::ddi::hwfq::publish();
     // `StgRing` (`StageTrace`): one relaxed load while the knob is 0, rate limited inside.
     crate::ddi::stage_trace::publish();
     publish_own();
