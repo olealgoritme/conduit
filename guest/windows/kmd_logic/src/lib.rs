@@ -27,6 +27,7 @@ pub mod host_rm_version;
 pub mod hws;
 pub mod native_channel;
 pub mod native_memory;
+pub mod native_teardown;
 pub mod nvda;
 pub mod nvrm_clients;
 pub mod nvrm_events;

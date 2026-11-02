@@ -272,11 +272,11 @@ pub unsafe extern "C" fn dxgkddi_destroy_hw_context(h_hw_context: IN_CONST_HANDL
         let mut context = unsafe { Box::from_raw(h_hw_context as *mut HwHandle) };
         if let Some(native) = context.native.as_mut() {
             let passive = unsafe { crate::irql::PassiveLevel::assume() };
+            // What RM would not free is filed for DestroyProcess
+            // (`native_channel`); an error here means the context was never
+            // torn down, and the handle stays.
             if let Err(error) = native.destroy(passive) {
                 let status = native_status(error);
-                // Keep the handle and all still-live RM/CPU-view state for a
-                // later retry; never turn a failed teardown into a leak by
-                // dropping only its Rust bookkeeping.
                 let _ = Box::into_raw(context);
                 return status;
             }
@@ -408,6 +408,8 @@ pub unsafe extern "C" fn dxgkddi_destroy_hw_queue(h_hw_queue: IN_CONST_HANDLE) -
     }
     let mut queue = unsafe { Box::from_raw(h_hw_queue as *mut HwQueue) };
     let passive = unsafe { crate::irql::PassiveLevel::assume() };
+    // What RM would not free is filed for DestroyProcess (`native_channel`); an
+    // error here means the queue was never torn down, and the handle stays.
     if let Err(error) = queue.native.destroy(passive) {
         let status = native_status(error);
         let _ = Box::into_raw(queue);

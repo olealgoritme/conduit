@@ -845,10 +845,10 @@ pub(crate) unsafe fn create_context_with(
 pub unsafe extern "C" fn dxgkddi_destroy_context(h_context: *mut c_void) -> NTSTATUS {
     crate::diag::record(0x0800_0002);
     if !h_context.is_null() {
-        // NVIDIA personality: a native TSG goes first, and a failed teardown
-        // keeps the whole context for a retry rather than leaking live RM state
-        // behind freed bookkeeping. Every queue on it is gone by WDDM contract.
-        // Default path: `native` is always `None` and nothing here runs.
+        // NVIDIA personality: a native TSG goes first (a TSG RM would not free
+        // is filed for DestroyProcess, `native_channel`). Every queue on it is
+        // gone by WDDM contract. Default path: `native` is always `None` and
+        // nothing here runs.
         // SAFETY: dxgkrnl passes the live hContext CreateContext returned.
         let context = unsafe { &mut *(h_context as *mut ContextContext) };
         if let Some(native) = context.native.as_mut() {
