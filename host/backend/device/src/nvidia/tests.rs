@@ -3387,6 +3387,218 @@ mod tests {
         assert_eq!(seen, vec![100_000]);
     }
 
+    // ------------------------------------------------------------------
+    // The NVIDIA UMD personality's RM policy (rmpolicy.rs) and the UMD
+    // release lock (umd_version.rs), through `dispatch`.
+    // ------------------------------------------------------------------
+
+    const POLICY_CLIENT: u32 = 0xc1d0_0042;
+
+    /// A backend in `mode` whose guest holds the client `POLICY_CLIENT`.
+    fn policy_backend(
+        host: &CountingHost,
+        mode: super::super::rmpolicy::Mode,
+    ) -> (NvidiaBackend, u64) {
+        let (mut be, h) = backend_on(host);
+        be.set_rm_policy(mode);
+        let mut root = rm_alloc(0x41);
+        root[8..12].copy_from_slice(&POLICY_CLIENT.to_le_bytes());
+        send_nested(&mut be, h, abi::ioctl::NV_ESC_RM_ALLOC, &root, 0);
+        (be, h)
+    }
+
+    fn rm_status(resp: &[u8], at: usize) -> u32 {
+        let body = size_of::<MsgHeader>() + size_of::<IoctlResp>();
+        u32::from_le_bytes(resp[body + at..body + at + 4].try_into().unwrap())
+    }
+
+    fn policy_control(cmd: u32, size: u32) -> Vec<u8> {
+        let mut c = rm_control(cmd, size);
+        c[0..4].copy_from_slice(&POLICY_CLIENT.to_le_bytes());
+        c[4..8].copy_from_slice(&POLICY_CLIENT.to_le_bytes());
+        c
+    }
+
+    /// NV2080_CTRL_CMD_PERF_BOOST: RM serves it to an unprivileged caller, and
+    /// NVIDIA's UMDs never send it. Enforced, it never reaches the host and
+    /// the guest reads NV_ERR_INSUFFICIENT_PERMISSIONS.
+    #[test]
+    fn an_unlisted_control_is_refused_when_enforced() {
+        use super::super::rmpolicy::{Mode, NV_ERR_INSUFFICIENT_PERMISSIONS};
+        let host = CountingHost::default();
+        let (mut be, h) = policy_backend(&host, Mode::Enforce);
+        let size = abi::rmallow::v615_71_09::CTRL
+            .iter()
+            .find(|e| e.cmd == 0x2080_200a)
+            .expect("PERF_BOOST is exported by RM")
+            .params_size;
+        let before = host.calls().len();
+        let resp = send_nested(
+            &mut be,
+            h,
+            abi::ioctl::NV_ESC_RM_CONTROL,
+            &policy_control(0x2080_200a, size),
+            size as usize,
+        );
+        assert_eq!(host.calls().len(), before, "{:x?}", host.calls());
+        assert_eq!(rm_status(&resp, 28), NV_ERR_INSUFFICIENT_PERMISSIONS);
+    }
+
+    /// Log-only serves the same control and only counts it.
+    #[test]
+    fn log_only_serves_what_enforce_would_refuse() {
+        use super::super::rmpolicy::Mode;
+        let host = CountingHost::default();
+        let (mut be, h) = policy_backend(&host, Mode::Log);
+        let size = abi::rmallow::v615_71_09::CTRL
+            .iter()
+            .find(|e| e.cmd == 0x2080_200a)
+            .unwrap()
+            .params_size;
+        let before = host.calls().len();
+        send_nested(
+            &mut be,
+            h,
+            abi::ioctl::NV_ESC_RM_CONTROL,
+            &policy_control(0x2080_200a, size),
+            size as usize,
+        );
+        assert_eq!(host.calls().len(), before + 1);
+        assert!(be.rm_misses.summary().contains("RM_CONTROL 0x2080200a"));
+    }
+
+    /// A listed control on the guest's own client reaches the host; the same
+    /// control naming a client this guest never made does not.
+    #[test]
+    fn a_listed_control_is_served_only_on_an_own_client() {
+        use super::super::rmpolicy::Mode;
+        let host = CountingHost::default();
+        let (mut be, h) = policy_backend(&host, Mode::Enforce);
+        let size = abi::rmallow::v615_71_09::CTRL
+            .iter()
+            .find(|e| e.cmd == 0x2080_0142)
+            .expect("GPU_GET_ID is exported by RM")
+            .params_size;
+        let before = host.calls().len();
+        send_nested(
+            &mut be,
+            h,
+            abi::ioctl::NV_ESC_RM_CONTROL,
+            &policy_control(0x2080_0142, size),
+            size as usize,
+        );
+        assert_eq!(host.calls().len(), before + 1);
+
+        let mut foreign = policy_control(0x2080_0142, size);
+        foreign[0..4].copy_from_slice(&0xc1d0_0001u32.to_le_bytes());
+        send_nested(
+            &mut be,
+            h,
+            abi::ioctl::NV_ESC_RM_CONTROL,
+            &foreign,
+            size as usize,
+        );
+        assert_eq!(host.calls().len(), before + 1, "{:x?}", host.calls());
+    }
+
+    /// The CUDA clock-limit control is answered NV_OK here when enforced.
+    #[test]
+    fn the_cuda_clock_limit_is_answered_here() {
+        use super::super::rmpolicy::Mode;
+        let host = CountingHost::default();
+        let (mut be, h) = policy_backend(&host, Mode::Enforce);
+        let before = host.calls().len();
+        let mut c = policy_control(0x0080_1909, 1);
+        c[28..32].copy_from_slice(&0xffu32.to_le_bytes());
+        let resp = send_nested(&mut be, h, abi::ioctl::NV_ESC_RM_CONTROL, &c, 1);
+        assert_eq!(host.calls().len(), before);
+        assert_eq!(rm_status(&resp, 28), 0);
+        assert_eq!(be.rm_absorbed, 1);
+    }
+
+    /// Off, the policy is not consulted at all.
+    #[test]
+    fn the_policy_off_changes_nothing() {
+        use super::super::rmpolicy::Mode;
+        let host = CountingHost::default();
+        let (mut be, h) = policy_backend(&host, Mode::Off);
+        let size = abi::rmallow::v615_71_09::CTRL
+            .iter()
+            .find(|e| e.cmd == 0x2080_200a)
+            .unwrap()
+            .params_size;
+        let before = host.calls().len();
+        send_nested(
+            &mut be,
+            h,
+            abi::ioctl::NV_ESC_RM_CONTROL,
+            &policy_control(0x2080_200a, size),
+            size as usize,
+        );
+        assert_eq!(host.calls().len(), before + 1);
+        assert!(be.rm_misses.is_empty());
+    }
+
+    fn umd_report(
+        be: &mut NvidiaBackend,
+        major: u32,
+        minor: u32,
+    ) -> protocol::messages::UmdVersionReply {
+        let mut v = hdr(MsgType::UmdVersion, 0);
+        v.extend_from_slice(
+            &protocol::messages::UmdVersion {
+                kind: protocol::messages::UMD_KIND_NVIDIA_WINDOWS,
+                major,
+                minor,
+                reserved: 0,
+            }
+            .to_bytes(),
+        );
+        let mut resp = vec![0u8; 64];
+        let n = be.dispatch(&v, &mut resp);
+        assert_eq!(parse_resp(&resp).status, 0);
+        protocol::messages::UmdVersionReply::from_bytes(&resp[size_of::<MsgHeader>()..n]).unwrap()
+    }
+
+    /// A release the host RM is not: the guest is told, and from then on no
+    /// RM call of its reaches the host. A matching report lifts it.
+    #[test]
+    fn a_mismatched_umd_release_shuts_rm_off_for_the_guest() {
+        use protocol::messages::{UMD_VERDICT_MATCH, UMD_VERDICT_MISMATCH};
+        let host = CountingHost::default();
+        let (mut be, h) = backend_on(&host);
+        be.set_umd_pin(Some(super::super::umd_version::Pin::Exact(
+            super::super::umd_version::WinVersion::new(615, 71),
+        )));
+        let r = umd_report(&mut be, 610, 88);
+        assert_eq!(r.verdict, UMD_VERDICT_MISMATCH);
+        assert_eq!((r.host_major, r.host_minor, r.host_patch), (615, 71, 9));
+
+        let resp = send_nested(&mut be, h, abi::ioctl::NV_ESC_RM_ALLOC, &rm_alloc(0x41), 0);
+        assert!(host.calls().is_empty(), "{:x?}", host.calls());
+        assert_eq!(
+            rm_status(&resp, 40),
+            super::super::rmpolicy::NV_ERR_INSUFFICIENT_PERMISSIONS
+        );
+
+        assert_eq!(umd_report(&mut be, 615, 71).verdict, UMD_VERDICT_MATCH);
+        send_nested(&mut be, h, abi::ioctl::NV_ESC_RM_ALLOC, &rm_alloc(0x41), 0);
+        assert_eq!(host.calls().len(), 1);
+    }
+
+    /// A report the backend cannot read is refused as a message, not judged.
+    #[test]
+    fn a_malformed_umd_report_is_an_error() {
+        let host = CountingHost::default();
+        let (mut be, _) = backend_on(&host);
+        let mut v = hdr(MsgType::UmdVersion, 0);
+        v.extend_from_slice(&[0u8; 8]);
+        let mut resp = vec![0u8; 64];
+        be.dispatch(&v, &mut resp);
+        assert!(parse_resp(&resp).status < 0);
+        assert!(be.umd_report.is_none());
+    }
+
     #[cfg(feature = "trace")]
     mod trace_tests {
         use super::*;

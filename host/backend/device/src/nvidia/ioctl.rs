@@ -255,6 +255,7 @@ impl NvidiaBackend {
         let n = self.serve_ioctl(cookie, payload, resp_buf);
         self.vidmem_note(payload, &mut resp_buf[..n]);
         self.note_clients(payload, &resp_buf[..n]);
+        self.rm_policy_note(payload, &resp_buf[..n]);
         self.note_rm_placement(payload, &resp_buf[..n]);
         self.note_gem_import(payload, &resp_buf[..n]);
         self.note_registrations(payload, &resp_buf[..n]);
@@ -434,6 +435,9 @@ impl NvidiaBackend {
         // agree in every byte an ioctl type is read from. The file the guest
         // sent it on is what distinguishes them, so that is what decides.
         if on_uvm {
+            if let Some(n) = self.rm_policy_uvm(cookie, request, resp_buf) {
+                return n;
+            }
             return self.dispatch_uvm(cookie, host_fd, request, param_in, resp_buf);
         }
 
@@ -474,6 +478,11 @@ impl NvidiaBackend {
                 traced_refusal!(self, Abi);
                 *self.abi_refused.entry(escape).or_insert(0) += 1;
                 return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::EINVAL);
+            }
+            // The NVIDIA UMD personality's narrower surface and the UMD
+            // release lock (rmpolicy.rs, umd_version.rs).
+            if let Some(n) = self.rm_policy_gate(cookie, escape, &ireq, param_in, resp_buf) {
+                return n;
             }
         }
 
