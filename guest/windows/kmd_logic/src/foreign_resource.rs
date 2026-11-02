@@ -4863,6 +4863,10 @@ mod shared_format_tests {
     /// interface. A static check of the driver's source: no executable line outside the
     /// one refusal (`ddi/present_packet.rs`, which names the flag only to REFUSE an MPO
     /// present) mentions a multi-plane-overlay capability, DDI or interface.
+    ///
+    /// The one exception is the NVIDIA UMD personality's MPO3 path (`ddi/mpo3.rs`, off
+    /// by default behind `NvMpo3`, never in the Helios personality): that module and the
+    /// files that wire it in through `mpo3::` gates may name it.
     #[test]
     fn the_kmd_never_advertises_overlay_planes() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../kmd_render/src");
@@ -4894,6 +4898,20 @@ mod shared_format_tests {
                 checked += 1;
                 let name = p.file_name().unwrap().to_string_lossy().into_owned();
                 let text = std::fs::read_to_string(&p).unwrap();
+                // The NVIDIA personality's MPO3 path and its gated wiring.
+                const MPO3_FILES: [&str; 6] = [
+                    "mpo3.rs",
+                    "lib.rs",
+                    "query_adapter_info.rs",
+                    "submit_command.rs",
+                    "interrupt.rs",
+                    "mod.rs",
+                ];
+                if MPO3_FILES.contains(&name.as_str())
+                    && (name == "mpo3.rs" || text.contains("mpo3::"))
+                {
+                    continue;
+                }
                 for (n, line) in text.lines().enumerate() {
                     let code = line.trim_start();
                     if code.starts_with("//") {
