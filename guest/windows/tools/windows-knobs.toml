@@ -304,6 +304,11 @@ class = "experiment"
 read = "transport generation (StartDevice)"
 effect = "NVIDIA Windows UMD research personality: 1 records NVDA calls only, 2 forwards root/device/subdevice RM controls through a KMD-owned client. 0 = off. The NVIDIA PCI personality's INF selects 2. Allocation, channel and submission formats are not implemented."
 
+[kmd.NvUmdVersion]
+class = "state"
+read = "StartDevice (NVIDIA personality)"
+effect = "The NVIDIA UMD release the installer staged, without the dot (`61088` for 610.88), in the `Parameters` subkey. Sent to the host at every start; a host that says its RM is another release makes the start fail (`NvUmdChk` = 1). 0 or absent = not recorded, nothing is checked."
+
 [kmd.KmdRmSysPollMs]
 class = "experiment"
 read = "transport generation (with KmdRmClient 5)"

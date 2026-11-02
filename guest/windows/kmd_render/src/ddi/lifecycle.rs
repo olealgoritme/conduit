@@ -14,6 +14,10 @@ use crate::dxgk::*;
 
 use super::bar_segment::{build_segment_table, setup_bar_segment};
 
+/// `STATUS_REVISION_MISMATCH`: the start of an NVIDIA personality whose UMDs
+/// are not the host RM's release.
+const STATUS_REVISION_MISMATCH: NTSTATUS = 0xC000_0059_u32 as NTSTATUS;
+
 /// Same-boot zeroing for the PRODUCTION LINEAR-scanout ladder (T6/R901).
 ///
 /// These eight names are written by `venus::create_linear_scanout_image` /
@@ -566,6 +570,17 @@ pub unsafe extern "C" fn dxgkddi_start_device(
             adapter.set_virtio(Some(gpu));
             // Now the interrupt can be claimed: hand the host its event buffers.
             let _ = adapter.with_virtio(|v| v.post_nvrm_event_buffers());
+
+            // NVIDIA personality: NVIDIA's UMDs speak the RM ABI of their own
+            // release, and nothing else on their path checks it. The host is
+            // told which release they are, and a release its RM is not ends
+            // the start here (Code 43, `NvUmdChk` = 1) instead of at the first
+            // control RM reads with another layout.
+            if crate::virtio::nvda::enabled()
+                && !crate::virtio::nvda::check_umd_release(passive, adapter)
+            {
+                return STATUS_REVISION_MISMATCH;
+            }
 
             // ── BAR memory segment / CPU host aperture ──────────────────────
             // Reserve the window head BEFORE any blob map can allocate a

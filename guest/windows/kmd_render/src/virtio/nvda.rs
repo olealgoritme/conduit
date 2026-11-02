@@ -754,3 +754,46 @@ fn user_shared_block(buf: &mut [u8]) -> NTSTATUS {
     nd::answer_user_shared(buf, base as u64);
     STATUS_SUCCESS
 }
+
+/// Tell the host which NVIDIA UMD release this guest was installed with
+/// (`Parameters\NvUmdVersion`) and read its verdict
+/// (`helios_kmd_logic::umd_version`). StartDevice, PASSIVE, transport up.
+///
+/// `false` only when the host says its RM is another release: the start then
+/// fails, and the host refuses this guest's RM calls until a start reports a
+/// release it accepts. No release recorded, a host without the check, or a
+/// transport error: recorded, and the start goes on.
+///
+/// `NvUmdVer` is the release reported (0 = none recorded), `NvUmdChk` the
+/// outcome (0 match, 1 mismatch, 2 unchecked by the host, 3 branch only,
+/// 0x10 host without the check, 0x11 host errno, 0x12 malformed reply,
+/// 0x13 transport error, 0xff not recorded), `NvHostRm` the host RM release
+/// (`6105704` for 610.57.04; 0 if not told).
+#[inline(never)]
+pub fn check_umd_release(passive: PassiveLevel, adapter: &AdapterContext) -> bool {
+    use helios_kmd_logic::umd_version as uv;
+    let raw = crate::diag::read_parameters_dword(crate::diag::knobs::NVIDIA_UMD_VERSION, 0);
+    crate::diag::record_named_bytes(b"NvUmdVer", raw);
+    let Some(release) = uv::Release::from_dword(raw) else {
+        crate::diag::record_named_bytes(b"NvUmdChk", 0xff);
+        crate::kmsg(c"Helios: NVIDIA UMD release not recorded (NvUmdVersion); not checked\n");
+        return true;
+    };
+    let req = uv::build_request(release);
+    let mut resp = [0u8; uv::REPLY_BYTES];
+    let outcome = match super::ctrl::raw_roundtrip(passive, adapter, &req, &mut resp, TIMEOUT_MS) {
+        Ok(n) => uv::parse_reply(&resp, n),
+        Err(_) => {
+            crate::diag::record_named_bytes(b"NvUmdChk", 0x13);
+            return true;
+        }
+    };
+    crate::diag::record_named_bytes(b"NvUmdChk", outcome.code());
+    crate::diag::record_named_bytes(b"NvHostRm", outcome.host());
+    if !outcome.start_allowed() {
+        crate::kmsg(
+            c"Helios: the NVIDIA UMDs are not the host RM's release (NvUmdChk=1); start refused\n",
+        );
+    }
+    outcome.start_allowed()
+}

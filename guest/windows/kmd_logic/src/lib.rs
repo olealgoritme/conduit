@@ -56,6 +56,7 @@ pub mod host_vblank;
 pub mod hpd_wake;
 pub mod independent_flip;
 pub mod rm_resource_import;
+pub mod umd_version;
 pub mod page_runs;
 pub mod rm_client;
 pub mod rm_present;
