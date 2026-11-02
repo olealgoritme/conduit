@@ -909,12 +909,17 @@ fn create_queue_objects(
         // answer (0 = allocated).
         let three_d = io.alloc(client, handles.at(5), handles.at(7), BLACKWELL_B, &[0u8; 16]);
         crate::diag::record_named_bytes(b"NvCh3dSt", u32::from(three_d.is_err()));
+        // The copy object must be the graphics runlist's copy engine (GRCE):
+        // engine type 0 let RM bind an async CE, and every method the UMD sent
+        // to subchannel 4 raised PBDMA DEVICE (Xid 32, SET_RENDER_ENABLE_C).
+        let grce = grce_engine(io, client).unwrap_or(0);
+        crate::diag::record_named_bytes(b"NvChGrce", grce);
         let copy = io.alloc(
             client,
             handles.at(5),
             handles.at(8),
             cp::Gen::Gb202.classes().copy,
-            &cc::ce_object_params(0),
+            &cc::ce_object_params(grce),
         );
         crate::diag::record_named_bytes(b"NvChCeSt", u32::from(copy.is_err()));
         crate::diag::record_named_bytes(b"NvQStep", 8);
@@ -1089,6 +1094,34 @@ fn zero(base: u64, len: u64) {
         offset += 8;
     }
     full_barrier();
+}
+
+/// The first GRCE (graphics-runlist copy engine) RM lists, cached.
+static GRCE_ENGINE: AtomicU32 = AtomicU32::new(0);
+
+fn grce_engine(io: Io<'_>, client: &NativeClient) -> Option<u32> {
+    let known = GRCE_ENGINE.load(Ordering::Relaxed);
+    if known != 0 {
+        return Some(known);
+    }
+    let mut list = Vec::new();
+    list.try_reserve_exact(cc::ENGINES_BYTES).ok()?;
+    list.resize(cc::ENGINES_BYTES, 0u8);
+    io.control(client, nd::H_SUBDEVICE, cc::CTRL_GET_ENGINES_V2, &mut list).ok()?;
+    let mut types = [0u32; cc::MAX_CAPS_QUERIES];
+    let n = cc::copy_engines(&list, &mut types);
+    for &t in types.get(..n).unwrap_or(&[]) {
+        let mut params = cc::ce_caps_params(t);
+        if io.control(client, nd::H_SUBDEVICE, cc::CTRL_CE_GET_CAPS_V2, &mut params).is_ok() {
+            if let Some(caps) = cc::parse_ce_caps(&params, t) {
+                if caps.is_grce() {
+                    GRCE_ENGINE.store(t, Ordering::Relaxed);
+                    return Some(t);
+                }
+            }
+        }
+    }
+    None
 }
 
 fn rm_error_code(error: rc::RmError) -> u32 {
