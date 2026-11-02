@@ -125,8 +125,10 @@ HKR,Parameters,SingleDeviceInstall,%REG_DWORD%,1
 HKR,Parameters,NvUmd,%REG_DWORD%,2
 ; The NVIDIA Windows driver version whose user-mode drivers this KMD speaks.
 ; Set-HeliosUmd.ps1 -Nvidia stages only an NVIDIA package of this version (a
-; NvUmdVersion value in the service key itself overrides it); the KMD publishes
-; the host RM's version beside it as NvHostRmVersion.
+; NvUmdVersion value in the service key itself overrides it), and the KMD
+; reports it to the host at every start of the NVIDIA personality, which
+; refuses a release its RM is not. REG_SZ only. The KMD publishes the host RM's
+; version beside it as NvHostRmVersion.
 HKR,Parameters,NvUmdVersion,%REG_SZ%,"610.88"
 
 [Helios_NVIDIA_DeviceSettings]
