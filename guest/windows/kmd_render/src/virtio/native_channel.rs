@@ -615,6 +615,10 @@ pub(crate) struct NativeQueue {
     /// `lock_fence_view`) and its MDL; 0 when locking failed.
     fence_view: u64,
     fence_mdl: usize,
+    /// Subchannel 4 bound to the copy class (`bind_copy_subchannel`), and how
+    /// many submissions were inspected for it.
+    copy_bound: core::sync::atomic::AtomicBool,
+    copy_tries: AtomicU32,
     _progress_fence_gpu: u64,
 }
 
@@ -682,6 +686,8 @@ impl NativeQueue {
             progress_fence_cpu: progress_cpu,
             fence_view,
             fence_mdl,
+            copy_bound: core::sync::atomic::AtomicBool::new(false),
+            copy_tries: AtomicU32::new(0),
             _progress_fence_gpu: progress_gpu,
         })
     }
@@ -698,6 +704,77 @@ impl NativeQueue {
         }
         // SAFETY: our MDL keeps the page locked and mapped until Drop.
         unsafe { (self.fence_view as *const u64).read_volatile() }
+    }
+
+    /// Whether subchannel 4 still needs its SET_OBJECT (and attempts remain).
+    pub(crate) fn wants_copy_binding(&self) -> bool {
+        !self.copy_bound.load(Ordering::Relaxed) && self.copy_tries.load(Ordering::Relaxed) < 64
+    }
+
+    /// The D3D UMDs drive the graphics copy engine on subchannel 4 without ever
+    /// binding it (subchannels 0..3 work unbound on the GR channel; 4 raised
+    /// PBDMA DEVICE, Xid 32, until bound). Their graphics pushbuffers open with
+    /// a run of NOP headers (14..19 zero dwords in the 610.88 captures too):
+    /// the first such run in the first 128 bytes of `dma_va` gets
+    /// SET_OBJECT(subchannel 4, the copy class), before GP_PUT is written.
+    /// NvCeBind: 1 bound, 2 no NOP run, 3 unknown header, 4 not mapped, 5 error.
+    pub(crate) fn bind_copy_subchannel(&self, passive: PassiveLevel, dma_va: u64) {
+        self.copy_tries.fetch_add(1, Ordering::Relaxed);
+        let (Some(adapter), Some(context)) =
+            (unsafe { self.adapter.as_ref() }, unsafe { self.context.as_ref() })
+        else {
+            return;
+        };
+        let process = context.process as usize;
+        let len = 0x80u64.min(0x1000 - (dma_va & 0xfff)) & !3;
+        let copy_class = cp::Gen::Gb202.classes().copy;
+        let mut outcome = 2u32;
+        let patched = super::native_memory::patch_gpu_bytes(passive, adapter, process, dma_va, len, |p| {
+            let words = p as *mut u32;
+            let n = (len / 4) as usize;
+            let mut pos = 0usize;
+            let mut run: Option<usize> = None;
+            while pos < n {
+                // SAFETY: pos < n dwords inside the mapped range.
+                let header = unsafe { words.add(pos).read_volatile() };
+                if header == 0 {
+                    match run {
+                        Some(start) => {
+                            // SET_OBJECT: INC_METHOD, count 1, subchannel 4, method 0.
+                            unsafe {
+                                words.add(start).write_volatile((1 << 29) | (1 << 16) | (4 << 13));
+                                words.add(start + 1).write_volatile(copy_class);
+                            }
+                            outcome = 1;
+                            return;
+                        }
+                        None => run = Some(pos),
+                    }
+                    pos += 1;
+                    continue;
+                }
+                run = None;
+                let count = ((header >> 16) & 0x1fff) as usize;
+                match header >> 29 {
+                    1 | 3 | 5 => pos += 1 + count,
+                    4 => pos += 1,
+                    _ => {
+                        outcome = 3;
+                        return;
+                    }
+                }
+            }
+        });
+        match patched {
+            Ok(true) => {}
+            Ok(false) => outcome = 4,
+            Err(_) => outcome = 5,
+        }
+        if outcome == 1 {
+            core::sync::atomic::fence(Ordering::SeqCst);
+            self.copy_bound.store(true, Ordering::Relaxed);
+        }
+        crate::diag::record_named_bytes(b"NvCeBind", outcome);
     }
 
     pub(crate) fn token(&self) -> Token {

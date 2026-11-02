@@ -154,6 +154,9 @@ struct State {
     /// System pages of NON-native allocations (dxgkrnl's monitored fences and
     /// the like) mapped into a process's space (`update_foreign_leaf`).
     foreign: Vec<HostMapping>,
+    /// The system pages behind each `update_leaf_system` descriptor (for CPU
+    /// access to what the GPU sees there, `patch_gpu_bytes`).
+    desc_pfns: Vec<(u32, Vec<u64>)>,
     orphan_pins: Vec<Pin>,
     idle_spaces: Vec<usize>,
     next_handle: u32,
@@ -167,6 +170,7 @@ impl State {
             spaces: Vec::new(),
             windows: Vec::new(),
             foreign: Vec::new(),
+            desc_pfns: Vec::new(),
             orphan_pins: Vec::new(),
             idle_spaces: Vec::new(),
             next_handle: FIRST_DYNAMIC_HANDLE,
@@ -382,6 +386,7 @@ pub fn install_client(
         state.spaces.clear();
         state.windows.clear();
         state.foreign.clear();
+        state.desc_pfns.clear();
         state
             .spaces
             .try_reserve_exact(1)
@@ -1018,6 +1023,7 @@ fn unmap_fixed(io: &Io<'_>, memory: u32, mapping: HostMapping) -> Result<(), Err
         io.rm_free(nd::H_DEVICE, mapping.virt)?;
     }
     if mapping.desc != 0 {
+        STATE.lock().desc_pfns.retain(|(desc, _)| *desc != mapping.desc);
         io.rm_free(nd::H_DEVICE, mapping.desc)?;
     }
     Ok(())
@@ -1092,7 +1098,14 @@ pub fn update_leaf_system(
         virt: used,
         desc,
     };
+    let mut kept = Vec::new();
+    if kept.try_reserve_exact(pfns.len()).is_ok() {
+        kept.extend_from_slice(pfns);
+    }
     let mut state = STATE.lock();
+    if !kept.is_empty() && state.desc_pfns.try_reserve(1).is_ok() {
+        state.desc_pfns.push((desc, kept));
+    }
     let allocation = state.allocation_mut(id)?;
     if allocation.mappings.try_reserve(1).is_err() {
         drop(state);
@@ -1181,6 +1194,84 @@ pub fn update_foreign_leaf(
     }
     state.foreign.push(mapping);
     Ok(())
+}
+
+/// CPU access to `len` bytes at GPU VA `va` of `process` exactly as the GPU
+/// sees them: VidMm's system pages for a system-placed native allocation, the
+/// RM memory otherwise. `visit` gets a temporary pointer; the range must not
+/// cross a 4-KiB page. PASSIVE. `Ok(false)` when nothing native maps `va`.
+pub fn patch_gpu_bytes(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    process: usize,
+    va: u64,
+    len: u64,
+    visit: impl FnOnce(*mut u8),
+) -> Result<bool, Error> {
+    if len == 0 || (va & 0xfff) + len > 0x1000 {
+        return Err(Error::Invalid);
+    }
+    enum Where {
+        System(u64),
+        Rm(u32, u64),
+    }
+    let found = {
+        let state = STATE.lock();
+        let mut found = None;
+        'outer: for allocation in state.allocations.iter() {
+            for m in allocation.mappings.iter().filter(|m| m.process == process) {
+                let Some(end) = m.piece.end() else { continue };
+                if va < m.piece.va || va + len > end {
+                    continue;
+                }
+                let delta = va - m.piece.va;
+                if m.desc != 0 {
+                    let pfn = state
+                        .desc_pfns
+                        .iter()
+                        .find(|(desc, _)| *desc == m.desc)
+                        .and_then(|(_, pfns)| pfns.get((delta >> 12) as usize).copied());
+                    if let Some(pfn) = pfn {
+                        found = Some(Where::System((pfn << 12) | (va & 0xfff)));
+                    }
+                } else {
+                    found = Some(Where::Rm(allocation.id, m.piece.memory_offset + delta));
+                }
+                break 'outer;
+            }
+        }
+        found
+    };
+    match found {
+        None => Ok(false),
+        Some(Where::System(physical)) => {
+            let mut pa: PHYSICAL_ADDRESS = unsafe { core::mem::zeroed() };
+            pa.QuadPart = (physical & !0xfff) as i64;
+            // SAFETY: a page VidMm keeps locked while it is mapped for the GPU;
+            // MmCached matches system RAM, and the view is released below.
+            let view = unsafe { MmMapIoSpace(pa, 0x1000, _MEMORY_CACHING_TYPE::MmCached) } as *mut u8;
+            if view.is_null() {
+                return Err(Error::NoMemory);
+            }
+            visit(unsafe { view.add((physical & 0xfff) as usize) });
+            unsafe { MmUnmapIoSpace(view.cast(), 0x1000) };
+            Ok(true)
+        }
+        Some(Where::Rm(id, offset)) => {
+            let mut visit = Some(visit);
+            // SAFETY: PASSIVE; the closure only writes inside the given range.
+            unsafe {
+                with_cpu_range(passive, adapter, id, offset, len, |_, native, got| {
+                    if got == len {
+                        if let Some(visit) = visit.take() {
+                            visit(native);
+                        }
+                    }
+                    true
+                })
+            }
+        }
+    }
 }
 
 /// Apply one native leaf update.  Non-leaf updates deliberately have no host
@@ -2080,6 +2171,7 @@ pub fn forget(passive: PassiveLevel) {
     state.spaces.clear();
     state.windows.clear();
     state.foreign.clear();
+    state.desc_pfns.clear();
     state.idle_spaces.clear();
     drop(state);
     for allocation in allocations.iter_mut() {
