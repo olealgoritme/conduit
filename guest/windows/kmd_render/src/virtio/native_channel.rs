@@ -1015,6 +1015,13 @@ fn create_queue_objects(
         crate::diag::record_named_bytes(b"NvQStep", 6);
         let mut bind = cc::bind_params(cc::ENGINE_GRAPHICS);
         io.control(client, handles.at(5), cc::CTRL_BIND, &mut bind)?;
+        io.alloc(
+            client,
+            handles.at(5),
+            handles.at(6),
+            BLACKWELL_COMPUTE_B,
+            &[0u8; 16],
+        )?;
         // The D3D UMDs drive the 3D class on subchannel 0 and the graphics copy
         // engine on subchannel 4 (they never SET_OBJECT them; their pushbuffers
         // assume both). RM maps a class's GR context buffers when its object is
@@ -1022,17 +1029,8 @@ fn create_queue_objects(
         // pipeline wrote through unset context addresses (Xid 31 at VA 0,
         // HUBCLIENT_SCC_NB). Best effort: NvCh3dSt / NvChCeSt record RM's
         // answer (0 = allocated).
-        let three_d = io.alloc(client, handles.at(5), handles.at(7), BLACKWELL_B, &[]);
+        let three_d = io.alloc(client, handles.at(5), handles.at(7), BLACKWELL_B, &[0u8; 16]);
         crate::diag::record_named_bytes(b"NvCh3dSt", u32::from(three_d.is_err()));
-        // 3D, then compute, then copy, all without parameters: as NVK on RM
-        // allocates them on the graphics channel whose copies run on subchannel 4.
-        io.alloc(
-            client,
-            handles.at(5),
-            handles.at(6),
-            BLACKWELL_COMPUTE_B,
-            &[],
-        )?;
         // The copy object must be the graphics runlist's copy engine (GRCE):
         // engine type 0 let RM bind an async CE, and every method the UMD sent
         // to subchannel 4 raised PBDMA DEVICE (Xid 32, SET_RENDER_ENABLE_C).
