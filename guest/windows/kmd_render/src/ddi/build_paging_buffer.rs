@@ -2214,6 +2214,15 @@ unsafe fn native_paging_operation(
     operation: &PagingOperation<'_>,
     note: &mut PagingNote,
 ) -> Option<NTSTATUS> {
+    if let PagingOperation::UpdatePageTable(update) = operation {
+        // Not this driver's RM memory (dxgkrnl's fences, legacy allocations):
+        // mirror its system pages into the process's RM VA space too.
+        let native = unsafe { paging_alloc_info(adapter, update.hAllocation) }
+            .is_some_and(|a| a.native_id != 0);
+        if !native && crate::ddi::wddm_surface::nvidia_selected() {
+            unsafe { foreign_leaf(adapter, update) };
+        }
+    }
     let allocation = match operation {
         PagingOperation::UpdatePageTable(u) => unsafe { paging_alloc_info(adapter, u.hAllocation) },
         PagingOperation::Transfer(t) => unsafe { paging_alloc_info(adapter, t.hAllocation) },
@@ -2329,6 +2338,64 @@ fn native_segment_matches(
     segment == allocation.native_segment
         || (allocation.native_segment == 0 && segment == crate::ddi::gpummu::APERTURE_SEGMENT_ID)
 }
+
+/// `native_memory::update_foreign_leaf` for a leaf update of a non-native
+/// allocation in a user process (PASSIVE only; the system process has no RM
+/// VA space of its own). All-system-page updates are mapped, anything else
+/// drops what was mapped there. Failures are counted (NvFgnFail/NvFgnWhy),
+/// never returned: the legacy path still owns the operation.
+unsafe fn foreign_leaf(adapter: &AdapterContext, update: &DXGK_BUILDPAGINGBUFFER_UPDATEPAGETABLE) {
+    if update.PageTableLevel != 0
+        || update.pPageTableEntries.is_null()
+        || update.NumPageTableEntries == 0
+        || unsafe { KeGetCurrentIrql() } != PASSIVE_LEVEL_IRQL
+        || unsafe { crate::device::ProcessContext::is_system_handle(update.hProcess as usize) }
+        || update.hProcess.is_null()
+    {
+        return;
+    }
+    let count = update.NumPageTableEntries as usize;
+    let repeat = update.Flags.Repeat() != 0;
+    let mut pfns = Vec::new();
+    if pfns.try_reserve_exact(count).is_err() {
+        return;
+    }
+    let mut all_system = true;
+    for index in 0..count {
+        let pte_index = if repeat { 0 } else { index };
+        // SAFETY: DXGK supplies Num entries (one with Repeat).
+        let pte = unsafe { core::ptr::read_unaligned(update.pPageTableEntries.add(pte_index)) };
+        let bits = unsafe { pte.__bindgen_anon_1.__bindgen_anon_1 };
+        if bits.Valid() == 0 || bits.Zero() != 0 || bits.Segment() != 0 || repeat && count != 1 {
+            all_system = false;
+            break;
+        }
+        pfns.push(unsafe { pte.__bindgen_anon_2.PageAddress });
+    }
+    if !all_system {
+        pfns.clear();
+    }
+    let passive = unsafe { PassiveLevel::assume() };
+    let n = FOREIGN_LEAF.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+    if let Err(error) = crate::virtio::native_memory::update_foreign_leaf(
+        passive,
+        adapter,
+        update.hProcess as usize,
+        update.FirstPteVirtualAddress,
+        count as u64,
+        &pfns,
+    ) {
+        crate::diag::record_named_bytes(b"NvFgnWhy", error as u32);
+        let failed = FOREIGN_FAIL.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+        crate::diag::record_named_bytes(b"NvFgnFail", failed);
+    }
+    if n % 64 == 1 {
+        crate::diag::record_named_bytes(b"NvFgnN", n);
+    }
+}
+
+static FOREIGN_LEAF: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static FOREIGN_FAIL: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 unsafe fn native_update_leaf(
     passive: PassiveLevel,

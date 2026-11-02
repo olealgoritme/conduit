@@ -151,6 +151,9 @@ struct State {
     spaces: Vec<(usize, u32)>,
     /// Per-process space -> its low window (see [`LOW_WINDOW_BASE`]).
     windows: Vec<(u32, u32)>,
+    /// System pages of NON-native allocations (dxgkrnl's monitored fences and
+    /// the like) mapped into a process's space (`update_foreign_leaf`).
+    foreign: Vec<HostMapping>,
     orphan_pins: Vec<Pin>,
     idle_spaces: Vec<usize>,
     next_handle: u32,
@@ -163,6 +166,7 @@ impl State {
             allocations: Vec::new(),
             spaces: Vec::new(),
             windows: Vec::new(),
+            foreign: Vec::new(),
             orphan_pins: Vec::new(),
             idle_spaces: Vec::new(),
             next_handle: FIRST_DYNAMIC_HANDLE,
@@ -377,6 +381,7 @@ pub fn install_client(
         let mut state = STATE.lock();
         state.spaces.clear();
         state.windows.clear();
+        state.foreign.clear();
         state
             .spaces
             .try_reserve_exact(1)
@@ -1098,6 +1103,83 @@ pub fn update_leaf_system(
     allocation
         .mappings
         .sort_unstable_by_key(|mapping| (mapping.process, mapping.piece.va));
+    Ok(())
+}
+
+/// A leaf update of an allocation this driver has no RM memory for (dxgkrnl's
+/// monitored-fence and progress-fence storage, any non-native allocation) in
+/// a process with a native VA space. The GPU signals queue progress and
+/// monitored fences by writing those VAs (0x10140...), so they must be mapped
+/// in RM's space too: system pages (`pfns`, one per PTE) become an OS
+/// descriptor mapped at the exact VA; `pfns` empty only drops what the
+/// process mapped in [first_va, first_va + pages * 4 KiB).
+pub fn update_foreign_leaf(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    process: usize,
+    first_va: u64,
+    pages: u64,
+    pfns: &[u64],
+) -> Result<(), Error> {
+    let _guard = lock(passive)?;
+    let client = STATE.lock().client()?;
+    let io = Io {
+        passive,
+        adapter,
+        client,
+    };
+    let len = pages.checked_mul(nm::PAGE_BYTES).ok_or(Error::Invalid)?;
+    let stale: Vec<HostMapping> = {
+        let mut state = STATE.lock();
+        let mut stale = Vec::new();
+        let mut kept = Vec::new();
+        for mapping in state.foreign.drain(..) {
+            if mapping.process == process
+                && nm::ranges_overlap(mapping.piece.va, mapping.piece.len, first_va, len)
+            {
+                stale.push(mapping);
+            } else {
+                kept.push(mapping);
+            }
+        }
+        state.foreign = kept;
+        stale
+    };
+    for mapping in stale {
+        let _ = unmap_fixed(&io, 0, mapping);
+    }
+    if pfns.is_empty() {
+        return Ok(());
+    }
+    let space = ensure_space(&io, process)?;
+    let desc = STATE.lock().mint()?;
+    alloc_system_descriptor(&io, desc, pfns, len)?;
+    let virt = STATE.lock().mint()?;
+    let piece = nm::MappingPiece {
+        va: first_va,
+        memory_offset: 0,
+        len,
+    };
+    let used = match map_fixed(&io, desc, len, true, space, virt, piece) {
+        Ok(used) => used,
+        Err(error) => {
+            let _ = io.rm_free(nd::H_DEVICE, desc);
+            return Err(error);
+        }
+    };
+    let mapping = HostMapping {
+        process,
+        piece,
+        virt: used,
+        desc,
+    };
+    let mut state = STATE.lock();
+    if state.foreign.try_reserve(1).is_err() {
+        drop(state);
+        let _ = unmap_fixed(&io, 0, mapping);
+        return Err(Error::NoMemory);
+    }
+    state.foreign.push(mapping);
     Ok(())
 }
 
@@ -1911,6 +1993,24 @@ pub fn release_process(passive: PassiveLevel, adapter: &AdapterContext, process:
         owned
     };
     let mut kept = 0;
+    let foreign: Vec<HostMapping> = {
+        let mut state = STATE.lock();
+        let mut mine = Vec::new();
+        state.foreign.retain(|m| {
+            if m.process == process {
+                mine.push(*m);
+                false
+            } else {
+                true
+            }
+        });
+        mine
+    };
+    for mapping in foreign {
+        if unmap_fixed(&io, 0, mapping).is_err() {
+            kept += 1;
+        }
+    }
     for (id, memory, mapping) in owned {
         if unmap_fixed(&io, memory, mapping).is_ok() {
             if let Ok(allocation) = STATE.lock().allocation_mut(id) {
@@ -1979,6 +2079,7 @@ pub fn forget(passive: PassiveLevel) {
     state.client = None;
     state.spaces.clear();
     state.windows.clear();
+    state.foreign.clear();
     state.idle_spaces.clear();
     drop(state);
     for allocation in allocations.iter_mut() {
