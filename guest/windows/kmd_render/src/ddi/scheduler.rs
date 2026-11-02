@@ -442,12 +442,15 @@ pub unsafe extern "C" fn dxgkddi_submit_command_to_hw_queue(
             args.DmaBufferPrivateDataSize as usize,
         )
     };
-    if queue.native.wants_copy_binding()
-        && unsafe { wdk_sys::ntddk::KeGetCurrentIrql() } == wdk_sys::PASSIVE_LEVEL as u8
-    {
-        // SAFETY: checked just above.
-        let passive = unsafe { crate::irql::PassiveLevel::assume() };
-        queue.native.bind_copy_subchannel(passive, args.DmaBufferVirtualAddress);
+    if queue.native.wants_copy_binding() {
+        let irql = unsafe { wdk_sys::ntddk::KeGetCurrentIrql() };
+        crate::virtio::native_channel::CE_BIND_IRQL.store(u32::from(irql), Ordering::Relaxed);
+        if irql <= wdk_sys::DISPATCH_LEVEL as u8 {
+            // SAFETY: the token only when the IRQL really is PASSIVE.
+            let passive = (irql == wdk_sys::PASSIVE_LEVEL as u8)
+                .then(|| unsafe { crate::irql::PassiveLevel::assume() });
+            queue.native.bind_copy_subchannel(passive, args.DmaBufferVirtualAddress);
+        }
     }
     match queue.native.submit(private) {
         Ok(()) => STATUS_SUCCESS,

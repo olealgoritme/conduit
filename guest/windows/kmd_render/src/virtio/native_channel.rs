@@ -718,7 +718,7 @@ impl NativeQueue {
     /// the first such run in the first 128 bytes of `dma_va` gets
     /// SET_OBJECT(subchannel 4, the copy class), before GP_PUT is written.
     /// NvCeBind: 1 bound, 2 no NOP run, 3 unknown header, 4 not mapped, 5 error.
-    pub(crate) fn bind_copy_subchannel(&self, passive: PassiveLevel, dma_va: u64) {
+    pub(crate) fn bind_copy_subchannel(&self, passive: Option<PassiveLevel>, dma_va: u64) {
         self.copy_tries.fetch_add(1, Ordering::Relaxed);
         let (Some(adapter), Some(context)) =
             (unsafe { self.adapter.as_ref() }, unsafe { self.context.as_ref() })
@@ -774,7 +774,8 @@ impl NativeQueue {
             core::sync::atomic::fence(Ordering::SeqCst);
             self.copy_bound.store(true, Ordering::Relaxed);
         }
-        crate::diag::record_named_bytes(b"NvCeBind", outcome);
+        // Recorded at teardown (PASSIVE): this may run at DISPATCH.
+        CE_BIND_OUTCOME.store(outcome, Ordering::Relaxed);
     }
 
     pub(crate) fn token(&self) -> Token {
@@ -831,6 +832,11 @@ impl NativeQueue {
             crate::diag::record_named_bytes(b"NvQGpPut", put);
             crate::diag::record_named_bytes(b"NvQFence", self.read_progress() as u32);
             crate::diag::record_named_bytes(b"NvQToken", self.parts.token);
+            crate::diag::record_named_bytes(b"NvCeBind", CE_BIND_OUTCOME.load(Ordering::Relaxed));
+            crate::diag::record_named_bytes(
+                b"NvCeIrql",
+                CE_BIND_IRQL.load(Ordering::Relaxed),
+            );
             // The channel's error notifier (NvNotification at ctl+0): info32 at
             // +8, info16|status<<16 at +12. Nonzero status = RM put it in error.
             // SAFETY: the same live control view.
@@ -1183,6 +1189,12 @@ fn zero(base: u64, len: u64) {
     }
     full_barrier();
 }
+
+/// The IRQL the last subchannel-4 binding attempt ran at (NvCeIrql).
+pub(crate) static CE_BIND_IRQL: AtomicU32 = AtomicU32::new(0xff);
+
+/// The last `bind_copy_subchannel` outcome (NvCeBind, written at teardown).
+static CE_BIND_OUTCOME: AtomicU32 = AtomicU32::new(0);
 
 /// The first GRCE (graphics-runlist copy engine) RM lists, cached.
 static GRCE_ENGINE: AtomicU32 = AtomicU32::new(0);

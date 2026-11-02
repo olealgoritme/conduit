@@ -1199,9 +1199,10 @@ pub fn update_foreign_leaf(
 /// CPU access to `len` bytes at GPU VA `va` of `process` exactly as the GPU
 /// sees them: VidMm's system pages for a system-placed native allocation, the
 /// RM memory otherwise. `visit` gets a temporary pointer; the range must not
-/// cross a 4-KiB page. PASSIVE. `Ok(false)` when nothing native maps `va`.
+/// cross a 4-KiB page. IRQL <= DISPATCH; the RM-memory case needs `passive`
+/// (`Err(Busy)` without). `Ok(false)` when nothing native maps `va`.
 pub fn patch_gpu_bytes(
-    passive: PassiveLevel,
+    passive: Option<PassiveLevel>,
     adapter: &AdapterContext,
     process: usize,
     va: u64,
@@ -1258,6 +1259,10 @@ pub fn patch_gpu_bytes(
             Ok(true)
         }
         Some(Where::Rm(id, offset)) => {
+            // The RM-memory view needs PASSIVE; system pages work up to DISPATCH.
+            let Some(passive) = passive else {
+                return Err(Error::Busy);
+            };
             let mut visit = Some(visit);
             // SAFETY: PASSIVE; the closure only writes inside the given range.
             unsafe {
