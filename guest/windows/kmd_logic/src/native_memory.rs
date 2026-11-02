@@ -143,8 +143,11 @@ pub fn parse_allocation_private(bytes: &[u8]) -> Result<AllocationPrivate, Priva
     }
     // Vulkan (`NVGL`) records use +0xc8/+0xcc for their size (+0xcc the fraction,
     // which read as the high half made a 0x0040000000000000 "system address" the
-    // KMD then failed to pin): they carry no system-memory pointer there.
-    let system_memory = if is_nvgl_record(bytes) {
+    // KMD then failed to pin): they carry no system-memory pointer there. Neither
+    // do CUDA records: +0xcc is 0x20 in all of them (read as the high half: a
+    // 0x20_0000_0000 "system address", so every cuCtxCreate allocation failed
+    // INVALID_PARAMETER); CUDA hands its own memory over as pSystemMem.
+    let system_memory = if is_nvgl_record(bytes) || is_cuda_record(bytes) {
         0
     } else {
         get64(bytes, SYSTEM_MEMORY_AT).ok_or(PrivateError::Short)?
@@ -1444,6 +1447,21 @@ mod nvgl_tests {
             }
             assert_eq!(after, want, "input {input:x?}");
         }
+    }
+
+    #[test]
+    fn cuda_records_carry_no_system_pointer() {
+        // Our cudatest (405.273) seq 595, byte-identical to capture 12300 seq 597:
+        // the first allocation after the context, 0x40 units of video memory.
+        let r = cuda_record(&[(0x10, 0x800), (0x14, 0x4_0000), (0x28, 0x42), (0x6c, 0x1_0000), (0x70, 0x3_0000), (0x74, 0x3_0000), (0x78, 0x1_0000), (0x90, 0x1_0000), (0xb8, 0x2_0000), (0xc0, 0x200), (0xcc, 0x20), (0xd0, 0x40), (0xec, 0x1_0000), (0x110, 0x20), (0x118, 0x40), (0x130, 0x1_0000), (0x134, 0x1_0000), (0x138, 0x1_0000), (0x1cc, 0x20)]);
+        let p = parse_allocation_private(&r).unwrap();
+        assert_eq!(p.system_memory, 0);
+        assert!(!p.system_backed());
+        assert_eq!(p.size, 0x40 * ALLOCATION_UNIT);
+        // The pSystemMem kind is not system-backed in this sense either.
+        let mut s = r;
+        put32(&mut s, 0x10, CUDA_KIND_SYSTEM_MEMORY).unwrap();
+        assert_eq!(parse_allocation_private(&s).unwrap().system_memory, 0);
     }
 
     #[test]
