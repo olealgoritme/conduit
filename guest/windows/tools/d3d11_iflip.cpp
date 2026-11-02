@@ -41,6 +41,9 @@
 //     exclusive   full-screen exclusive (SetFullscreenState TRUE) at size=WxH (default: the current
 //                 mode): Windows switches the output to that mode. ALLOW_TEARING is not allowed in
 //                 exclusive mode, so `tearing` is dropped there; interval0 is immediate anyway.
+//                 Implies `fg`: DXGI's SetFullscreenState calls SetForegroundWindow on the swap
+//                 chain's window itself and returns DXGI_ERROR_NOT_CURRENTLY_AVAILABLE
+//                 (0x887a0022) when that fails, before it reaches the kernel or the driver.
 //     size=WxH    swap chain (and borderless window) size (default: the output's current mode)
 //     setmode=WxH ChangeDisplaySettingsEx the output to WxH first (CDS_FULLSCREEN, as SDL's
 //                 exclusive full screen does), restored at the end; the window then covers it
@@ -195,6 +198,8 @@ int main(int argc, char** argv) {
     else if (!strcmp(a, "counter")) counter = true;
     else L("unknown option %s", a);
   }
+  // DXGI refuses full screen for a window that cannot take the foreground (see `exclusive`).
+  if (exclusive) takeFg = true;
   if (buffers < 2) buffers = 2;
   if (buffers > 16) buffers = 16;
   L("d3d11_iflip pid=%lu seconds=%d %s interval=%d tearing=%d cursor=%s format=%s buffers=%d "
@@ -391,6 +396,8 @@ int main(int argc, char** argv) {
   L("IDXGISwapChainMedia %s", media ? "available" : "NOT available");
 
   if (exclusive) {
+    L("exclusive: foreground before SetFullscreenState: %s (foreground hwnd=%p)",
+      GetForegroundWindow() == hwnd ? "this window" : "ANOTHER window", GetForegroundWindow());
     HRESULT hf = sc->SetFullscreenState(TRUE, nullptr);
     DXGI_MODE_DESC md = {};
     md.Width = width;
