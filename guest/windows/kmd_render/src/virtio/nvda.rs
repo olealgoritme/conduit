@@ -638,16 +638,14 @@ pub fn memory_client(
     }
 }
 
-/// Serve one NVDA private buffer. The caller has already matched NVDA_MAGIC.
-/// `h_device` may be zero for NVAPI's adapter-scoped calls. CUDA's two
-/// context-scoped local replies validate both raw WDDM scopes in pure logic.
 /// The Vulkan ICD's wait poll (`0x01000021`), sent while it waits for GPU work.
 const WAIT_POLL_FUNCTION: u32 = 0x0100_0021;
 
-/// Test knobs `NvDumpVa` / `NvDumpVb` (a GPU VA >> 8 each, 0 = off): on the
-/// ICD's wait poll, the 64 bytes the GPU sees at that VA of the
-/// caller's process (`native_memory::patch_gpu_bytes`: VidMm's system pages or
-/// the RM memory) as `NvDmpA0`..`NvDmpAf` / `NvDmpB0`..`NvDmpBf`, with
+/// Test knobs `NvDumpVa` / `NvDumpVb` (a GPU VA >> 8 each, 0 = off) and
+/// `NvDumpLen` (bytes, default 64, at most 1024, cut at the VA's 4-KiB page):
+/// on the ICD's wait poll, the bytes the GPU sees at that VA of the caller's
+/// process (`native_memory::patch_gpu_bytes`: VidMm's system pages or the RM
+/// memory) as dwords `NvDmpA00`.. / `NvDmpB00`.. (two hex digits), with
 /// `NvDmpASt` / `NvDmpBSt` = 1 read, 2 nothing native mapped there, 3 error,
 /// and `NvDmpN` the dumps taken. The first 8 polls and every 4096th after.
 fn dump_watched_vas(passive: PassiveLevel, adapter: &AdapterContext, h_device: usize) {
@@ -658,6 +656,13 @@ fn dump_watched_vas(passive: PassiveLevel, adapter: &AdapterContext, h_device: u
         crate::diag::KnobName::new(b"NvDumpVa"),
         crate::diag::KnobName::new(b"NvDumpVb"),
     ];
+    static LEN: AtomicU32 = AtomicU32::new(KNOB_UNREAD);
+    let mut len = LEN.load(Ordering::Relaxed);
+    if len == KNOB_UNREAD {
+        len = crate::diag::read_config_dword(crate::diag::KnobName::new(b"NvDumpLen"), 64);
+        LEN.store(len, Ordering::Relaxed);
+    }
+    let len = (len.clamp(4, 1024) & !3) as u64;
     let mut pages = [0u32; 2];
     for (i, page) in pages.iter_mut().enumerate() {
         let mut value = PAGES[i].load(Ordering::Relaxed);
@@ -686,16 +691,19 @@ fn dump_watched_vas(passive: PassiveLevel, adapter: &AdapterContext, h_device: u
             continue;
         }
         let letter = b'A' + slot as u8;
-        let mut words = [0u32; 16];
+        let va = u64::from(*page) << 8;
+        let bytes = len.min(0x1000 - (va & 0xfff));
+        let count = (bytes / 4) as usize;
+        let mut words = [0u32; 256];
         let read = super::native_memory::patch_gpu_bytes(
             Some(passive),
             adapter,
             process,
-            u64::from(*page) << 8,
-            64,
+            va,
+            bytes,
             |p| {
-                for (i, word) in words.iter_mut().enumerate() {
-                    // SAFETY: `p` is valid for the 64 bytes asked for.
+                for (i, word) in words.iter_mut().take(count).enumerate() {
+                    // SAFETY: `p` is valid for the `bytes` asked for.
                     *word = unsafe { core::ptr::read_volatile((p as *const u32).add(i)) };
                 }
             },
@@ -705,10 +713,11 @@ fn dump_watched_vas(passive: PassiveLevel, adapter: &AdapterContext, h_device: u
             Ok(false) => 2,
             Err(_) => 3,
         };
-        for (i, word) in words.iter().enumerate() {
-            let mut name = *b"NvDmpA0";
+        for (i, word) in words.iter().take(count).enumerate() {
+            let mut name = *b"NvDmpA00";
             name[5] = letter;
-            name[6] = b"0123456789abcdef"[i];
+            name[6] = b"0123456789abcdef"[i >> 4];
+            name[7] = b"0123456789abcdef"[i & 15];
             crate::diag::record_named_bytes(&name, *word);
         }
         let mut name = *b"NvDmpASt";
@@ -719,6 +728,9 @@ fn dump_watched_vas(passive: PassiveLevel, adapter: &AdapterContext, h_device: u
     crate::diag::record_named_bytes(b"NvDmpN", dumps);
 }
 
+/// Serve one NVDA private buffer. The caller has already matched NVDA_MAGIC.
+/// `h_device` may be zero for NVAPI's adapter-scoped calls. CUDA's two
+/// context-scoped local replies validate both raw WDDM scopes in pure logic.
 pub fn escape(
     passive: PassiveLevel,
     adapter: &AdapterContext,
