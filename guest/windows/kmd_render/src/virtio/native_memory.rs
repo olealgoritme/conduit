@@ -515,20 +515,28 @@ pub fn ring_backing(
     let state = STATE.lock();
     let allocation = state.allocation(id)?;
     let end = gpfifo_va.checked_add(ring_bytes).ok_or(Error::Invalid)?;
-    let mapping = allocation
-        .mappings
-        .iter()
-        .find(|mapping| {
-            mapping.piece.va <= gpfifo_va
-                && mapping
-                    .piece
-                    .end()
-                    .is_some_and(|mapping_end| mapping_end >= end)
-        })
-        .ok_or(Error::Invalid)?;
-    if ring_bytes == 0 {
+    if ring_bytes == 0 || ring_bytes > allocation.size {
         return Err(Error::Invalid);
     }
+    let Some(mapping) = allocation.mappings.iter().find(|mapping| {
+        mapping.piece.va <= gpfifo_va
+            && mapping
+                .piece
+                .end()
+                .is_some_and(|mapping_end| mapping_end >= end)
+    }) else {
+        // MakeResident is asynchronous: the UMD creates its queue before VidMm
+        // has paged the ring in and updated its PTEs. RM's channel needs only
+        // the GPFIFO VA, which VidMm maps before any submission runs; the
+        // VA-space match is checked once mapped (va_space 0 = not yet).
+        return Ok(super::native_channel::NativeRingBacking {
+            memory: allocation.memory,
+            mapped_bytes: ring_bytes,
+            va_space: 0,
+            id,
+            offset: 0,
+        });
+    };
     let va_space = state
         .spaces
         .iter()

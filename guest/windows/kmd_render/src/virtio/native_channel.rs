@@ -632,7 +632,9 @@ impl NativeQueue {
         let process = unsafe { context.process.as_mut() }.ok_or(NativeError::Invalid)?;
         let handles = ObjectHandles::mint()?;
         let mut native = take_process(process)?;
-        if native.epoch != context.epoch || backing.va_space != native.vaspace {
+        if native.epoch != context.epoch
+            || (backing.va_space != 0 && backing.va_space != native.vaspace)
+        {
             crate::diag::record_named_bytes(b"NvQStep", 0x80);
             crate::diag::record_named_bytes(b"NvQSpaces", backing.va_space ^ native.vaspace);
             restore_process(process, native);
