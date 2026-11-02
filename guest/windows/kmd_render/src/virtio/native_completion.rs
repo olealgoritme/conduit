@@ -145,6 +145,7 @@ fn set_up(io: &Io<'_>, source: Source) -> Option<u32> {
         return None;
     }
     let mut made = 0u32;
+    let mut allocated = 0u32;
     for (i, &index) in source.notifiers().iter().enumerate() {
         let block = rc::nvos64(
             root,
@@ -167,7 +168,10 @@ fn set_up(io: &Io<'_>, source: Source) -> Option<u32> {
                 rc::rm_reply(resp.get(..n).unwrap_or(&[]), rc::NVOS64_STATUS_AT).map(|_| ())
             });
         match alloc {
-            Ok(()) => made += 1,
+            Ok(()) => {
+                made += 1;
+                allocated |= 1 << i;
+            }
             // An engine this GPU does not have (CE indices past its last copy
             // engine): the others still count.
             Err(error) => fail(source, STEP_ALLOC, rm_code(error)),
@@ -198,16 +202,36 @@ fn set_up(io: &Io<'_>, source: Source) -> Option<u32> {
             // events stay allocated (freed with the client) but the file is not
             // counted as a source.
             fail(source, STEP_NOTIFY, rm_code(error));
-            made = 0;
+            free_events(io, source, allocated);
+            let _ = io.close_file(file);
+            return None;
         }
     }
     EVENTS.fetch_add(made, Ordering::Relaxed);
     if made == 0 {
-        // Events RM made on the file go with it.
         let _ = io.close_file(file);
         return None;
     }
     Some(file)
+}
+
+/// Free the event objects `allocated` (bit per notifier) of `source`, before
+/// their file is closed. Best effort: the client's teardown frees what is left.
+fn free_events(io: &Io<'_>, source: Source, allocated: u32) {
+    let mut resp = [0u8; 128];
+    for i in 0..source.notifiers().len() {
+        if allocated & (1 << i) == 0 {
+            continue;
+        }
+        let block = rc::nvos00(io.client.root, nd::H_SUBDEVICE, source.event_handle(i));
+        let _ = io.exchange(
+            io.client.ctl,
+            rc::nv_cmd(rc::ESC_RM_FREE, rc::NVOS00_BYTES as u32),
+            &block,
+            &[],
+            &mut resp,
+        );
+    }
 }
 
 /// The transport (and with it the client and its files) is gone. PASSIVE.
