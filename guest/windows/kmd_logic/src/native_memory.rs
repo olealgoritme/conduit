@@ -286,17 +286,28 @@ fn nvgl_size(bytes: &[u8]) -> Option<(u32, u32)> {
 /// pixel in the 16-bit word at +0x6e.
 const NVGL_KIND_IMAGE: u32 = 0x8;
 
-pub const NVGL_WRITEBACK_FIELDS: usize = 18;
+pub const NVGL_WRITEBACK_FIELDS: usize = 20;
 
-/// Fields of a Vulkan (`NVGL`) record the 610.88 KMD writes (all 75 NVGL records
-/// of the vktest capture): the same frame as a D3D record's, with its own size
-/// fields (+0xcc/+0xd0/+0xd4/+0xd8), +0x8c = 0x7810, +0xc0 | 0x4000, the
-/// page/placement bits in +0xe0 and +0x10c, and +0xc8: 0x10000000 for a typed
-/// buffer, an image's row pitch in the same 2^-32-of-64-KiB fixed point (width x
-/// bytes per pixel, << 16), the UMD's own value for an untyped record. +0xdc is
-/// the UMD's input and is left alone (0x20000000 / 0x20040000 there are kept).
-/// Writing the CUDA-shaped handles here instead broke vkCreateDevice (the ICD
-/// freed its first allocations and crashed).
+/// +0xbc bit 20 of an NVGL record (the ICD's first allocation, 0x01100000):
+/// NVIDIA's KMD adds 0x80000 to +0x108 and +0x120 for it, and only for it.
+const NVGL_BC_ATTR_80000: u32 = 0x0010_0000;
+
+/// Fields of a Vulkan (`NVGL`) record the 610.88 KMD writes, checked byte for
+/// byte against all 75 NVGL records of the vktest capture (all 586 bytes): the
+/// same frame as a D3D record's, with its own size fields (+0xcc/+0xd0/+0xd4/
+/// +0xd8, and the 1/16-unit rounding of a fraction mirrored at +0x114),
+/// +0x8c = 0x7810, +0xc0 | 0x4000, the page/placement bits in +0xe0, +0xc8 and
+/// +0x10c: 0x10000000 for a typed buffer (+0x10c | 0x10 from 2 MiB of the wide
+/// kind), an image's row pitch in the same 2^-32-of-64-KiB fixed point (width x
+/// bytes per pixel, << 16), the UMD's own value for an untyped record; +0x108 and
+/// +0x120 keep the UMD's value except for +0xbc bit 20; +0x1ac = +0x1b0 =
+/// 0x60000. +0xdc is the UMD's input and is left alone.
+///
+/// A record asking for compression (+0xdc bit 29) is answered uncompressed:
+/// NVIDIA's KMD grants it (bit 29 copied to +0x11c, +0x108/+0x120 | 0x20000,
+/// +0x1ac = 0x80000, a compression tag line at +0x1bc for images), but the
+/// memory behind it here is linear and uncompressed, and the ICD accepts the
+/// ungranted answer (the dispatch-loop buffers are allocated and locked).
 pub fn nvgl_writeback(input: &[u8]) -> Option<[(usize, u32); NVGL_WRITEBACK_FIELDS]> {
     let kind = get32(input, 0x10)?;
     let bc = get32(input, 0xbc)?;
@@ -318,15 +329,6 @@ pub fn nvgl_writeback(input: &[u8]) -> Option<[(usize, u32); NVGL_WRITEBACK_FIEL
         0x80
     };
     let e0 = get32(input, 0xe0)? | page;
-    let mut x10c = get32(input, 0x10c)?;
-    if typed {
-        x10c = 0x1000_0000 | if wide && units >= 0x20 { 0x10 } else { 0 };
-    }
-    let (mut x108, mut x120) = (get32(input, 0x108)?, get32(input, 0x120)?);
-    if kind == 0x0220_0000 {
-        x108 |= 0x8_0000;
-        x120 |= 0x8_0000;
-    }
     let c8 = if image {
         let width = get32(input, 0x30)?;
         let bytes_per_pixel = get32(input, 0x6c)? >> 16;
@@ -336,7 +338,28 @@ pub fn nvgl_writeback(input: &[u8]) -> Option<[(usize, u32); NVGL_WRITEBACK_FIEL
     } else {
         get32(input, 0xc8)?
     };
-    let cc = if typed { fraction } else { get32(input, 0xcc)? };
+    let x10c = if image {
+        c8
+    } else if typed {
+        0x1000_0000 | if wide && units >= 0x20 { 0x10 } else { 0 }
+    } else {
+        get32(input, 0x10c)?
+    };
+    let attr = if bc & NVGL_BC_ATTR_80000 != 0 { 0x8_0000 } else { 0 };
+    let x108 = get32(input, 0x108)? | attr;
+    let x120 = get32(input, 0x120)? | attr;
+    let input_fraction = get32(input, 0xcc)?;
+    let mut x114 = get32(input, 0x114)?;
+    if typed && x114 != 0 && x114 == input_fraction {
+        // The fraction's mirror rounds to 1/16 unit, without the whole-unit
+        // rounding of images or of 2 MiB and up (0xc0000000 stays, 0x02000000
+        // of the 16x8 image becomes 0x10000000).
+        let rounded = u64::from(x114).div_ceil(0x1000_0000) * 0x1000_0000;
+        if let Ok(rounded) = u32::try_from(rounded) {
+            x114 = rounded;
+        }
+    }
+    let cc = if typed { fraction } else { input_fraction };
     Some([
         (0x38, 1),
         (0x3c, 1),
@@ -354,8 +377,10 @@ pub fn nvgl_writeback(input: &[u8]) -> Option<[(usize, u32); NVGL_WRITEBACK_FIEL
         (0xfc, 0xffff),
         (0x108, x108),
         (0x10c, x10c),
+        (0x114, x114),
         (0x120, x120),
         (0x1ac, 0x6_0000),
+        (0x1b0, 0x6_0000),
     ])
 }
 
@@ -1370,6 +1395,65 @@ mod nvgl_tests {
         }
         let first = record(&[(0x10, 0x0220_0000), (0xbc, 0x110_0000), (0xd0, 1)]);
         assert_eq!(get32(&after(&first), 0xe0), Some(0x80));
+    }
+
+    #[test]
+    fn two_mib_staging_record_matches_the_capture_byte_for_byte() {
+        // vktest capture seq 2468 (vkAllocateMemory of 2 MiB, kind 0x02200000,
+        // +0xbc 0x400d0000): every written field, beyond 0x100 too. +0x108 and
+        // +0x120 stay 0x140000; +0x1b0 becomes 0x60000.
+        let r = record(&[(0x10, 0x0220_0000), (0x14, 0x4_0004), (0x20, 0x200), (0x28, 0x33), (0x38, 1), (0x6c, 0x1_0000), (0x70, 0x3_0000), (0x74, 0x3_0000), (0x78, 0x1_0000), (0x90, 0x1_0000), (0xa0, 0xffff_0000), (0xa4, 0xffff_ffff), (0xa8, 0xffff), (0xbc, 0x400d_0000), (0xc0, 0x200), (0xd0, 0x20), (0xec, 0x1_0000), (0x100, 0xa71e_0000), (0x104, 0x1c95), (0x108, 0x14_0000), (0x118, 0x20), (0x120, 0x14_0000), (0x130, 0x1_0000), (0x134, 0x1_0000), (0x138, 0x1_0000)]);
+        let a = after(&r);
+        let mut want = r;
+        for (at, value) in [(0x3c, 1), (0x40, 1), (0x8c, 0x7810), (0xc0, 0x4200), (0xc8, 0x1000_0000), (0xd4, 0xffff_0000), (0xd8, 0x1f), (0xe0, 0x180), (0xf4, 0xffff_0000), (0xf8, 0xffff_ffff), (0xfc, 0xffff), (0x10c, 0x1000_0010), (0x1ac, 0x6_0000), (0x1b0, 0x6_0000)] {
+            put32(&mut want, at, value).unwrap();
+        }
+        for at in (0..ALLOCATION_PRIVATE_BYTES - 3).step_by(4) {
+            assert_eq!(get32(&a, at), get32(&want, at), "+{at:#x}");
+        }
+    }
+
+    #[test]
+    fn attribute_bit_80000_follows_bc_bit_20() {
+        // Seq 1387: +0xbc 0x01100000 -> +0x108/+0x120 0x100000 -> 0x180000; seq
+        // 2468 (+0xbc 0x400d0000, same kind) keeps 0x140000.
+        let first = record(&[(0x10, 0x0220_0000), (0xbc, 0x110_0000), (0xd0, 1), (0x108, 0x10_0000), (0x120, 0x10_0000)]);
+        let a = after(&first);
+        assert_eq!((get32(&a, 0x108), get32(&a, 0x120)), (Some(0x18_0000), Some(0x18_0000)));
+        let other = record(&[(0x10, 0x0220_0800), (0xbc, 0xc00d_0000), (0xd0, 1), (0x108, 0x14_0000), (0x120, 0x14_0080)]);
+        let a = after(&other);
+        assert_eq!((get32(&a, 0x108), get32(&a, 0x120)), (Some(0x14_0000), Some(0x14_0080)));
+    }
+
+    #[test]
+    fn compression_requests_are_answered_uncompressed() {
+        // Seq 3509 asks for compression (+0xdc bit 29). This KMD's memory is
+        // linear and uncompressed: +0x11c stays 0, +0x108/+0x120 keep the UMD's
+        // 0x140000, +0x1ac/+0x1b0 are the uncompressed 0x60000.
+        let r = record(&[(0x10, 0x0220_0800), (0xbc, 0xc10d_0000), (0xd0, 1), (0xdc, 0x2000_0000), (0x108, 0x14_0000), (0x120, 0x14_0000)]);
+        let a = after(&r);
+        for (at, want) in [(0xdc, 0x2000_0000), (0x108, 0x14_0000), (0x11c, 0), (0x120, 0x14_0000), (0x1ac, 0x6_0000), (0x1b0, 0x6_0000), (0xe0, 0x100)] {
+            assert_eq!(get32(&a, at), Some(want), "+{at:#x}");
+        }
+    }
+
+    #[test]
+    fn image_pitch_and_fraction_mirror_match_the_capture() {
+        // Seq 2457 (16x8): +0x10c = pitch 64 << 16, +0x114 0x02000000 ->
+        // 0x10000000 while +0xcc rounds to a whole unit. Seq 5130 (640x480):
+        // +0x10c = 2560 << 16, +0x114 = 0x14 (the count) stays.
+        let small = record(&[(0x10, 0x0020_0808), (0x30, 0x10), (0x34, 8), (0x6c, 0x4_0000), (0xbc, 0xc000_0000), (0xcc, 0x0200_0000), (0x108, 0x14_0000), (0x114, 0x0200_0000), (0x11c, 0x4_0000), (0x120, 0x14_0002)]);
+        let a = after(&small);
+        for (at, want) in [(0xcc, 0), (0xd0, 1), (0x10c, 0x40_0000), (0x114, 0x1000_0000), (0x108, 0x14_0000), (0x11c, 0x4_0000), (0x120, 0x14_0002)] {
+            assert_eq!(get32(&a, at), Some(want), "small +{at:#x}");
+        }
+        let swap = record(&[(0x10, 0x0220_0808), (0x30, 0x280), (0x34, 0x1e0), (0x6c, 0x4_0000), (0xbc, 0xc000_0000), (0xd0, 0x14), (0x114, 0x14), (0x120, 0x14_0002)]);
+        let a = after(&swap);
+        assert_eq!((get32(&a, 0x10c), get32(&a, 0x114)), (Some(0x0a00_0000), Some(0x14)));
+        // Seq 2184: 0x3f units + 0xc0000000 -> 0x40 units, +0x114 keeps 0xc0000000.
+        let big = record(&[(0x10, 0x0220_0800), (0xbc, 0xc00d_0000), (0xcc, 0xc000_0000), (0xd0, 0x3f), (0x114, 0xc000_0000)]);
+        let a = after(&big);
+        assert_eq!((get32(&a, 0xcc), get32(&a, 0xd0), get32(&a, 0x114)), (Some(0), Some(0x40), Some(0xc000_0000)));
     }
 
     #[test]
