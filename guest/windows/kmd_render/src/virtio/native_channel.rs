@@ -776,6 +776,10 @@ impl NativeQueue {
         }
         // Recorded at teardown (PASSIVE): this may run at DISPATCH.
         CE_BIND_OUTCOME.store(outcome, Ordering::Relaxed);
+        CE_BIND_SEEN.fetch_or(1 << outcome, Ordering::Relaxed);
+        if outcome == 1 {
+            CE_BIND_DONE.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     pub(crate) fn token(&self) -> Token {
@@ -833,6 +837,8 @@ impl NativeQueue {
             crate::diag::record_named_bytes(b"NvQFence", self.read_progress() as u32);
             crate::diag::record_named_bytes(b"NvQToken", self.parts.token);
             crate::diag::record_named_bytes(b"NvCeBind", CE_BIND_OUTCOME.load(Ordering::Relaxed));
+            crate::diag::record_named_bytes(b"NvCeSeen", CE_BIND_SEEN.load(Ordering::Relaxed));
+            crate::diag::record_named_bytes(b"NvCeDone", CE_BIND_DONE.load(Ordering::Relaxed));
             crate::diag::record_named_bytes(
                 b"NvCeIrql",
                 CE_BIND_IRQL.load(Ordering::Relaxed),
@@ -1193,8 +1199,11 @@ fn zero(base: u64, len: u64) {
 /// The IRQL the last subchannel-4 binding attempt ran at (NvCeIrql).
 pub(crate) static CE_BIND_IRQL: AtomicU32 = AtomicU32::new(0xff);
 
-/// The last `bind_copy_subchannel` outcome (NvCeBind, written at teardown).
+/// The last `bind_copy_subchannel` outcome (NvCeBind, written at teardown),
+/// every outcome seen as a bit mask (NvCeSeen) and the bindings made (NvCeDone).
 static CE_BIND_OUTCOME: AtomicU32 = AtomicU32::new(0);
+static CE_BIND_SEEN: AtomicU32 = AtomicU32::new(0);
+static CE_BIND_DONE: AtomicU32 = AtomicU32::new(0);
 
 /// The first GRCE (graphics-runlist copy engine) RM lists, cached.
 static GRCE_ENGINE: AtomicU32 = AtomicU32::new(0);
