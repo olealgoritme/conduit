@@ -204,16 +204,22 @@ impl PrivateWriteback {
     }
 }
 
-/// Whether the UMD created the allocation shareable (D3DKMT CreateShared): bit
-/// 19 of +0x134, set in all 6 shared and none of 319 unshared records of the
-/// 610.88 captures (DWM primary, DXGI shared surfaces). dxgkrnl refuses a
-/// shareable CpuVisible allocation unless its segment set is aperture-only
-/// ("VerifySupportedSegmentSetAndAdjustFlags failed").
+/// Whether the UMD created the allocation shareable (D3DKMT CreateShared):
+/// +0x20 bit 15 together with +0x24 bit 1. That holds for all 34 shared and 1
+/// of 492 unshared records (a D3D12 texture the UMD never locks) of the 610.88
+/// captures and a shared-texture sweep; either bit alone also marks locked
+/// unshared D3D12 buffers. dxgkrnl refuses a shareable CpuVisible allocation
+/// unless its segment set is aperture-only ("VerifySupportedSegmentSetAndAdjustFlags
+/// failed").
 pub fn is_shared_record(bytes: &[u8]) -> bool {
-    get32(bytes, SHARED_AT).is_some_and(|v| v & SHARED_BIT != 0)
+    let usage = get32(bytes, SHARED_USAGE_AT).unwrap_or(0);
+    let bind = get32(bytes, SHARED_BIND_AT).unwrap_or(0);
+    usage & SHARED_USAGE_BIT != 0 && bind & SHARED_BIND_BIT != 0
 }
-pub const SHARED_AT: usize = 0x134;
-pub const SHARED_BIT: u32 = 1 << 19;
+pub const SHARED_USAGE_AT: usize = 0x20;
+pub const SHARED_USAGE_BIT: u32 = 1 << 15;
+pub const SHARED_BIND_AT: usize = 0x24;
+pub const SHARED_BIND_BIT: u32 = 1 << 1;
 
 /// Whether an NVDA allocation record is the D3D11/D3D12 UMDs' (its size is
 /// in the fixed-point fields at 0x10c..0x114, not in 64-KiB units at 0xd0).
@@ -603,9 +609,12 @@ mod tests {
 
     #[test]
     fn shared_records_are_recognised() {
-        assert!(is_shared_record(&d3d_record(&[(SHARED_AT, 0xc_0000)])));
-        assert!(is_shared_record(&d3d_record(&[(SHARED_AT, 0x8_0000)])));
-        assert!(!is_shared_record(&d3d_record(&[(SHARED_AT, 0x4_0000)])));
+        // Shared texture (sweep), DWM primary.
+        assert!(is_shared_record(&d3d_record(&[(0x20, 0x8011), (0x24, 0x23)])));
+        assert!(is_shared_record(&d3d_record(&[(0x20, 0x8015), (0x24, 0x2_0063)])));
+        // The same texture unshared, and a locked D3D12 buffer with bit 15.
+        assert!(!is_shared_record(&d3d_record(&[(0x20, 0x11), (0x24, 0)])));
+        assert!(!is_shared_record(&d3d_record(&[(0x20, 0x200_8010), (0x24, 0x800_0021)])));
         assert!(!is_shared_record(&d3d_record(&[])));
     }
 
