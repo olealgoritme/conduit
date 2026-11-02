@@ -433,6 +433,20 @@ pub fn apply_local(
             put32(buf, NVDA_RESULT_AT, 1);
             put32(buf, NVDA_RESULT2_AT, 1);
         }
+        0x0100_0124 => {
+            // Device-scoped 0x48-byte request the D3D11 UMD makes when a swap
+            // chain is created and destroyed (+0x30 = 1 or 0, two process
+            // handles at +0x38/+0x40). The 610.88 capture answers it with a
+            // 0x30-byte reply, result 1 at both result words and +0x30..+0x48
+            // cleared. Refused, the UMD sent it again around every present.
+            exact(buf, 0x48)?;
+            put32(buf, NVDA_SIZE_AT, NVDA_COMMON_HEADER_BYTES as u32);
+            put32(buf, NVDA_RESULT_AT, 1);
+            put32(buf, NVDA_RESULT2_AT, 1);
+            for at in (0x30..0x48).step_by(4) {
+                put32(buf, at, 0);
+            }
+        }
         function
             if is_rm_control_function(function)
                 && parse_rm_control(buf).is_ok_and(|c| {
@@ -1117,6 +1131,24 @@ mod tests {
         let mut other = before.clone();
         test_put32(&mut other, RM_CMD_AT, 0x0090_0101);
         assert_eq!(apply_local(&mut other, 0, 0), Ok(LocalOutcome::ForwardRmControl));
+    }
+
+    #[test]
+    fn swapchain_0124_matches_the_capture() {
+        let mut buf = local_request(0x0100_0124, 0x48);
+        buf[0x20..0x24].copy_from_slice(&0x190u32.to_le_bytes());
+        buf[0x30..0x34].copy_from_slice(&1u32.to_le_bytes());
+        buf[0x38..0x3c].copy_from_slice(&0x680u32.to_le_bytes());
+        buf[0x40..0x44].copy_from_slice(&0x684u32.to_le_bytes());
+        let before = buf.clone();
+        assert_eq!(apply_local(&mut buf, 0, 0), Ok(LocalOutcome::Applied));
+        assert_eq!(&buf[0x08..0x0c], &0x30u32.to_le_bytes());
+        assert_eq!(&buf[0x14..0x18], &1u32.to_le_bytes());
+        assert_eq!(&buf[0x2c..0x30], &1u32.to_le_bytes());
+        assert!(buf[0x30..0x48].iter().all(|b| *b == 0));
+        assert_eq!(&buf[0x20..0x24], &before[0x20..0x24]);
+        let mut short = local_request(0x0100_0124, 0x47);
+        assert_eq!(apply_local(&mut short, 0, 0), Err(LocalError::Invalid));
     }
 
     #[test]
