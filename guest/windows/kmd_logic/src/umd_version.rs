@@ -7,10 +7,14 @@
 //! which release it was installed with and the host decides whether its RM
 //! speaks that ABI.
 //!
-//! The release comes from the service's `Parameters\NvUmdVersion` DWORD, which
-//! the installer writes when it stages the UMDs: NVIDIA's own number with the
-//! dot taken out, `61088` for `610.88` (file version `32.0.16.1088`). Two
-//! decimal digits of minor, as NVIDIA numbers its Windows releases.
+//! The release is the REG_SZ [`VALUE_NAME`] (`NvUmdVersion`), the one value the
+//! installer checks a package against before it stages NVIDIA's UMDs
+//! (`packaging/windows/Helios-PackageCommon.ps1`): in the service key
+//! (`HKLM\SYSTEM\CurrentControlSet\Services\helios_kmd_render`), an
+//! administrator's override, else in its `Parameters` subkey, where the Helios
+//! INF writes the release this KMD speaks (`610.88`). NVIDIA's short form, two
+//! decimal digits of minor as NVIDIA numbers its Windows releases, or a driver
+//! file version (`32.0.16.1088`), the two forms the installer accepts.
 //!
 //! What the start does with the answer:
 //!
@@ -20,6 +24,7 @@
 //! | mismatch                            | fails   |
 //! | `-EPROTO` (host predates the check) | goes on |
 //! | no release recorded in the registry | goes on |
+//! | a value that is not a release       | goes on |
 //! | transport error, malformed reply    | goes on |
 //!
 //! Only a host that says "mismatch" stops the start: the host refuses that
@@ -48,6 +53,14 @@ pub const VERDICT_BRANCH: u32 = 3;
 /// `EPROTO`: what a backend without the message answers.
 pub const EPROTO: u32 = 71;
 
+/// The registry value the release is read from, in the service key and in its
+/// `Parameters` subkey.
+pub const VALUE_NAME: &str = "NvUmdVersion";
+/// `REG_SZ`, the value's one type.
+pub const REG_SZ: u32 = 1;
+/// Longest value data looked at, in bytes (UTF-16, terminator included).
+pub const MAX_VALUE_BYTES: usize = 64;
+
 const STATUS_AT: usize = 8;
 
 fn wr32(b: &mut [u8], at: usize, v: u32) {
@@ -65,20 +78,105 @@ pub struct Release {
     pub minor: u32,
 }
 
+/// Digits only, 1..=`max` of them.
+fn number(s: &[u8], max: usize) -> Option<u32> {
+    if s.is_empty() || s.len() > max || !s.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    Some(s.iter().fold(0, |n, d| n * 10 + u32::from(d - b'0')))
+}
+
 impl Release {
-    /// From the `NvUmdVersion` DWORD (`61088`). 0 and anything without a
-    /// three-digit major are "not recorded".
-    pub fn from_dword(v: u32) -> Option<Self> {
-        let major = v / 100;
-        (100..1000).contains(&major).then_some(Self {
-            major,
-            minor: v % 100,
-        })
+    /// From the text of `NvUmdVersion`, in either form the installer accepts:
+    /// NVIDIA's short one, `610.88` (a three-digit major, two digits of minor),
+    /// or a driver file version, `32.0.16.1088` (the last digit of the third
+    /// field and the four of the fourth: `610.88`). Anything else, a Linux
+    /// release such as `610.57.04` among it, is not a Windows release.
+    pub fn parse(text: &[u8]) -> Option<Self> {
+        let mut parts = [&text[..0]; 4];
+        let mut count = 0;
+        for part in text.split(|&b| b == b'.') {
+            *parts.get_mut(count)? = part;
+            count += 1;
+        }
+        let release = match count {
+            2 if parts[0].len() == 3 && parts[1].len() == 2 => Self {
+                major: number(parts[0], 3)?,
+                minor: number(parts[1], 2)?,
+            },
+            4 => {
+                for part in &parts[..2] {
+                    number(part, 5)?;
+                }
+                let branch = number(parts[2], 5)? % 10;
+                let build = number(parts[3], 4)?;
+                Self {
+                    major: branch * 100 + build / 100,
+                    minor: build % 100,
+                }
+            }
+            _ => return None,
+        };
+        (100..1000).contains(&release.major).then_some(release)
     }
 
-    /// Back to the DWORD form, for diagnostics.
+    /// NVIDIA's number with the dot taken out (`61088`), for diagnostics.
     pub const fn dword(self) -> u32 {
         self.major * 100 + self.minor
+    }
+}
+
+/// One `NvUmdVersion` value, as the registry holds it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Value {
+    /// No value, or an empty string.
+    Absent,
+    Release(Release),
+    /// A value that is not a REG_SZ holding a release: another type (a DWORD
+    /// among them), too long, not ASCII, or not a version.
+    Unusable,
+}
+
+impl Value {
+    /// From a value's registry type and data (UTF-16LE, a terminating NUL and
+    /// anything after it ignored). Surrounding blanks are ignored, as the
+    /// installer ignores them.
+    pub fn from_registry(value_type: u32, data: &[u8]) -> Self {
+        if value_type != REG_SZ || data.len() > MAX_VALUE_BYTES {
+            return Self::Unusable;
+        }
+        let mut text = [0u8; MAX_VALUE_BYTES / 2];
+        let mut len = 0;
+        for unit in data.chunks_exact(2) {
+            let unit = u16::from_le_bytes([unit[0], unit[1]]);
+            if unit == 0 {
+                break;
+            }
+            let Ok(byte) = u8::try_from(unit) else {
+                return Self::Unusable;
+            };
+            if !byte.is_ascii() {
+                return Self::Unusable;
+            }
+            text[len] = byte;
+            len += 1;
+        }
+        let text = text[..len].trim_ascii();
+        if text.is_empty() {
+            return Self::Absent;
+        }
+        Release::parse(text).map_or(Self::Unusable, Self::Release)
+    }
+}
+
+/// The value a start reports: the service key's (an administrator's override)
+/// when it holds anything, else the `Parameters` one the INF writes. An
+/// override that is not a release is not passed over for the INF's, as the
+/// installer does not pass over it either.
+pub fn configured(service: Value, parameters: impl FnOnce() -> Value) -> Value {
+    match service {
+        Value::Absent => parameters(),
+        held => held,
     }
 }
 
@@ -200,20 +298,149 @@ mod tests {
         r
     }
 
+    const R61088: Release = Release {
+        major: 610,
+        minor: 88,
+    };
+
+    /// `text` as REG_SZ data: UTF-16LE with its terminator.
+    fn sz(text: &str) -> ([u8; 2 * MAX_VALUE_BYTES], usize) {
+        let mut out = [0u8; 2 * MAX_VALUE_BYTES];
+        let mut n = 0;
+        for unit in text.encode_utf16().chain([0]) {
+            out[n..n + 2].copy_from_slice(&unit.to_le_bytes());
+            n += 2;
+        }
+        (out, n)
+    }
+
+    fn value(text: &str) -> Value {
+        let (data, n) = sz(text);
+        Value::from_registry(REG_SZ, &data[..n])
+    }
+
     #[test]
-    fn the_registry_dword_is_nvidias_number_without_the_dot() {
+    fn the_short_form_is_nvidias_windows_release() {
+        assert_eq!(Release::parse(b"610.88"), Some(R61088));
         assert_eq!(
-            Release::from_dword(61088),
+            Release::parse(b"581.08"),
             Some(Release {
-                major: 610,
-                minor: 88
+                major: 581,
+                minor: 8
             })
         );
-        assert_eq!(Release::from_dword(58108).map(|r| r.minor), Some(8));
-        assert_eq!(Release::from_dword(0), None);
-        assert_eq!(Release::from_dword(9999), None);
-        assert_eq!(Release::from_dword(u32::MAX), None);
-        assert_eq!(Release::from_dword(61088).unwrap().dword(), 61088);
+        assert_eq!(Release::parse(b"610.88").unwrap().dword(), 61088);
+        for bad in [
+            &b"610"[..],
+            b"610.8",
+            b"610.088",
+            b"61.88",
+            b"6100.88",
+            b"061.88",
+            b"610.57.04",
+            b"610.88.",
+            b".610.88",
+            b"610,88",
+            b"610.x8",
+            b"+10.88",
+            b"",
+            b"1.2.3.4.5",
+        ] {
+            assert_eq!(Release::parse(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_file_version_reads_as_the_installer_reads_it() {
+        assert_eq!(Release::parse(b"32.0.16.1088"), Some(R61088));
+        assert_eq!(
+            Release::parse(b"32.0.15.6094"),
+            Some(Release {
+                major: 560,
+                minor: 94
+            })
+        );
+        assert_eq!(
+            Release::parse(b"32.0.15.8108"),
+            Some(Release {
+                major: 581,
+                minor: 8
+            })
+        );
+        // No three-digit major (the branch digit 0), a fourth field past four
+        // digits, empty fields.
+        assert_eq!(Release::parse(b"32.0.10.0988"), None);
+        assert_eq!(Release::parse(b"32.0.16.10880"), None);
+        assert_eq!(Release::parse(b"32..16.1088"), None);
+    }
+
+    #[test]
+    fn the_registry_value_is_a_reg_sz() {
+        assert_eq!(value("610.88"), Value::Release(R61088));
+        assert_eq!(value("  610.88 "), Value::Release(R61088));
+        assert_eq!(value("32.0.16.1088"), Value::Release(R61088));
+        assert_eq!(value(""), Value::Absent);
+        assert_eq!(value("   "), Value::Absent);
+        assert_eq!(Value::from_registry(REG_SZ, &[]), Value::Absent);
+        assert_eq!(value("610.57.04"), Value::Unusable);
+        assert_eq!(value("latest"), Value::Unusable);
+        assert_eq!(value("610.88\u{e9}"), Value::Unusable);
+        assert_eq!(value("\u{3610}.88"), Value::Unusable);
+        // Without a terminator, and with data after it.
+        let (data, n) = sz("610.88");
+        assert_eq!(
+            Value::from_registry(REG_SZ, &data[..n - 2]),
+            Value::Release(R61088)
+        );
+        let mut tail = data;
+        tail[n..n + 2].copy_from_slice(&u16::from(b'9').to_le_bytes());
+        assert_eq!(
+            Value::from_registry(REG_SZ, &tail[..n + 2]),
+            Value::Release(R61088)
+        );
+    }
+
+    #[test]
+    fn another_type_or_an_oversized_value_is_unusable() {
+        // A DWORD 61088, what an earlier package wrote.
+        assert_eq!(
+            Value::from_registry(4, &61088u32.to_le_bytes()),
+            Value::Unusable
+        );
+        let (data, n) = sz("610.88");
+        for other in [0, 2, 3, 7, 11] {
+            assert_eq!(Value::from_registry(other, &data[..n]), Value::Unusable);
+        }
+        let (long, n) = sz("                                610.88");
+        assert!(n > MAX_VALUE_BYTES);
+        assert_eq!(Value::from_registry(REG_SZ, &long[..n]), Value::Unusable);
+        let (fits, n) = sz("                         610.88");
+        assert_eq!(n, MAX_VALUE_BYTES);
+        assert_eq!(
+            Value::from_registry(REG_SZ, &fits[..n]),
+            Value::Release(R61088)
+        );
+    }
+
+    #[test]
+    fn the_service_key_overrides_the_inf_value() {
+        let inf = || value("610.88");
+        let other = Release {
+            major: 615,
+            minor: 71,
+        };
+        assert_eq!(configured(Value::Absent, inf), Value::Release(R61088));
+        assert_eq!(
+            configured(Value::Release(other), inf),
+            Value::Release(other)
+        );
+        assert_eq!(configured(Value::Unusable, inf), Value::Unusable);
+        assert_eq!(configured(Value::Absent, || Value::Absent), Value::Absent);
+        // The INF's value is not read when the override holds one.
+        assert_eq!(
+            configured(Value::Release(other), || unreachable!()),
+            Value::Release(other)
+        );
     }
 
     #[test]
