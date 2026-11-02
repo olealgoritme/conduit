@@ -706,11 +706,38 @@ fn alloc_system_descriptor(io: &Io<'_>, memory: u32, pfns: &[u64], size: u64) ->
             core::mem::forget(big);
             return Err(Error::Host);
         }
-        Err(_) => return Err(Error::Host),
+        Err(refusal) => {
+            // NvSysHost: 0x2000_0000 | refusal kind for a transport/forward refusal.
+            crate::diag::record_named_bytes(b"NvSysHost", 0x2000_0000 | refusal_code(&refusal));
+            crate::diag::record_named_bytes(b"NvSysPages", pfns.len() as u32);
+            return Err(Error::Host);
+        }
     };
-    rc::rm_reply(reply, cr::NVOS02_STATUS_AT)
-        .map(|_| ())
-        .map_err(|_| Error::Host)
+    rc::rm_reply(reply, cr::NVOS02_STATUS_AT).map(|_| ()).map_err(|error| {
+        // NvSysHost: RM's NV_STATUS, 0x1000_0000 | errno for a host refusal,
+        // 0x3000_0000 for a malformed reply; NvSysPages: the descriptor's pages.
+        let code = match error {
+            rc::RmError::Status(status) => status,
+            rc::RmError::Host(errno) => 0x1000_0000 | errno,
+            rc::RmError::Malformed => 0x3000_0000,
+        };
+        crate::diag::record_named_bytes(b"NvSysHost", code);
+        crate::diag::record_named_bytes(b"NvSysPages", pfns.len() as u32);
+        Error::Host
+    })
+}
+
+fn refusal_code(refusal: &Refusal) -> u32 {
+    match refusal {
+        Refusal::MsgType => 1,
+        Refusal::NotOwned => 2,
+        Refusal::NoResources => 3,
+        Refusal::Forbidden => 4,
+        Refusal::BadRange => 5,
+        Refusal::Transport(_) => 6,
+        #[allow(unreachable_patterns)]
+        _ => 7,
+    }
 }
 
 /// Create the real local-linear or pSystemMem OS-descriptor backing.  All

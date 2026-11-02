@@ -39,6 +39,8 @@ const BLACKWELL_COMPUTE_B: u32 = 0xcec0;
 const BINDINGS: [(u32, u32); 4] = [(0, 0xce97), (1, 0xcec0), (2, 0xcd40), (4, 0)];
 /// The GB20x 3D class (`clce97.h`).
 const BLACKWELL_B: u32 = 0xce97;
+/// RM's software-method class (`cl5080.h`), bound by the UMDs on subchannel 5.
+const NV50_DEFERRED_API_CLASS: u32 = 0x5080;
 const FIRST_NATIVE_HANDLE: u32 = 0x4e43_1000;
 const HANDLE_STRIDE: u32 = 16;
 
@@ -1044,6 +1046,19 @@ fn create_queue_objects(
             &cc::ce_object_params(grce),
         );
         crate::diag::record_named_bytes(b"NvChCeSt", u32::from(copy.is_err()));
+        // The D3D UMDs' copy queues open with SET_OBJECT(subchannel 5,
+        // NV50_DEFERRED_API_CLASS). On a GR channel without that object every
+        // later subchannel-4 (copy engine) method raises PBDMA DEVICE (Xid 32,
+        // reproduced on the host RM); with the object allocated, RM accepts the
+        // binding and the copy engine keeps working. Best effort: NvChDapiSt.
+        let deferred = io.alloc(
+            client,
+            handles.at(5),
+            handles.at(9),
+            NV50_DEFERRED_API_CLASS,
+            &[0u8; 1],
+        );
+        crate::diag::record_named_bytes(b"NvChDapiSt", u32::from(deferred.is_err()));
         crate::diag::record_named_bytes(b"NvQStep", 8);
         let mut index = cc::token_notif_index_params();
         io.control(
