@@ -433,6 +433,40 @@ pub fn apply_local(
             put32(buf, NVDA_RESULT_AT, 1);
             put32(buf, NVDA_RESULT2_AT, 1);
         }
+        0x0200_000c => {
+            // 0xac-byte per-head display query of the Vulkan ICD (head index at +0x34,
+            // asked for heads 0..3 before it creates a device). The 610.88 capture
+            // answers a 0x30-byte reply, result 1; head 0 carries its mode at +0x40:
+            // width, height, 32 bpp, refresh Hz, format 0x15 (A8R8G8B8), and 1 at +0x88
+            // and +0x9d; the other heads stay zero. The KMD fills head 0's real mode
+            // over these defaults (`set_head_mode`).
+            exact(buf, 0xac)?;
+            let head = rc::get32(buf, 0x34).unwrap_or(u32::MAX);
+            put32(buf, NVDA_SIZE_AT, NVDA_COMMON_HEADER_BYTES as u32);
+            put32(buf, NVDA_RESULT_AT, 1);
+            put32(buf, NVDA_RESULT2_AT, 1);
+            for at in (0x40..0xac).step_by(4) {
+                put32(buf, at, 0);
+            }
+            if head == 0 {
+                set_head_mode(buf, 1024, 768, 60);
+                put32(buf, 0x48, 32);
+                put32(buf, 0x50, 0x15);
+                put32(buf, 0x88, 1);
+                put32(buf, 0x9c, 0x100);
+            }
+        }
+        0x0100_0057 => {
+            // 0x38-byte request the Vulkan ICD makes after creating its device. The
+            // capture answers a 0x30-byte reply, result 1, and a nonzero 32-bit value
+            // at +0x30 that differs per run (an identifier).
+            exact(buf, 0x38)?;
+            put32(buf, NVDA_SIZE_AT, NVDA_COMMON_HEADER_BYTES as u32);
+            put32(buf, NVDA_RESULT_AT, 1);
+            put32(buf, NVDA_RESULT2_AT, 1);
+            put32(buf, 0x30, 0x1c95_a71e ^ (h_device as u32));
+            put32(buf, 0x34, 0);
+        }
         0x0100_0116 => {
             // 0x39-byte request the D3D11 UMD makes while it sets up a swap chain
             // (DWM's primary every retry). The 610.88 capture answers a 0x30-byte
@@ -524,6 +558,18 @@ impl From<u32> for Persona {
     fn from(value: u32) -> Self {
         Self::from_knob(value)
     }
+}
+
+/// Head 0's mode in a `0x0200000c` reply: width +0x40, height +0x44, refresh +0x4c.
+pub fn set_head_mode(buf: &mut [u8], width: u32, height: u32, refresh_hz: u32) {
+    put32(buf, 0x40, width);
+    put32(buf, 0x44, height);
+    put32(buf, 0x4c, refresh_hz);
+}
+
+/// Whether `buf` is a `0x0200000c` reply for head 0 (the KMD fills the real mode in).
+pub fn is_head0_query(buf: &[u8]) -> bool {
+    rc::get32(buf, NVDA_FUNCTION_AT) == Some(0x0200_000c) && rc::get32(buf, 0x34) == Some(0)
 }
 
 #[cfg(test)]
@@ -1166,6 +1212,33 @@ mod tests {
         assert_eq!(&buf[0x20..0x24], &before[0x20..0x24]);
         let mut short = local_request(0x0100_0124, 0x47);
         assert_eq!(apply_local(&mut short, 0, 0), Err(LocalError::Invalid));
+    }
+
+    #[test]
+    fn head_query_0200000c_matches_the_capture() {
+        let mut buf = local_request(0x0200_000c, 0xac);
+        test_put32(&mut buf, 0x30, 0);
+        test_put32(&mut buf, 0x34, 0);
+        test_put32(&mut buf, 0x38, 1);
+        assert_eq!(apply_local(&mut buf, 0, 0), Ok(LocalOutcome::Applied));
+        assert_eq!(&buf[0x08..0x0c], &0x30u32.to_le_bytes());
+        assert_eq!(&buf[0x40..0x54], &[0, 4, 0, 0, 0, 3, 0, 0, 32, 0, 0, 0, 60, 0, 0, 0, 0x15, 0, 0, 0]);
+        assert_eq!(buf[0x88], 1);
+        assert_eq!(buf[0x9d], 1);
+        assert!(is_head0_query(&buf));
+        let mut other = local_request(0x0200_000c, 0xac);
+        test_put32(&mut other, 0x34, 2);
+        assert_eq!(apply_local(&mut other, 0, 0), Ok(LocalOutcome::Applied));
+        assert!(other[0x40..0xac].iter().all(|b| *b == 0));
+        assert!(!is_head0_query(&other));
+    }
+
+    #[test]
+    fn id_0100_0057_is_nonzero() {
+        let mut buf = local_request(0x0100_0057, 0x38);
+        assert_eq!(apply_local(&mut buf, 0x40000500, 0), Ok(LocalOutcome::Applied));
+        assert_eq!(&buf[0x08..0x0c], &0x30u32.to_le_bytes());
+        assert_ne!(&buf[0x30..0x34], &[0, 0, 0, 0]);
     }
 
     #[test]

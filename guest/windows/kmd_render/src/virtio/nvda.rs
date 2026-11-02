@@ -603,7 +603,15 @@ pub fn escape(
     // transport. This also returns shortened 0x30 replies directly, while the
     // backing buffer still has its original (larger) length.
     match nd::apply_local(buf, h_device, h_context) {
-        Ok(nd::LocalOutcome::Applied) => return STATUS_SUCCESS,
+        Ok(nd::LocalOutcome::Applied) => {
+            // The Vulkan ICD's per-head query: head 0 is the mode this adapter scans out.
+            if nd::is_head0_query(buf) {
+                let (width, height) = adapter.scanout_extent();
+                let hz = (adapter.effective_refresh_mhz() + 500) / 1000;
+                nd::set_head_mode(buf, width, height, hz.max(1));
+            }
+            return STATUS_SUCCESS;
+        }
         Ok(nd::LocalOutcome::ForwardRmControl) => {}
         Err(nd::LocalError::Invalid) => {
             REFUSALS.fetch_add(1, Ordering::Relaxed);
