@@ -87,6 +87,10 @@ pub(crate) struct NativeRingBacking {
     pub memory: u32,
     pub mapped_bytes: u64,
     pub va_space: u32,
+    /// The ring's native allocation and the byte offset of the ring in it
+    /// (diagnosis: the KMD reads the GPFIFO back through its own CPU view).
+    pub id: u32,
+    pub offset: u64,
 }
 
 /// Process-native state is taken out of its spinlock before any host call.
@@ -601,6 +605,8 @@ pub(crate) struct NativeQueue {
     epoch: u64,
     parts: QueueParts,
     ring_bytes: u32,
+    ring_id: u32,
+    ring_offset: u64,
     gp_put: SpinLock<u32>,
     progress_fence_cpu: u64,
     _progress_fence_gpu: u64,
@@ -658,6 +664,8 @@ impl NativeQueue {
             epoch: context.epoch,
             parts,
             ring_bytes: queue.ring_bytes,
+            ring_id: backing.id,
+            ring_offset: backing.offset,
             gp_put: SpinLock::new(0),
             progress_fence_cpu: progress_cpu,
             _progress_fence_gpu: progress_gpu,
@@ -742,6 +750,33 @@ impl NativeQueue {
             };
             crate::diag::record_named_bytes(b"NvQErrInfo", info32);
             crate::diag::record_named_bytes(b"NvQErrSt", word);
+            // The first two GPFIFO entries as RM memory holds them: zero means
+            // the UMD's CPU writes never reached the memory the GPU fetches.
+            if let Some(adapter) = unsafe { self.adapter.as_ref() } {
+                let mut words = [0u32; 4];
+                // SAFETY: PASSIVE (DestroyHwQueue); copies 16 bytes out.
+                let read = unsafe {
+                    super::native_memory::with_cpu_range(
+                        passive,
+                        adapter,
+                        self.ring_id,
+                        self.ring_offset,
+                        16,
+                        |relative, native, len| {
+                            let at = relative as usize / 4;
+                            let n = (len as usize / 4).min(4usize.saturating_sub(at));
+                            for i in 0..n {
+                                words[at + i] = (native as *const u32).add(i).read_volatile();
+                            }
+                            true
+                        },
+                    )
+                };
+                crate::diag::record_named_bytes(b"NvQRingRd", u32::from(read.is_ok_and(|ok| ok)));
+                crate::diag::record_named_bytes(b"NvQRing0", words[0]);
+                crate::diag::record_named_bytes(b"NvQRing1", words[1]);
+                crate::diag::record_named_bytes(b"NvQRing2", words[2]);
+            }
         }
         let Some(adapter) = (unsafe { self.adapter.as_ref() }) else {
             return Ok(());

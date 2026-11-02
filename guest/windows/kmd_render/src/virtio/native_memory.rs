@@ -539,6 +539,8 @@ pub fn ring_backing(
         memory: allocation.memory,
         mapped_bytes: ring_bytes,
         va_space,
+        id,
+        offset: mapping.piece.memory_offset + (gpfifo_va - mapping.piece.va),
     })
 }
 
