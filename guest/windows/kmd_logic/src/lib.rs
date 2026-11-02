@@ -28,6 +28,7 @@ pub mod host_rm_version;
 pub mod hws;
 pub mod hw_flip_queue;
 pub mod native_channel;
+pub mod native_completion;
 pub mod native_hang;
 pub mod native_memory;
 pub mod native_teardown;
