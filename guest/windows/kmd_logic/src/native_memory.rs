@@ -331,6 +331,19 @@ pub fn nvgl_writeback(input: &[u8]) -> Option<[(usize, u32); NVGL_WRITEBACK_FIEL
 
 pub const CUDA_WRITEBACK_FIELDS: usize = 16;
 
+/// +0x10 of a CUDA record: set on every allocation the CUDA driver backs with
+/// its own user memory (D3DKMT `pSystemMem`; 38 of 90 records in the two
+/// cudatest captures, all of them and only them), clear (0x800) on video memory.
+pub const CUDA_KIND_AT: usize = 0x10;
+pub const CUDA_KIND_SYSTEM_MEMORY: u32 = 0x0100_0000;
+
+/// Whether a CUDA record describes memory the UMD supplies (`pSystemMem`): the
+/// KMD reports it as existing system memory in an aperture segment.
+pub fn is_cuda_system_memory(bytes: &[u8]) -> bool {
+    is_cuda_record(bytes)
+        && get32(bytes, CUDA_KIND_AT).is_some_and(|kind| kind & CUDA_KIND_SYSTEM_MEMORY != 0)
+}
+
 /// Whether an NVDA record is the CUDA driver's (`**VN` tag, size in 64-KiB units
 /// at 0xd0): neither a D3D nor a Vulkan record.
 pub fn is_cuda_record(bytes: &[u8]) -> bool {
@@ -1307,6 +1320,18 @@ mod nvgl_tests {
             }
             assert_eq!(after, want, "input {input:x?}");
         }
+    }
+
+    #[test]
+    fn cuda_system_memory_follows_the_kind_word() {
+        // 610.88 cudatest: kind 0x01000000 with pSystemMem, kind 0x800 without.
+        assert!(is_cuda_system_memory(&cuda_record(&[(0x10, 0x0100_0000), (0x14, 0x4_0100), (0xd0, 0x20)])));
+        assert!(!is_cuda_system_memory(&cuda_record(&[(0x10, 0x800), (0x14, 0x4_0000), (0xd0, 0x400)])));
+        // Not a CUDA record: a D3D record (no units at 0xd0) and a Vulkan one.
+        assert!(!is_cuda_system_memory(&cuda_record(&[(0x10, 0x0100_0000)])));
+        let mut vk = cuda_record(&[(0x10, 0x0100_0000), (0xd0, 1)]);
+        put32(&mut vk, RECORD_TAG_AT, RECORD_TAG_NVGL).unwrap();
+        assert!(!is_cuda_system_memory(&vk));
     }
 
     #[test]
