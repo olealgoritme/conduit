@@ -845,6 +845,9 @@ pub(crate) unsafe fn create_context_with(
 pub unsafe extern "C" fn dxgkddi_destroy_context(h_context: *mut c_void) -> NTSTATUS {
     crate::diag::record(0x0800_0002);
     if !h_context.is_null() {
+        // NVIDIA personality: the Vulkan ICD's copy context's own channel
+        // (`ddi::nv_copy`); nothing when the context has none.
+        crate::ddi::nv_copy::destroy_context(h_context as usize);
         // NVIDIA personality: a native TSG goes first (a TSG RM would not free
         // is filed for DestroyProcess, `native_channel`). Every queue on it is
         // gone by WDDM contract. Default path: `native` is always `None` and
