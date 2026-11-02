@@ -1213,6 +1213,27 @@ fn grce_engine(io: Io<'_>, client: &NativeClient) -> Option<u32> {
     if known != 0 {
         return Some(known);
     }
+    // RM's own answer first: the copy engine partnered with GR0 on runqueue 0
+    // for this channel class (NV2080_CTRL_CMD_GPU_GET_ENGINE_PARTNERLIST, what
+    // RM itself uses for a CE object on a GR channel). The first GRCE in the
+    // caps list (COPY0) was not it: subchannel 4 still raised PBDMA DEVICE.
+    let mut partners = [0u8; 144];
+    partners[0..4].copy_from_slice(&1u32.to_le_bytes()); // NV2080_ENGINE_TYPE_GR0
+    partners[4..8].copy_from_slice(&cp::Gen::Gb202.classes().gpfifo.to_le_bytes());
+    if io
+        .control(client, nd::H_SUBDEVICE, 0x2080_0147, &mut partners)
+        .is_ok()
+    {
+        let count = u32::from_le_bytes([partners[12], partners[13], partners[14], partners[15]]);
+        if count >= 1 {
+            let first = u32::from_le_bytes([partners[16], partners[17], partners[18], partners[19]]);
+            crate::diag::record_named_bytes(b"NvChGrPartn", first | (count << 16));
+            if first != 0 {
+                GRCE_ENGINE.store(first, Ordering::Relaxed);
+                return Some(first);
+            }
+        }
+    }
     let mut list = Vec::new();
     list.try_reserve_exact(cc::ENGINES_BYTES).ok()?;
     list.resize(cc::ENGINES_BYTES, 0u8);
