@@ -241,36 +241,36 @@ pub enum Detect {
     Event = 2,
 }
 
-/// Consecutive poll-found moves after which a queue counts as not seen by
-/// events (one is tolerated: a poll tick can land between the GPU's write and
-/// the event's arrival).
-pub const COVER_LOST_AFTER: u8 = 2;
+/// Consecutive event-found moves after which a queue counts as seen by events.
+/// Events are per engine, not per queue: one that another queue's (or another
+/// host client's) interrupt raised can find this queue's progress by chance, so
+/// one is not enough. A single poll-found move undoes it: then a completion
+/// waited for the poll, so at most one completion waits for the long period
+/// before the poll is fast again.
+pub const COVER_GAIN_AFTER: u8 = 2;
 
-/// Whether a queue's completions arrive as events. A new queue is not covered
-/// until an event first sees it move.
+/// Whether a queue's completions arrive as events. A new queue is not covered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Cover {
-    poll_streak: u8,
+    event_streak: u8,
 }
 
 impl Cover {
     pub const fn new() -> Self {
-        Self {
-            poll_streak: COVER_LOST_AFTER,
-        }
+        Self { event_streak: 0 }
     }
 
     /// One observed move.
     pub fn note(&mut self, by: Detect) {
         match by {
-            Detect::Event => self.poll_streak = 0,
-            Detect::Poll => self.poll_streak = self.poll_streak.saturating_add(1),
+            Detect::Event => self.event_streak = self.event_streak.saturating_add(1),
+            Detect::Poll => self.event_streak = 0,
             Detect::Submit => {}
         }
     }
 
     pub const fn event_driven(&self) -> bool {
-        self.poll_streak < COVER_LOST_AFTER
+        self.event_streak >= COVER_GAIN_AFTER
     }
 }
 
@@ -496,23 +496,26 @@ mod tests {
     }
 
     #[test]
-    fn cover_needs_an_event_and_is_lost_to_the_poll() {
+    fn cover_needs_two_events_and_is_lost_to_one_poll() {
         let mut c = Cover::new();
         assert!(!c.event_driven());
         c.note(Detect::Submit);
+        c.note(Detect::Event);
+        // One event may be another engine's, by chance.
         assert!(!c.event_driven());
+        c.note(Detect::Submit);
         c.note(Detect::Event);
         assert!(c.event_driven());
-        // One poll hit is a race with the event, tolerated.
-        c.note(Detect::Poll);
-        assert!(c.event_driven());
-        c.note(Detect::Event);
-        c.note(Detect::Poll);
-        c.note(Detect::Poll);
-        assert!(!c.event_driven());
         for _ in 0..1000 {
-            c.note(Detect::Poll);
+            c.note(Detect::Event);
         }
+        assert!(c.event_driven());
+        // A completion the poll had to find: fast again at once.
+        c.note(Detect::Poll);
+        assert!(!c.event_driven());
+        c.note(Detect::Event);
+        c.note(Detect::Poll);
+        c.note(Detect::Event);
         assert!(!c.event_driven());
         c.note(Detect::Event);
         assert!(c.event_driven());
