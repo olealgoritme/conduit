@@ -838,10 +838,19 @@ fn user_shared_block(buf: &mut [u8]) -> NTSTATUS {
 #[inline(never)]
 pub fn check_umd_release(passive: PassiveLevel, adapter: &AdapterContext) -> bool {
     use helios_kmd_logic::umd_version as uv;
-    let name = crate::diag::knobs::NVIDIA_UMD_VERSION;
     let value = uv::configured(
-        crate::diag::read_config_value(name, uv::Value::Absent, uv::Value::from_registry),
-        || crate::diag::read_parameters_value(name, uv::Value::Absent, uv::Value::from_registry),
+        crate::diag::read_config_sz(
+            crate::diag::knobs::NVIDIA_UMD_VERSION,
+            uv::Value::Absent,
+            uv::Value::from_registry,
+        ),
+        || {
+            crate::diag::read_parameters_sz(
+                crate::diag::knobs::NVIDIA_UMD_VERSION,
+                uv::Value::Absent,
+                uv::Value::from_registry,
+            )
+        },
     );
     let release = match value {
         uv::Value::Release(release) => release,

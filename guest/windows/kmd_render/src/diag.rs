@@ -1286,7 +1286,7 @@ pub mod knobs {
     /// the service key itself overrides it. The installer stages only an NVIDIA
     /// package of this release, and every StartDevice of the NVIDIA personality
     /// reports it to the host (`virtio::nvda::check_umd_release`,
-    /// `helios_kmd_logic::umd_version`). Read with [`super::read_config_value`].
+    /// `helios_kmd_logic::umd_version`). Read with [`super::read_config_sz`].
     pub const NVIDIA_UMD_VERSION: KnobName = KnobName::new(b"NvUmdVersion");
     /// `KmdRmSysCache` (default 0). With `KmdRmClient` = 5: what the RM system-memory
     /// primary is made of (read at the service's bring-up; `docs/kmd-rm-client.md` 15.5).
@@ -1875,7 +1875,7 @@ struct ValueQuery<T> {
     out: T,
 }
 
-/// `RTL_QUERY_REGISTRY_ROUTINE` for [`read_config_value`]: hands the value's own
+/// `RTL_QUERY_REGISTRY_ROUTINE` for [`read_config_sz`]: hands the value's own
 /// type and data to the decoder, so nothing of another type is ever written
 /// through a pointer meant for this one (unlike `RTL_QUERY_REGISTRY_DIRECT`).
 unsafe extern "C" fn query_value<T>(
@@ -1886,7 +1886,7 @@ unsafe extern "C" fn query_value<T>(
     _context: wdk_sys::PVOID,
     entry: wdk_sys::PVOID,
 ) -> wdk_sys::NTSTATUS {
-    // SAFETY: `entry` is the EntryContext `read_service_value` passed: its own
+    // SAFETY: `entry` is the EntryContext `read_service_sz` passed: its own
     // `ValueQuery<T>`, live and not otherwise borrowed for the whole call.
     let query = unsafe { &mut *entry.cast::<ValueQuery<T>>() };
     let bytes: &[u8] = if data.is_null() || length == 0 {
@@ -1900,19 +1900,19 @@ unsafe extern "C" fn query_value<T>(
     wdk_sys::STATUS_SUCCESS
 }
 
-/// Read a service-key value of any type through `decode(type, data)`; `absent`
-/// when the value (or the key) does not exist. For values that are not REG_DWORD
-/// (`NvUmdVersion` is a REG_SZ). PASSIVE_LEVEL only.
-pub fn read_config_value<T: Copy>(name: KnobName, absent: T, decode: fn(u32, &[u8]) -> T) -> T {
-    read_service_value(SERVICE_NAME.as_ptr(), name, absent, decode)
+/// Read a REG_SZ service-key value through `decode(type, data)`; `absent` when
+/// the value (or the key) does not exist. `decode` sees the value's actual type
+/// and raw data, so it refuses a value of another type itself. PASSIVE_LEVEL only.
+pub fn read_config_sz<T: Copy>(name: KnobName, absent: T, decode: fn(u32, &[u8]) -> T) -> T {
+    read_service_sz(SERVICE_NAME.as_ptr(), name, absent, decode)
 }
 
-/// [`read_config_value`] for a value under the service's `Parameters` subkey.
-pub fn read_parameters_value<T: Copy>(name: KnobName, absent: T, decode: fn(u32, &[u8]) -> T) -> T {
-    read_service_value(SERVICE_PARAMETERS.as_ptr(), name, absent, decode)
+/// [`read_config_sz`] for a value under the service's `Parameters` subkey.
+pub fn read_parameters_sz<T: Copy>(name: KnobName, absent: T, decode: fn(u32, &[u8]) -> T) -> T {
+    read_service_sz(SERVICE_PARAMETERS.as_ptr(), name, absent, decode)
 }
 
-fn read_service_value<T: Copy>(
+fn read_service_sz<T: Copy>(
     path: *const u16,
     name: KnobName,
     absent: T,
