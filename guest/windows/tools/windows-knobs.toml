@@ -305,9 +305,10 @@ read = "transport generation (StartDevice)"
 effect = "NVIDIA Windows UMD research personality: 1 records NVDA calls only, 2 forwards root/device/subdevice RM controls through a KMD-owned client. 0 = off. The NVIDIA PCI personality's INF selects 2. Allocation, channel and submission formats are not implemented."
 
 [kmd.NvUmdVersion]
-class = "state"
+class = "supported"
 read = "StartDevice (NVIDIA personality)"
-effect = "The NVIDIA UMD release the installer staged, without the dot (`61088` for 610.88), in the `Parameters` subkey. Sent to the host at every start; a host that says its RM is another release makes the start fail (`NvUmdChk` = 1). 0 or absent = not recorded, nothing is checked."
+effect = "The NVIDIA Windows release whose UMDs this KMD speaks, NVIDIA's short form (`610.88`; a driver file version such as `32.0.16.1088` is also read). The INF writes it under `Parameters`; the same value in the service key itself overrides it. The installer stages only an NVIDIA package of this release, and every start reports it to the host: a host that says its RM is another release makes the start fail (`NvUmdChk` = 1). Absent = nothing is checked (`NvUmdChk` = 0xff); a value that is not a REG_SZ release is not checked either (`NvUmdChk` = 0xfe)."
+see = "[installer README](../guest/windows/installer/README.md)"
 
 [kmd.KmdRmSysPollMs]
 class = "experiment"
