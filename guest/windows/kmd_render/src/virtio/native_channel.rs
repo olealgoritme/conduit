@@ -40,6 +40,10 @@ const BLACKWELL_COMPUTE_B: u32 = 0xcec0;
 const BINDINGS: [(u32, u32); 4] = [(0, 0xce97), (1, 0xcec0), (2, 0xcd40), (4, 0)];
 /// The GB20x 3D class (`clce97.h`).
 const BLACKWELL_B: u32 = 0xce97;
+/// The GB100 inline-to-memory class (`clcd40.h`).
+const BLACKWELL_INLINE_TO_MEMORY_A: u32 = 0xcd40;
+/// The 2D class (`cl902d.h`).
+const FERMI_TWOD_A: u32 = 0x902d;
 /// RM's software-method class (`cl5080.h`), bound by the UMDs on subchannel 5.
 const NV50_DEFERRED_API_CLASS: u32 = 0x5080;
 const FIRST_NATIVE_HANDLE: u32 = 0x4e43_1000;
@@ -1312,6 +1316,20 @@ fn create_queue_objects(
             &[0u8; 1],
         );
         crate::diag::record_named_bytes(b"NvChDapiSt", u32::from(deferred.is_err()));
+        // NVIDIA's KMD puts an inline-to-memory and a 2D object on every graphics
+        // channel next to the 3D one: the Vulkan ICD asks their engine ids by the
+        // pseudo handles 0xff1fe01a / 0xff1fe02c (610.88 capture) and drives them
+        // without allocating them itself. Best effort: NvChI2mSt / NvCh2dSt.
+        let i2m = io.alloc(
+            client,
+            handles.at(5),
+            handles.at(10),
+            BLACKWELL_INLINE_TO_MEMORY_A,
+            &[0u8; 16],
+        );
+        crate::diag::record_named_bytes(b"NvChI2mSt", u32::from(i2m.is_err()));
+        let two_d = io.alloc(client, handles.at(5), handles.at(11), FERMI_TWOD_A, &[0u8; 16]);
+        crate::diag::record_named_bytes(b"NvCh2dSt", u32::from(two_d.is_err()));
         crate::diag::record_named_bytes(b"NvQStep", 8);
         let mut index = cc::token_notif_index_params();
         io.control(
