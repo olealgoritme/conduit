@@ -34,6 +34,9 @@ use wdk_sys::{PHYSICAL_ADDRESS, _MEMORY_CACHING_TYPE};
 
 const TIMEOUT_MS: u64 = 2_500;
 const BLACKWELL_COMPUTE_B: u32 = 0xcec0;
+/// (subchannel, class) the D3D UMDs drive on a graphics channel: 3D, compute,
+/// inline-to-memory, copy (the copy class from the generation table).
+const BINDINGS: [(u32, u32); 4] = [(0, 0xce97), (1, 0xcec0), (2, 0xcd40), (4, 0)];
 /// The GB20x 3D class (`clce97.h`).
 const BLACKWELL_B: u32 = 0xce97;
 const FIRST_NATIVE_HANDLE: u32 = 0x4e43_1000;
@@ -738,17 +741,22 @@ impl NativeQueue {
                 // SAFETY: pos < n dwords inside the mapped range.
                 let header = unsafe { words.add(pos).read_volatile() };
                 if header == 0 {
-                    match run {
-                        Some(start) => {
-                            // SET_OBJECT: INC_METHOD, count 1, subchannel 4, method 0.
+                    let start = *run.get_or_insert(pos);
+                    if pos + 1 - start >= BINDINGS.len() * 2 {
+                        // SET_OBJECT (INC_METHOD, count 1, method 0) for every
+                        // subchannel the UMD drives, as NVK binds its channel
+                        // (subchannel 4 alone left the D3D11 clear failing).
+                        for (i, (subchannel, class)) in BINDINGS.iter().enumerate() {
+                            let class = if *subchannel == 4 { copy_class } else { *class };
                             unsafe {
-                                words.add(start).write_volatile((1 << 29) | (1 << 16) | (4 << 13));
-                                words.add(start + 1).write_volatile(copy_class);
+                                words
+                                    .add(start + 2 * i)
+                                    .write_volatile((1 << 29) | (1 << 16) | (subchannel << 13));
+                                words.add(start + 2 * i + 1).write_volatile(class);
                             }
-                            outcome = 1;
-                            return;
                         }
-                        None => run = Some(pos),
+                        outcome = 1;
+                        return;
                     }
                     pos += 1;
                     continue;
