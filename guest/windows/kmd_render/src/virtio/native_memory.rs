@@ -212,12 +212,14 @@ struct Allocation {
 /// The record fields CreateAllocation wrote, re-applied at open.
 #[derive(Clone, Copy)]
 enum Writeback {
-    /// CUDA/Vulkan records: RM handles and 64-KiB-unit sizes.
+    /// Records of no known UMD: RM handles and 64-KiB-unit sizes.
     Native(nm::PrivateWriteback),
     /// D3D11/D3D12 records: the 610.88 KMD's field set (`nm::d3d_writeback`).
     D3d([(usize, u32); nm::D3D_WRITEBACK_FIELDS]),
     /// Vulkan (`NVGL`) records: `nm::nvgl_writeback`.
     Nvgl([(usize, u32); nm::NVGL_WRITEBACK_FIELDS]),
+    /// CUDA (`**VN`) records: `nm::cuda_writeback`.
+    Cuda([(usize, u32); nm::CUDA_WRITEBACK_FIELDS]),
 }
 
 impl Writeback {
@@ -226,6 +228,7 @@ impl Writeback {
             Self::Native(w) => nm::writeback_allocation_private(bytes, w),
             Self::D3d(fields) => nm::apply_fields(bytes, fields),
             Self::Nvgl(fields) => nm::apply_fields(bytes, fields),
+            Self::Cuda(fields) => nm::apply_fields(bytes, fields),
         }
     }
 }
@@ -966,6 +969,12 @@ pub fn create(
         // Vulkan records: the 610.88 KMD's NVGL field set, not CUDA's handles.
         match nm::nvgl_writeback(private_bytes) {
             Some(fields) => Writeback::Nvgl(fields),
+            None => Writeback::Native(writeback),
+        }
+    } else if nm::is_cuda_record(private_bytes) {
+        // CUDA records: the 610.88 KMD's field set (no RM handles in the record).
+        match nm::cuda_writeback(private_bytes) {
+            Some(fields) => Writeback::Cuda(fields),
             None => Writeback::Native(writeback),
         }
     } else {

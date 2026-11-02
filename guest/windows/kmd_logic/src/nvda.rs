@@ -17,6 +17,8 @@ pub const NVDA_MAX_BYTES: usize = 1024 * 1024;
 
 pub const NVDA_SIZE_AT: usize = 0x08;
 pub const NVDA_TAG_AT: usize = 0x0c;
+/// The tag (`**VN`) of CUDA's and NVAPI's escapes and of CUDA allocation records.
+pub const NVDA_TAG_NV: u32 = 0x4e56_2a2a;
 pub const NVDA_FUNCTION_AT: usize = 0x10;
 pub const NVDA_RESULT_AT: usize = 0x14;
 pub const NVDA_RESULT2_AT: usize = 0x2c;
