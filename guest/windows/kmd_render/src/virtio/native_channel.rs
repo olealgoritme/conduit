@@ -611,6 +611,10 @@ pub(crate) struct NativeQueue {
     ring_offset: u64,
     gp_put: SpinLock<u32>,
     progress_fence_cpu: u64,
+    /// Our own locked, non-paged view of the progress fence (see
+    /// `lock_fence_view`) and its MDL; 0 when locking failed.
+    fence_view: u64,
+    fence_mdl: usize,
     _progress_fence_gpu: u64,
 }
 
@@ -628,6 +632,7 @@ impl NativeQueue {
     ) -> Result<Self, NativeError> {
         nc::validate_queue_flags(queue_flags)?;
         nc::validate_progress_fence(progress_cpu, progress_gpu)?;
+
         if backing.memory == 0 || backing.mapped_bytes < u64::from(queue.ring_bytes) {
             return Err(NativeError::UnbackedRing);
         }
@@ -662,6 +667,9 @@ impl NativeQueue {
         );
         restore_process(process, native);
         result?;
+        // Last, so no early return can leave the page locked.
+        let (fence_view, fence_mdl) = lock_fence_view(progress_cpu);
+        crate::diag::record_named_bytes(b"NvQFenceLock", u32::from(fence_view != 0));
         Ok(Self {
             adapter: context.adapter,
             context: context as *const NativeContext as *mut NativeContext,
@@ -672,6 +680,8 @@ impl NativeQueue {
             ring_offset: backing.offset,
             gp_put: SpinLock::new(0),
             progress_fence_cpu: progress_cpu,
+            fence_view,
+            fence_mdl,
             _progress_fence_gpu: progress_gpu,
         })
     }
@@ -680,13 +690,14 @@ impl NativeQueue {
     /// dxgkrnl supplied at CreateHwQueue (`HwQueueProgressFenceCPUVirtualAddress`,
     /// documented as a kernel-mode VA). Any IRQL; one volatile 64-bit load.
     pub(crate) fn read_progress(&self) -> u64 {
-        if self.progress_fence_cpu == 0 || self.progress_fence_cpu % 8 != 0 {
+        // Only our locked view: the poll runs at DISPATCH, and dxgkrnl's own view
+        // was found unmapped there (bugcheck 0xD1 in hws_poll_timer_callback
+        // after a D3D11 device hang).
+        if self.fence_view == 0 || self.fence_view % 8 != 0 {
             return 0;
         }
-        // SAFETY: nonzero (validated at creation) and 8-aligned (checked above),
-        // and live until DestroyHwQueue returns; the poll unregisters a queue
-        // before destroying it.
-        unsafe { (self.progress_fence_cpu as *const u64).read_volatile() }
+        // SAFETY: our MDL keeps the page locked and mapped until Drop.
+        unsafe { (self.fence_view as *const u64).read_volatile() }
     }
 
     pub(crate) fn token(&self) -> Token {
@@ -1122,6 +1133,37 @@ fn grce_engine(io: Io<'_>, client: &NativeClient) -> Option<u32> {
         }
     }
     None
+}
+
+extern "C" {
+    fn helios_lock_system_read_seh(va: *mut c_void, length: u32, mapped: *mut *mut c_void) -> *mut c_void;
+    fn helios_unlock_system_buffer(mdl: *mut c_void);
+}
+
+/// Lock the 8-byte progress fence behind dxgkrnl's CPU view and map it once in
+/// our own non-paged view. PASSIVE (CreateHwQueue). (0, 0) on failure.
+fn lock_fence_view(cpu_va: u64) -> (u64, usize) {
+    if cpu_va == 0 || cpu_va % 8 != 0 {
+        return (0, 0);
+    }
+    let mut mapped: *mut c_void = core::ptr::null_mut();
+    // SAFETY: the shim catches the probe's raise; 8 bytes never cross a page.
+    let mdl = unsafe { helios_lock_system_read_seh(cpu_va as *mut c_void, 8, &mut mapped) };
+    if mdl.is_null() || mapped.is_null() {
+        return (0, 0);
+    }
+    (mapped as u64, mdl as usize)
+}
+
+impl Drop for NativeQueue {
+    fn drop(&mut self) {
+        if self.fence_mdl != 0 {
+            // SAFETY: the MDL from lock_fence_view, released once.
+            unsafe { helios_unlock_system_buffer(self.fence_mdl as *mut c_void) };
+            self.fence_mdl = 0;
+            self.fence_view = 0;
+        }
+    }
 }
 
 fn rm_error_code(error: rc::RmError) -> u32 {

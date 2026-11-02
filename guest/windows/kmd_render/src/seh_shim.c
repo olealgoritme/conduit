@@ -145,6 +145,51 @@ helios_lock_user_pages_seh(PVOID VirtualAddress, ULONG Length)
     return mdl;
 }
 
+/*
+ * helios_lock_system_buffer_seh for a READ-ONLY kernel view (IoReadAccess=0):
+ * dxgkrnl's HW-queue progress-fence CPU view, which the DISPATCH-level progress
+ * poll reads. Locking it keeps the page resident and mapped until the queue is
+ * destroyed, whatever dxgkrnl does with its own view meanwhile.
+ */
+PMDL
+helios_lock_system_read_seh(
+    PVOID VirtualAddress,
+    ULONG Length,
+    PVOID *MappedSystemAddress)
+{
+    PMDL mdl;
+    PVOID mapping;
+
+    if (!VirtualAddress || !Length || !MappedSystemAddress)
+        return (PMDL)0;
+    *MappedSystemAddress = (PVOID)0;
+
+    mdl = IoAllocateMdl(VirtualAddress, Length,
+                        /*SecondaryBuffer*/ 0, /*ChargeQuota*/ 0, (PVOID)0);
+    if (!mdl)
+        return (PMDL)0;
+
+    __try {
+        MmProbeAndLockPages(mdl, /*KernelMode*/ 0, /*IoReadAccess*/ 0);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        IoFreeMdl(mdl);
+        return (PMDL)0;
+    }
+
+    mapping = MmMapLockedPagesSpecifyCache(
+        mdl, /*KernelMode*/ 0, /*MmCached*/ 1, (PVOID)0,
+        /*BugCheckOnFailure*/ 0,
+        /*NormalPagePriority | MdlMappingNoExecute*/ 0x40000010UL);
+    if (!mapping) {
+        MmUnlockPages(mdl);
+        IoFreeMdl(mdl);
+        return (PMDL)0;
+    }
+
+    *MappedSystemAddress = mapping;
+    return mdl;
+}
+
 void
 helios_unlock_system_buffer(PMDL Mdl)
 {
