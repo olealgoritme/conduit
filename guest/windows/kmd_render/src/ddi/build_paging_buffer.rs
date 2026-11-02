@@ -2301,6 +2301,9 @@ unsafe fn native_paging_operation(
 }
 
 static NATIVE_REFUSED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static LEAF_IN_SYSTEM: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static LEAF_IN_APERTURE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static LEAF_IN_SEGMENT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 /// A native paging operation that could not run. BuildPagingBuffer may only answer success
 /// or a retry status: anything else is bugcheck 0x10E (VIDEO_MEMORY_MANAGEMENT_INTERNAL, 0xB).
@@ -2393,6 +2396,22 @@ unsafe fn native_update_leaf(
         let segment = bits.Segment() as u32;
         if segment != allocation.native_segment {
             crate::diag::record_named_bytes(b"NvPgLeafSeg", segment);
+        }
+        if index == 0 {
+            // Where VidMm placed native allocations, per leaf update: system
+            // pages (segment 0), the aperture, or the allocation's own segment.
+            let counter = match segment {
+                0 => &LEAF_IN_SYSTEM,
+                crate::ddi::gpummu::APERTURE_SEGMENT_ID => &LEAF_IN_APERTURE,
+                _ => &LEAF_IN_SEGMENT,
+            };
+            let n = counter.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+            let name: &[u8] = match segment {
+                0 => b"NvPgLeafInSys",
+                crate::ddi::gpummu::APERTURE_SEGMENT_ID => b"NvPgLeafInApt",
+                _ => b"NvPgLeafInSeg",
+            };
+            crate::diag::record_named_bytes(name, n);
         }
         if !native_segment_matches(allocation, segment)
             && segment != 0
