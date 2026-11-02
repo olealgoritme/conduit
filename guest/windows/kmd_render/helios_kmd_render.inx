@@ -123,6 +123,11 @@ AddReg         = Helios_NVIDIA_Service_AddReg
 [Helios_NVIDIA_Service_AddReg]
 HKR,Parameters,SingleDeviceInstall,%REG_DWORD%,1
 HKR,Parameters,NvUmd,%REG_DWORD%,2
+; The NVIDIA Windows driver version whose user-mode drivers this KMD speaks.
+; Set-HeliosUmd.ps1 -Nvidia stages only an NVIDIA package of this version (a
+; NvUmdVersion value in the service key itself overrides it); the KMD publishes
+; the host RM's version beside it as NvHostRmVersion.
+HKR,Parameters,NvUmdVersion,%REG_SZ%,"610.88"
 
 [Helios_NVIDIA_DeviceSettings]
 HKR,, UserModeDriverName,       %REG_MULTI_SZ%, %13%\nvldumdx.dll,%13%\nvldumdx.dll,%13%\nvldumdx.dll,%13%\nvldumdx.dll

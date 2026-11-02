@@ -91,6 +91,13 @@ if ($classKey -and (Test-Path -LiteralPath $classKey)) {
     Restore-HeliosRegistrySnapshot $classKey "OpenGLFlagsWow" $state.previousOpenGL.OpenGLFlagsWow
 }
 
+# NVIDIA's own user-mode drivers (Set-HeliosUmd.ps1 -Nvidia): the System32
+# files, the nvlddmkm alias's image path and the registry values go back to
+# what they were; the staged files go with the driver package below.
+try { Disable-HeliosNvidiaUmd -ForUninstall } catch {
+    Write-Warning "NVIDIA user-mode driver cleanup did not complete: $($_.Exception.Message)"
+}
+
 # If a VM configuration change moved the adapter after installation, remove a
 # Helios registration from the current instance as well. Do not touch values
 # that no longer point at this package's WGL ICD.
