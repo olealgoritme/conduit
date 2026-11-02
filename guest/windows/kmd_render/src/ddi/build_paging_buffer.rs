@@ -2462,6 +2462,7 @@ unsafe fn native_update_leaf(
     let device_local = allocation.native_segment != 0;
     let mut system_pfns = Vec::new();
     let mut any_other = false;
+    let mut segment_noted = false;
     for index in 0..count {
         let pte_index = if repeat { 0 } else { index };
         // SAFETY: Repeat selects one entry; otherwise DXGK supplies Num entries.
@@ -2492,7 +2493,10 @@ unsafe fn native_update_leaf(
         // allocations): the PTE then names system memory (segment 0) or the
         // aperture. Refusing that failed every NVIDIA D3D11 page-in.
         let segment = bits.Segment() as u32;
-        if segment != allocation.native_segment {
+        if segment != allocation.native_segment && !segment_noted {
+            // Once per update: a diag write per PTE cost up to 512 deferred
+            // registry writes for one system-page leaf update.
+            segment_noted = true;
             crate::diag::record_named_bytes(b"NvPgLeafSeg", segment);
         }
         if index == 0 {
