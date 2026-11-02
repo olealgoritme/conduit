@@ -70,6 +70,11 @@ Assert-True ($rtxUmd -and $rtxUmd.Data[0] -eq "C:\DS\nvldumdx.dll") "the INF's R
 Assert-True ($heliosUmd -and $heliosUmd.Data[0] -eq "<>" -and $heliosUmd.Data[1] -eq "C:\DS\helios_umd.dll") "the INF's Helios section does not register helios_umd.dll"
 $pin = Get-HeliosInfHkrValues $inx @("Helios_NVIDIA_Service_AddReg") "" | Where-Object { $_.Subkey -eq "Parameters" -and $_.Name -eq "NvUmdVersion" }
 Assert-True ($pin -and (ConvertTo-HeliosNvidiaVersion $pin.Data[0])) "the INF does not set Parameters\NvUmdVersion"
+# The KMD reads it as REG_SZ in NVIDIA's short form (umd_version.rs): no
+# AddReg type bits (FLG_ADDREG_TYPE_SZ is 0) and a three-digit major with two
+# digits of minor.
+Assert-True (($pin.Flags -band 0x00FF0001) -eq 0) "the INF does not write Parameters\NvUmdVersion as REG_SZ"
+Assert-True ($pin.Data[0] -match '^\d{3}\.\d{2}$') "the INF's NvUmdVersion '$($pin.Data[0])' is not NVIDIA's short form"
 
 $scratch = Join-Path ([IO.Path]::GetTempPath()) ("conduit-packaging-{0}" -f [Guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Path $scratch | Out-Null

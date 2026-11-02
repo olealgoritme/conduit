@@ -126,13 +126,18 @@ None of this can be switched off from the command line.
   `Environment=CONDUIT_RM_POLICY=enforce` next to `CONDUIT_NVIDIA_UMD=1` in
   the `conduit-backend@NAME.service` drop-in and restart the VM.
 - **NVIDIA UMD release (`CONDUIT_NVIDIA_UMD=1`).** NVIDIA's UMDs speak the RM
-  ABI of their own release. The guest KMD reports the release the installer
-  staged at every adapter start, and the backend accepts only the release
-  paired with the host driver (`host/backend/device/src/nvidia/umd_version.rs`;
+  ABI of their own release. The guest's REG_SZ `NvUmdVersion` (written by the
+  Helios INF under the service key's `Parameters`, `610.88`; a value in the
+  service key itself overrides it) names that release: the installer stages
+  only an NVIDIA package of it, and the guest KMD reports it at every adapter
+  start. The backend accepts only the release paired with the host driver
+  (`host/backend/device/src/nvidia/umd_version.rs`;
   `CONDUIT_NVIDIA_UMD_VERSION=610.88` pins one, `any` turns the check off).
   On a mismatch the host logs one error naming both releases, the guest's
   adapter fails to start (Code 43, `NvUmdChk` = 1 in the KMD's diagnostics)
-  and every RM call from that guest is refused.
+  and every RM call from that guest is refused. A guest without the value,
+  or with one that is not a release, reports nothing and the backend has
+  nothing to compare (`NvUmdChk` = 0xff or 0xfe).
 
 The backend counts refusals and logs the totals when the VM exits
 (`conduit logs NAME`).

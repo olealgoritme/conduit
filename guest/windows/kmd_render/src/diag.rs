@@ -1281,9 +1281,12 @@ pub mod knobs {
     /// 2 = forward NVDA RM controls through the KMD-owned RM client. Read once per
     /// transport generation; the NVIDIA PCI personality's INF install selects 2.
     pub const NVIDIA_UMD: KnobName = KnobName::new(b"NvUmd");
-    /// `NvUmdVersion` (Parameters key, default 0 = not recorded): the NVIDIA UMD
-    /// release the installer staged, `61088` for 610.88. Reported to the host at
-    /// every StartDevice of the NVIDIA personality (`virtio::nvda::check_umd_release`).
+    /// `NvUmdVersion` (REG_SZ, absent = not checked): the NVIDIA UMD release this
+    /// KMD speaks, `610.88`. The INF writes it under `Parameters`; the same value in
+    /// the service key itself overrides it. The installer stages only an NVIDIA
+    /// package of this release, and every StartDevice of the NVIDIA personality
+    /// reports it to the host (`virtio::nvda::check_umd_release`,
+    /// `helios_kmd_logic::umd_version`). Read with [`super::read_config_sz`].
     pub const NVIDIA_UMD_VERSION: KnobName = KnobName::new(b"NvUmdVersion");
     /// `KmdRmSysCache` (default 0). With `KmdRmClient` = 5: what the RM system-memory
     /// primary is made of (read at the service's bring-up; `docs/kmd-rm-client.md` 15.5).
@@ -1860,6 +1863,99 @@ fn read_service_dword(path: *const u16, name: KnobName, default: u32) -> u32 {
         );
     }
     value
+}
+
+/// `RTL_QUERY_REGISTRY_NOEXPAND`: hand REG_EXPAND_SZ / REG_MULTI_SZ data to the
+/// query routine as stored, in one call and with its own type.
+const RTL_QUERY_REGISTRY_NOEXPAND: u32 = 0x10;
+
+/// What [`query_value`] fills in: the caller's decoder and its result.
+struct ValueQuery<T> {
+    decode: fn(u32, &[u8]) -> T,
+    out: T,
+}
+
+/// `RTL_QUERY_REGISTRY_ROUTINE` for [`read_config_sz`]: hands the value's own
+/// type and data to the decoder, so nothing of another type is ever written
+/// through a pointer meant for this one (unlike `RTL_QUERY_REGISTRY_DIRECT`).
+unsafe extern "C" fn query_value<T>(
+    _name: wdk_sys::PWSTR,
+    value_type: wdk_sys::ULONG,
+    data: wdk_sys::PVOID,
+    length: wdk_sys::ULONG,
+    _context: wdk_sys::PVOID,
+    entry: wdk_sys::PVOID,
+) -> wdk_sys::NTSTATUS {
+    // SAFETY: `entry` is the EntryContext `read_service_sz` passed: its own
+    // `ValueQuery<T>`, live and not otherwise borrowed for the whole call.
+    let query = unsafe { &mut *entry.cast::<ValueQuery<T>>() };
+    let bytes: &[u8] = if data.is_null() || length == 0 {
+        &[]
+    } else {
+        // SAFETY: RtlQueryRegistryValues passes `length` readable bytes at `data`,
+        // valid until the routine returns; the slice does not outlive it.
+        unsafe { core::slice::from_raw_parts(data.cast::<u8>().cast_const(), length as usize) }
+    };
+    query.out = (query.decode)(value_type, bytes);
+    wdk_sys::STATUS_SUCCESS
+}
+
+/// Read a REG_SZ service-key value through `decode(type, data)`; `absent` when
+/// the value (or the key) does not exist. `decode` sees the value's actual type
+/// and raw data, so it refuses a value of another type itself. PASSIVE_LEVEL only.
+pub fn read_config_sz<T: Copy>(name: KnobName, absent: T, decode: fn(u32, &[u8]) -> T) -> T {
+    read_service_sz(SERVICE_NAME.as_ptr(), name, absent, decode)
+}
+
+/// [`read_config_sz`] for a value under the service's `Parameters` subkey.
+pub fn read_parameters_sz<T: Copy>(name: KnobName, absent: T, decode: fn(u32, &[u8]) -> T) -> T {
+    read_service_sz(SERVICE_PARAMETERS.as_ptr(), name, absent, decode)
+}
+
+fn read_service_sz<T: Copy>(
+    path: *const u16,
+    name: KnobName,
+    absent: T,
+    decode: fn(u32, &[u8]) -> T,
+) -> T {
+    let name = name.0;
+    hot::note_bytes(name);
+    let mut name_buf = [0u16; 16];
+    let n = name.len().min(MAX_CONFIG_NAME);
+    let mut i = 0;
+    while i < n {
+        name_buf[i] = name[i] as u16;
+        i += 1;
+    }
+    name_buf[n] = 0;
+
+    let mut query = ValueQuery {
+        decode,
+        out: absent,
+    };
+    // SAFETY: zeroed RTL_QUERY_REGISTRY_TABLE entries are valid; the second,
+    // all-zero entry terminates the table (Name == NULL, QueryRoutine == NULL).
+    let mut table: [wdk_sys::RTL_QUERY_REGISTRY_TABLE; 2] = unsafe { core::mem::zeroed() };
+    table[0].QueryRoutine = Some(query_value::<T>);
+    table[0].Flags = RTL_QUERY_REGISTRY_NOEXPAND;
+    table[0].Name = name_buf.as_ptr() as *mut u16;
+    table[0].EntryContext = (&mut query as *mut ValueQuery<T>).cast();
+    // DefaultType stays REG_NONE: an absent value calls no routine and leaves
+    // `query.out` at `absent`; a missing key fails the call the same way.
+    // SAFETY: PASSIVE_LEVEL; Path is the NUL-terminated service subkey relative
+    // to RTL_REGISTRY_SERVICES; the table is NUL-entry-terminated; EntryContext
+    // points at `query`, live for the duration of the call, which is all the
+    // routine uses it for.
+    unsafe {
+        let _ = wdk_sys::ntddk::RtlQueryRegistryValues(
+            RTL_REGISTRY_SERVICES,
+            path,
+            table.as_mut_ptr(),
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+        );
+    }
+    query.out
 }
 
 /// Append one DWORD breadcrumb. Cheap and lossy by design (best-effort tracing).

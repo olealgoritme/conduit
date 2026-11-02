@@ -444,6 +444,10 @@ function Protect-ConduitDataDirectory([string]$Dir = (Join-Path $env:ProgramData
 #   Parameters\NvUmdVersion  REG_SZ, written by the Helios INF: the NVIDIA
 #                            Windows driver version the KMD speaks (e.g. 610.88).
 #   NvUmdVersion             REG_SZ, optional: overrides the INF's value.
+#   The KMD reads the same value (override first) and reports it to the host
+#   at every start of the NVIDIA personality; the host refuses a release its
+#   RM is not (docs/SECURITY.md). Staging writes no version of its own: a
+#   package is staged only when it is this release.
 #   NvHostRmVersion          REG_SZ, written by the KMD: the host RM's version
 #                            string (e.g. 610.57.04), once per transport start.
 # The package's version must equal NvUmdVersion, and its branch (the number
