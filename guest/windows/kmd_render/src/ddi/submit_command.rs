@@ -978,6 +978,22 @@ pub(crate) unsafe fn signal_monitored_fence(dxgkrnl: &DXGKRNL_INTERFACE, node: u
     unsafe { notify_at_dirql(dxgkrnl, &mut interrupt) }
 }
 
+/// `DXGK_INTERRUPT_GPU_ENGINE_TIMEOUT` for `node` (engine 0), see
+/// [`notify_at_dirql`]: under hardware scheduling this is how the KMD asks dxgkrnl
+/// to reset an engine, which it answers with `DxgkDdiResetHwEngine`. Used by the
+/// NVIDIA personality for faulted or hung native channels (`ddi::hws`). Callable
+/// at <= DIRQL.
+pub(crate) unsafe fn signal_gpu_engine_timeout(dxgkrnl: &DXGKRNL_INTERFACE, node: u32) -> NTSTATUS {
+    let mut interrupt = unsafe { core::mem::zeroed::<DXGKARGCB_NOTIFY_INTERRUPT_DATA>() };
+    interrupt.InterruptType = _DXGK_INTERRUPT_TYPE::DXGK_INTERRUPT_GPU_ENGINE_TIMEOUT;
+    // SAFETY: GpuEngineTimeout is the arm for this interrupt type.
+    let timeout = unsafe { interrupt.__bindgen_anon_1.GpuEngineTimeout.as_mut() };
+    timeout.NodeOrdinal = node;
+    timeout.EngineOrdinal = 0;
+    // SAFETY: fully-initialized packet, live for the call.
+    unsafe { notify_at_dirql(dxgkrnl, &mut interrupt) }
+}
+
 /// Synthesize a `DXGK_INTERRUPT_CRTC_VSYNC` for the display half's single target
 /// (viogpu3d FlipThread analog, `viogpu_vidpn.cpp:1977-1983`). `physical_address`
 /// is the primary currently bound via `SetVidPnSourceAddress` (0 before the first
@@ -1921,6 +1937,9 @@ pub unsafe extern "C" fn dxgkddi_reset_from_timeout(h_adapter: *mut c_void) -> N
     // discarding that same scheduler epoch.  Dxgkrnl owns the post-reset fence
     // state; no completion from the abandoned epoch may escape concurrently.
     let _ = abandon_pending_submissions(adapter, AbandonOutcome::Silent, None);
+    // NVIDIA personality: every native channel goes with the adapter's devices; their
+    // progress fences are completed so nothing waits on them (none otherwise).
+    let _ = crate::ddi::hws::recover_native(adapter, crate::ddi::hws::Recover::All);
     adapter.with_wddm_notify_lock(|guard| {
         let _ = guard.with_virtio(|order, v| v.purge_all_present_streams_ordered(order));
     });

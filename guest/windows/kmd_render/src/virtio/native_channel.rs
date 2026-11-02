@@ -55,6 +55,9 @@ pub(crate) enum NativeError {
     Transport,
     Rm,
     UnbackedRing,
+    /// The queue was recovered from a fault or hang (`ddi::hws::recover_native`):
+    /// nothing reaches its channel any more.
+    Dead,
 }
 
 impl From<nc::PrivateError> for NativeError {
@@ -453,9 +456,62 @@ pub(crate) struct NativeContext {
     /// TSG scheduling is shared by every queue of the context and uses the
     /// 610.57.04-allow-listed NVA06C control, not the unlisted channel control.
     scheduled: AtomicU32,
+    /// dxgkrnl's own handle for this context (`DXGKARG_CREATECONTEXT.hContext` on
+    /// input), which `DxgkCbInvalidateHwContext` names; 0 = unknown.
+    dxg_context: usize,
 }
 
 impl NativeContext {
+    pub(crate) fn set_dxg_context(&mut self, handle: usize) {
+        self.dxg_context = handle;
+    }
+
+    pub(crate) fn dxg_context(&self) -> usize {
+        self.dxg_context
+    }
+
+    /// Take the context's TSG off the runlist (`NVA06C_CTRL_CMD_GPFIFO_SCHEDULE`
+    /// false): RM preempts it and runs nothing of it again. Recovery of a faulted or
+    /// hung context; idempotent (a context never scheduled, or already taken off,
+    /// sends nothing). PASSIVE.
+    pub(crate) fn unschedule(&self, passive: PassiveLevel) -> Result<(), NativeError> {
+        if self.scheduled.swap(0, Ordering::AcqRel) == 0 {
+            return Ok(());
+        }
+        let tsg = self.tsg;
+        self.with_client(passive, |io, client| {
+            let mut params = cc::schedule_params(false);
+            io.control(client, tsg, cc::CTRL_GPFIFO_SCHEDULE, &mut params)
+        })
+    }
+
+    /// Run `f` with this context's RM client, if its transport generation is live.
+    fn with_client(
+        &self,
+        passive: PassiveLevel,
+        f: impl FnOnce(Io<'_>, &NativeClient) -> Result<(), NativeError>,
+    ) -> Result<(), NativeError> {
+        let Some(adapter) = (unsafe { self.adapter.as_ref() }) else {
+            return Err(NativeError::Transport);
+        };
+        let Some(process) = (unsafe { self.process.as_mut() }) else {
+            return Err(NativeError::Transport);
+        };
+        let native = take_process(process)?;
+        if native.epoch != self.epoch {
+            restore_process(process, native);
+            return Err(NativeError::Transport);
+        }
+        let io = Io {
+            passive,
+            adapter,
+            epoch: native.epoch,
+        };
+        let result = f(io, &native.client);
+        restore_process(process, native);
+        result
+    }
+
     pub(crate) fn owner(&self) -> DeviceOwner {
         self.owner
     }
@@ -513,6 +569,7 @@ impl NativeContext {
             tsg,
             ctxshare,
             scheduled: AtomicU32::new(0),
+            dxg_context: 0,
         })
     }
 
@@ -641,6 +698,8 @@ pub(crate) struct NativeQueue {
     copy_bound: core::sync::atomic::AtomicBool,
     copy_tries: AtomicU32,
     _progress_fence_gpu: u64,
+    /// Recovered (`mark_dead`): submissions no longer reach the channel.
+    dead: core::sync::atomic::AtomicBool,
 }
 
 impl NativeQueue {
@@ -715,6 +774,7 @@ impl NativeQueue {
             copy_bound: core::sync::atomic::AtomicBool::new(false),
             copy_tries: AtomicU32::new(0),
             _progress_fence_gpu: progress_gpu,
+            dead: core::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -730,6 +790,82 @@ impl NativeQueue {
         }
         // SAFETY: our MDL keeps the page locked and mapped until Drop.
         unsafe { (self.fence_view as *const u64).read_volatile() }
+    }
+
+    /// The channel's error notifier, if RM put the channel in error. Any IRQL: two
+    /// volatile loads from the queue's control view.
+    pub(crate) fn channel_error(&self) -> Option<helios_kmd_logic::native_hang::ChannelError> {
+        use helios_kmd_logic::native_hang as nh;
+        let ctl = self.parts.ctl.va;
+        if ctl == 0 {
+            return None;
+        }
+        // SAFETY: the queue's live control view (CTL_BYTES, non-paged); the
+        // notifier's words are 4-byte aligned inside its first page.
+        let (info32, word) = unsafe {
+            (
+                ((ctl + nh::ERROR_INFO32_AT) as *const u32).read_volatile(),
+                ((ctl + nh::ERROR_WORD_AT) as *const u32).read_volatile(),
+            )
+        };
+        nh::channel_error(info32, word)
+    }
+
+    /// USERD GP_GET: how far the channel fetched its ring. Any IRQL; 0 unmapped.
+    pub(crate) fn gp_get(&self) -> u32 {
+        let ctl = self.parts.ctl.va;
+        if ctl == 0 {
+            return 0;
+        }
+        // SAFETY: as in `channel_error`; USERD is at USERD_OFFSET of the view.
+        unsafe { ((ctl + cc::USERD_OFFSET + u64::from(cp::USERD_GP_GET)) as *const u32).read_volatile() }
+    }
+
+    /// Stop every later submission from reaching the channel. Once this returns no
+    /// submit is between its check and its doorbell write (both happen under the
+    /// GP_PUT lock). Any IRQL.
+    pub(crate) fn mark_dead(&self) {
+        self.dead.store(true, Ordering::Release);
+        drop(self.gp_put.lock());
+    }
+
+    /// Write `value` into the progress fence (never moving it backwards), through
+    /// the KMD's locked view: the completion of work a dead channel will never do.
+    /// `false` when there is no view. Any IRQL.
+    pub(crate) fn complete_progress(&self, value: u64) -> bool {
+        if self.fence_view == 0 || self.fence_view % 8 != 0 {
+            return false;
+        }
+        // SAFETY: our MDL keeps the page locked and mapped writable until Drop;
+        // the GPU writes the same 8 bytes only forward, as this does.
+        unsafe {
+            (*(self.fence_view as *const core::sync::atomic::AtomicU64))
+                .fetch_max(value, Ordering::AcqRel)
+        };
+        true
+    }
+
+    /// The context this queue belongs to (it outlives the queue).
+    pub(crate) fn context(&self) -> Option<&NativeContext> {
+        // SAFETY: WDDM destroys every queue before its context.
+        unsafe { self.context.as_ref() }
+    }
+
+    /// `NV906F_CTRL_CMD_RESET_CHANNEL` on this queue's channel, channel only (no
+    /// engine reset). Recovery of a faulted or hung context. PASSIVE.
+    pub(crate) fn reset_channel(&self, passive: PassiveLevel) -> Result<(), NativeError> {
+        use helios_kmd_logic::native_hang as nh;
+        let (Some(handles), true) = (self.parts.handles, self.parts.channel_allocated) else {
+            return Ok(());
+        };
+        let context = self.context().ok_or(NativeError::Invalid)?;
+        if context.epoch != self.epoch {
+            return Err(NativeError::Transport);
+        }
+        context.with_client(passive, |io, client| {
+            let mut params = nh::reset_channel_params();
+            io.control(client, handles.at(5), nh::CTRL_RESET_CHANNEL, &mut params)
+        })
     }
 
     /// Whether subchannel 4 still needs its SET_OBJECT (and attempts remain).
@@ -835,6 +971,9 @@ impl NativeQueue {
             return Err(NativeError::Transport);
         }
         let mut previous = self.gp_put.lock();
+        if self.dead.load(Ordering::Acquire) {
+            return Err(NativeError::Dead);
+        }
         let submit = nc::parse_submit_private(private, *previous, self.ring_bytes)
             .map_err(|_| NativeError::Invalid)?;
         let ctl = self.parts.ctl.va;
