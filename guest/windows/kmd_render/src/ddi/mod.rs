@@ -46,6 +46,7 @@ pub(crate) mod gpummu;
 pub(crate) mod hpd;
 pub(crate) mod hws;
 pub(crate) mod interrupt;
+pub(crate) mod mpo3;
 mod lifecycle;
 pub(crate) mod mode_list;
 pub(crate) mod mirror_thread;

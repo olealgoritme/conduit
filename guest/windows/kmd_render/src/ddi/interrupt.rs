@@ -530,17 +530,22 @@ pub unsafe extern "C" fn dxgkddi_control_interrupt(
 ) -> NTSTATUS {
     CONTROL_INT_COUNT.fetch_add(1, Ordering::Relaxed);
     let p = h_adapter as *const AdapterContext;
+    // With MPO3 registered (`ddi::mpo3`, NVIDIA personality) dxgkrnl enables the
+    // vsync by its MPO3 type; the same heartbeat serves both.
+    let vsync = interrupt_type == _DXGK_INTERRUPT_TYPE::DXGK_INTERRUPT_CRTC_VSYNC
+        || interrupt_type
+            == _DXGK_INTERRUPT_TYPE::DXGK_INTERRUPT_CRTC_VSYNC_WITH_MULTIPLANE_OVERLAY3;
     if !p.is_null()
-        && interrupt_type == _DXGK_INTERRUPT_TYPE::DXGK_INTERRUPT_CRTC_VSYNC
+        && vsync
         // SAFETY: dxgkrnl hands our AdapterContext; `display_half` is a plain bool
         // set once at StartDevice.
         && unsafe { (*p).display_half() }
     {
         // SAFETY: valid for the device lifetime.
         let adapter = unsafe { &*p };
-        adapter
-            .vsync_enabled
-            .store((enable != 0) as u32, Ordering::Release);
+        let on = enable != 0
+            || crate::ddi::mpo3::part(crate::ddi::mpo3::PART_VSYNC_ALWAYS);
+        adapter.vsync_enabled.store(on as u32, Ordering::Release);
         // `VsCiT`, `VsCiSt`: atomics only (DIRQL).
         crate::ddi::stall_diag::note_control_vsync(enable != 0);
         return STATUS_SUCCESS;

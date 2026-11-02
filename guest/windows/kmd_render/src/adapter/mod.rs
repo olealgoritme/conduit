@@ -1802,6 +1802,7 @@ impl AdapterContext {
         }
         self.last_primary_address
             .store(primary.address, Ordering::Release);
+        crate::ddi::mpo3::note_published();
         // `FlipPub` / `FlipPubT` (`ddi::stall_diag`): every publication, bound or kept, any
         // class. Atomics only, as this is reached from DIRQL and DISPATCH too.
         crate::ddi::stall_diag::note_published(primary.address);

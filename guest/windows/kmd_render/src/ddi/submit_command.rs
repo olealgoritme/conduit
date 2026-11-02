@@ -988,6 +988,9 @@ pub(crate) unsafe fn signal_crtc_vsync(
     physical_address: i64,
     target_id: u32,
 ) -> NTSTATUS {
+    if crate::ddi::mpo3::active() {
+        return unsafe { signal_crtc_vsync_mpo3(dxgkrnl, target_id) };
+    }
     let mut interrupt = unsafe { core::mem::zeroed::<DXGKARGCB_NOTIFY_INTERRUPT_DATA>() };
     interrupt.InterruptType = _DXGK_INTERRUPT_TYPE::DXGK_INTERRUPT_CRTC_VSYNC;
     // SAFETY: CrtcVsync is the correct union arm for DXGK_INTERRUPT_CRTC_VSYNC.
@@ -995,6 +998,30 @@ pub(crate) unsafe fn signal_crtc_vsync(
     vsync.VidPnTargetId = target_id;
     vsync.PhysicalAddress.QuadPart = physical_address;
     // SAFETY: fully-initialized packet, live for the call.
+    unsafe { notify_at_dirql(dxgkrnl, &mut interrupt) }
+}
+
+/// The MPO3 form of the vsync (`ddi::mpo3`), as NVIDIA's KMD reports it: layer 0 is
+/// listed when a primary was published since the last report, otherwise the vsync
+/// carries no plane. Callable at <= DIRQL.
+unsafe fn signal_crtc_vsync_mpo3(dxgkrnl: &DXGKRNL_INTERFACE, target_id: u32) -> NTSTATUS {
+    let mut info = unsafe { core::mem::zeroed::<DXGK_MULTIPLANE_OVERLAY_VSYNC_INFO3>() };
+    info.LayerIndex = 0;
+    let flipped = crate::ddi::mpo3::take_completion();
+    let mut interrupt = unsafe { core::mem::zeroed::<DXGKARGCB_NOTIFY_INTERRUPT_DATA>() };
+    interrupt.InterruptType =
+        _DXGK_INTERRUPT_TYPE::DXGK_INTERRUPT_CRTC_VSYNC_WITH_MULTIPLANE_OVERLAY3;
+    // SAFETY: the arm for DXGK_INTERRUPT_CRTC_VSYNC_WITH_MULTIPLANE_OVERLAY3.
+    let vsync = unsafe { interrupt.__bindgen_anon_1.CrtcVsyncWithMultiPlaneOverlay3.as_mut() };
+    vsync.VidPnTargetId = target_id;
+    vsync.MultiPlaneOverlayVsyncInfoCount = u32::from(flipped);
+    vsync.pMultiPlaneOverlayVsyncInfo = &mut info;
+    let mut frequency = unsafe { core::mem::zeroed::<wdk_sys::LARGE_INTEGER>() };
+    let counter = unsafe { wdk_sys::ntddk::KeQueryPerformanceCounter(&mut frequency) };
+    // SAFETY: LARGE_INTEGER is a plain i64 union.
+    vsync.GpuFrequency = unsafe { frequency.QuadPart } as u64;
+    vsync.GpuClockCounter = unsafe { counter.QuadPart } as u64;
+    // SAFETY: fully-initialized packet; `info` lives for the call.
     unsafe { notify_at_dirql(dxgkrnl, &mut interrupt) }
 }
 

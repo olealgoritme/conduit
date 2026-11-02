@@ -233,6 +233,27 @@ fn build_ddi_table() -> DRIVER_INITIALIZATION_DATA {
 
     if crate::ddi::wddm_surface::nvidia_selected() {
         register_nvidia_hws(&mut data);
+        // MPO3, as NVIDIA's KMD: at WDDM 3.2 DWM flips through it (`ddi::mpo3`).
+        if ddi::mpo3::select_at_driver_entry() & ddi::mpo3::PART_DDIS != 0 {
+            data.DxgkDdiGetMultiPlaneOverlayCaps = Some(ddi::mpo3::get_multi_plane_overlay_caps);
+            data.DxgkDdiGetPostCompositionCaps = Some(ddi::mpo3::get_post_composition_caps);
+            data.DxgkDdiCheckMultiPlaneOverlaySupport3 =
+                Some(ddi::mpo3::check_multi_plane_overlay_support3);
+            data.DxgkDdiSetVidPnSourceAddressWithMultiPlaneOverlay3 =
+                Some(ddi::mpo3::set_vidpn_source_address_with_multi_plane_overlay3);
+            if ddi::mpo3::part(ddi::mpo3::PART_LEGACY) {
+                data.DxgkDdiSetVidPnSourceAddressWithMultiPlaneOverlay =
+                    Some(ddi::mpo3::set_vidpn_source_address_with_multi_plane_overlay);
+                data.DxgkDdiSetVidPnSourceAddressWithMultiPlaneOverlay2 =
+                    Some(ddi::mpo3::set_vidpn_source_address_with_multi_plane_overlay2);
+                data.DxgkDdiCheckMultiPlaneOverlaySupport =
+                    Some(ddi::mpo3::check_multi_plane_overlay_support);
+                data.DxgkDdiCheckMultiPlaneOverlaySupport2 =
+                    Some(ddi::mpo3::check_multi_plane_overlay_support2);
+                data.DxgkDdiPostMultiPlaneOverlayPresent =
+                    Some(ddi::mpo3::post_multi_plane_overlay_present);
+            }
+        }
     }
 
     data

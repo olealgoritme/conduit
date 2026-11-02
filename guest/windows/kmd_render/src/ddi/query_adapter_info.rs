@@ -486,6 +486,24 @@ unsafe fn query_driver_caps(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTE
     )
     .clamp(1, FLIP_QUEUE_DEPTH_MAX);
     out.set(caps_offset!(MaxQueuedFlipOnVSync), max_queued_flip_on_vsync);
+    // The NVIDIA personality flips through MPO3 (`ddi::mpo3`): one plane, immediate
+    // flips allowed, the same queue depth.
+    {
+        use crate::ddi::mpo3::{part, PART_CAPS, PART_IMMEDIATE, PART_QUEUE};
+        if part(PART_CAPS) {
+            // dxgkrnl's adapter start refuses SupportMultiPlaneOverlay without at
+            // least one overlay plane ("doesn't report any overlay planes or panel
+            // fitter", 1..=8) and without SupportDirectFlip (set below).
+            out.set(caps_offset!(SupportMultiPlaneOverlay), 1 as BOOLEAN);
+            out.set(caps_offset!(MaxOverlayPlanes), 1 as UINT);
+        }
+        if part(PART_IMMEDIATE) {
+            out.set(caps_offset!(SupportMultiPlaneOverlayImmediateFlip), 1 as BOOLEAN);
+        }
+        if part(PART_QUEUE) {
+            out.set(caps_offset!(MaxQueuedMultiPlaneOverlayFlipVSync), max_queued_flip_on_vsync);
+        }
+    }
     // Same reason as `FlipCapV`: what was ADVERTISED, so a knob that read as its
     // default cannot be mistaken for a knob that had no effect.
     crate::diag::record_named_bytes(b"FlipQueV", max_queued_flip_on_vsync);
@@ -503,7 +521,14 @@ unsafe fn query_driver_caps(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTE
     // `CheckDirectFlipSupport` (knob `DirectFlipSupport`) is the third door. The value
     // lands in the 0x01D7 diag record bit 2. (The old denial here dated from when the
     // display was an IddCx capture and the KMD scanned out nothing; that premise is gone.)
-    let support_direct_flip: BOOLEAN = if knobs.direct_flip { 1 } else { 0 };
+    // MPO (`ddi::mpo3` caps) requires it: dxgkrnl fails the adapter start otherwise.
+    let support_direct_flip: BOOLEAN = if knobs.direct_flip
+        || crate::ddi::mpo3::part(crate::ddi::mpo3::PART_CAPS)
+    {
+        1
+    } else {
+        0
+    };
     out.set(caps_offset!(SupportDirectFlip), support_direct_flip);
     // `D3d12Node`: a second 3D node (ordinal 1) for the D3D12 UMD's contexts,
     // completed independently of node 0 (`virtio::gpu`, "WDDM nodes"). The count
