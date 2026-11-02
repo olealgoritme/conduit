@@ -641,6 +641,84 @@ pub fn memory_client(
 /// Serve one NVDA private buffer. The caller has already matched NVDA_MAGIC.
 /// `h_device` may be zero for NVAPI's adapter-scoped calls. CUDA's two
 /// context-scoped local replies validate both raw WDDM scopes in pure logic.
+/// The Vulkan ICD's wait poll (`0x01000021`), sent while it waits for GPU work.
+const WAIT_POLL_FUNCTION: u32 = 0x0100_0021;
+
+/// Test knobs `NvDumpVa` / `NvDumpVb` (a 4-KiB page number each, 0 = off): on
+/// the ICD's wait poll, the first 64 bytes the GPU sees at that VA of the
+/// caller's process (`native_memory::patch_gpu_bytes`: VidMm's system pages or
+/// the RM memory) as `NvDmpA0`..`NvDmpAf` / `NvDmpB0`..`NvDmpBf`, with
+/// `NvDmpASt` / `NvDmpBSt` = 1 read, 2 nothing native mapped there, 3 error,
+/// and `NvDmpN` the dumps taken. The first 8 polls and every 4096th after.
+fn dump_watched_vas(passive: PassiveLevel, adapter: &AdapterContext, h_device: usize) {
+    static PAGES: [AtomicU32; 2] = [AtomicU32::new(KNOB_UNREAD), AtomicU32::new(KNOB_UNREAD)];
+    static POLLS: AtomicU32 = AtomicU32::new(0);
+    static DUMPS: AtomicU32 = AtomicU32::new(0);
+    const KNOBS: [crate::diag::KnobName; 2] = [
+        crate::diag::KnobName::new(b"NvDumpVa"),
+        crate::diag::KnobName::new(b"NvDumpVb"),
+    ];
+    let mut pages = [0u32; 2];
+    for (i, page) in pages.iter_mut().enumerate() {
+        let mut value = PAGES[i].load(Ordering::Relaxed);
+        if value == KNOB_UNREAD {
+            value = crate::diag::read_config_dword(KNOBS[i], 0);
+            PAGES[i].store(value, Ordering::Relaxed);
+        }
+        *page = value;
+    }
+    if pages == [0, 0] {
+        return;
+    }
+    let n = POLLS.fetch_add(1, Ordering::Relaxed);
+    if n >= 8 && n % 4096 != 0 {
+        return;
+    }
+    // SAFETY: dxgkrnl's hDevice for this Escape, or null (then None).
+    let Some(process) = (unsafe {
+        crate::device::DeviceHandleRef::from_raw(h_device as crate::dxgk::HANDLE)
+    })
+    .map(|device| device.creator_process()) else {
+        return;
+    };
+    for (slot, page) in pages.iter().enumerate() {
+        if *page == 0 {
+            continue;
+        }
+        let letter = b'A' + slot as u8;
+        let mut words = [0u32; 16];
+        let read = super::native_memory::patch_gpu_bytes(
+            Some(passive),
+            adapter,
+            process,
+            u64::from(*page) << 12,
+            64,
+            |p| {
+                for (i, word) in words.iter_mut().enumerate() {
+                    // SAFETY: `p` is valid for the 64 bytes asked for.
+                    *word = unsafe { core::ptr::read_volatile((p as *const u32).add(i)) };
+                }
+            },
+        );
+        let status = match read {
+            Ok(true) => 1,
+            Ok(false) => 2,
+            Err(_) => 3,
+        };
+        for (i, word) in words.iter().enumerate() {
+            let mut name = *b"NvDmpA0";
+            name[5] = letter;
+            name[6] = b"0123456789abcdef"[i];
+            crate::diag::record_named_bytes(&name, *word);
+        }
+        let mut name = *b"NvDmpASt";
+        name[5] = letter;
+        crate::diag::record_named_bytes(&name, status);
+    }
+    let dumps = DUMPS.fetch_add(1, Ordering::Relaxed) + 1;
+    crate::diag::record_named_bytes(b"NvDmpN", dumps);
+}
+
 pub fn escape(
     passive: PassiveLevel,
     adapter: &AdapterContext,
@@ -657,6 +735,9 @@ pub fn escape(
     };
     ESCAPES.fetch_add(1, Ordering::Relaxed);
     LAST_FUNCTION.store(header.function, Ordering::Relaxed);
+    if header.function == WAIT_POLL_FUNCTION {
+        dump_watched_vas(passive, adapter, h_device);
+    }
     // Pure local replies never initialize the KMD RM client and never touch the
     // transport. This also returns shortened 0x30 replies directly, while the
     // backing buffer still has its original (larger) length.
