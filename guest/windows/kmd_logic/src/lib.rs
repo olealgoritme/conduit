@@ -31,6 +31,7 @@ pub mod native_channel;
 pub mod native_hang;
 pub mod native_memory;
 pub mod native_teardown;
+pub mod nv_copy;
 pub mod nvda;
 pub mod nvrm_clients;
 pub mod nvrm_events;

@@ -8654,7 +8654,7 @@ impl VirtioGpu {
             && stream_ready
             && execution.map_or(true, |wait| wait.completed())
             && blt_ready
-            && gdi_seq.map_or(true, crate::ddi::gdi_exec::seq_ready)
+            && gdi_seq.map_or(true, crate::ddi::nv_copy::gate_ready)
             // A held packet must not take the immediate-signal path: that is the
             // exact case the experiment measures (a packet with nothing real to
             // wait for), so the hold has to be able to reach it.
@@ -8941,7 +8941,7 @@ impl VirtioGpu {
             }
             // `GdiAccel`: the GDI executor has not run this packet's job yet. Not rebasable
             // (see `WddmPending::gdi_seq`); the executor's completion requests the DPC.
-            if !gdi_seq.map_or(true, crate::ddi::gdi_exec::seq_ready) {
+            if !gdi_seq.map_or(true, crate::ddi::nv_copy::gate_ready) {
                 return WddmTake::BlockedOnProducer;
             }
             // FOURTH ARM, AND DELIBERATELY LAST (`WddmHoldMs`, UV1). Placed after
