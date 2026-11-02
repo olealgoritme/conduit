@@ -2219,6 +2219,7 @@ unsafe fn native_paging_operation(
         // mirror its system pages into the process's RM VA space too.
         let native = unsafe { paging_alloc_info(adapter, update.hAllocation) }
             .is_some_and(|a| a.native_id != 0);
+        unsafe { watch_update(update, native) };
         if !native && crate::ddi::wddm_surface::nvidia_selected() {
             unsafe { foreign_leaf(adapter, update) };
         }
@@ -2392,6 +2393,31 @@ unsafe fn foreign_leaf(adapter: &AdapterContext, update: &DXGK_BUILDPAGINGBUFFER
     if n % 64 == 1 {
         crate::diag::record_named_bytes(b"NvFgnN", n);
     }
+}
+
+/// `native_memory::watch` op 1: an UpdatePageTable that covers a watched page.
+unsafe fn watch_update(update: &DXGK_BUILDPAGINGBUFFER_UPDATEPAGETABLE, native: bool) {
+    let count = u64::from(update.NumPageTableEntries);
+    let va = update.FirstPteVirtualAddress;
+    if !crate::virtio::native_memory::watch::covers(va, count * 4096) {
+        return;
+    }
+    let mut detail = u32::from(native) | (u32::from(update.PageTableLevel != 0) << 1);
+    if !update.pPageTableEntries.is_null() && count != 0 {
+        // SAFETY: DXGK supplies at least one entry when the count is nonzero.
+        let pte = unsafe { core::ptr::read_unaligned(update.pPageTableEntries) };
+        let bits = unsafe { pte.__bindgen_anon_1.__bindgen_anon_1 };
+        detail |= (u32::from(bits.Valid() != 0) << 2) | (u32::from(bits.Segment() == 0) << 3);
+    }
+    if unsafe { KeGetCurrentIrql() } != PASSIVE_LEVEL_IRQL {
+        detail |= 1 << 4;
+    }
+    if update.hProcess.is_null()
+        || unsafe { crate::device::ProcessContext::is_system_handle(update.hProcess as usize) }
+    {
+        detail |= 1 << 5;
+    }
+    crate::virtio::native_memory::watch::event(va, count * 4096, 1, detail, update.hProcess as usize);
 }
 
 static FOREIGN_LEAF: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);

@@ -40,6 +40,59 @@ const FIRST_DYNAMIC_HANDLE: u32 = 0x4e57_1000;
 const PIN_CHUNK_BYTES: u64 = u32::MAX as u64 & !(nm::PAGE_BYTES - 1);
 const LOCAL_4K_MAP_FLAGS: u32 = 1 << 8;
 
+
+/// VA watch (test knobs `NvWatch0`..`NvWatch3`: 4-KiB page numbers, 0 = off). Every
+/// page-table update, mapping, eviction and unmap that covers a watched page is
+/// logged in a 32-entry ring: `NvWa<k>` = the operation's first VA page, `NvWc<k>`
+/// = op << 24 | detail << 16 | process & 0xffff, `NvWN` = events so far. Ops:
+/// 1 UpdatePageTable seen (detail: bit0 native, bit1 level != 0, bit2 PTE 0 valid,
+/// bit3 PTE 0 system page, bit4 not PASSIVE, bit5 system process), 2/3 foreign
+/// map ok/failed, 4 foreign drop, 5/6 native vidmem map ok/failed, 7/8 system map
+/// ok/failed, 10 unmapped (also by an eviction; detail = the `Error` on failure).
+pub mod watch {
+    use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
+    static PAGES: [AtomicU64; 4] = [const { AtomicU64::new(u64::MAX) }; 4];
+    static READ: AtomicU32 = AtomicU32::new(0);
+    static EVENTS: AtomicU32 = AtomicU32::new(0);
+
+    fn pages() -> [u64; 4] {
+        if READ.load(Ordering::Acquire) == 0 {
+            let names: [&'static [u8]; 4] = [b"NvWatch0", b"NvWatch1", b"NvWatch2", b"NvWatch3"];
+            for (slot, name) in PAGES.iter().zip(names) {
+                let v = crate::diag::read_config_dword(crate::diag::KnobName::new(name), 0);
+                slot.store(if v == 0 { u64::MAX } else { u64::from(v) }, Ordering::Relaxed);
+            }
+            READ.store(1, Ordering::Release);
+        }
+        [0, 1, 2, 3].map(|i| PAGES[i].load(Ordering::Relaxed))
+    }
+
+    /// Whether [va, va + len) covers a watched page.
+    pub fn covers(va: u64, len: u64) -> bool {
+        let first = va >> 12;
+        let end = va.saturating_add(len.max(1)).saturating_add(0xfff) >> 12;
+        pages().iter().any(|&p| p != u64::MAX && p >= first && p < end)
+    }
+
+    pub fn event(va: u64, len: u64, op: u32, detail: u32, process: usize) {
+        if !covers(va, len) {
+            return;
+        }
+        let n = EVENTS.fetch_add(1, Ordering::Relaxed);
+        let k = (n % 32) as u8;
+        let mut a = *b"NvWa00";
+        a[4] = b'0' + k / 10;
+        a[5] = b'0' + k % 10;
+        crate::diag::record_named_bytes(&a, (va >> 12) as u32);
+        let mut c = *b"NvWc00";
+        c[4] = b'0' + k / 10;
+        c[5] = b'0' + k % 10;
+        crate::diag::record_named_bytes(&c, (op << 24) | ((detail & 0xff) << 16) | (process as u32 & 0xffff));
+        crate::diag::record_named_bytes(b"NvWN", n + 1);
+    }
+}
+
 static NEXT_ID: AtomicU32 = AtomicU32::new(1);
 /// Replacements whose RM idle-channels quiesce was refused (`update_leaf`).
 static QUIESCE_REFUSED: AtomicU32 = AtomicU32::new(0);
@@ -439,8 +492,18 @@ pub fn channel_client(
         let space = ensure_space(&io, process)?;
         return Ok((client, space));
     }
+    // First user: bring the client up, then give this process its OWN space like
+    // every later one. Answering the shared device space here bound the first
+    // process's channels (DWM's, at every boot) to a space its mappings never
+    // went to: ring fetch FAULT_PDE at 0x4000000.
     let client = super::nvda::memory_client(passive, adapter, process)?;
-    Ok((client, H_VASPACE))
+    let io = Io {
+        passive,
+        adapter,
+        client,
+    };
+    let space = ensure_space(&io, process)?;
+    Ok((client, space))
 }
 
 /// Return this process's real VA space, creating it on first use. VidMm's
@@ -555,6 +618,7 @@ fn is_window(virt: u32) -> bool {
 /// entire ring must be covered by one live native mapping at the exact VA.
 pub fn ring_backing(
     id: u32,
+    process: usize,
     gpfifo_va: u64,
     ring_bytes: u64,
 ) -> Result<super::native_channel::NativeRingBacking, Error> {
@@ -564,8 +628,11 @@ pub fn ring_backing(
     if ring_bytes == 0 || ring_bytes > allocation.size {
         return Err(Error::Invalid);
     }
+    // Only the queue's own process: every process has its own VA space and the
+    // same VA in another one (a shared ring, a stale piece) is another mapping.
     let Some(mapping) = allocation.mappings.iter().find(|mapping| {
-        mapping.piece.va <= gpfifo_va
+        mapping.process == process
+            && mapping.piece.va <= gpfifo_va
             && mapping
                 .piece
                 .end()
@@ -964,7 +1031,13 @@ fn map_fixed(
     if let Some(window) = window_of(space).filter(|_| piece.va >= LOW_WINDOW_BASE && end <= LOW_WINDOW_END) {
         return map_in_window(io, memory, window, flags, piece);
     }
-    let params = cc::virtual_params(io.client.root, space, Some(piece.va), piece.len);
+    // System pages map with 4-KiB PTEs at VidMm's 4-KiB-aligned VAs: their virtual
+    // object must be 4-KiB-paged, or RM aligns it down to the big page.
+    let params = if system_backed {
+        cc::virtual_params_4k(io.client.root, space, Some(piece.va), piece.len)
+    } else {
+        cc::virtual_params(io.client.root, space, Some(piece.va), piece.len)
+    };
     io.rm_alloc(nd::H_DEVICE, virt, cc::NV50_MEMORY_VIRTUAL, &params)
         .inspect_err(|_| {
             // The refused fixed VA (4-KiB page number) and length in pages.
@@ -1019,9 +1092,38 @@ fn map_fixed(
             &mut ignored,
         );
         let _ = io.rm_free(nd::H_DEVICE, virt);
+        note_wrong_address(piece.va, got);
         return Err(Error::WrongAddress);
     }
     Ok(virt)
+}
+
+/// `NvWrongVa` / `NvWrongGot`: the page numbers of the VA a fixed mapping asked for
+/// and the one RM answered when they differ; `NvWrongN` how often.
+fn note_wrong_address(want: u64, got: u64) {
+    let n = WRONG_ADDRESS.fetch_add(1, Ordering::Relaxed) + 1;
+    crate::diag::record_named_bytes(b"NvWrongN", n);
+    crate::diag::record_named_bytes(b"NvWrongVa", (want >> 12) as u32);
+    crate::diag::record_named_bytes(b"NvWrongGot", (got >> 12) as u32);
+}
+
+static WRONG_ADDRESS: AtomicU32 = AtomicU32::new(0);
+static FAILED_MAPS: AtomicU32 = AtomicU32::new(0);
+
+/// `NvFail<k>` (k = 0..7, a ring): the 4-KiB page number of the first VA of a leaf
+/// update that left its range unmapped, `NvFailE<k>` = why (low byte the
+/// `Error`, next byte the site: 1 native vidmem, 2 system pages, 3/4/5 foreign
+/// pages' eviction / OS descriptor / mapping).
+fn note_failed_map(va: u64, site: u32, error: Error) {
+    let n = FAILED_MAPS.fetch_add(1, Ordering::Relaxed);
+    let k = (n % 8) as u8;
+    let mut name = *b"NvFail0";
+    name[6] = b'0' + k;
+    crate::diag::record_named_bytes(&name, (va >> 12) as u32);
+    let mut why = *b"NvFailE0";
+    why[7] = b'0' + k;
+    crate::diag::record_named_bytes(&why, (site << 8) | error as u32);
+    crate::diag::record_named_bytes(b"NvFailN", n + 1);
 }
 
 /// `NVOS46_FLAGS_DMA_OFFSET_FIXED_TRUE`: for a virtual object, `dmaOffset` is
@@ -1073,12 +1175,14 @@ fn map_in_window(
             &[],
             &mut ignored,
         );
+        note_wrong_address(piece.va, got);
         return Err(Error::WrongAddress);
     }
     Ok(window)
 }
 
 fn unmap_fixed(io: &Io<'_>, memory: u32, mapping: HostMapping) -> Result<(), Error> {
+    watch::event(mapping.piece.va, mapping.piece.len, 10, 0, mapping.process);
     let memory = if mapping.desc != 0 { mapping.desc } else { memory };
     let block = nm::nvos47_unmap(
         io.client.root,
@@ -1346,8 +1450,13 @@ pub fn update_leaf_system(
         let delta = (index * chunk_pages) as u64 * nm::PAGE_BYTES;
         let va = first_va.checked_add(delta).ok_or(Error::Invalid)?;
         let offset = allocation_offset.checked_add(delta).ok_or(Error::Invalid)?;
+        let chunk_len = chunk.len() as u64 * nm::PAGE_BYTES;
         if let Err(error) = map_system_chunk(&io, id, process, space, va, offset, chunk, &why) {
+            note_failed_map(va, 2, error);
+            watch::event(va, chunk_len, 8, error as u32, process);
             first_error.get_or_insert(error);
+        } else {
+            watch::event(va, chunk_len, 7, 0, process);
         }
     }
     first_error.map_or(Ok(()), Err)
@@ -1431,6 +1540,15 @@ pub fn update_foreign_leaf(
     pages: u64,
     pfns: &[u64],
 ) -> Result<(), Error> {
+    // dxgkrnl maps a process's monitored-fence and progress-fence pages before
+    // the process makes any native allocation, often before anything brought
+    // the KMD's RM client up: bring it up here, or those pages were never
+    // mirrored (NvFgnFail with NotReady) and the GPU's fence writes faulted
+    // (Xid 31, CE FAULT_PTE writes at the fence VAs).
+    let up = STATE.lock().client.is_some();
+    if !up && !pfns.is_empty() {
+        super::nvda::memory_client(passive, adapter, process)?;
+    }
     let _guard = lock(passive)?;
     let client = STATE.lock().client()?;
     let io = Io {
@@ -1459,13 +1577,16 @@ pub fn update_foreign_leaf(
         let _ = unmap_fixed(&io, 0, mapping);
     }
     if pfns.is_empty() {
+        watch::event(first_va, len, 4, 0, process);
         return Ok(());
     }
     let space = ensure_space(&io, process)?;
     // Native allocations VidMm no longer shows here (see `update_leaf`).
-    evict_range(&io, space, process, first_va, len, None)?;
+    evict_range(&io, space, process, first_va, len, None)
+        .inspect_err(|e| note_failed_map(first_va, 3, *e))?;
     let desc = STATE.lock().mint()?;
-    alloc_system_descriptor(&io, desc, pfns, len)?;
+    alloc_system_descriptor(&io, desc, pfns, len)
+        .inspect_err(|e| note_failed_map(first_va, 4, *e))?;
     let virt = STATE.lock().mint()?;
     let piece = nm::MappingPiece {
         va: first_va,
@@ -1475,10 +1596,13 @@ pub fn update_foreign_leaf(
     let used = match map_fixed(&io, desc, len, true, space, virt, piece) {
         Ok(used) => used,
         Err(error) => {
+            note_failed_map(first_va, 5, error);
+            watch::event(first_va, len, 3, error as u32, process);
             let _ = io.rm_free(nd::H_DEVICE, desc);
             return Err(error);
         }
     };
+    watch::event(first_va, len, 2, 0, process);
     let mapping = HostMapping {
         process,
         piece,
@@ -1726,7 +1850,15 @@ pub fn update_leaf(
     let mut made = Vec::new();
     for (piece, virt) in planned.iter().copied() {
         let mapped = map_fixed(&io, memory, size, system_backed, space, virt, piece);
+        watch::event(
+            piece.va,
+            piece.len,
+            if mapped.is_ok() { 5 } else { 6 },
+            mapped.as_ref().err().map_or(0, |e| *e as u32),
+            process,
+        );
         if let Err(error) = mapped {
+            note_failed_map(piece.va, 1, error);
             // Who collided: the process key, the allocation, its space and how
             // many allocations / tracked mappings of this process exist.
             {

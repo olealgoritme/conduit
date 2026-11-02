@@ -3156,6 +3156,7 @@ fn build_backing(
 pub(crate) unsafe fn native_ring_backing(
     adapter: &AdapterContext,
     _owner: crate::virtio::gpu::DeviceOwner,
+    process: usize,
     allocation: u32,
     gpfifo_va: u64,
     ring_bytes: u64,
@@ -3171,7 +3172,7 @@ pub(crate) unsafe fn native_ring_backing(
         if ctx.native_id == 0 {
             return Err(RefError::Invalid);
         }
-        crate::virtio::native_memory::ring_backing(ctx.native_id, gpfifo_va, ring_bytes)
+        crate::virtio::native_memory::ring_backing(ctx.native_id, process, gpfifo_va, ring_bytes)
             .map_err(|_| RefError::Invalid)
     })
     .ok()

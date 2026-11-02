@@ -299,16 +299,27 @@ impl Io<'_> {
     /// Quiesce every channel in this KMD client before a live VA replacement or
     /// teardown. This is a real host-RM wait, not a bookkeeping "idle" flag.
     fn idle_channels(self, client: &NativeClient) -> Result<(), NativeError> {
-        let mut data = [0u8; 52];
+        // NVOS30_PARAMETERS: 4 handles, 3 NvP64 arrays, flags, timeout, status = 52
+        // bytes, 56 with the struct's 8-byte alignment (the size the ioctl encodes).
+        let mut data = [0u8; NVOS30_BYTES];
         data[0..4].copy_from_slice(&client.root.to_le_bytes());
         data[4..8].copy_from_slice(&nd::H_DEVICE.to_le_bytes());
         let mut response = [0u8; 512];
-        let n = self.exchange(client.gpu, rc::nv_cmd(0x41, 52), &data, &[], &mut response)?;
+        let n = self.exchange(
+            client.gpu,
+            rc::nv_cmd(0x41, NVOS30_BYTES as u32),
+            &data,
+            &[],
+            &mut response,
+        )?;
         let reply = response.get(..n).ok_or(NativeError::Transport)?;
         rc::rm_reply(reply, 48).map_err(|_| NativeError::Transport)?;
         Ok(())
     }
 }
+
+/// `sizeof(NVOS30_PARAMETERS)` on x86-64 (`NV_ESC_RM_IDLE_CHANNELS`).
+const NVOS30_BYTES: usize = 56;
 
 /// Stop new submissions and wait for outstanding work before touching live VAs.
 pub(crate) fn quiesce(
@@ -447,6 +458,11 @@ pub(crate) struct NativeContext {
 impl NativeContext {
     pub(crate) fn owner(&self) -> DeviceOwner {
         self.owner
+    }
+
+    /// The process key native memory files this context's mappings under.
+    pub(crate) fn process_key(&self) -> usize {
+        self.process as usize
     }
 
     pub(crate) fn create(
@@ -941,6 +957,19 @@ impl NativeQueue {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// `NvChT<k>` / `NvChV<k>` / `NvChS<k>` (a 16-entry ring): each native channel's
+/// work-submit token (low bits = the host channel id an Xid names), its GPFIFO
+/// VA page and its context share handle, so host faults can be tied to a guest queue.
+fn note_channel(token: u32, gpfifo_va: u64, space: u32) {
+    static N: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    let k = (n % 16) as u8;
+    let digit = if k < 10 { b'0' + k } else { b'a' + k - 10 };
+    crate::diag::record_named_bytes(&[b'N', b'v', b'C', b'h', b'T', digit], token);
+    crate::diag::record_named_bytes(&[b'N', b'v', b'C', b'h', b'V', digit], (gpfifo_va >> 12) as u32);
+    crate::diag::record_named_bytes(&[b'N', b'v', b'C', b'h', b'S', digit], space);
+}
+
 fn create_queue_objects(
     io: Io<'_>,
     client: &NativeClient,
@@ -1080,6 +1109,7 @@ fn create_queue_objects(
             .ok_or(NativeError::Transport)?
             .0;
         crate::diag::record_named_bytes(b"NvQStep", 10);
+        note_channel(parts.token, queue.gpfifo_va, ctxshare);
         if scheduled
             .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()

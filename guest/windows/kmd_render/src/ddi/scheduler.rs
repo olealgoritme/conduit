@@ -345,6 +345,7 @@ pub(crate) unsafe fn create_native_queue(
         crate::ddi::create_allocation::native_ring_backing(
             adapter,
             owner,
+            native_context.process_key(),
             parsed.allocation,
             parsed.gpfifo_va,
             u64::from(parsed.ring_bytes),

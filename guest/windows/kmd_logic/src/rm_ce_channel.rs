@@ -436,6 +436,19 @@ pub fn virtual_params(root: u32, h_vaspace: u32, va: Option<u64>, size: u64) -> 
     a
 }
 
+/// `NVOS32_ATTR_PAGE_SIZE_4KB` (24:23 = 1).
+const NVOS32_ATTR_PAGE_SIZE_4KB: u32 = 1 << 23;
+
+/// [`virtual_params`] of a virtual object with 4-KiB pages. A fixed-address virtual
+/// object with the default page size takes the space's big pages and RM aligns its
+/// address down to 64 KiB: a mapping of system pages at a 4-KiB-aligned VA (VidMm's
+/// fence and system-placed pieces) came back at the 64-KiB boundary below it.
+pub fn virtual_params_4k(root: u32, h_vaspace: u32, va: Option<u64>, size: u64) -> [u8; MEM_ALLOC_BYTES] {
+    let mut a = virtual_params(root, h_vaspace, va, size);
+    put32(&mut a, 24, NVOS32_ATTR_PAGE_SIZE_4KB);
+    a
+}
+
 /// `NVOS46_FLAGS_CACHE_SNOOP_ENABLE` (4:4) and `NVOS46_FLAGS_PAGE_SIZE_4KB` (11:8 = 1): how NVK
 /// and the tool map system memory.
 pub const MAP_FLAGS_SYSMEM: u32 = (1 << 4) | (1 << 8);
@@ -2198,5 +2211,20 @@ mod tests {
             !diag.replace(&knob, "").replace(&direct, "").contains("b\"Ce"),
             "diag.rs spells a Ce counter name"
         );
+    }
+}
+
+#[cfg(test)]
+mod virtual_4k_tests {
+    use super::*;
+
+    #[test]
+    fn four_k_virtual_sets_only_the_page_size_attr() {
+        let plain = virtual_params(1, 2, Some(0x2_1179_f000), 0x8_0000);
+        let small = virtual_params_4k(1, 2, Some(0x2_1179_f000), 0x8_0000);
+        assert_eq!(u32::from_le_bytes(small[24..28].try_into().unwrap()), 1 << 23);
+        let mut back = small;
+        back[24..28].copy_from_slice(&[0; 4]);
+        assert_eq!(back, plain);
     }
 }
