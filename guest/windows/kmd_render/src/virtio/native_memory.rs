@@ -1041,7 +1041,15 @@ pub fn update_leaf_system(
     let mut none = Vec::new();
     none.try_reserve_exact(pfns.len()).map_err(|_| Error::NoMemory)?;
     none.resize(pfns.len(), None);
-    update_leaf(passive, adapter, id, process, first_va, allocation_offset, &none)?;
+    // NvSysWhy: 1 dropping the old mappings (an error name in NvSysErr), 2 the
+    // OS descriptor, 3 mapping it.
+    let why = |code: u32, error: Error| {
+        crate::diag::record_named_bytes(b"NvSysWhy", code);
+        crate::diag::record_named_bytes(b"NvSysErr", error as u32);
+        error
+    };
+    update_leaf(passive, adapter, id, process, first_va, allocation_offset, &none)
+        .map_err(|error| why(1, error))?;
 
     let _guard = lock(passive)?;
     let client = STATE.lock().client()?;
@@ -1055,7 +1063,7 @@ pub fn update_leaf_system(
         .checked_mul(nm::PAGE_BYTES)
         .ok_or(Error::Invalid)?;
     let desc = STATE.lock().mint()?;
-    alloc_system_descriptor(&io, desc, pfns, len)?;
+    alloc_system_descriptor(&io, desc, pfns, len).map_err(|error| why(2, error))?;
     let virt = STATE.lock().mint()?;
     let shown = nm::MappingPiece {
         va: first_va,
@@ -1066,7 +1074,7 @@ pub fn update_leaf_system(
         Ok(used) => used,
         Err(error) => {
             let _ = io.rm_free(nd::H_DEVICE, desc);
-            return Err(error);
+            return Err(why(3, error));
         }
     };
     let mapping = HostMapping {
