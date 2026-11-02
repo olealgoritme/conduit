@@ -204,6 +204,18 @@ pub fn is_context_private(buf: &[u8]) -> bool {
     buf.len() == CONTEXT_PRIVATE_BYTES && get32(buf, 0) == Some(NVDA_MAGIC)
 }
 
+/// Whether `buf` is NVDA context private data of any layout: the NVDA magic and
+/// its declared size (+0x08) equal to the buffer length. Besides the 3200-byte
+/// HW-queue header ([`is_context_private`]) the 610.88 Vulkan ICD sends a
+/// 0xdf1-byte one (version 0x00010004, tag NVGL) for its node-3 copy context,
+/// which has no HW queues; NVIDIA's KMD answers both with the same
+/// `DXGK_CONTEXTINFO` (`hws::NVDA_CONTEXT_INFO`).
+pub fn is_nvda_context_header(buf: &[u8]) -> bool {
+    buf.len() >= 0x10
+        && get32(buf, 0) == Some(NVDA_MAGIC)
+        && get32(buf, CONTEXT_DECLARED_SIZE_AT) == u32::try_from(buf.len()).ok()
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct QueuePrivate {
     /// Captured input words.  Their meanings are not guessed and they play no
@@ -591,5 +603,30 @@ mod tests {
             validate_progress_fence(0x1000, MAX_VA - 4),
             Err(PrivateError::ProgressFence)
         );
+    }
+
+    #[test]
+    fn vulkan_copy_context_header_is_nvda_but_not_a_hw_queue_context() {
+        // 610.88 Vulkan ICD, NodeOrdinal 3, Flags 0x4: the first 0x28 bytes of
+        // its 3569-byte CreateContext private data (L3 capture seq 123474).
+        let mut b = vec![0u8; 0xdf1];
+        b[..0x28].copy_from_slice(&[
+            0x41, 0x44, 0x56, 0x4e, 0x04, 0x00, 0x01, 0x00, 0xf1, 0x0d, 0x00, 0x00, 0x4c, 0x47,
+            0x56, 0x4e, 0x03, 0x00, 0x00, 0x00, 0x0c, 0x40, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x08, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x30, 0x00, 0x00,
+        ]);
+        assert!(is_nvda_context_header(&b));
+        assert!(!is_context_private(&b));
+        // The HW-queue header is one too.
+        let mut hws = context();
+        hws[8..12].copy_from_slice(&(CONTEXT_PRIVATE_BYTES as u32).to_le_bytes());
+        assert!(is_nvda_context_header(&hws));
+        // A declared size that is not the buffer's, a foreign magic or a stub is not.
+        assert!(!is_nvda_context_header(&b[..0xdf0]));
+        let mut foreign = b.clone();
+        foreign[0] = 0;
+        assert!(!is_nvda_context_header(&foreign));
+        assert!(!is_nvda_context_header(&b[..0x0c]));
+        assert!(!is_nvda_context_header(&[]));
     }
 }
