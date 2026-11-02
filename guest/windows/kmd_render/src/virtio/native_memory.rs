@@ -439,12 +439,21 @@ fn ensure_space(io: &Io<'_>, process: usize) -> Result<u32, Error> {
         .try_reserve_exact(1)
         .map_err(|_| Error::NoMemory)?;
     let space = STATE.lock().mint()?;
+    // NvVaDevice=1 (experiment): the device's own VA space (index GPU_DEVICE,
+    // shared by every process, no window) as NVK on RM uses, to tell whether
+    // the new per-process spaces are what the graphics copy engine fails on.
+    let device_space =
+        crate::diag::read_config_dword(crate::diag::KnobName::new(b"NvVaDevice"), 0) == 1;
     let reply = io.rm_alloc(
         nd::H_DEVICE,
         space,
         cc::FERMI_VASPACE_A,
-        &cc::vaspace_params_vidmm(),
+        &if device_space { cc::vaspace_params() } else { cc::vaspace_params_vidmm() },
     )?;
+    if device_space {
+        STATE.lock().spaces.push((process, space));
+        return Ok(space);
+    }
     // Diagnosis: the space RM made (vaSize at +8, vaBase at +40 of the
     // returned NV_VASPACE_ALLOCATION_PARAMETERS), in 64-KiB units.
     crate::diag::record_named_bytes(
