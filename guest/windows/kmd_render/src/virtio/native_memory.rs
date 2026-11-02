@@ -103,6 +103,9 @@ struct HostMapping {
     process: usize,
     piece: nm::MappingPiece,
     virt: u32,
+    /// The OS-descriptor memory object of VidMm's system pages this mapping
+    /// shows (`update_leaf_system`), 0 when it maps the allocation's RM memory.
+    desc: u32,
 }
 
 struct Pin {
@@ -985,6 +988,7 @@ fn map_in_window(
 }
 
 fn unmap_fixed(io: &Io<'_>, memory: u32, mapping: HostMapping) -> Result<(), Error> {
+    let memory = if mapping.desc != 0 { mapping.desc } else { memory };
     let block = nm::nvos47_unmap(
         io.client.root,
         nd::H_DEVICE,
@@ -1002,11 +1006,89 @@ fn unmap_fixed(io: &Io<'_>, memory: u32, mapping: HostMapping) -> Result<(), Err
     )?;
     rc::rm_reply(response.get(..n).ok_or(Error::Host)?, cc::NVOS47_STATUS_AT)
         .map_err(|_| Error::Host)?;
-    if is_window(mapping.virt) {
-        // The space's low window outlives its mappings (`release_process`).
-        return Ok(());
+    // The space's low window outlives its mappings (`release_process`).
+    if !is_window(mapping.virt) {
+        io.rm_free(nd::H_DEVICE, mapping.virt)?;
     }
-    io.rm_free(nd::H_DEVICE, mapping.virt)
+    if mapping.desc != 0 {
+        io.rm_free(nd::H_DEVICE, mapping.desc)?;
+    }
+    Ok(())
+}
+
+/// A leaf update whose PTEs place a device-local native allocation in SYSTEM
+/// pages. VidMm keeps CPU-accessed allocations there (the UMD's Lock2 view is
+/// those pages), so the GPU must see the same pages, not the allocation's RM
+/// video memory: GPFIFO entries and pushbuffers the UMD wrote were otherwise
+/// invisible to the GPU. Whatever the process mapped in the range is dropped,
+/// the pages (`pfns`, one per 4-KiB PTE) become an RM OS-descriptor object and
+/// that is mapped at the exact VA. VidMm's Transfer operations move contents
+/// between these pages and the RM memory when it changes the placement.
+pub fn update_leaf_system(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    id: u32,
+    process: usize,
+    first_va: u64,
+    allocation_offset: u64,
+    pfns: &[u64],
+) -> Result<(), Error> {
+    if pfns.is_empty() {
+        return Err(Error::Invalid);
+    }
+    let mut none = Vec::new();
+    none.try_reserve_exact(pfns.len()).map_err(|_| Error::NoMemory)?;
+    none.resize(pfns.len(), None);
+    update_leaf(passive, adapter, id, process, first_va, allocation_offset, &none)?;
+
+    let _guard = lock(passive)?;
+    let client = STATE.lock().client()?;
+    let io = Io {
+        passive,
+        adapter,
+        client,
+    };
+    let space = ensure_space(&io, process)?;
+    let len = (pfns.len() as u64)
+        .checked_mul(nm::PAGE_BYTES)
+        .ok_or(Error::Invalid)?;
+    let desc = STATE.lock().mint()?;
+    alloc_system_descriptor(&io, desc, pfns, len)?;
+    let virt = STATE.lock().mint()?;
+    let shown = nm::MappingPiece {
+        va: first_va,
+        memory_offset: 0,
+        len,
+    };
+    let used = match map_fixed(&io, desc, len, true, space, virt, shown) {
+        Ok(used) => used,
+        Err(error) => {
+            let _ = io.rm_free(nd::H_DEVICE, desc);
+            return Err(error);
+        }
+    };
+    let mapping = HostMapping {
+        process,
+        piece: nm::MappingPiece {
+            va: first_va,
+            memory_offset: allocation_offset,
+            len,
+        },
+        virt: used,
+        desc,
+    };
+    let mut state = STATE.lock();
+    let allocation = state.allocation_mut(id)?;
+    if allocation.mappings.try_reserve(1).is_err() {
+        drop(state);
+        let _ = unmap_fixed(&io, 0, mapping);
+        return Err(Error::NoMemory);
+    }
+    allocation.mappings.push(mapping);
+    allocation
+        .mappings
+        .sort_unstable_by_key(|mapping| (mapping.process, mapping.piece.va));
+    Ok(())
 }
 
 /// Apply one native leaf update.  Non-leaf updates deliberately have no host
@@ -1180,6 +1262,11 @@ pub fn update_leaf(
             let mut rollback = Vec::new();
             let mut rollback_ok = true;
             for old_mapping in affected_old.iter().copied() {
+                if old_mapping.desc != 0 {
+                    // Its descriptor is gone with the unmap; nothing to restore.
+                    rollback_ok = false;
+                    break;
+                }
                 let virt = match STATE.lock().mint() {
                     Ok(v) => v,
                     Err(_) => {
@@ -1226,6 +1313,7 @@ pub fn update_leaf(
             piece,
             // The window's handle when the piece went into the low window.
             virt: mapped.unwrap_or(virt),
+            desc: 0,
         });
     }
 

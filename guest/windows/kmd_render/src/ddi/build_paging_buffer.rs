@@ -2365,6 +2365,10 @@ unsafe fn native_update_leaf(
     let mut pieces = Vec::new();
     pieces.try_reserve_exact(count).map_err(|_| ())?;
     let repeat = update.Flags.Repeat() != 0;
+    // VidMm's system pages for a device-local allocation (`update_leaf_system`).
+    let device_local = allocation.native_segment != 0;
+    let mut system_pfns = Vec::new();
+    let mut any_other = false;
     for index in 0..count {
         let pte_index = if repeat { 0 } else { index };
         // SAFETY: Repeat selects one entry; otherwise DXGK supplies Num entries.
@@ -2377,6 +2381,7 @@ unsafe fn native_update_leaf(
         }
         if bits.Valid() == 0 {
             pieces.push(None);
+            any_other = true;
             continue;
         }
         if repeat && count != 1 {
@@ -2424,6 +2429,14 @@ unsafe fn native_update_leaf(
         if page_address > (u64::MAX >> 12) {
             return Err(());
         }
+        if device_local && segment == 0 {
+            if system_pfns.try_reserve(1).is_err() {
+                return Err(());
+            }
+            system_pfns.push(page_address);
+        } else {
+            any_other = true;
+        }
         // PageAddress is VidMm's segment placement, never a host GPA.  The RM
         // memory offset comes only from AllocationOffsetInBytes + page index.
         let piece = native::MappingPiece {
@@ -2446,6 +2459,23 @@ unsafe fn native_update_leaf(
     } {
         fail(4);
         return Err(());
+    }
+    if !system_pfns.is_empty() {
+        if any_other || repeat {
+            // Part system pages, part something else: not one descriptor.
+            fail(6);
+            return Err(());
+        }
+        return crate::virtio::native_memory::update_leaf_system(
+            passive,
+            adapter,
+            allocation.native_id,
+            update.hProcess as usize,
+            update.FirstPteVirtualAddress,
+            update.AllocationOffsetInBytes,
+            &system_pfns,
+        )
+        .map_err(|error| fail(0x300 | (error.ntstatus() as u32 & 0xff)));
     }
     crate::virtio::native_memory::update_leaf(
         passive,
