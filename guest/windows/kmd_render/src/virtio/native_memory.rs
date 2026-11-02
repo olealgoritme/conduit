@@ -5,9 +5,12 @@
 //! adds a `FERMI_VASPACE_A(GPU_DEVICE)`, real memory objects, and fixed
 //! `NV50_MEMORY_VIRTUAL` + `MAP_MEMORY_DMA` mappings at VidMm's exact VAs.
 //!
-//! Locking: one PASSIVE mutex serializes every RM operation and every lifetime
-//! change.  The leaf spinlock is used only to copy or publish plain state; it is
-//! never held over a host round trip, an MDL operation, or an allocation.
+//! Locking: one PASSIVE mutex serializes RM operations on published objects and
+//! every lifetime change; its wait is bounded (`LOCK_MAX_MS`), so a holder stuck
+//! on the host fails its waiters with `Busy` instead of blocking them forever.
+//! `create` makes the RM object of a new, not yet published allocation outside
+//! the mutex.  The leaf spinlock is used only to copy or publish plain state; it
+//! is never held over a host round trip, an MDL operation, or an allocation.
 
 use alloc::boxed::Box;
 use alloc::vec;
@@ -305,8 +308,28 @@ fn mutex(passive: PassiveLevel) -> Result<&'static PassiveMutex, Error> {
     Ok(mutex)
 }
 
+/// The longest any caller waits for the native-memory mutex. Holders make host
+/// round trips, each bounded and refused at once while the host does not answer
+/// (`ctrl::raw_roundtrip`), so a holder normally lets go well within this; VidMm's
+/// paging thread must still never wait on one indefinitely.
+const LOCK_MAX_MS: u64 = 20_000;
+/// Waits for the mutex that gave up after [`LOCK_MAX_MS`] (`NvMemLockTo`).
+static LOCK_TIMEOUTS: AtomicU32 = AtomicU32::new(0);
+
 fn lock(passive: PassiveLevel) -> Result<PassiveMutexGuard<'static>, Error> {
-    mutex(passive)?.lock(passive).ok_or(Error::Busy)
+    let start = crate::adapter::foreign_scanout::now_100ns();
+    match mutex(passive)?.lock_within(passive, LOCK_MAX_MS) {
+        Some(guard) => Ok(guard),
+        None => {
+            // An escape abort returns early; only a wait that ran out is a timeout.
+            let waited = crate::adapter::foreign_scanout::now_100ns().saturating_sub(start);
+            if waited >= LOCK_MAX_MS * 10_000 {
+                let n = LOCK_TIMEOUTS.fetch_add(1, Ordering::Relaxed) + 1;
+                crate::diag::record_named_bytes(b"NvMemLockTo", n);
+            }
+            Err(Error::Busy)
+        }
+    }
 }
 
 pub(crate) struct Io<'a> {
@@ -867,29 +890,41 @@ pub fn create(
     private_bytes: &mut [u8],
 ) -> Result<Created, Error> {
     step(1);
-    let _guard = lock(passive)?;
-    step(2);
-    // As in `channel_client`: release STATE before `channel_client` re-takes it.
-    let existing = STATE.lock().client.as_ref().copied();
-    let client = match existing {
-        Some(client) => client,
-        None => channel_client(passive, adapter, 0)?.0,
+    // The client, the base VA space and the new handle are taken under the mutex;
+    // the RM object itself is made after it is released (no holder of the mutex
+    // waits on this allocation's round trips, so VidMm's paging thread is never
+    // queued behind a host that does not answer), and the record is published
+    // under it again, only if the client generation is still the one used.
+    let (client, epoch, space, memory) = {
+        let _guard = lock(passive)?;
+        step(2);
+        // As in `channel_client`: release STATE before `channel_client` re-takes it.
+        let existing = STATE.lock().client.as_ref().copied();
+        let client = match existing {
+            Some(client) => client,
+            None => channel_client(passive, adapter, 0)?.0,
+        };
+        step(3);
+        let epoch = adapter.with_virtio(|v| v.nvrm_epoch()).unwrap_or(0);
+        if epoch == 0 || epoch != client.epoch {
+            return Err(Error::NotReady);
+        }
+        let io = Io {
+            passive,
+            adapter,
+            client,
+        };
+        let space = ensure_space(&io, 0)?;
+        step(4);
+        let memory = STATE.lock().mint()?;
+        (client, epoch, space, memory)
     };
-    step(3);
-    let epoch = adapter.with_virtio(|v| v.nvrm_epoch()).unwrap_or(0);
-    if epoch == 0 || epoch != client.epoch {
-        return Err(Error::NotReady);
-    }
     let io = Io {
         passive,
         adapter,
         client,
     };
-    step(4);
-    let (memory, pins) = {
-        let mut state = STATE.lock();
-        (state.mint()?, Vec::new())
-    };
+    let pins = Vec::new();
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     if id == 0 {
         return Err(Error::NoMemory);
@@ -938,7 +973,7 @@ pub fn create(
         private.kind,
         rc::SURFACE_ATTR,
         rc::SURFACE_ATTR2,
-        ensure_space(&io, 0)?,
+        space,
     ) {
         Some(writeback) => writeback,
         None => {
@@ -1002,19 +1037,35 @@ pub fn create(
         surface,
         scanout_gem: 0,
     };
-    {
-        let mut state = STATE.lock();
-        if state.allocations.try_reserve_exact(1).is_err() {
-            drop(state);
-            let mut allocation = allocation;
-            if io.rm_free(nd::H_DEVICE, memory).is_ok() {
-                unlock_pins(&mut allocation.pins);
+    // Publish under the mutex. A transport sweep that ran meanwhile (`forget`)
+    // closed this client with the object in it: the record is dropped and its pins
+    // kept, as for any object whose host state is unknown.
+    let mut unpublished = Some(allocation);
+    let refused = match lock(passive) {
+        Ok(_guard) => {
+            let mut state = STATE.lock();
+            if state.client.as_ref().map(|c| c.epoch) != Some(epoch) {
+                Some((Error::NotReady, false))
+            } else if state.allocations.try_reserve_exact(1).is_err() {
+                Some((Error::NoMemory, true))
             } else {
-                preserve_ambiguous_pins(&mut allocation.pins);
+                if let Some(allocation) = unpublished.take() {
+                    state.allocations.push(allocation);
+                }
+                None
             }
-            return Err(Error::NoMemory);
         }
-        state.allocations.push(allocation);
+        Err(error) => Some((error, true)),
+    };
+    if let Some((error, free)) = refused {
+        // Outside the mutex: the object was never published, nothing else names it.
+        let mut pins = unpublished.map(|a| a.pins).unwrap_or_default();
+        if free && io.rm_free(nd::H_DEVICE, memory).is_ok() {
+            unlock_pins(&mut pins);
+        } else {
+            preserve_ambiguous_pins(&mut pins);
+        }
+        return Err(error);
     }
     super::nvda::note_memory(memory);
     Ok(Created {
@@ -2755,7 +2806,10 @@ pub fn discard(id: u32) -> Result<(), Error> {
 /// Forget host objects after the transport-wide close sweep.  Kernel CPU views
 /// and MDLs still belong to the guest and are released here, at PASSIVE.
 pub fn forget(passive: PassiveLevel) {
-    let Ok(_guard) = lock(passive) else {
+    // Unbounded: a skipped forget would leave the old generation's client in place
+    // and every later `create` refused as NotReady. Holders' round trips are
+    // bounded, so this wait ends.
+    let Ok(_guard) = mutex(passive).and_then(|m| m.lock(passive).ok_or(Error::Busy)) else {
         return;
     };
     let mut state = STATE.lock();
