@@ -433,6 +433,9 @@ function Get-HeliosNvidiaRequiredFiles {
         "nvldumdx.dll", "nvldumd.dll", "nvoglv64.dll", "nvoglv32.dll",
         "nvcuda64.dll", "nvcuda32.dll", "nvdxgdmal64.dll", "nvdxgdmal32.dll",
         "nvapi64.dll", "nvapi64_impl.dll", "nvapi.dll", "nvapi_impl.dll", "nvcuda_loader64.dll",
+        # cuInit opens nvcubins.bin from the UMD folder and loads the object
+        # loader and the PTX JIT from there; without nvcubins.bin it fails.
+        "nvcubins.bin", "nvobjectloader64.dll", "nvptxJitCompiler64.dll",
         "nv-vk64.json", "nv-vk32.json", "nvlddmkm.sys"
     )
 }
