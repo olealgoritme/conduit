@@ -293,6 +293,13 @@ unsafe fn query_driver_caps(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTE
     );
     let support_per_engine_tdr: BOOLEAN = 1;
     out.set(caps_offset!(SupportPerEngineTDR), support_per_engine_tdr);
+    // NVIDIA personality: the 610.88 adapter reports ADAPTERTYPE 0x31B, which
+    // includes HybridDiscrete (ours was 0x103), and NVIDIA's Vulkan ICD left
+    // our adapter before its hybrid query and OpenAdapterFromHdc.
+    if nvidia_umd_enabled() {
+        let hybrid_discrete: BOOLEAN = 1;
+        out.set(caps_offset!(HybridDiscrete), hybrid_discrete);
+    }
 
     // Required WDDM 1.2+ render-only caps. Bit positions verified field-by-field
     // against WDK 10.0.26100 `shared/d3dkmddi.h` (2026-06-18). `__bindgen_anon_1`
