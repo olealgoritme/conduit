@@ -53,7 +53,7 @@ fn native_status(error: NativeError) -> NTSTATUS {
         NativeError::Busy => STATUS_DEVICE_BUSY,
         NativeError::NoMemory => STATUS_NO_MEMORY,
         NativeError::Unsupported => STATUS_NOT_SUPPORTED,
-        NativeError::Transport | NativeError::Rm => STATUS_IO_DEVICE_ERROR,
+        NativeError::Transport | NativeError::Rm | NativeError::Dead => STATUS_IO_DEVICE_ERROR,
     }
 }
 
@@ -158,6 +158,9 @@ pub unsafe extern "C" fn dxgkddi_reset_engine(
         },
         Some(reset_node),
     );
+    // Native NVIDIA channels on the node that were reported faulted or hung are
+    // recovered too (none outside the NVIDIA personality).
+    let _ = crate::ddi::hws::recover_native(adapter, crate::ddi::hws::Recover::Flagged(reset_node));
     // Present streams are node 0's (DWM, D3D11 presents); a reset of the D3D12
     // node (`D3d12Node`) leaves them.
     if reset_node == 0 {
@@ -455,6 +458,13 @@ pub unsafe extern "C" fn dxgkddi_submit_command_to_hw_queue(
     }
     match queue.native.submit(private) {
         Ok(()) => STATUS_SUCCESS,
+        // A recovered queue: its context is (being) invalidated and the channel
+        // runs nothing more, so the submission is completed as it arrives and
+        // nobody waits on it.
+        Err(NativeError::Dead) => {
+            queue.native.complete_progress(args.HwQueueProgressFenceId);
+            STATUS_SUCCESS
+        }
         Err(error) => native_status(error),
     }
 }

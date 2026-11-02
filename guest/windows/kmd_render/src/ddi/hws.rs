@@ -32,8 +32,17 @@
 //!   `SetContextSchedulingProperties`, `NotifyContextPriorityChange` store what
 //!   they are given and succeed; nothing consumes it yet (the host RM runlist
 //!   scheduler does the scheduling). No scheduling-log entries are written.
-//! * `ResetHwEngine` / `ResumeHwEngine` succeed without touching the host
-//!   engine (best effort: they only kick the progress poll).
+//! * Fault and hang recovery for native queues ([`recover_native`]): the poll
+//!   watches each queue's channel error notifier and, with work outstanding, its
+//!   progress fence and GP_GET (`helios_kmd_logic::native_hang`). A fault, or no
+//!   movement for `NvHangMs` (default 10 s, 0 = hang detection off), raises
+//!   `DXGK_INTERRUPT_GPU_ENGINE_TIMEOUT` on the queue's node; `ResetHwEngine`
+//!   then takes the affected contexts' TSGs off the runlist, resets their
+//!   channels (`NvRcReset` bit 0, default on), completes their progress fences
+//!   and invalidates the contexts (`DxgkCbInvalidateHwContext`). A report that
+//!   no reset answers within 3 s is force-completed by the poll itself, so no
+//!   wait on a dead channel outlives timeout + grace. `ResumeHwEngine` kicks
+//!   the poll. The host engine itself is never reset.
 //! * `ValidateSubmitCommand` succeeds; `SubmitCommandToHwQueue` validates its
 //!   own private data.
 //! * Software HW queues ([`SoftQueue`]): queues on contexts without NVDA
@@ -65,6 +74,7 @@ use crate::sync::SpinLock;
 use crate::virtio::native_channel::{NativeContext, NativeQueue};
 use helios_kmd_logic::hws::{self as logic, PollNext, Progress};
 use helios_kmd_logic::native_channel as native_format;
+use helios_kmd_logic::native_hang::{self as hang, Action, Watch};
 
 // ── counters (atomics; mirrored at PASSIVE by `publish_counters`) ──────────────────────────────
 static HWS_ENABLED: AtomicU32 = AtomicU32::new(0);
@@ -215,6 +225,24 @@ static ENGINE_RESETS: AtomicU32 = AtomicU32::new(0);
 static ENGINE_RESUMES: AtomicU32 = AtomicU32::new(0);
 static SMF: AtomicU32 = AtomicU32::new(0);
 static SMF_KINDS: AtomicU32 = AtomicU32::new(0);
+/// Native queue recovery (`recover_native`, the poll's watch): faults and hangs
+/// reported, reports force-completed without a reset, queues recovered, contexts
+/// invalidated, the last `DxgkCbInvalidateHwContext` / `RESET_CHANNEL` /
+/// TSG-unschedule status, the last cause (`native_hang::Cause::code`) and the
+/// engine-timeout interrupts dxgkrnl refused.
+static NAT_FAULTS: AtomicU32 = AtomicU32::new(0);
+static NAT_HANGS: AtomicU32 = AtomicU32::new(0);
+static NAT_FORCED: AtomicU32 = AtomicU32::new(0);
+static NAT_RECOVERED: AtomicU32 = AtomicU32::new(0);
+static NAT_INVALIDATED: AtomicU32 = AtomicU32::new(0);
+static NAT_INVALIDATE_ST: AtomicU32 = AtomicU32::new(0);
+static NAT_RESET_ST: AtomicU32 = AtomicU32::new(0);
+static NAT_UNSCHED_ST: AtomicU32 = AtomicU32::new(0);
+static NAT_LAST_CAUSE: AtomicU32 = AtomicU32::new(0);
+static NAT_TDR_FAIL: AtomicU32 = AtomicU32::new(0);
+/// `NvHangMs` (u32::MAX until read) and `NvRcReset`, read at CreateHwQueue.
+static HANG_MS: AtomicU32 = AtomicU32::new(u32::MAX);
+static RC_RESET: AtomicU32 = AtomicU32::new(hang::DEFAULT_RC_RESET);
 
 /// Mirror the `Hws*` counters at PASSIVE (from `publish_nvrm_counters`). Writes
 /// nothing in the default personality.
@@ -252,6 +280,37 @@ pub(crate) fn publish_counters() {
     crate::diag::record_named_bytes(b"HwsSmfDefer", r(&SMF_DEFERRED));
     crate::diag::record_named_bytes(b"HwsSmfEarly", r(&SMF_EARLY));
     crate::diag::record_named_bytes(b"HwsSmfTaken", r(&SMF_TAKEN));
+    crate::diag::record_named_bytes(b"HwsNatFault", r(&NAT_FAULTS));
+    crate::diag::record_named_bytes(b"HwsNatHang", r(&NAT_HANGS));
+    crate::diag::record_named_bytes(b"HwsNatForce", r(&NAT_FORCED));
+    crate::diag::record_named_bytes(b"HwsNatRecov", r(&NAT_RECOVERED));
+    crate::diag::record_named_bytes(b"HwsNatInval", r(&NAT_INVALIDATED));
+    crate::diag::record_named_bytes(b"HwsNatInvSt", r(&NAT_INVALIDATE_ST));
+    crate::diag::record_named_bytes(b"HwsNatRstSt", r(&NAT_RESET_ST));
+    crate::diag::record_named_bytes(b"HwsNatUnsSt", r(&NAT_UNSCHED_ST));
+    crate::diag::record_named_bytes(b"HwsNatCause", r(&NAT_LAST_CAUSE));
+    crate::diag::record_named_bytes(b"HwsNatTdrF", r(&NAT_TDR_FAIL));
+}
+
+/// Read `NvHangMs` / `NvRcReset` from the service key (PASSIVE, CreateHwQueue).
+fn read_recovery_knobs() {
+    let ms = crate::diag::read_config_dword(
+        crate::diag::KnobName::new(b"NvHangMs"),
+        hang::DEFAULT_HANG_MS,
+    );
+    HANG_MS.store(ms, Ordering::Relaxed);
+    let rc = crate::diag::read_config_dword(
+        crate::diag::KnobName::new(b"NvRcReset"),
+        hang::DEFAULT_RC_RESET,
+    );
+    RC_RESET.store(rc, Ordering::Relaxed);
+}
+
+fn hang_timeout() -> Option<u64> {
+    match HANG_MS.load(Ordering::Relaxed) {
+        u32::MAX => hang::hang_timeout_100ns(hang::DEFAULT_HANG_MS),
+        ms => hang::hang_timeout_100ns(ms),
+    }
 }
 
 // ── StartDevice: the HWSCH handshake ─────────────────────────────────────────────────────────
@@ -333,12 +392,15 @@ struct Slot {
     queue: usize,
     node: u32,
     progress: Progress,
+    /// Fault / hang detection and recovery state (`native_hang`).
+    watch: Watch,
 }
 
 const EMPTY: Slot = Slot {
     queue: 0,
     node: 0,
     progress: Progress::starting_at(0),
+    watch: Watch::new(),
 };
 
 struct Registry {
@@ -350,6 +412,9 @@ struct Registry {
     /// Nodes owed one more `MONITORED_FENCE_SIGNALED` (a CPU-side
     /// SignalMonitoredFence, delivered again on the next tick).
     pending_nodes: u32,
+    /// Recoveries in progress: while nonzero the queues they picked are used
+    /// outside this lock, so no slot may be removed (DestroyHwQueue waits).
+    recovering: u32,
 }
 
 static REGISTRY: SpinLock<Registry> = SpinLock::new(Registry {
@@ -357,6 +422,7 @@ static REGISTRY: SpinLock<Registry> = SpinLock::new(Registry {
     armed: false,
     idle_ticks: 0,
     pending_nodes: 0,
+    recovering: 0,
 });
 
 fn node_bit(node: u32) -> u32 {
@@ -376,6 +442,7 @@ fn register_queue(queue: &NativeQueue, node: u32) -> bool {
                 queue: queue as *const NativeQueue as usize,
                 node,
                 progress: Progress::starting_at(initial),
+                watch: Watch::new(),
             };
             true
         }
@@ -383,10 +450,42 @@ fn register_queue(queue: &NativeQueue, node: u32) -> bool {
     }
 }
 
-fn unregister_queue(queue: usize) -> Option<Slot> {
+/// Remove a queue's slot. `Err(())` while a recovery is using registered queues
+/// outside the lock (the caller waits and retries).
+fn try_unregister_queue(queue: usize) -> Result<Option<Slot>, ()> {
     let mut r = REGISTRY.lock();
-    let slot = r.slots.iter_mut().find(|slot| slot.queue == queue)?;
-    Some(core::mem::replace(slot, EMPTY))
+    if r.recovering != 0 {
+        return Err(());
+    }
+    Ok(r
+        .slots
+        .iter_mut()
+        .find(|slot| slot.queue == queue)
+        .map(|slot| core::mem::replace(slot, EMPTY)))
+}
+
+/// The longest DestroyHwQueue waits for a recovery to finish (each of its host
+/// round trips is bounded, and refused at once while the host does not answer).
+const UNREGISTER_WAIT_MS: u64 = 60_000;
+
+/// [`try_unregister_queue`], waiting out a recovery in progress. PASSIVE
+/// (DestroyHwQueue). After [`UNREGISTER_WAIT_MS`] the slot is left registered and
+/// `Err(())` returned: the queue must then not be freed.
+fn unregister_queue(queue: usize) -> Result<Option<Slot>, ()> {
+    let deadline = crate::adapter::foreign_scanout::now_100ns()
+        .saturating_add(UNREGISTER_WAIT_MS * 10_000);
+    loop {
+        match try_unregister_queue(queue) {
+            Ok(slot) => return Ok(slot),
+            Err(()) if crate::adapter::foreign_scanout::now_100ns() < deadline => {
+                let Some(passive) = crate::irql::PassiveLevel::try_assume() else {
+                    return Err(());
+                };
+                crate::virtio::ctrl::sleep_ms(passive, 1);
+            }
+            Err(()) => return Err(()),
+        }
+    }
 }
 
 fn restore_slot(saved: Slot) {
@@ -430,6 +529,9 @@ fn arm(adapter: &AdapterContext, due_100ns: i64) {
 pub(crate) fn poll_tick(adapter: &AdapterContext) {
     POLL_TICKS.fetch_add(1, Ordering::Relaxed);
     let mut nodes = 0u32;
+    let mut timeout_nodes = 0u32;
+    let now = crate::adapter::foreign_scanout::now_100ns();
+    let hang_timeout = hang_timeout();
     let next = {
         let mut r = REGISTRY.lock();
         let mut any_outstanding = false;
@@ -438,11 +540,43 @@ pub(crate) fn poll_tick(adapter: &AdapterContext) {
             // SAFETY: a registered queue is live until DestroyHwQueue removed its
             // slot under this lock (see `Slot::queue`).
             let queue = unsafe { &*(slot.queue as *const NativeQueue) };
-            if slot.progress.observe(queue.read_progress()) {
+            let value = queue.read_progress();
+            if slot.progress.observe(value) {
                 nodes |= node_bit(slot.node);
                 progressed = true;
             }
-            any_outstanding |= slot.progress.outstanding();
+            let sample = hang::Sample {
+                now,
+                outstanding: slot.progress.outstanding(),
+                progress: value,
+                gp_get: queue.gp_get(),
+                error: queue.channel_error(),
+            };
+            match slot.watch.tick(sample, hang_timeout) {
+                Action::None => {}
+                Action::Report(cause) => {
+                    let counter = match cause {
+                        hang::Cause::Fault(_) => &NAT_FAULTS,
+                        hang::Cause::Hang => &NAT_HANGS,
+                    };
+                    counter.fetch_add(1, Ordering::Relaxed);
+                    NAT_LAST_CAUSE.store(cause.code(), Ordering::Relaxed);
+                    timeout_nodes |= node_bit(slot.node);
+                }
+                Action::ForceComplete(_) => {
+                    // No reset came: complete the queue here (atomics only), so
+                    // nothing waits on it; its context stays valid until dxgkrnl or
+                    // the UMD tears it down.
+                    NAT_FORCED.fetch_add(1, Ordering::Relaxed);
+                    queue.mark_dead();
+                    queue.complete_progress(hang::completion_value(slot.progress.submitted, value));
+                    nodes |= node_bit(slot.node);
+                    progressed = true;
+                }
+            }
+            // A report waiting for its reset keeps the poll alive for the grace
+            // fallback, outstanding work or not.
+            any_outstanding |= slot.progress.outstanding() || slot.watch.in_grace();
         }
         nodes |= core::mem::take(&mut r.pending_nodes);
         if progressed || !any_outstanding {
@@ -458,6 +592,188 @@ pub(crate) fn poll_tick(adapter: &AdapterContext) {
         arm(adapter, due);
     }
     signal_nodes(adapter, nodes);
+    report_engine_timeouts(adapter, timeout_nodes);
+}
+
+/// Raise `DXGK_INTERRUPT_GPU_ENGINE_TIMEOUT` once per node in `nodes`; dxgkrnl
+/// answers with `DxgkDdiResetHwEngine` for the node. <= DISPATCH.
+fn report_engine_timeouts(adapter: &AdapterContext, nodes: u32) {
+    if nodes == 0 {
+        return;
+    }
+    let Some(dxgkrnl) = adapter.dxgkrnl_opt() else {
+        return;
+    };
+    for node in 0..32u32 {
+        if nodes & (1 << node) != 0 {
+            // SAFETY: the live adapter's callback table; <= DISPATCH.
+            let status =
+                unsafe { crate::ddi::submit_command::signal_gpu_engine_timeout(dxgkrnl, node) };
+            if status != STATUS_SUCCESS {
+                NAT_TDR_FAIL.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+// ── native queue recovery ────────────────────────────────────────────────────────────────────
+
+/// What [`recover_native`] recovers.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Recover {
+    /// `DxgkDdiResetHwEngine` for this node: the contexts of the queues reported
+    /// faulted or hung on it, plus any whose error notifier is set now.
+    Engine(u32),
+    /// `DxgkDdiResetEngine` for this node: only the contexts of reported queues.
+    Flagged(u32),
+    /// An adapter reset (`DxgkDdiResetFromTimeout`): every native queue. No
+    /// context is invalidated (the adapter reset ends every device anyway).
+    All,
+}
+
+#[derive(Clone, Copy)]
+struct Victim {
+    queue: usize,
+    context: usize,
+    node: u32,
+    submitted: u64,
+}
+
+const NO_VICTIM: Victim = Victim {
+    queue: 0,
+    context: 0,
+    node: 0,
+    submitted: 0,
+};
+
+/// Recover native queues from a fault or hang: every queue of an affected
+/// context is marked dead (no submission reaches its channel again) and its
+/// progress fence completed to everything submitted, so dxgkrnl's waits, process
+/// teardown and the stop-time scheduler flush end. At PASSIVE each affected
+/// context's TSG is also taken off the runlist, its channels reset (`NvRcReset`
+/// bit 0) and, unless the whole adapter is being reset, the context invalidated
+/// with `DxgkCbInvalidateHwContext` (dxgkrnl puts its device in error; the UMD
+/// sees a removed device and creates new contexts). Returns how many queues were
+/// recovered. NVIDIA personality only; 0 otherwise.
+pub(crate) fn recover_native(adapter: &AdapterContext, what: Recover) -> u32 {
+    if !crate::ddi::wddm_surface::nvidia_selected() {
+        return 0;
+    }
+    let mut victims = [NO_VICTIM; MAX_QUEUES];
+    let mut count = 0usize;
+    {
+        let mut r = REGISTRY.lock();
+        let mut contexts = [0usize; MAX_QUEUES];
+        let mut n_contexts = 0usize;
+        for slot in r.slots.iter().filter(|slot| slot.queue != 0 && !slot.watch.is_dead()) {
+            // SAFETY: registered queues are live while their slot is (see `Slot`).
+            let queue = unsafe { &*(slot.queue as *const NativeQueue) };
+            let culprit = match what {
+                Recover::All => true,
+                Recover::Engine(node) => {
+                    slot.node == node
+                        && (slot.watch.flagged().is_some() || queue.channel_error().is_some())
+                }
+                Recover::Flagged(node) => slot.node == node && slot.watch.flagged().is_some(),
+            };
+            let key = queue.context().map_or(0, |c| c as *const NativeContext as usize);
+            if culprit && key != 0 && !contexts[..n_contexts].contains(&key) {
+                contexts[n_contexts] = key;
+                n_contexts += 1;
+            }
+        }
+        if n_contexts == 0 {
+            return 0;
+        }
+        for slot in r.slots.iter_mut().filter(|slot| slot.queue != 0 && !slot.watch.is_dead()) {
+            // SAFETY: as above.
+            let queue = unsafe { &*(slot.queue as *const NativeQueue) };
+            let key = queue.context().map_or(0, |c| c as *const NativeContext as usize);
+            if key != 0 && contexts[..n_contexts].contains(&key) && count < MAX_QUEUES {
+                victims[count] = Victim {
+                    queue: slot.queue,
+                    context: key,
+                    node: slot.node,
+                    submitted: slot.progress.submitted,
+                };
+                count += 1;
+                slot.watch.mark_dead();
+            }
+        }
+        // The picked queues stay registered (and so alive) until this drops to 0.
+        r.recovering += 1;
+    }
+    let victims = &victims[..count];
+    let mut nodes = 0u32;
+    for v in victims {
+        // SAFETY: pinned by `recovering` (DestroyHwQueue cannot remove the slot).
+        let queue = unsafe { &*(v.queue as *const NativeQueue) };
+        queue.mark_dead();
+        queue.complete_progress(hang::completion_value(v.submitted, queue.read_progress()));
+        nodes |= node_bit(v.node);
+    }
+    NAT_RECOVERED.fetch_add(count as u32, Ordering::Relaxed);
+    if let Some(passive) = crate::irql::PassiveLevel::try_assume() {
+        let reset = RC_RESET.load(Ordering::Relaxed) & 1 != 0;
+        for (i, v) in victims.iter().enumerate() {
+            if victims[..i].iter().any(|w| w.context == v.context) {
+                continue;
+            }
+            // SAFETY: a queue's context outlives it, and the queue is pinned.
+            let context = unsafe { &*(v.context as *const NativeContext) };
+            let unscheduled = context.unschedule(passive);
+            NAT_UNSCHED_ST.store(native_code(unscheduled), Ordering::Relaxed);
+            if reset {
+                for w in victims.iter().filter(|w| w.context == v.context) {
+                    // SAFETY: pinned, as above.
+                    let queue = unsafe { &*(w.queue as *const NativeQueue) };
+                    NAT_RESET_ST.store(native_code(queue.reset_channel(passive)), Ordering::Relaxed);
+                }
+            }
+            if what != Recover::All {
+                invalidate_context(adapter, context.dxg_context());
+            }
+        }
+    }
+    REGISTRY.lock().recovering -= 1;
+    // The completed fences: dxgkrnl re-reads the nodes' monitored fences.
+    after_submit(adapter, 0, None, nodes);
+    count as u32
+}
+
+/// 0 for success, 0x100 + the error's discriminant otherwise (diagnostics).
+fn native_code(result: Result<(), crate::virtio::native_channel::NativeError>) -> u32 {
+    match result {
+        Ok(()) => 0,
+        Err(error) => 0x100 | error as u32,
+    }
+}
+
+/// `DxgkCbInvalidateHwContext` for dxgkrnl's context handle `handle` as the
+/// primary cause of an engine reset. PASSIVE.
+fn invalidate_context(adapter: &AdapterContext, handle: usize) {
+    if handle == 0 {
+        NAT_INVALIDATE_ST.store(u32::MAX, Ordering::Relaxed);
+        return;
+    }
+    let Some(dxgkrnl) = adapter.dxgkrnl_opt() else {
+        return;
+    };
+    let Some(invalidate) = dxgkrnl.DxgkCbInvalidateHwContext else {
+        NAT_INVALIDATE_ST.store(u32::MAX - 1, Ordering::Relaxed);
+        return;
+    };
+    // SAFETY: an all-zero DXGKARGCB_INVALIDATEHWCONTEXT is valid plain data;
+    // CollateralDamage 0 (Flags.Value 0) = this context caused the reset.
+    let mut args: DXGKARGCB_INVALIDATEHWCONTEXT = unsafe { core::mem::zeroed() };
+    args.hAdapter = dxgkrnl.DeviceHandle;
+    args.hHwContext = handle as HANDLE;
+    // SAFETY: the live adapter's callback table; PASSIVE (the caller holds the token).
+    let status = unsafe { invalidate(&args) };
+    NAT_INVALIDATE_ST.store(status as u32, Ordering::Relaxed);
+    if status == STATUS_SUCCESS {
+        NAT_INVALIDATED.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// After a submit (or a kernel-side fence signal): record it, look once at the
@@ -507,6 +823,9 @@ pub unsafe extern "C" fn dxgkddi_create_context(
     }
     // SAFETY: dxgkrnl's live args for this call.
     let args = unsafe { &mut *create_context };
+    // On input hContext is dxgkrnl's handle for the context (the one
+    // `DxgkCbInvalidateHwContext` names); CreateContext overwrites it with ours.
+    let runtime_context = args.hContext as usize;
     let private = if args.PrivateDriverDataSize == 0 || args.pPrivateDriverData.is_null() {
         &[][..]
     } else {
@@ -547,7 +866,10 @@ pub unsafe extern "C" fn dxgkddi_create_context(
         };
         // SAFETY: PASSIVE; `h_device` is live.
         match unsafe { super::scheduler::create_native_context(h_device, &device) } {
-            Ok(native) => Some(native),
+            Ok(mut native) => {
+                native.set_dxg_context(runtime_context);
+                Some(native)
+            }
             Err(status) => {
                 CTX_NATIVE_FAIL.fetch_add(1, Ordering::Relaxed);
                 return status;
@@ -620,6 +942,8 @@ pub unsafe extern "C" fn dxgkddi_create_hw_queue(
         SOFT_QUEUES.fetch_add(1, Ordering::Relaxed);
         return STATUS_SUCCESS;
     };
+    // PASSIVE: the recovery knobs, read again with every native queue.
+    read_recovery_knobs();
     let status = unsafe { super::scheduler::create_native_queue(context.adapter_ptr(), native, args) };
     if status != STATUS_SUCCESS {
         QUEUE_FAIL.fetch_add(1, Ordering::Relaxed);
@@ -654,7 +978,15 @@ pub unsafe extern "C" fn dxgkddi_destroy_hw_queue(h_hw_queue: IN_CONST_HANDLE) -
     // SAFETY: a handle this driver minted, or null (both handled).
     let key = unsafe { super::scheduler::native_queue_of(h_hw_queue) }
         .map_or(0, |queue| queue as *const NativeQueue as usize);
-    let saved = if key != 0 { unregister_queue(key) } else { None };
+    let saved = if key != 0 {
+        match unregister_queue(key) {
+            Ok(saved) => saved,
+            // A recovery still uses the queue: it must not be freed now.
+            Err(()) => return STATUS_DEVICE_BUSY,
+        }
+    } else {
+        None
+    };
     // SAFETY: forwarded unchanged.
     let status = unsafe { super::scheduler::dxgkddi_destroy_hw_queue(h_hw_queue) };
     if status != STATUS_SUCCESS {
@@ -1000,9 +1332,10 @@ pub unsafe extern "C" fn dxgkddi_resume_context(
     STATUS_SUCCESS
 }
 
-/// Best effort: the host RM owns the engine, so nothing is reset here. Kicks
-/// the progress poll so whatever completed is reported. TODO: an RM channel
-/// recovery (RC) path for native channels.
+/// Recovers the native contexts on the node that were reported faulted or hung
+/// (or whose channel error notifier is set now) and invalidates them
+/// ([`recover_native`]); healthy contexts on the node keep running, since the
+/// host engine itself is not reset. Then kicks the progress poll.
 pub unsafe extern "C" fn dxgkddi_reset_hw_engine(
     h_adapter: IN_CONST_HANDLE,
     args: INOUT_PDXGKARG_RESETHWENGINE,
@@ -1011,8 +1344,10 @@ pub unsafe extern "C" fn dxgkddi_reset_hw_engine(
         return STATUS_INVALID_PARAMETER;
     }
     ENGINE_RESETS.fetch_add(1, Ordering::Relaxed);
-    // SAFETY: our adapter context.
+    // SAFETY: our adapter context; dxgkrnl's live args.
     let adapter = unsafe { &*(h_adapter as *const AdapterContext) };
+    let node = unsafe { (*args).NodeOrdinal };
+    let _ = recover_native(adapter, Recover::Engine(node));
     after_submit(adapter, 0, None, 0);
     STATUS_SUCCESS
 }

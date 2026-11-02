@@ -321,6 +321,16 @@ pub const COUNTERS: &[&str] = &[
     "HwsSmfDefer",
     "HwsSmfEarly",
     "HwsSmfTaken",
+    "HwsNatFault",
+    "HwsNatHang",
+    "HwsNatForce",
+    "HwsNatRecov",
+    "HwsNatInval",
+    "HwsNatInvSt",
+    "HwsNatRstSt",
+    "HwsNatUnsSt",
+    "HwsNatCause",
+    "HwsNatTdrF",
 ];
 
 #[cfg(test)]

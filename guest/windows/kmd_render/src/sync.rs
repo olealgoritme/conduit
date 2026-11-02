@@ -71,8 +71,24 @@ pub(crate) const STATUS_WAIT_ABORTED: i32 = 0xC000_0120u32 as i32;
 /// # Safety
 /// `object` is an initialized dispatcher object that outlives the wait; PASSIVE_LEVEL.
 pub(crate) unsafe fn wait_logged_abortable(object: PVOID, which: u32, abortable: bool) -> i32 {
+    // SAFETY: per the fn contract.
+    unsafe { wait_logged_within(object, which, abortable, None) }
+}
+
+/// [`wait_logged_abortable`] that also gives up, returning [`STATUS_WAIT_ABORTED`]
+/// without the object, once `max_ms` of 100 ms slices expired (`None` = never).
+///
+/// # Safety
+/// As [`wait_logged_abortable`].
+pub(crate) unsafe fn wait_logged_within(
+    object: PVOID,
+    which: u32,
+    abortable: bool,
+    max_ms: Option<u64>,
+) -> i32 {
     let mut slices = 0u32;
     let mut slice_ms = 0u32;
+    let mut waited_ms = 0u64;
     loop {
         // SAFETY: an all-zero LARGE_INTEGER is a valid plain integer union.
         let mut timeout: wdk_sys::LARGE_INTEGER = unsafe { core::mem::zeroed() };
@@ -89,6 +105,10 @@ pub(crate) unsafe fn wait_logged_abortable(object: PVOID, which: u32, abortable:
                 crate::ddi::escape_wait::note_lock_abort(why);
                 return STATUS_WAIT_ABORTED;
             }
+        }
+        waited_ms += 100;
+        if max_ms.is_some_and(|max| waited_ms >= max) {
+            return STATUS_WAIT_ABORTED;
         }
         slice_ms += 100;
         if slice_ms >= helios_kmd_logic::stall_diag::LONG_WAIT_SLICE_MS {
@@ -229,6 +249,28 @@ impl PassiveMutex {
                 self.raw.get().cast::<core::ffi::c_void>() as PVOID,
                 helios_kmd_logic::stall_diag::lock::CONTENT,
                 true,
+            )
+        };
+        (status >= 0).then_some(PassiveMutexGuard {
+            owner: self,
+            _not_send: PhantomData,
+        })
+    }
+
+    /// [`Self::lock`] that gives up after `max_ms` (`None` then), for a caller that
+    /// must never block indefinitely behind a holder stuck on the host.
+    pub(crate) fn lock_within(
+        &self,
+        _passive: PassiveLevel,
+        max_ms: u64,
+    ) -> Option<PassiveMutexGuard<'_>> {
+        // SAFETY: as in `lock`, with a bounded wait.
+        let status = unsafe {
+            wait_logged_within(
+                self.raw.get().cast::<core::ffi::c_void>() as PVOID,
+                helios_kmd_logic::stall_diag::lock::CONTENT,
+                true,
+                Some(max_ms),
             )
         };
         (status >= 0).then_some(PassiveMutexGuard {

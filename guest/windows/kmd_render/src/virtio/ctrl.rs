@@ -628,7 +628,68 @@ fn spin_for_completion(block: &WaitBlockRef<'_>, budget_100ns: u64) -> bool {
 /// A timeout abandons the entry; its eventual completion neither copies nor
 /// signals. An RM call that outlives `timeout_ms` may still have taken effect on
 /// the host, so the caller must treat the handle as indeterminate.
+///
+/// Every call is admitted by the host-liveness state
+/// (`helios_kmd_logic::host_liveness`): once round trips time out with nothing
+/// answering, new calls fail at once with `Timeout` instead of each waiting its
+/// whole budget on a backend that is gone, and one probe per interval finds out
+/// whether it is back. `NvHostDead` / `NvHostBack` count the transitions,
+/// `NvHostRef` the calls refused so far.
 pub fn raw_roundtrip(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    req: &[u8],
+    resp_out: &mut [u8],
+    timeout_ms: u64,
+) -> Result<usize, VirtioError> {
+    use helios_kmd_logic::host_liveness as hl;
+    let start = crate::adapter::foreign_scanout::now_100ns();
+    let admit = HOST_LIVENESS.lock().admit(start);
+    if admit == hl::Admit::Refuse {
+        HOST_REFUSED.fetch_add(1, Ordering::Relaxed);
+        return Err(VirtioError::Timeout);
+    }
+    let wait_ms = hl::wait_ms(admit, timeout_ms);
+    let result = raw_roundtrip_once(passive, adapter, req, resp_out, wait_ms);
+    let now = crate::adapter::foreign_scanout::now_100ns();
+    match result {
+        Ok(_) => {
+            if HOST_LIVENESS.lock().on_reply(now) {
+                let n = HOST_BACK.fetch_add(1, Ordering::Relaxed) + 1;
+                crate::diag::record_named_bytes(b"NvHostBack", n);
+                crate::diag::record_named_bytes(b"NvHostRef", HOST_REFUSED.load(Ordering::Relaxed));
+            }
+        }
+        Err(VirtioError::Timeout) | Err(VirtioError::QueueFull) => {
+            // A ring that stayed full for the whole enqueue budget is as silent as a
+            // wait that timed out.
+            let budget = if matches!(result, Err(VirtioError::QueueFull)) {
+                wait_ms.max(ENQUEUE_RETRY_MAX_MS)
+            } else {
+                wait_ms
+            };
+            if HOST_LIVENESS.lock().on_timeout(start, now, budget) {
+                let n = HOST_DEAD.fetch_add(1, Ordering::Relaxed) + 1;
+                crate::diag::record_named_bytes(b"NvHostDead", n);
+                crate::diag::record_named_bytes(b"NvHostRef", HOST_REFUSED.load(Ordering::Relaxed));
+            }
+        }
+        Err(_) => {}
+    }
+    result
+}
+
+/// Host-liveness state for raw round trips (see [`raw_roundtrip`]).
+static HOST_LIVENESS: crate::sync::SpinLock<helios_kmd_logic::host_liveness::Liveness> =
+    crate::sync::SpinLock::new(helios_kmd_logic::host_liveness::Liveness::new());
+/// Raw round trips refused while the host was unresponsive (`NvHostRef`), times it
+/// was declared unresponsive (`NvHostDead`) and answered again (`NvHostBack`).
+pub static HOST_REFUSED: AtomicU32 = AtomicU32::new(0);
+static HOST_DEAD: AtomicU32 = AtomicU32::new(0);
+static HOST_BACK: AtomicU32 = AtomicU32::new(0);
+
+/// One admitted [`raw_roundtrip`].
+fn raw_roundtrip_once(
     passive: PassiveLevel,
     adapter: &AdapterContext,
     req: &[u8],
@@ -681,6 +742,10 @@ pub fn raw_roundtrip(
         // As in `ctrl_roundtrip`: the buffer is a loop value, handed back by every
         // refusal arm, so a retry that forgets it does not compile.
         let mut budget = Budget::new(ENQUEUE_RETRY_MAX_MS);
+        // The nominal budget can be ~16x its real time (see `sleep_ms`); this clock
+        // bounds the retries to the budget in real time as well.
+        let enqueue_deadline = crate::adapter::foreign_scanout::now_100ns()
+            .saturating_add(ENQUEUE_RETRY_MAX_MS * 10_000);
         let ticket = loop {
             let res = adapter.with_virtio(move |v| {
                 v.drain_used();
@@ -691,7 +756,9 @@ pub fn raw_roundtrip(
                 Ok(Ok(ticket)) => break ticket,
                 Ok(Err((m_back, VirtioError::QueueFull))) => {
                     meta = m_back;
-                    if budget.charge_slice() {
+                    if budget.charge_slice()
+                        || crate::adapter::foreign_scanout::now_100ns() >= enqueue_deadline
+                    {
                         return Err(VirtioError::QueueFull);
                     }
                     reap_parked(passive, adapter);
