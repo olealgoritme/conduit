@@ -117,11 +117,18 @@ fn show(adapter: &AdapterContext, native_id: u32, mode: (u32, u32)) {
     }
     let prepared = native_memory::with_io(passive, adapter, |io| {
         let drm = drm_file(io)?;
-        let gem = if source.gem != 0 {
-            source.gem
+        // Read again under the I/O mutex: the allocation may have been destroyed
+        // (or given a GEM) since `scanout_source` above.
+        let current = native_memory::scanout_source(native_id)?;
+        let gem = if current.gem != 0 {
+            current.gem
         } else {
-            let gem = import(io, drm, &source)?;
-            native_memory::set_scanout_gem(native_id, gem)?;
+            let gem = import(io, drm, &current)?;
+            if let Err(error) = native_memory::set_scanout_gem(native_id, gem) {
+                // Nothing would ever close it.
+                close_gem(io, drm, gem);
+                return Err(error);
+            }
             let g = GEMS.fetch_add(1, Ordering::Relaxed) + 1;
             crate::diag::record_named_bytes(b"NvScGem", g);
             gem
@@ -271,6 +278,10 @@ pub(crate) fn release_gem(io: &Io<'_>, gem: u32) {
         return;
     }
     let _ = io.adapter.foreign_scanout_release(KMD, Some(drm));
+    close_gem(io, drm, gem);
+}
+
+fn close_gem(io: &Io<'_>, drm: u32, gem: u32) {
     let data = rc::gem_close_params(gem);
     let mut resp = [0u8; REPLY_MAX];
     let _ = io.exchange(drm, rc::DRM_IOCTL_GEM_CLOSE, &data, &[], &mut resp);

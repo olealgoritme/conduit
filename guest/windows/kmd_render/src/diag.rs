@@ -76,6 +76,8 @@ const REG_DWORD: u32 = 4;
 const REG_QWORD: u32 = 11;
 /// `REG_BINARY`.
 const REG_BINARY: u32 = 3;
+/// `REG_SZ`.
+const REG_SZ: u32 = 1;
 /// Cap on breadcrumbs so a chatty steady state can't grow the key unbounded.
 const MAX_STEPS: u32 = 3000;
 
@@ -185,6 +187,29 @@ pub fn record_named_binary(name: &[u8], data: &[u8]) {
             REG_BINARY,
             data.as_ptr() as *mut core::ffi::c_void,
             len,
+        );
+    }
+}
+
+/// A `REG_SZ` value in the service key: `name` is a NUL-terminated UTF-16 value name, `value` a
+/// NUL-terminated UTF-16 string of `bytes` bytes (terminator included). Not part of the mirror's
+/// changed-only cache; for one-shot values such as `NvHostRmVersion`. PASSIVE_LEVEL only.
+pub fn record_named_string(name: &[u16], value: &[u16], bytes: u32) {
+    if name.last() != Some(&0) || value.len() * 2 < bytes as usize || bytes < 2 {
+        return;
+    }
+    hot::note(name);
+    // SAFETY: PASSIVE_LEVEL (see module note). `name` is NUL-terminated (checked above); ValueData
+    // points to `bytes` readable bytes of `value` (checked above), which RtlWriteRegistryValue
+    // copies before returning without writing through the pointer.
+    unsafe {
+        let _ = RtlWriteRegistryValue(
+            RTL_REGISTRY_SERVICES,
+            SERVICE_NAME.as_ptr(),
+            name.as_ptr(),
+            REG_SZ,
+            value.as_ptr() as *mut core::ffi::c_void,
+            bytes,
         );
     }
 }

@@ -120,6 +120,16 @@ The uninstaller deliberately keeps Khronos loader DLLs because another vendor
 installed later may use them. Add `-RemoveKhronosLoaders` to remove loaders that
 this package originally installed, but only if their hashes are unchanged.
 
+## NVIDIA's own user-mode drivers (RTX personality)
+
+On the RTX personality (`PCI\VEN_10DE&DEV_2B85`) `Install-Helios.ps1 -NvidiaUmd
+[-NvidiaPackage FOLDER]` or, after installation, `C:\ProgramData\Helios\Set-HeliosUmd.ps1
+-Nvidia [-Package FOLDER]` stages NVIDIA's own user-mode drivers from the user's
+NVIDIA driver package; `-HeliosUmd` / `Set-HeliosUmd.ps1 -Helios` undoes it. The
+package never carries NVIDIA files. Version check, the files and registry
+values involved and the revert are described in
+[installer/README.md](../../installer/README.md#nvidias-own-user-mode-drivers-rtx-personality-opt-in).
+
 ## Current limits
 
 - D3D12 resource ownership across APIs, host-loss/error propagation, and some

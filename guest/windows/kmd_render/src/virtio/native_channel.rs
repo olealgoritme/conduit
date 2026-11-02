@@ -26,6 +26,7 @@ use core::ffi::c_void;
 use core::sync::atomic::{AtomicU32, Ordering};
 use helios_kmd_logic::ce_present::{self as cp, Token};
 use helios_kmd_logic::native_channel as nc;
+use helios_kmd_logic::native_teardown as nt;
 use helios_kmd_logic::nvda as nd;
 use helios_kmd_logic::rm_ce_channel as cc;
 use helios_kmd_logic::rm_client::{self as rc};
@@ -103,19 +104,66 @@ pub(crate) struct NativeRingBacking {
     pub offset: u64,
 }
 
-/// Process-native state is taken out of its spinlock before any host call.
-/// `Busy` therefore never appears at submit IRQL; submission uses only the
-/// completed queue's own views.
-pub(crate) enum NativeProcessState {
-    Empty,
-    Busy,
-    Ready(NativeProcess),
-}
+/// A process's native association (`nt::Slot`): one thread initializes it, every
+/// create and destroy works on a copy, so concurrent teardowns of one process
+/// never refuse each other. Submission uses only the completed queue's views.
+pub(crate) type NativeProcessState = nt::Slot<NativeProcess>;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct NativeProcess {
     client: NativeClient,
     vaspace: u32,
     epoch: u64,
+}
+
+/// How long a create or destroy waits out another thread's initialization of the
+/// process (`sleep_ms` rounds up to the timer period, ~16 ms: about 5 s).
+const SLOT_WAIT_TRIES: u32 = 320;
+
+/// RM objects failed teardowns left allocated, freed again at DestroyProcess
+/// (dxgkrnl never repeats a Destroy DDI).
+static LEDGER: SpinLock<nt::Ledger<64>> = SpinLock::new(nt::Ledger::new());
+/// `NvTdFiled` objects filed, `NvTdFreed` freed at DestroyProcess, `NvTdLost` neither
+/// (another generation, refused again, no client, or a slot that never came up).
+static TD_FILED: AtomicU32 = AtomicU32::new(0);
+static TD_FREED: AtomicU32 = AtomicU32::new(0);
+static TD_LOST: AtomicU32 = AtomicU32::new(0);
+
+/// RM objects one queue teardown could not free: (parent, object), children first.
+#[derive(Clone, Copy, Default)]
+struct Left {
+    items: [(u32, u32); 3],
+    n: usize,
+}
+
+impl Left {
+    fn add(&mut self, parent: u32, object: u32) {
+        if let Some(slot) = self.items.get_mut(self.n) {
+            *slot = (parent, object);
+            self.n += 1;
+        }
+    }
+}
+
+fn file_leftover(process: usize, epoch: u64, parent: u32, object: u32) {
+    let filed = LEDGER.lock().push(nt::Leftover {
+        process,
+        epoch,
+        parent,
+        object,
+    });
+    if filed {
+        TD_FILED.fetch_add(1, Ordering::Relaxed);
+    } else {
+        TD_LOST.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+fn file_leftovers(process: usize, epoch: u64, left: &mut Left) {
+    for &(parent, object) in left.items.get(..left.n).unwrap_or(&[]) {
+        file_leftover(process, epoch, parent, object);
+    }
+    *left = Left::default();
 }
 
 #[derive(Clone, Copy)]
@@ -344,71 +392,66 @@ fn process_slot(process: &ProcessContext) -> &SpinLock<NativeProcessState> {
     process.native_state()
 }
 
-fn replace_process(process: &ProcessContext, next: NativeProcessState) -> NativeProcessState {
-    core::mem::replace(&mut *process_slot(process).lock(), next)
-}
-
+/// The process's association for the live transport, initializing it on first use;
+/// another thread's initialization is waited out.
 fn ensure_process(
     passive: PassiveLevel,
     adapter: &AdapterContext,
     process: &ProcessContext,
-) -> Result<(), NativeError> {
+) -> Result<NativeProcess, NativeError> {
     let epoch = adapter.with_virtio(|v| v.nvrm_epoch()).unwrap_or(0);
-    match replace_process(process, NativeProcessState::Busy) {
-        NativeProcessState::Ready(previous) => {
-            if previous.epoch == epoch && epoch != 0 {
-                *process_slot(process).lock() = NativeProcessState::Ready(previous);
-                return Ok(());
+    for _ in 0..SLOT_WAIT_TRIES {
+        // A previous transport generation is simply forgotten here. Its host files
+        // were closed by the transport sweep; old queues carry the same epoch and
+        // refuse submission/teardown host calls.
+        let begin = process_slot(process)
+            .lock()
+            .begin(|native| native.epoch == epoch && epoch != 0);
+        match begin {
+            nt::Begin::Ready(native) => return Ok(native),
+            nt::Begin::Wait => super::ctrl::sleep_ms(passive, 1),
+            nt::Begin::Initialize => {
+                let result = if epoch == 0 {
+                    Err(NativeError::Transport)
+                } else {
+                    super::native_memory::channel_client(
+                        passive,
+                        adapter,
+                        process as *const ProcessContext as usize,
+                    )
+                    .map_err(|_| NativeError::Transport)
+                    .and_then(|(client, vaspace)| {
+                        if client.epoch == epoch {
+                            Ok(NativeProcess {
+                                client,
+                                vaspace,
+                                epoch,
+                            })
+                        } else {
+                            Err(NativeError::Transport)
+                        }
+                    })
+                };
+                process_slot(process).lock().finish(result.as_ref().ok().copied());
+                return result;
             }
-            // A previous transport generation is simply forgotten here. Its
-            // host files were closed by the transport sweep; old queues carry
-            // the same epoch and refuse submission/teardown host calls.
-            *process_slot(process).lock() = NativeProcessState::Empty;
         }
-        NativeProcessState::Busy => {
-            *process_slot(process).lock() = NativeProcessState::Busy;
-            return Err(NativeError::Busy);
-        }
-        NativeProcessState::Empty => {}
     }
-    if epoch == 0 {
-        *process_slot(process).lock() = NativeProcessState::Empty;
-        return Err(NativeError::Transport);
-    }
-    let (client, vaspace) = super::native_memory::channel_client(
-        passive,
-        adapter,
-        process as *const ProcessContext as usize,
-    )
-    .map_err(|_| NativeError::Transport)?;
-    if client.epoch != epoch {
-        *process_slot(process).lock() = NativeProcessState::Empty;
-        return Err(NativeError::Transport);
-    }
-    *process_slot(process).lock() = NativeProcessState::Ready(NativeProcess {
-        client,
-        vaspace,
-        epoch,
-    });
-    Ok(())
+    Err(NativeError::Busy)
 }
 
-fn take_process(process: &ProcessContext) -> Result<NativeProcess, NativeError> {
-    match replace_process(process, NativeProcessState::Busy) {
-        NativeProcessState::Ready(native) => Ok(native),
-        NativeProcessState::Busy => {
-            *process_slot(process).lock() = NativeProcessState::Busy;
-            Err(NativeError::Busy)
-        }
-        NativeProcessState::Empty => {
-            *process_slot(process).lock() = NativeProcessState::Empty;
-            Err(NativeError::Transport)
+/// A copy of the process's ready association (`Transport` when it has none),
+/// waiting out another thread's initialization.
+fn peek_process(passive: PassiveLevel, process: &ProcessContext) -> Result<NativeProcess, NativeError> {
+    for _ in 0..SLOT_WAIT_TRIES {
+        let peek = process_slot(process).lock().peek();
+        match peek {
+            nt::Peek::Ready(native) => return Ok(native),
+            nt::Peek::Empty => return Err(NativeError::Transport),
+            nt::Peek::Wait => super::ctrl::sleep_ms(passive, 1),
         }
     }
-}
-
-fn restore_process(process: &ProcessContext, native: NativeProcess) {
-    *process_slot(process).lock() = NativeProcessState::Ready(native);
+    Err(NativeError::Busy)
 }
 
 fn validate_blackwell(io: Io<'_>, client: &NativeClient) -> Result<(), NativeError> {
@@ -527,11 +570,11 @@ impl NativeContext {
         process: &mut ProcessContext,
         owner: DeviceOwner,
     ) -> Result<Self, NativeError> {
-        ensure_process(passive, adapter, process)?;
+        let native = ensure_process(passive, adapter, process)?;
+        let key = &*process as *const ProcessContext as usize;
         let handles = ObjectHandles::mint()?;
         let tsg = handles.at(0);
         let ctxshare = handles.at(1);
-        let mut native = take_process(process)?;
         let io = Io {
             passive,
             adapter,
@@ -553,13 +596,14 @@ impl NativeContext {
                 cc::FERMI_CONTEXT_SHARE_A,
                 &cc::ctxshare_params(native.vaspace),
             ) {
-                let _ = io.free(&native.client, nd::H_DEVICE, tsg);
+                if io.free(&native.client, nd::H_DEVICE, tsg).is_err() {
+                    file_leftover(key, native.epoch, nd::H_DEVICE, tsg);
+                }
                 return Err(error);
             }
             Ok(())
         })();
         let epoch = native.epoch;
-        restore_process(process, native);
         result?;
         Ok(Self {
             adapter: adapter as *const AdapterContext as *mut AdapterContext,
@@ -577,17 +621,20 @@ impl NativeContext {
         let Some(adapter) = (unsafe { self.adapter.as_ref() }) else {
             return Ok(());
         };
-        let Some(process) = (unsafe { self.process.as_mut() }) else {
+        let Some(process) = (unsafe { self.process.as_ref() }) else {
             return Ok(());
         };
-        let mut native = match take_process(process) {
+        let native = match peek_process(passive, process) {
             Ok(native) => native,
             // The transport-wide close already reclaimed the whole client.
             Err(NativeError::Transport) => return Ok(()),
-            Err(error) => return Err(error),
+            // No client to free it with: the transport's sweep reclaims it.
+            Err(_) => {
+                TD_LOST.fetch_add(1, Ordering::Relaxed);
+                return Ok(());
+            }
         };
         if native.epoch != self.epoch {
-            restore_process(process, native);
             return Ok(());
         }
         let io = Io {
@@ -605,10 +652,13 @@ impl NativeContext {
             );
         }
         // Queue destruction precedes context destruction, so this also frees
-        // the context share without any live channel beneath it.
-        let result = io.free(&native.client, nd::H_DEVICE, self.tsg);
-        restore_process(process, native);
-        result
+        // the context share without any live channel beneath it. dxgkrnl never
+        // repeats DestroyContext: a TSG RM would not free is filed for
+        // DestroyProcess, and the context goes either way.
+        if io.free(&native.client, nd::H_DEVICE, self.tsg).is_err() {
+            file_leftover(self.process_key(), native.epoch, nd::H_DEVICE, self.tsg);
+        }
+        Ok(())
     }
 }
 
@@ -634,6 +684,8 @@ struct QueueParts {
     usermode: CpuView,
     channel_allocated: bool,
     token: u32,
+    /// What the last `destroy` could not free, for the caller to file.
+    left: Left,
 }
 
 impl QueueParts {
@@ -650,27 +702,54 @@ impl QueueParts {
         }
     }
 
+    /// Every step is tried; the first error is returned. What RM would not free,
+    /// or must not free yet, goes to `self.left` (children first): the channel if
+    /// its free failed, and then also USERD and the doorbell memory, which a
+    /// channel RM still owns can address. CPU views (kernel view, host map, RM's
+    /// CPU mapping and its file) never stay: the GPU does not use them.
     fn destroy(&mut self, io: Io<'_>, client: &NativeClient, tsg: u32) -> Result<(), NativeError> {
         let Some(handles) = self.handles else {
             return Ok(());
         };
+        let mut result = Ok(());
+        let mut channel_gone = true;
         if self.channel_allocated {
-            // Never unmap USERD, the doorbell, or the ring while RM may still
-            // own a live channel which can address them.
-            io.free(client, tsg, handles.at(5))?;
+            if let Err(error) = io.free(client, tsg, handles.at(5)) {
+                channel_gone = false;
+                self.left.add(tsg, handles.at(5));
+                result = Err(error);
+            }
             self.channel_allocated = false;
         }
-        cpu_unmap(io, client, &mut self.usermode)?;
-        if self.usermode_allocated {
-            io.free(client, nd::H_SUBDEVICE, handles.at(4))?;
-            self.usermode_allocated = false;
+        for view in [&mut self.usermode, &mut self.ctl] {
+            // `cpu_unmap` drops the kernel view first, whatever fails after it.
+            if let Err(error) = cpu_unmap(io, client, view) {
+                if result.is_ok() {
+                    result = Err(error);
+                }
+            }
         }
-        cpu_unmap(io, client, &mut self.ctl)?;
-        if self.ctl_allocated {
-            io.free(client, nd::H_DEVICE, handles.at(3))?;
-            self.ctl_allocated = false;
+        for (allocated, parent, object) in [
+            (&mut self.usermode_allocated, nd::H_SUBDEVICE, handles.at(4)),
+            (&mut self.ctl_allocated, nd::H_DEVICE, handles.at(3)),
+        ] {
+            if !*allocated {
+                continue;
+            }
+            *allocated = false;
+            if channel_gone {
+                match io.free(client, parent, object) {
+                    Ok(()) => continue,
+                    Err(error) => {
+                        if result.is_ok() {
+                            result = Err(error);
+                        }
+                    }
+                }
+            }
+            self.left.add(parent, object);
         }
-        Ok(())
+        result
     }
 }
 
@@ -720,15 +799,14 @@ impl NativeQueue {
         if backing.memory == 0 || backing.mapped_bytes < u64::from(queue.ring_bytes) {
             return Err(NativeError::UnbackedRing);
         }
-        let process = unsafe { context.process.as_mut() }.ok_or(NativeError::Invalid)?;
+        let process = unsafe { context.process.as_ref() }.ok_or(NativeError::Invalid)?;
         let handles = ObjectHandles::mint()?;
-        let mut native = take_process(process)?;
+        let native = peek_process(passive, process)?;
         if native.epoch != context.epoch
             || (backing.va_space != 0 && backing.va_space != native.vaspace)
         {
             crate::diag::record_named_bytes(b"NvQStep", 0x80);
             crate::diag::record_named_bytes(b"NvQSpaces", backing.va_space ^ native.vaspace);
-            restore_process(process, native);
             return Err(NativeError::Transport);
         }
         let io = Io {
@@ -749,7 +827,8 @@ impl NativeQueue {
             queue,
             &mut parts,
         );
-        restore_process(process, native);
+        // A half-made queue's objects RM would not free go to DestroyProcess.
+        file_leftovers(context.process_key(), native.epoch, &mut parts.left);
         result?;
         // NvCeBindOn: bit 0 enables the binding, bits 8..12 are subchannel 4's
         // SET_OBJECT ENGINE field (its engine on the GR runlist; 0 = GR itself).
@@ -1068,20 +1147,25 @@ impl NativeQueue {
         let Some(context) = (unsafe { self.context.as_ref() }) else {
             return Ok(());
         };
-        let Some(process) = (unsafe { context.process.as_mut() }) else {
+        let Some(process) = (unsafe { context.process.as_ref() }) else {
             return Ok(());
         };
-        let mut native = match take_process(process) {
+        let native = match peek_process(passive, process) {
             Ok(native) => native,
             Err(NativeError::Transport) => {
                 self.parts.drop_views();
                 return Ok(());
             }
-            Err(error) => return Err(error),
+            // No client to free its objects with: the transport's sweep reclaims
+            // them; the kernel views go now.
+            Err(_) => {
+                self.parts.drop_views();
+                TD_LOST.fetch_add(1, Ordering::Relaxed);
+                return Ok(());
+            }
         };
         if native.epoch != self.epoch {
             self.parts.drop_views();
-            restore_process(process, native);
             return Ok(());
         }
         let io = Io {
@@ -1089,9 +1173,12 @@ impl NativeQueue {
             adapter,
             epoch: native.epoch,
         };
-        let result = self.parts.destroy(io, &native.client, context.tsg);
-        restore_process(process, native);
-        result
+        // dxgkrnl never repeats DestroyHwQueue: what RM would not free is filed for
+        // DestroyProcess and the queue goes either way (its fence page unlocks in
+        // `Drop`).
+        let _ = self.parts.destroy(io, &native.client, context.tsg);
+        file_leftovers(context.process_key(), native.epoch, &mut self.parts.left);
+        Ok(())
     }
 }
 
@@ -1526,19 +1613,61 @@ fn full_barrier() {
     unsafe { core::arch::x86_64::_mm_mfence() };
 }
 
-/// Forget the process's association after all contexts and queues are gone.
-/// The shared native-memory client and VA space have transport lifetime and are
-/// reclaimed by `native_memory::forget`, never closed per process here.
+/// Forget the process's association after all contexts and queues are gone, and
+/// free again what their failed teardowns left in RM (children first). The shared
+/// native-memory client and VA space have transport lifetime and are reclaimed by
+/// `native_memory::forget`; the process's own VA space goes in
+/// `native_memory::release_process`, after this. `Busy` only while another
+/// thread is still initializing the process, which WDDM's ordering rules out.
 pub(crate) fn destroy_process(
-    _passive: PassiveLevel,
-    _adapter: &AdapterContext,
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
     process: &mut ProcessContext,
 ) -> Result<(), NativeError> {
-    match replace_process(process, NativeProcessState::Empty) {
-        NativeProcessState::Empty | NativeProcessState::Ready(_) => Ok(()),
-        NativeProcessState::Busy => {
-            *process_slot(process).lock() = NativeProcessState::Busy;
-            Err(NativeError::Busy)
+    let key = process as *const ProcessContext as usize;
+    let mut ready = None;
+    let mut cleared = false;
+    for _ in 0..SLOT_WAIT_TRIES {
+        let outcome = process_slot(process).lock().clear();
+        match outcome {
+            Ok(native) => {
+                ready = native;
+                cleared = true;
+                break;
+            }
+            Err(nt::Initializing) => super::ctrl::sleep_ms(passive, 1),
         }
     }
+    if !cleared {
+        return Err(NativeError::Busy);
+    }
+    let epoch = adapter.with_virtio(|v| v.nvrm_epoch()).unwrap_or(0);
+    LEDGER.lock().keep_epoch(epoch);
+    let mut touched = false;
+    loop {
+        let next = LEDGER.lock().take(key);
+        let Some(leftover) = next else {
+            break;
+        };
+        touched = true;
+        let freed = ready.filter(|native| native.epoch == leftover.epoch).is_some_and(|native| {
+            let io = Io {
+                passive,
+                adapter,
+                epoch: native.epoch,
+            };
+            io.free(&native.client, leftover.parent, leftover.object).is_ok()
+        });
+        if freed {
+            TD_FREED.fetch_add(1, Ordering::Relaxed);
+        } else {
+            TD_LOST.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    if touched || TD_LOST.load(Ordering::Relaxed) != 0 {
+        crate::diag::record_named_bytes(b"NvTdFiled", TD_FILED.load(Ordering::Relaxed));
+        crate::diag::record_named_bytes(b"NvTdFreed", TD_FREED.load(Ordering::Relaxed));
+        crate::diag::record_named_bytes(b"NvTdLost", TD_LOST.load(Ordering::Relaxed));
+    }
+    Ok(())
 }

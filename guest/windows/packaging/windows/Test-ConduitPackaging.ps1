@@ -51,6 +51,26 @@ Assert-True ($install.Contains("-MultipleInstances Parallel")) "the tray task is
 Assert-True ($install.Contains("The context menu command was not installed (the tray app was)")) "context menu copy failures are not separate"
 Assert-True ($install.Contains("The virtio-input driver was not installed")) "a vioinput failure is not just a warning"
 
+# NVIDIA UMD mode: version forms and checks, and the INF sections it reads.
+Assert-True ((ConvertTo-HeliosNvidiaVersion "32.0.16.1088") -eq "610.88") "a driver file version is not converted to NVIDIA's short form"
+Assert-True ((ConvertTo-HeliosNvidiaVersion "610.57.04") -eq "610.57.04") "a short version is changed"
+Assert-True ((Get-HeliosNvidiaBranch "610.57.04") -eq "610") "the branch of a host RM version is wrong"
+Assert-HeliosNvidiaVersion "32.0.16.1088" "610.88" "610.57.04"
+foreach ($case in @(@("32.0.16.1074", "610.88", "610.57.04"), @("610.88", "610.88", "615.10"), @("610.88", "610.88", ""))) {
+    $threw = $false
+    try { Assert-HeliosNvidiaVersion $case[0] $case[1] $case[2] } catch { $threw = $true }
+    Assert-True $threw "package $($case[0]) passed against NvUmdVersion $($case[1]) and host RM '$($case[2])'"
+}
+$inx = Read-HeliosInf (Join-Path $here "..\..\kmd_render\helios_kmd_render.inx")
+$rtxValues = @(Get-HeliosInfHkrValues $inx @(Get-HeliosInfDirective $inx "Helios_NVIDIA_Install" "AddReg") "C:\DS")
+$heliosValues = @(Get-HeliosInfHkrValues $inx @(Get-HeliosInfDirective $inx "Helios_Install" "AddReg") "C:\DS")
+$rtxUmd = $rtxValues | Where-Object { $_.Name -eq "UserModeDriverName" }
+$heliosUmd = $heliosValues | Where-Object { $_.Name -eq "UserModeDriverName" }
+Assert-True ($rtxUmd -and $rtxUmd.Data[0] -eq "C:\DS\nvldumdx.dll") "the INF's RTX section does not register nvldumdx.dll"
+Assert-True ($heliosUmd -and $heliosUmd.Data[0] -eq "<>" -and $heliosUmd.Data[1] -eq "C:\DS\helios_umd.dll") "the INF's Helios section does not register helios_umd.dll"
+$pin = Get-HeliosInfHkrValues $inx @("Helios_NVIDIA_Service_AddReg") "" | Where-Object { $_.Subkey -eq "Parameters" -and $_.Name -eq "NvUmdVersion" }
+Assert-True ($pin -and (ConvertTo-HeliosNvidiaVersion $pin.Data[0])) "the INF does not set Parameters\NvUmdVersion"
+
 $scratch = Join-Path ([IO.Path]::GetTempPath()) ("conduit-packaging-{0}" -f [Guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Path $scratch | Out-Null
 try {

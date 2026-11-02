@@ -20,6 +20,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use helios_kmd_logic::ce_route as cr;
 use helios_kmd_logic::native_memory as nm;
+use helios_kmd_logic::native_teardown as nt;
 use helios_kmd_logic::nvda as nd;
 use helios_kmd_logic::rm_ce_channel as cc;
 use helios_kmd_logic::rm_client as rc;
@@ -513,6 +514,10 @@ pub fn channel_client(
     adapter: &AdapterContext,
     process: usize,
 ) -> Result<(NativeClient, u32), Error> {
+    // Under the I/O mutex (a recursive KMUTEX: `create` already holds it), like
+    // every other `ensure_space` caller, so two threads cannot both find no space
+    // for one process and each allocate one.
+    let _guard = lock(passive)?;
     // Copy the client out first: a guard in an `if let` scrutinee lives through
     // the body (edition 2021), and `ensure_space` takes STATE again on this
     // non-reentrant spinlock (CreateContext spun forever in ensure_space).
@@ -773,6 +778,16 @@ fn preserve_ambiguous_pins(pins: &mut Vec<Pin>) {
     STATE.lock().orphan_pins.append(pins);
 }
 
+/// A create that will not finish gives back its RM memory; the pins unlock only
+/// when RM confirms the free (else the host may still name the pages).
+fn abandon_memory(io: &Io<'_>, memory: u32, pins: &mut Vec<Pin>) {
+    if io.rm_free(nd::H_DEVICE, memory).is_ok() {
+        unlock_pins(pins);
+    } else {
+        preserve_ambiguous_pins(pins);
+    }
+}
+
 fn pin_system_memory(system_memory: u64, size: u64) -> Result<(Vec<Pin>, Vec<u64>), Error> {
     let page_count = usize::try_from(size / nm::PAGE_BYTES).map_err(|_| Error::NoMemory)?;
     let mut pins = Vec::new();
@@ -1016,11 +1031,7 @@ pub fn create(
     ) {
         Some(writeback) => writeback,
         None => {
-            if io.rm_free(nd::H_DEVICE, memory).is_ok() {
-                unlock_pins(&mut pins);
-            } else {
-                preserve_ambiguous_pins(&mut pins);
-            }
+            abandon_memory(&io, memory, &mut pins);
             return Err(Error::Invalid);
         }
     };
@@ -1046,9 +1057,7 @@ pub fn create(
         Writeback::Native(writeback)
     };
     if writeback.apply(private_bytes).is_err() {
-        if io.rm_free(nd::H_DEVICE, memory).is_ok() {
-            unlock_pins(&mut pins);
-        }
+        abandon_memory(&io, memory, &mut pins);
         return Err(Error::Invalid);
     }
     let segment = if private.system_backed() {
@@ -2689,32 +2698,47 @@ pub fn destroy(passive: PassiveLevel, adapter: &AdapterContext, id: u32) -> Resu
         adapter,
         client,
     };
-    let (memory, mappings, has_cpu, gem) = {
+    let (memory, mappings, gem) = {
         let state = STATE.lock();
         let allocation = state.allocation(id)?;
         (
             allocation.memory,
             allocation.mappings.clone(),
-            allocation.cpu.is_some(),
             allocation.scanout_gem,
         )
     };
-    if has_cpu {
-        return Err(Error::Busy);
+    // A CPU view dxgkrnl did not unmap first (an UnmapApertureSegment that came
+    // above PASSIVE leaves it, `cpu_host_aperture`) goes here: nothing maps the
+    // allocation through the aperture once it is destroyed.
+    let cpu = STATE.lock().allocation_mut(id)?.cpu.take();
+    if let Some(mut mapping) = cpu {
+        if let Err(error) = cpu_unmap_for(&io, memory, &mut mapping) {
+            STATE.lock().allocation_mut(id)?.cpu = Some(mapping);
+            return Err(error);
+        }
     }
     if gem != 0 {
         super::native_scanout::release_gem(&io, gem);
         STATE.lock().allocation_mut(id)?.scanout_gem = 0;
     }
+    // Every mapping is tried; one RM refuses stays recorded (and the allocation
+    // with it), the others are gone and not named again.
+    let mut unmapped = Ok(());
     for mapping in mappings {
-        unmap_fixed(&io, memory, mapping)?;
-        STATE
-            .lock()
-            .allocation_mut(id)?
-            .mappings
-            .retain(|live| !(live.virt == mapping.virt && live.piece.va == mapping.piece.va));
+        match unmap_fixed(&io, memory, mapping) {
+            Ok(()) => {
+                STATE
+                    .lock()
+                    .allocation_mut(id)?
+                    .mappings
+                    .retain(|live| !(live.virt == mapping.virt && live.piece.va == mapping.piece.va));
+            }
+            Err(error) => unmapped = Err(error),
+        }
     }
+    unmapped?;
     io.rm_free(nd::H_DEVICE, memory)?;
+    super::nvda::forget_memory(memory);
     let mut allocation = {
         let mut state = STATE.lock();
         let index = state
@@ -2770,6 +2794,9 @@ pub fn release_process(passive: PassiveLevel, adapter: &AdapterContext, process:
     let foreign: Vec<HostMapping> = {
         let mut state = STATE.lock();
         let mut mine = Vec::new();
+        if mine.try_reserve(state.foreign.len()).is_err() {
+            return 1;
+        }
         state.foreign.retain(|m| {
             if m.process == process {
                 mine.push(*m);
@@ -2783,6 +2810,14 @@ pub fn release_process(passive: PassiveLevel, adapter: &AdapterContext, process:
     for mapping in foreign {
         if unmap_fixed(&io, 0, mapping).is_err() {
             kept += 1;
+            // Still mapped: recorded under the dead key (see below).
+            let mut state = STATE.lock();
+            if state.foreign.try_reserve(1).is_ok() {
+                state.foreign.push(HostMapping {
+                    process: nt::DEAD_PROCESS,
+                    ..mapping
+                });
+            }
         }
     }
     for (id, memory, mapping) in owned {
@@ -2816,6 +2851,22 @@ pub fn release_process(passive: PassiveLevel, adapter: &AdapterContext, process:
             }
         }
         STATE.lock().idle_spaces.retain(|p| *p != process);
+    }
+    if kept != 0 {
+        // What RM would not release stays recorded, but no longer under this key:
+        // the key is the freed ProcessContext's address, and a new process at the
+        // same address must get a fresh space, not the dead one's. Allocation
+        // teardown and the transport's sweep still find it.
+        let mut state = STATE.lock();
+        for allocation in state.allocations.iter_mut() {
+            for mapping in allocation.mappings.iter_mut() {
+                mapping.process = nt::retire_owner(mapping.process, process);
+            }
+        }
+        for (owner, _) in state.spaces.iter_mut() {
+            *owner = nt::retire_owner(*owner, process);
+        }
+        state.idle_spaces.retain(|p| *p != process);
     }
     kept
 }
@@ -2859,7 +2910,11 @@ pub fn forget(passive: PassiveLevel) {
     state.foreign.clear();
     state.desc_pfns.clear();
     state.idle_spaces.clear();
+    // Pins kept because the host's answer was unknown: the sweep closed every
+    // object that could name them.
+    let mut orphans = core::mem::take(&mut state.orphan_pins);
     drop(state);
+    unlock_pins(&mut orphans);
     for allocation in allocations.iter_mut() {
         if let Some(cpu) = allocation.cpu.as_mut() {
             if cpu.kernel_va != 0 {

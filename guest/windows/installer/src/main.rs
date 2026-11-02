@@ -14,6 +14,8 @@
 //!   HeliosSetup.exe                              GUI
 //!   HeliosSetup.exe --silent [--automatic] [--log PATH]
 //!   HeliosSetup.exe --silent --uninstall [--log PATH]
+//!   HeliosSetup.exe [--silent] --nvidia-umd [FOLDER]   RTX personality: NVIDIA's own UMDs
+//!   HeliosSetup.exe [--silent] --helios-umd            RTX personality: the Helios UMDs
 //!   HeliosSetup.exe --bundle <payloadDir> <out.exe>   CI packing step only
 
 #![windows_subsystem = "windows"]
@@ -47,11 +49,26 @@ pub enum Event {
     Done(i32),
 }
 
+/// Which user-mode drivers an install or repair registers on the RTX personality
+/// (`Install-Helios.ps1 -NvidiaUmd` / `-HeliosUmd`). NVIDIA's files come from the
+/// user's own NVIDIA driver package; the installer never carries or downloads them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UmdChoice {
+    /// Keep what the last install or `Set-HeliosUmd.ps1` chose.
+    Keep,
+    /// NVIDIA's own UMDs from this extracted NVIDIA driver folder, or (`None`)
+    /// from NVIDIA's own copy in the DriverStore.
+    Nvidia(Option<PathBuf>),
+    /// The Helios UMDs.
+    Helios,
+}
+
 pub struct Options {
     pub silent: bool,
     pub uninstall: bool,
     pub automatic: bool,
     pub log: Option<PathBuf>,
+    pub umd: UmdChoice,
 }
 
 pub struct Payload {
@@ -99,7 +116,7 @@ pub fn cleanup_payload(payload: &Payload) {
     }
 }
 
-fn build_command(payload: &Payload, op: Op, automatic: bool) -> Command {
+fn build_command(payload: &Payload, op: Op, automatic: bool, umd: &UmdChoice) -> Command {
     let install = payload.dir.join("Install-Helios.ps1");
     let uninstall = payload.dir.join("Uninstall-Helios.ps1");
     let mut command = Command::new(powershell());
@@ -130,6 +147,20 @@ fn build_command(payload: &Payload, op: Op, automatic: bool) -> Command {
             command.arg("-File").arg(uninstall);
         }
     }
+    if op != Op::Uninstall {
+        match umd {
+            UmdChoice::Keep => {}
+            UmdChoice::Nvidia(folder) => {
+                command.arg("-NvidiaUmd");
+                if let Some(folder) = folder {
+                    command.arg("-NvidiaPackage").arg(folder);
+                }
+            }
+            UmdChoice::Helios => {
+                command.arg("-HeliosUmd");
+            }
+        }
+    }
     command
 }
 
@@ -137,10 +168,10 @@ fn build_command(payload: &Payload, op: Op, automatic: bool) -> Command {
 /// receiver ends with exactly one `Done(exit_code)`. The caller owns cleaning up
 /// the payload directory: the GUI keeps one extraction for the whole process and
 /// removes it on exit; silent mode removes it after its single run.
-pub fn start_worker(payload: Payload, op: Op, automatic: bool) -> Receiver<Event> {
+pub fn start_worker(payload: Payload, op: Op, automatic: bool, umd: UmdChoice) -> Receiver<Event> {
     let (tx, rx) = channel();
     thread::spawn(move || {
-        let mut command = build_command(&payload, op, automatic);
+        let mut command = build_command(&payload, op, automatic, &umd);
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
         let mut child = match command.spawn() {
             Ok(child) => child,
@@ -260,7 +291,7 @@ fn run_silent(exe: &Path, options: &Options) -> i32 {
         }
     };
     let stderr = file.try_clone();
-    let mut command = build_command(&payload, op, options.automatic);
+    let mut command = build_command(&payload, op, options.automatic, &options.umd);
     command.stdout(Stdio::from(file));
     if let Ok(stderr) = stderr {
         command.stderr(Stdio::from(stderr));
@@ -280,7 +311,13 @@ fn run_silent(exe: &Path, options: &Options) -> i32 {
 
 fn parse_args() -> (Options, Option<(PathBuf, PathBuf)>) {
     let argv: Vec<String> = std::env::args().collect();
-    let mut options = Options { silent: false, uninstall: false, automatic: false, log: None };
+    let mut options = Options {
+        silent: false,
+        uninstall: false,
+        automatic: false,
+        log: None,
+        umd: UmdChoice::Keep,
+    };
     let mut bundle = None;
     let mut i = 1;
     while i < argv.len() {
@@ -292,6 +329,18 @@ fn parse_args() -> (Options, Option<(PathBuf, PathBuf)>) {
                 options.log = Some(PathBuf::from(&argv[i + 1]));
                 i += 1;
             }
+            "--nvidia-umd" | "/nvidia-umd" => {
+                // An optional folder follows; the next option does not count as one.
+                let folder = argv
+                    .get(i + 1)
+                    .filter(|next| !next.starts_with("--") && !next.starts_with('/'))
+                    .map(PathBuf::from);
+                if folder.is_some() {
+                    i += 1;
+                }
+                options.umd = UmdChoice::Nvidia(folder);
+            }
+            "--helios-umd" | "/helios-umd" => options.umd = UmdChoice::Helios,
             "--bundle" if i + 2 < argv.len() => {
                 bundle = Some((PathBuf::from(&argv[i + 1]), PathBuf::from(&argv[i + 2])));
                 i += 2;
@@ -331,5 +380,5 @@ fn main() {
         std::process::exit(code);
     }
 
-    std::process::exit(gui::run(&exe, options.automatic));
+    std::process::exit(gui::run(&exe, options.automatic, options.umd));
 }

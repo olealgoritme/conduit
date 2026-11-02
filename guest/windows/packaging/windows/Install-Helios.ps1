@@ -13,10 +13,18 @@ param(
     # viogpudo prompt; installing Helios already implies replacing the display
     # driver, so it approves the removal without a console prompt.
     [switch]$ReplaceViogpudo,
-    # Optional path to an extracted NVIDIA 610.88 Display.Driver directory.
-    # Required only for the RTX-personality adapter when no matching package is
-    # already present in DriverStore.
-    [string]$NvidiaPackage
+    # RTX personality only (PCI\VEN_10DE&DEV_2B85): run NVIDIA's own user-mode
+    # drivers, taken from the user's NVIDIA driver package (Set-HeliosUmd.ps1
+    # -Nvidia). Without it (and without -HeliosUmd) an update keeps the choice
+    # the last install or Set-HeliosUmd.ps1 made; a first install registers the
+    # Helios UMDs.
+    [switch]$NvidiaUmd,
+    # With -NvidiaUmd: an extracted NVIDIA driver download (the folder holding
+    # Display.Driver, or Display.Driver itself). Absent: NVIDIA's own copy in
+    # the DriverStore. Nothing is downloaded.
+    [string]$NvidiaPackage,
+    # RTX personality: register the Helios UMDs, undoing -NvidiaUmd.
+    [switch]$HeliosUmd
 )
 
 Set-StrictMode -Version Latest
@@ -60,7 +68,10 @@ function Initialize-HeliosAutomaticProvisioning([Parameter(Mandatory)][string]$B
 
     $scriptPath = Join-Path $provisioningRoot "Install-Helios.ps1"
     $powerShellPath = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
-    $nvidiaArgument = if ($NvidiaPackage) { " -NvidiaPackage `"$NvidiaPackage`"" } else { "" }
+    $nvidiaArgument = ""
+    if ($NvidiaUmd) { $nvidiaArgument += " -NvidiaUmd" }
+    if ($NvidiaPackage) { $nvidiaArgument += " -NvidiaPackage `"$NvidiaPackage`"" }
+    if ($HeliosUmd) { $nvidiaArgument += " -HeliosUmd" }
     $action = New-ScheduledTaskAction -Execute $powerShellPath -Argument (
         "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`" -Automatic$nvidiaArgument"
     )
@@ -93,6 +104,7 @@ if (-not [Environment]::Is64BitProcess) {
     throw "Run the installer with native 64-bit Windows PowerShell to manage both registry views and system directories."
 }
 if ($Force) { $Repair = $true }
+if ($NvidiaUmd -and $HeliosUmd) { throw "Pass -NvidiaUmd or -HeliosUmd, not both." }
 Write-HeliosProgress 3 "Checking administrator rights"
 
 $bundleRoot = $PSScriptRoot
@@ -398,11 +410,30 @@ if ($activeInfText -notmatch "helios_kmd_render") {
 }
 $classKey = Get-HeliosDisplayClassKey $instanceId
 $state.classKey = $classKey
-if ($instanceId -match "^PCI\\VEN_10DE&DEV_2B85") {
-    Write-HeliosProgress 70 "Staging NVIDIA 610.88 user-mode drivers"
-    $nvidiaStage = Install-HeliosNvidiaUmd $NvidiaPackage
-    $state.nvidiaPackage = $nvidiaStage.Source
-    $state.nvidiaDriverStore = $nvidiaStage.Destination
+if (Test-HeliosNvidiaPersonality $instanceId) {
+    # The RTX personality's INF registers NVIDIA's UMD names; they are kept only
+    # with NVIDIA's files staged beside them, otherwise the Helios UMDs are
+    # registered (Set-HeliosUmd.ps1 switches later).
+    $previousUmd = Read-HeliosNvidiaState
+    $keepNvidia = -not $HeliosUmd -and $previousUmd -and [string]$previousUmd.mode -eq "nvidia"
+    if ($NvidiaUmd -or $keepNvidia) {
+        $package = if ($NvidiaPackage) { $NvidiaPackage } elseif (-not $NvidiaUmd) { [string]$previousUmd.package } else { "" }
+        Write-HeliosProgress 70 "Staging NVIDIA's user-mode drivers"
+        try {
+            $nvidiaStage = Enable-HeliosNvidiaUmd $package
+            Write-Host "Staged NVIDIA $($nvidiaStage.Version) user-mode drivers from $($nvidiaStage.Source)."
+        } catch {
+            $message = $_.Exception.Message
+            Disable-HeliosNvidiaUmd
+            if ($NvidiaUmd) { throw "NVIDIA's user-mode drivers were not staged (the Helios UMDs are registered): $message" }
+            Write-Warning "NVIDIA's user-mode drivers were not staged again ($message); the Helios UMDs are registered. Run $stateRoot\Set-HeliosUmd.ps1 -Nvidia to try again."
+        }
+    } else {
+        Write-HeliosProgress 70 "Registering the Helios user-mode drivers"
+        Disable-HeliosNvidiaUmd
+    }
+} elseif ($NvidiaUmd) {
+    throw "NVIDIA's user-mode drivers need the RTX personality (PCI\VEN_10DE&DEV_2B85); this adapter is $instanceId."
 }
 if (-not $previousState) {
     $state.previousOpenGL = [ordered]@{
@@ -518,6 +549,7 @@ Copy-Item -LiteralPath (Join-Path $bundleRoot "Helios-PackageCommon.ps1") -Desti
 Copy-Item -LiteralPath (Join-Path $bundleRoot "Uninstall-Helios.ps1") -Destination $stateRoot -Force
 Copy-Item -LiteralPath (Join-Path $bundleRoot "Verify-Helios.ps1") -Destination $stateRoot -Force
 Copy-Item -LiteralPath (Join-Path $bundleRoot "Set-HeliosDisplay.ps1") -Destination $stateRoot -Force
+Copy-Item -LiteralPath (Join-Path $bundleRoot "Set-HeliosUmd.ps1") -Destination $stateRoot -Force
 # Windows keeps the Microsoft Basic Display adapter as DISPLAY1 and adds Helios as
 # an extended second monitor, so the desktop is not on the Helios screen.
 # Set-HeliosDisplay.ps1 makes Helios the only ACTIVE display (the Basic Display

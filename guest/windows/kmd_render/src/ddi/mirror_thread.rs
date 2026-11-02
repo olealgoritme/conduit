@@ -368,6 +368,13 @@ fn run_pass(mask: u32) -> bool {
             adapter.pacing_publish();
             PACES.fetch_add(1, Ordering::Relaxed);
         }
+        // `NvHostRmVersion` for the installer: once per transport generation (a few tries at
+        // most), a no-op lock check on every other pass.
+        if STOPPING.load(Ordering::Acquire) == 0 {
+            if let Some(passive) = crate::irql::PassiveLevel::try_assume() {
+                crate::virtio::nvda::publish_host_version(passive, adapter);
+            }
+        }
     }
     if mask & NV != 0 && STOPPING.load(Ordering::Acquire) == 0 {
         crate::ddi::publish_nvrm_counters();
