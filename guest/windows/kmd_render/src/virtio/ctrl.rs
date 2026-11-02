@@ -688,11 +688,6 @@ pub static HOST_REFUSED: AtomicU32 = AtomicU32::new(0);
 static HOST_DEAD: AtomicU32 = AtomicU32::new(0);
 static HOST_BACK: AtomicU32 = AtomicU32::new(0);
 
-/// Whether raw round trips are currently refused because the host stopped answering.
-pub(crate) fn host_unresponsive() -> bool {
-    HOST_LIVENESS.lock().unresponsive()
-}
-
 /// One admitted [`raw_roundtrip`].
 fn raw_roundtrip_once(
     passive: PassiveLevel,
