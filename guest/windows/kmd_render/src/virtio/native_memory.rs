@@ -41,6 +41,8 @@ const PIN_CHUNK_BYTES: u64 = u32::MAX as u64 & !(nm::PAGE_BYTES - 1);
 const LOCAL_4K_MAP_FLAGS: u32 = 1 << 8;
 
 static NEXT_ID: AtomicU32 = AtomicU32::new(1);
+/// Replacements whose RM idle-channels quiesce was refused (`update_leaf`).
+static QUIESCE_REFUSED: AtomicU32 = AtomicU32::new(0);
 static IO_MUTEX: SpinLock<Option<&'static PassiveMutex>> = SpinLock::new(None);
 static STATE: SpinLock<State> = SpinLock::new(State::new());
 
@@ -1210,12 +1212,16 @@ pub fn update_leaf(
         return Ok(());
     }
 
-    // A changed live mapping is quiesced in RM before any old object is removed.
-    // Fresh mappings need no such wait; permanent errors still cannot retire a fence.
-    // (The unchanged case returned above, so only "replaces a live mapping" is
-    // left to test: quiescing every fresh mapping failed each first page-in.)
-    if !affected_old.is_empty() {
-        super::native_channel::quiesce(passive, adapter, process).map_err(|_| Error::Busy)?;
+    // Replacing a live mapping: VidMm only changes an allocation's placement once
+    // no GPU work that uses it is outstanding (it waits for the paging and
+    // context fences first), so RM's idle-channels quiesce is only a belt on
+    // top. It is best effort: its refusal (Busy) had VidMm's every move between
+    // system pages and video memory skipped (NvPgLeafWhy 0x311).
+    if !affected_old.is_empty()
+        && super::native_channel::quiesce(passive, adapter, process).is_err()
+    {
+        let n = QUIESCE_REFUSED.fetch_add(1, Ordering::Relaxed) + 1;
+        crate::diag::record_named_bytes(b"NvQuiesceRef", n);
     }
 
     // Mint handles before tearing down anything.  A local handle-space
