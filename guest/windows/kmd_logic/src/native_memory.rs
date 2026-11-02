@@ -204,6 +204,17 @@ impl PrivateWriteback {
     }
 }
 
+/// Whether the UMD created the allocation shareable (D3DKMT CreateShared): bit
+/// 19 of +0x134, set in all 6 shared and none of 319 unshared records of the
+/// 610.88 captures (DWM primary, DXGI shared surfaces). dxgkrnl refuses a
+/// shareable CpuVisible allocation unless its segment set is aperture-only
+/// ("VerifySupportedSegmentSetAndAdjustFlags failed").
+pub fn is_shared_record(bytes: &[u8]) -> bool {
+    get32(bytes, SHARED_AT).is_some_and(|v| v & SHARED_BIT != 0)
+}
+pub const SHARED_AT: usize = 0x134;
+pub const SHARED_BIT: u32 = 1 << 19;
+
 /// Whether an NVDA allocation record is the D3D11/D3D12 UMDs' (its size is
 /// in the fixed-point fields at 0x10c..0x114, not in 64-KiB units at 0xd0).
 pub fn is_d3d_record(bytes: &[u8]) -> bool {
@@ -588,6 +599,14 @@ mod tests {
 
     fn field(f: &[(usize, u32)], at: usize) -> u32 {
         f.iter().find(|(o, _)| *o == at).map(|(_, v)| *v).unwrap()
+    }
+
+    #[test]
+    fn shared_records_are_recognised() {
+        assert!(is_shared_record(&d3d_record(&[(SHARED_AT, 0xc_0000)])));
+        assert!(is_shared_record(&d3d_record(&[(SHARED_AT, 0x8_0000)])));
+        assert!(!is_shared_record(&d3d_record(&[(SHARED_AT, 0x4_0000)])));
+        assert!(!is_shared_record(&d3d_record(&[])));
     }
 
     #[test]

@@ -3217,6 +3217,7 @@ unsafe fn create_native_one(
         | native::PrivateError::UnsupportedCompression(_) => STATUS_NOT_SUPPORTED,
         _ => STATUS_INVALID_PARAMETER,
     })?;
+    let shared = native::is_shared_record(bytes);
     let created = crate::virtio::native_memory::create(passive, adapter, &private, bytes)
         .map_err(|error| {
             // Which native-memory error refused it (Error discriminant + 1), and where.
@@ -3331,6 +3332,13 @@ unsafe fn create_native_one(
         // NVOS33/window aperture path, without a WB cache alias.
         let flags = if created.system_memory != 0 {
             0x0000_0015 // CpuVisible | Cached | ExistingSysMem
+        } else if shared {
+            // dxgkrnl refuses a shareable CpuVisible allocation unless its
+            // segments are all aperture ("Shareable can only be used in
+            // combination with CpuVisible if the supported segment set contains
+            // exclusively aperture segments"): DWM's DDisplay primary failed
+            // INVALID_PARAMETER and DWM fail-fast as out of memory.
+            0
         } else {
             0x0000_0001 // CpuVisible (uncached/write-combined)
         };
