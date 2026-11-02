@@ -644,8 +644,8 @@ pub fn memory_client(
 /// The Vulkan ICD's wait poll (`0x01000021`), sent while it waits for GPU work.
 const WAIT_POLL_FUNCTION: u32 = 0x0100_0021;
 
-/// Test knobs `NvDumpVa` / `NvDumpVb` (a 4-KiB page number each, 0 = off): on
-/// the ICD's wait poll, the first 64 bytes the GPU sees at that VA of the
+/// Test knobs `NvDumpVa` / `NvDumpVb` (a GPU VA >> 8 each, 0 = off): on the
+/// ICD's wait poll, the 64 bytes the GPU sees at that VA of the
 /// caller's process (`native_memory::patch_gpu_bytes`: VidMm's system pages or
 /// the RM memory) as `NvDmpA0`..`NvDmpAf` / `NvDmpB0`..`NvDmpBf`, with
 /// `NvDmpASt` / `NvDmpBSt` = 1 read, 2 nothing native mapped there, 3 error,
@@ -691,7 +691,7 @@ fn dump_watched_vas(passive: PassiveLevel, adapter: &AdapterContext, h_device: u
             Some(passive),
             adapter,
             process,
-            u64::from(*page) << 12,
+            u64::from(*page) << 8,
             64,
             |p| {
                 for (i, word) in words.iter_mut().enumerate() {
