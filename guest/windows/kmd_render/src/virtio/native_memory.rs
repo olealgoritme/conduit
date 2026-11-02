@@ -143,6 +143,28 @@ struct Allocation {
     cpu: Option<CpuMapping>,
     resident: Option<(u64, bool)>,
     poisoned: bool,
+    /// What CreateAllocation wrote into the NVDA record. dxgkrnl hands the UMD
+    /// the record the KMD's OpenAllocation writes (create's copy is dropped),
+    /// so the same values are written again at open (`writeback_open`).
+    writeback: Option<Writeback>,
+}
+
+/// The record fields CreateAllocation wrote, re-applied at open.
+#[derive(Clone, Copy)]
+enum Writeback {
+    /// CUDA/Vulkan records: RM handles and 64-KiB-unit sizes.
+    Native(nm::PrivateWriteback),
+    /// D3D11/D3D12 records: the 610.88 KMD's field set (`nm::d3d_writeback`).
+    D3d([(usize, u32); nm::D3D_WRITEBACK_FIELDS]),
+}
+
+impl Writeback {
+    fn apply(&self, bytes: &mut [u8]) -> Result<(), nm::PrivateError> {
+        match self {
+            Self::Native(w) => nm::writeback_allocation_private(bytes, w),
+            Self::D3d(fields) => nm::apply_fields(bytes, fields),
+        }
+    }
 }
 
 struct State {
@@ -852,7 +874,18 @@ pub fn create(
         }
     };
     step(7);
-    if nm::writeback_allocation_private(private_bytes, &writeback).is_err() {
+    // D3D records keep their inputs (0x8c, 0x10c..0x120) and get the D3D field
+    // set; the size in 64-KiB units is what the UMD reserves VA for.
+    let writeback = if nm::is_d3d_record(private_bytes) {
+        let units = u32::try_from(private.size / nm::ALLOCATION_UNIT).unwrap_or(u32::MAX);
+        match nm::d3d_writeback(private_bytes, units) {
+            Some(fields) => Writeback::D3d(fields),
+            None => Writeback::Native(writeback),
+        }
+    } else {
+        Writeback::Native(writeback)
+    };
+    if writeback.apply(private_bytes).is_err() {
         if io.rm_free(nd::H_DEVICE, memory).is_ok() {
             unlock_pins(&mut pins);
         }
@@ -879,6 +912,7 @@ pub fn create(
         cpu: None,
         resident: None,
         poisoned: false,
+        writeback: Some(writeback),
     };
     {
         let mut state = STATE.lock();
@@ -1072,6 +1106,15 @@ fn unmap_fixed(io: &Io<'_>, memory: u32, mapping: HostMapping) -> Result<(), Err
         io.rm_free(nd::H_DEVICE, mapping.desc)?;
     }
     Ok(())
+}
+
+/// Write the record values CreateAllocation produced for native allocation
+/// `id` into `bytes` (an NVDA record dxgkrnl passes to OpenAllocation). The
+/// UMD reads sizes and handles from it: without them the D3D12 UMD reserved a
+/// zero-size VA range (INVALID_PARAMETER) and removed its device.
+pub fn writeback_open(id: u32, bytes: &mut [u8]) -> Result<(), Error> {
+    let writeback = STATE.lock().allocation(id)?.writeback.ok_or(Error::Invalid)?;
+    writeback.apply(bytes).map_err(|_| Error::Invalid)
 }
 
 /// How many mappings `evict_range` dropped (NvEvict) and how many of their
@@ -1293,18 +1336,49 @@ pub fn update_leaf_system(
         client,
     };
     let space = ensure_space(&io, process)?;
+    // One OS descriptor per SYSTEM_CHUNK_PAGES: RM refused large ones (512 and
+    // 335 pages) with NV_ERR_INVALID_ADDRESS after pinning them (bpftrace:
+    // every pin succeeded), and the range stayed unmapped (ring fetch faults).
+    // A refused chunk still fails the update; the chunks mapped before it stay.
+    let chunk_pages = SYSTEM_CHUNK_PAGES.max(1);
+    let mut first_error = None;
+    for (index, chunk) in pfns.chunks(chunk_pages).enumerate() {
+        let delta = (index * chunk_pages) as u64 * nm::PAGE_BYTES;
+        let va = first_va.checked_add(delta).ok_or(Error::Invalid)?;
+        let offset = allocation_offset.checked_add(delta).ok_or(Error::Invalid)?;
+        if let Err(error) = map_system_chunk(&io, id, process, space, va, offset, chunk, &why) {
+            first_error.get_or_insert(error);
+        }
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
+/// Pages per OS descriptor of `update_leaf_system`.
+const SYSTEM_CHUNK_PAGES: usize = 128;
+
+#[allow(clippy::too_many_arguments)]
+fn map_system_chunk(
+    io: &Io<'_>,
+    id: u32,
+    process: usize,
+    space: u32,
+    va: u64,
+    allocation_offset: u64,
+    pfns: &[u64],
+    why: &dyn Fn(u32, Error) -> Error,
+) -> Result<(), Error> {
     let len = (pfns.len() as u64)
         .checked_mul(nm::PAGE_BYTES)
         .ok_or(Error::Invalid)?;
     let desc = STATE.lock().mint()?;
-    alloc_system_descriptor(&io, desc, pfns, len).map_err(|error| why(2, error))?;
+    alloc_system_descriptor(io, desc, pfns, len).map_err(|error| why(2, error))?;
     let virt = STATE.lock().mint()?;
     let shown = nm::MappingPiece {
-        va: first_va,
+        va,
         memory_offset: 0,
         len,
     };
-    let used = match map_fixed(&io, desc, len, true, space, virt, shown) {
+    let used = match map_fixed(io, desc, len, true, space, virt, shown) {
         Ok(used) => used,
         Err(error) => {
             let _ = io.rm_free(nd::H_DEVICE, desc);
@@ -1314,7 +1388,7 @@ pub fn update_leaf_system(
     let mapping = HostMapping {
         process,
         piece: nm::MappingPiece {
-            va: first_va,
+            va,
             memory_offset: allocation_offset,
             len,
         },
@@ -1332,7 +1406,7 @@ pub fn update_leaf_system(
     let allocation = state.allocation_mut(id)?;
     if allocation.mappings.try_reserve(1).is_err() {
         drop(state);
-        let _ = unmap_fixed(&io, 0, mapping);
+        let _ = unmap_fixed(io, 0, mapping);
         return Err(Error::NoMemory);
     }
     allocation.mappings.push(mapping);
@@ -2058,6 +2132,7 @@ pub unsafe fn with_cpu_range(
                 cpu: None,
                 resident: None,
                 poisoned: a.poisoned,
+                writeback: a.writeback,
             },
             existing,
             pending,
@@ -2163,6 +2238,7 @@ pub fn map_aperture(
             cpu: None,
             resident: None,
             poisoned: a.poisoned,
+            writeback: a.writeback,
         }
     };
     let mut mapping = cpu_map(

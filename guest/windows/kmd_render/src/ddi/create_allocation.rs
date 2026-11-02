@@ -4267,6 +4267,59 @@ unsafe fn fail_open(
 /// `D3DKMTCreateAllocation` fails with the open status. For each open-info entry
 /// return a miniport-owned, device-specific tracking handle as required by the
 /// DDI contract.
+/// NvOpenWb: native records rewritten at open; NvOpenWbErr: refused (no
+/// context, not native, or no stored values).
+static OPEN_WRITEBACKS: AtomicU32 = AtomicU32::new(0);
+static OPEN_WRITEBACK_ERRORS: AtomicU32 = AtomicU32::new(0);
+
+/// Re-apply the create-time NVDA record values for a native allocation being
+/// opened (see the call site). Anything that is not an NVDA record of one of
+/// our native allocations is left untouched.
+///
+/// # Safety
+/// `info` is an entry of dxgkrnl's live `DXGKARG_OPENALLOCATION` array.
+unsafe fn native_open_writeback(
+    passive: crate::irql::PassiveLevel,
+    dxg: &crate::dxgk::DXGKRNL_INTERFACE,
+    info: &mut DXGK_OPENALLOCATIONINFO,
+) {
+    use helios_kmd_logic::native_memory as native;
+    if !crate::virtio::nvda::enabled() {
+        return;
+    }
+    let len = info.PrivateDriverDataSize as usize;
+    if info.pPrivateDriverData.is_null() || len < native::ALLOCATION_PRIVATE_BYTES {
+        return;
+    }
+    // SAFETY: dxgkrnl's writable per-allocation buffer of `len` bytes for this call.
+    let bytes = unsafe { core::slice::from_raw_parts_mut(info.pPrivateDriverData as *mut u8, len) };
+    if !native::is_nvda_allocation(bytes) {
+        return;
+    }
+    let native_id = crate::adapter::producer::with_allocation_reference(
+        passive,
+        dxg,
+        info.hAllocation,
+        false,
+        |global| {
+            // SAFETY: the create-time handle data is the AllocationContext this
+            // driver returned; resolve_alloc checks its magic first.
+            Ok(unsafe { resolve_alloc(global as HANDLE) }.map_or(0, |ctx| ctx.native_id))
+        },
+    )
+    .unwrap_or(0);
+    let done = native_id != 0 && crate::virtio::native_memory::writeback_open(native_id, bytes).is_ok();
+    let (counter, name): (&AtomicU32, &[u8]) = if done {
+        (&OPEN_WRITEBACKS, &b"NvOpenWb"[..])
+    } else {
+        (&OPEN_WRITEBACK_ERRORS, &b"NvOpenWbErr"[..])
+    };
+    let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+    if n == 1 || n % 64 == 0 {
+        crate::diag::record_named_bytes(name, n);
+    }
+}
+
 pub unsafe extern "C" fn dxgkddi_open_allocation(
     h_device: IN_CONST_HANDLE,
     open_allocation: IN_CONST_PDXGKARG_OPENALLOCATION,
@@ -4324,6 +4377,10 @@ pub unsafe extern "C" fn dxgkddi_open_allocation(
         let info = unsafe { &mut *args.pOpenAllocation.add(i) };
         crate::diag::record(0x0C21_0000 | ((info.PrivateDriverDataSize as u32).min(0xFFFF)));
         crate::diag::record(0x0C35_0000 | ((info.hAllocation as usize as u32) & 0xFFFF));
+        // NVDA records: the UMD receives the record OpenAllocation leaves, not
+        // the one CreateAllocation wrote (dxgkrnl refills it from the caller's
+        // input before this call and copies only this one back).
+        unsafe { native_open_writeback(passive, dxg, info) };
 
         // Capture the backing venus identity + geometry from the open-time
         // private data (the create-time `HeliosWddmAllocPrivate` write-back or a

@@ -204,6 +204,78 @@ impl PrivateWriteback {
     }
 }
 
+/// Whether an NVDA allocation record is the D3D11/D3D12 UMDs' (its size is
+/// in the fixed-point fields at 0x10c..0x114, not in 64-KiB units at 0xd0).
+pub fn is_d3d_record(bytes: &[u8]) -> bool {
+    get32(bytes, SIZE_UNITS_AT) == Some(0)
+}
+
+/// Fields of a D3D record the KMD writes, as the 610.88 KMD does (every D3D11
+/// and D3D12 record of the 2026-10-31 captures; the inputs at 0x8c and
+/// 0x10c..0x120 stay as the UMD wrote them). The UMD sizes the VA range it
+/// reserves for the allocation from 0xd0 (64-KiB units): a zero there was a
+/// zero-size ReserveGpuVirtualAddress and a removed D3D12 device.
+pub const D3D_WRITEBACK_FIELDS: usize = 17;
+
+pub fn d3d_writeback(input: &[u8], units: u32) -> Option<[(usize, u32); D3D_WRITEBACK_FIELDS]> {
+    let bytes_size = get32(input, 0x10c)?;
+    let integer = get32(input, SIZE_INTEGER_AT)?;
+    let count = get32(input, SIZE_COUNT_AT)?;
+    let kind = get32(input, 0x120)?;
+    // Three record shapes: byte-sized (0x114 = 0), unit-sized (0x10c = 0) and
+    // both (a texture: 0x110 = 0, or a fixed-point count in 0x110).
+    let texture = bytes_size != 0 && integer == 0 && count != 0;
+    let (cc, d0, d4) = if count == 0 {
+        (integer, 0, integer.wrapping_sub(0x1_0000))
+    } else {
+        (integer & 0x3fff_ffff, units, 0xffff_0000)
+    };
+    let c0 = if bytes_size == 0 {
+        0x4000
+    } else if texture {
+        (bytes_size >> 2) | 0x4000
+    } else {
+        bytes_size | 0x4000
+    };
+    let c4 = if texture {
+        bytes_size >> 2
+    } else if count == 0 {
+        if bytes_size == 0x40_0000 { 0x8_0000 } else { 0x1_0000 }
+    } else {
+        0x1_0000 | (cc & 0xffff)
+    };
+    Some([
+        (0x38, 1),
+        (0x3c, 1),
+        (0x40, 1),
+        (0xb8, 0x2_0000),
+        (0xc0, c0),
+        (0xc4, c4),
+        (0xc8, bytes_size),
+        (0xcc, cc),
+        (0xd0, d0),
+        (0xd4, d4),
+        (0xd8, d0.saturating_sub(1)),
+        (0xdc, if texture { 0x4_0000 } else { 0 }),
+        (0xe0, 0x280),
+        (0xf4, 0xffff_0000),
+        (0xf8, 0xffff_ffff),
+        (0xfc, 0xffff),
+        (0x108, kind),
+    ])
+}
+
+/// Apply [`d3d_writeback`] fields.
+pub fn apply_fields(bytes: &mut [u8], fields: &[(usize, u32)]) -> Result<(), PrivateError> {
+    if bytes.len() < ALLOCATION_PRIVATE_BYTES {
+        return Err(PrivateError::Short);
+    }
+    for (offset, value) in fields {
+        put32(bytes, *offset, *value).ok_or(PrivateError::Short)?;
+    }
+    Ok(())
+}
+
 pub fn writeback_allocation_private(
     bytes: &mut [u8],
     writeback: &PrivateWriteback,
@@ -504,6 +576,56 @@ mod tests {
         b[SYSTEM_MEMORY_AT..SYSTEM_MEMORY_AT + 8].copy_from_slice(&system_memory.to_le_bytes());
         b[SIZE_UNITS_AT..SIZE_UNITS_AT + 4].copy_from_slice(&size_units.to_le_bytes());
         b
+    }
+
+    fn d3d_record(at: &[(usize, u32)]) -> [u8; ALLOCATION_PRIVATE_BYTES] {
+        let mut b = [0u8; ALLOCATION_PRIVATE_BYTES];
+        for (o, v) in at {
+            b[*o..*o + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        b
+    }
+
+    fn field(f: &[(usize, u32)], at: usize) -> u32 {
+        f.iter().find(|(o, _)| *o == at).map(|(_, v)| *v).unwrap()
+    }
+
+    #[test]
+    fn d3d_writeback_matches_the_captured_kmd() {
+        // D3D12 texture record (capture seq 2079): 256 KiB, reserved as 0x40000.
+        let b = d3d_record(&[(0x10c, 0x400_0000), (0x114, 4), (0x120, 0x4_0002)]);
+        assert!(is_d3d_record(&b));
+        let f = d3d_writeback(&b, 4).unwrap();
+        for (at, want) in [(0xc0, 0x100_4000), (0xc4, 0x100_0000), (0xc8, 0x400_0000), (0xcc, 0),
+            (0xd0, 4), (0xd4, 0xffff_0000), (0xd8, 3), (0xdc, 0x4_0000), (0x108, 0x4_0002)] {
+            assert_eq!(field(&f, at), want, "texture +{at:#x}");
+        }
+        // Unit-sized: 0x110 = 0x114 = 2.
+        let b = d3d_record(&[(0x110, 2), (0x114, 2), (0x120, 0x9_0000)]);
+        let f = d3d_writeback(&b, 2).unwrap();
+        for (at, want) in [(0xc0, 0x4000), (0xc4, 0x1_0002), (0xc8, 0), (0xcc, 2), (0xd0, 2),
+            (0xd4, 0xffff_0000), (0xd8, 1), (0x108, 0x9_0000)] {
+            assert_eq!(field(&f, at), want, "units +{at:#x}");
+        }
+        // Byte-sized: 0x10c = 0x110 = 1 GiB.
+        let b = d3d_record(&[(0x10c, 0x4000_0000), (0x110, 0x4000_0000), (0x120, 0x9_0000)]);
+        let f = d3d_writeback(&b, 0x4000).unwrap();
+        for (at, want) in [(0xc0, 0x4000_4000), (0xc4, 0x1_0000), (0xc8, 0x4000_0000),
+            (0xcc, 0x4000_0000), (0xd0, 0), (0xd4, 0x3fff_0000), (0xd8, 0)] {
+            assert_eq!(field(&f, at), want, "bytes +{at:#x}");
+        }
+        // Fixed point: 0x110 = 0x4000001d (0x1d units and a fraction).
+        let b = d3d_record(&[(0x10c, 0x4000_0000), (0x110, 0x4000_001d), (0x114, 0x1d)]);
+        let f = d3d_writeback(&b, 0x1e).unwrap();
+        for (at, want) in [(0xc4, 0x1_001d), (0xcc, 0x1d), (0xd0, 0x1e), (0xd8, 0x1d)] {
+            assert_eq!(field(&f, at), want, "fixed +{at:#x}");
+        }
+        // The inputs are not among the written fields.
+        for at in [0x8c, 0x10c, 0x110, 0x114, 0x120] {
+            assert!(f.iter().all(|(o, _)| *o != at));
+        }
+        // A CUDA record is not D3D.
+        assert!(!is_d3d_record(&d3d_record(&[(SIZE_UNITS_AT, 1)])));
     }
 
     #[test]
