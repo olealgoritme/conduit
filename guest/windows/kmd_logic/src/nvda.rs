@@ -564,6 +564,40 @@ pub fn apply_local(
             buf[0x40..0x40 + NVDA_DRIVER_BRANCH.len()].copy_from_slice(NVDA_DRIVER_BRANCH);
             buf[0x80..0x80 + NVDA_ADAPTER_NAME.len()].copy_from_slice(NVDA_ADAPTER_NAME);
         }
+        0x0100_010e => {
+            // Adapter-scoped 0x34-byte NVAPI query (Escape Flags 8, no hDevice).
+            // The 610.88 capture (vktest seq 3789, 3812) keeps the size and answers
+            // result 1 in both result words and 0x100 at +0x30.
+            exact(buf, 0x34)?;
+            put32(buf, NVDA_RESULT_AT, 1);
+            put32(buf, NVDA_RESULT2_AT, 1);
+            put32(buf, 0x30, 0x100);
+        }
+        0x0200_001d => {
+            // 0x34-byte device- and context-scoped query the D3D12 UMD makes once
+            // per present (the Vulkan ICD's swap chain presents through it). The
+            // capture answers a 0x30-byte reply, result 1 in both result words and
+            // a word at +0x30: 1 for the first five presents (seq 5797...), 0x20
+            // for three, then 0x100. This answers the first frames' 1.
+            exact(buf, 0x34)?;
+            context(h_device, h_context)?;
+            put32(buf, NVDA_SIZE_AT, NVDA_COMMON_HEADER_BYTES as u32);
+            put32(buf, NVDA_RESULT_AT, 1);
+            put32(buf, NVDA_RESULT2_AT, 1);
+            put32(buf, 0x30, 1);
+        }
+        0x0200_0031 => {
+            // 0x34-byte device-scoped request the D3D12 UMD makes at teardown
+            // (+0x30 a value from the UMD). The capture (seq 19409) answers a bare
+            // 0x30-byte success; the request word stays.
+            exact(buf, 0x34)?;
+            if h_device == 0 {
+                return Err(LocalError::Invalid);
+            }
+            put32(buf, NVDA_SIZE_AT, NVDA_COMMON_HEADER_BYTES as u32);
+            put32(buf, NVDA_RESULT_AT, 1);
+            put32(buf, NVDA_RESULT2_AT, 1);
+        }
         0x0100_0124 => {
             // Device-scoped 0x48-byte request the D3D11 UMD makes when a swap
             // chain is created and destroyed (+0x30 = 1 or 0, two process
@@ -1543,6 +1577,37 @@ mod tests {
         assert_eq!(&buf[0x14..0x18], &1u32.to_le_bytes());
         assert_eq!(&buf[0x2c..0x30], &0u32.to_le_bytes());
         assert_ne!(&buf[0x30..0x34], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn present_path_queries_match_the_capture() {
+        // vktest capture seq 3789: 0x0100010e keeps its size, 0x100 at +0x30.
+        let mut nvapi = local_request(0x0100_010e, 0x34);
+        let before = nvapi.clone();
+        assert_eq!(apply_local(&mut nvapi, 0, 0), Ok(LocalOutcome::Applied));
+        assert_eq!(&nvapi[0x08..0x0c], &0x34u32.to_le_bytes());
+        assert_eq!(&nvapi[0x14..0x18], &1u32.to_le_bytes());
+        assert_eq!(&nvapi[0x2c..0x34], &[1, 0, 0, 0, 0, 1, 0, 0]);
+        assert_eq!(&nvapi[..0x14], &before[..0x14]);
+        assert_eq!(&nvapi[0x18..0x2c], &before[0x18..0x2c]);
+        // Seq 5797: 0x0200001d, 0x30-byte reply, 1 at +0x30; needs device and context.
+        let mut present = local_request(0x0200_001d, 0x34);
+        assert_eq!(apply_local(&mut present, 0x40006500, 0x400077c0), Ok(LocalOutcome::Applied));
+        assert_eq!(&present[0x08..0x0c], &0x30u32.to_le_bytes());
+        assert_eq!(&present[0x14..0x18], &1u32.to_le_bytes());
+        assert_eq!(&present[0x2c..0x34], &[1, 0, 0, 0, 1, 0, 0, 0]);
+        let mut unscoped = local_request(0x0200_001d, 0x34);
+        assert_eq!(apply_local(&mut unscoped, 0x40006500, 0), Err(LocalError::Invalid));
+        // Seq 19409: 0x02000031 bare 0x30-byte success, request word +0x30 kept.
+        let mut teardown = local_request(0x0200_0031, 0x34);
+        test_put32(&mut teardown, 0x30, 0x354c);
+        assert_eq!(apply_local(&mut teardown, 0x40006500, 0), Ok(LocalOutcome::Applied));
+        assert_eq!(&teardown[0x08..0x0c], &0x30u32.to_le_bytes());
+        assert_eq!(&teardown[0x2c..0x34], &[1, 0, 0, 0, 0x4c, 0x35, 0, 0]);
+        for function in [0x0100_010e, 0x0200_001d, 0x0200_0031] {
+            let mut short = local_request(function, 0x33);
+            assert_eq!(apply_local(&mut short, 1, 1), Err(LocalError::Invalid));
+        }
     }
 
     fn class_engine_request(h_object: u32) -> Vec<u8> {
