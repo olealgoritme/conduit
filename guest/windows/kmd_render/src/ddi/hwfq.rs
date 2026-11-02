@@ -429,11 +429,12 @@ pub unsafe extern "C" fn control_interrupt3(
         || args.InterruptType
             == _DXGK_INTERRUPT_TYPE::DXGK_INTERRUPT_CRTC_VSYNC_WITH_MULTIPLANE_OVERLAY3;
     // SAFETY: plain C enum union reads; which arm is meaningful depends on the type.
+    let (vsync_state, interrupt_state) =
+        unsafe { (args.__bindgen_anon_1.CrtcVsyncState, args.__bindgen_anon_1.InterruptState) };
     let enable = if vsync {
-        unsafe { args.__bindgen_anon_1.CrtcVsyncState } == _DXGK_CRTC_VSYNC_STATE::DXGK_VSYNC_ENABLE
+        vsync_state == _DXGK_CRTC_VSYNC_STATE::DXGK_VSYNC_ENABLE
     } else {
-        unsafe { args.__bindgen_anon_1.InterruptState }
-            == _DXGK_INTERRUPT_STATE::DXGK_INTERRUPT_ENABLE
+        interrupt_state == _DXGK_INTERRUPT_STATE::DXGK_INTERRUPT_ENABLE
     };
     unsafe {
         crate::ddi::interrupt::dxgkddi_control_interrupt(
