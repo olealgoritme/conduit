@@ -631,10 +631,12 @@ fn ensure_space(io: &Io<'_>, process: usize) -> Result<u32, Error> {
 /// (0x10000) and the UMDs' low VAs included.
 const LOW_WINDOW_BASE: u64 = 0x1_0000;
 const LOW_WINDOW_END: u64 = 0x1_0000_0000;
-/// The high window of a per-process space: [8 GiB, 16 TiB), every VidMm VA above
-/// the reserved [4 GiB, 8 GiB) (`NATIVE_VIRTUAL_ADDRESS_BIT_COUNT` = 44).
+/// The high window of a per-process space: [8 GiB, 40 GiB), where VidMm places
+/// allocations above the reserved [4 GiB, 8 GiB). A window over the whole 16 TiB
+/// exhausted RM's page-table pool (pool_alloc NO_MEMORY); VAs above 40 GiB still
+/// map through fixed virtual objects.
 const HIGH_WINDOW_BASE: u64 = 0x2_0000_0000;
-const HIGH_WINDOW_END: u64 = 1 << 44;
+const HIGH_WINDOW_END: u64 = 0xa_0000_0000;
 
 /// The window of `space` that holds [va, end), if any.
 fn window_for(space: u32, va: u64, end: u64) -> Option<u32> {
