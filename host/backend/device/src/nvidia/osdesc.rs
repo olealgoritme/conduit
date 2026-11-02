@@ -33,6 +33,33 @@ use super::*;
 /// `NV_ERR_NOT_SUPPORTED` (nvstatuscodes.h).
 pub(super) const NV_ERR_NOT_SUPPORTED: u32 = 0x56;
 
+/// `NV_ERR_INVALID_ADDRESS` (nvstatuscodes.h): what RM answers when the kernel
+/// would not pin the pages behind the address.
+pub(super) const NV_ERR_INVALID_ADDRESS: u32 = 0x1e;
+
+/// How long to wait before each further attempt at a registration RM refused
+/// with [`NV_ERR_INVALID_ADDRESS`]; one more attempt per entry. 63 ms at most.
+pub(super) const PIN_RETRY_DELAYS: [std::time::Duration; 6] = [
+    std::time::Duration::from_millis(1),
+    std::time::Duration::from_millis(2),
+    std::time::Duration::from_millis(4),
+    std::time::Duration::from_millis(8),
+    std::time::Duration::from_millis(16),
+    std::time::Duration::from_millis(32),
+];
+
+/// RM's status in a forwarded registration's reply: `None` when the host
+/// refused the ioctl itself or the reply does not reach that far.
+fn rm_status(resp_buf: &[u8], n: usize, status_at: usize) -> Option<u32> {
+    let head = size_of::<MsgHeader>() + size_of::<IoctlResp>();
+    if n < head || read_struct::<MsgHeader>(resp_buf, 0).status != 0 {
+        return None;
+    }
+    resp_buf[head..n]
+        .get(status_at..status_at.checked_add(4)?)
+        .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+}
+
 /// Which of the three routes a call arrived on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Registration {
@@ -280,38 +307,81 @@ impl NvidiaBackend {
         let at = s.params_at + s.route.address_at;
         forwarded[at..at + 8].copy_from_slice(&stitched.addr().to_le_bytes());
 
-        let n = match route {
-            Registration::Alloc => self.dispatch_nested(
-                cookie, host_fd, request, &forwarded, resp_buf, 48, 16, 32, None, None,
-            ),
-            Registration::AllocMemory => self.dispatch_fd_carrying(
-                cookie,
-                host_fd,
-                request,
-                abi::ioctl::NV_ESC_RM_ALLOC_MEMORY,
-                &forwarded,
-                resp_buf,
-            ),
-            Registration::VidHeap => {
-                self.dispatch_simple(cookie, host_fd, request, &forwarded, resp_buf)
+        // RM pins the pages with FOLL_LONGTERM, and the kernel first migrates
+        // any page it will not pin long-term where it lies: a page in a
+        // MIGRATE_CMA or isolated pageblock. A host kernel with Kexec HandOver
+        // (CONFIG_KEXEC_HANDOVER_ENABLE_DEFAULT, Ubuntu's 7.0) keeps its KHO
+        // scratch areas, gigabytes of them, as MIGRATE_CMA, and a VM's guest
+        // RAM is movable memory that lands there. When such a migration fails
+        // -- the page is busy, or there is no unmovable page to move it to --
+        // the pin fails, RM tries the range as I/O memory, finds an ordinary
+        // mapping ("Cannot map memory with base addr ..." in the kernel log)
+        // and answers NV_ERR_INVALID_ADDRESS. Most of those failures are
+        // transient, and every attempt keeps what it did migrate, so the call
+        // is made again a few times before the refusal is passed on.
+        let mut attempt = 0;
+        let n = loop {
+            let n = match route {
+                Registration::Alloc => self.dispatch_nested(
+                    cookie, host_fd, request, &forwarded, resp_buf, 48, 16, 32, None, None,
+                ),
+                Registration::AllocMemory => self.dispatch_fd_carrying(
+                    cookie,
+                    host_fd,
+                    request,
+                    abi::ioctl::NV_ESC_RM_ALLOC_MEMORY,
+                    &forwarded,
+                    resp_buf,
+                ),
+                Registration::VidHeap => {
+                    self.dispatch_simple(cookie, host_fd, request, &forwarded, resp_buf)
+                }
+            };
+            if rm_status(resp_buf, n, s.status_at) != Some(NV_ERR_INVALID_ADDRESS) {
+                if attempt > 0 {
+                    self.registrations_retried += 1;
+                    log::info!(
+                        "{}: {:#x} bytes answered {:#x?} on attempt {} after RM refused the \
+                         pages as NV_ERR_INVALID_ADDRESS",
+                        route.what(),
+                        length,
+                        rm_status(resp_buf, n, s.status_at),
+                        attempt + 1,
+                    );
+                }
+                break n;
             }
+            let Some(&delay) = PIN_RETRY_DELAYS.get(attempt) else {
+                self.registrations_unpinned += 1;
+                log::warn!(
+                    "{}: RM refused {:#x} bytes at host address {:#x} as NV_ERR_INVALID_ADDRESS \
+                     {} times: the host kernel would not pin the guest's pages long-term. \
+                     If the kernel log says \"Cannot map memory with base addr\", the pages sit \
+                     in MIGRATE_CMA pageblocks (Kexec HandOver scratch; kho=off on the host's \
+                     command line removes them) and could not be migrated out",
+                    route.what(),
+                    length,
+                    stitched.addr(),
+                    attempt + 1,
+                );
+                break n;
+            };
+            std::thread::sleep(delay);
+            attempt += 1;
         };
 
         // RM's own answer decides whether the span is kept. Anything but
         // NV_OK means nothing was registered, and `stitched` falling out of
         // scope here unmaps it.
-        let head = size_of::<MsgHeader>() + size_of::<IoctlResp>();
-        if n < head || read_struct::<MsgHeader>(resp_buf, 0).status != 0 {
+        if rm_status(resp_buf, n, s.status_at) != Some(NV_OK) {
             return n;
         }
+        let head = size_of::<MsgHeader>() + size_of::<IoctlResp>();
         let out = &resp_buf[head..n];
         let word = |at: usize| -> Option<u32> {
             out.get(at..at + 4)
                 .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
         };
-        if word(s.status_at) != Some(NV_OK) {
-            return n;
-        }
         // hRoot is the first field of all three parameter structs.
         let (Some(client), Some(object)) = (word(0), word(s.hmemory_at)) else {
             return n;

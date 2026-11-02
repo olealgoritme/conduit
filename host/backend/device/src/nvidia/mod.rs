@@ -308,6 +308,11 @@ pub struct NvidiaBackend {
     /// over, which is the number that must be zero.
     registrations_served: u64,
     registrations_peak: usize,
+    /// Registrations RM refused with NV_ERR_INVALID_ADDRESS (the kernel would
+    /// not pin the pages) and then answered on a later attempt, and those it
+    /// refused on every attempt. See `osdesc::PIN_RETRY_DELAYS`.
+    registrations_retried: u64,
+    registrations_unpinned: u64,
     /// Guest memory registered with RM by address, by the client and object
     /// handle that own it. Holding the [`Stitched`] span is what keeps the
     /// host mapping alive: RM pinned those pages for the life of the object,
@@ -523,6 +528,8 @@ impl NvidiaBackend {
             registrations: std::collections::HashMap::new(),
             registrations_served: 0,
             registrations_peak: 0,
+            registrations_retried: 0,
+            registrations_unpinned: 0,
             uvm_denied: std::collections::HashSet::new(),
             os_events: std::collections::HashMap::new(),
             allow_refused: std::collections::BTreeMap::new(),
@@ -971,11 +978,18 @@ impl NvidiaBackend {
         // Guest memory this process still has mapped after RM has been told to
         // let go of it. Anything but zero is a leak of the guest's pages into
         // the backend's address space, and the number is only visible here.
-        if self.registrations_served > 0 || !self.registrations.is_empty() {
+        if self.registrations_served > 0
+            || self.registrations_unpinned > 0
+            || !self.registrations.is_empty()
+        {
             let left = self.registrations.len();
             let line = format!(
-                "NvidiaBackend::teardown: {} registration(s) by address, at most {} held at once, {left} still held",
-                self.registrations_served, self.registrations_peak,
+                "NvidiaBackend::teardown: {} registration(s) by address, at most {} held at once, {left} still held; \
+                 {} answered only after a refused pin, {} refused on every attempt",
+                self.registrations_served,
+                self.registrations_peak,
+                self.registrations_retried,
+                self.registrations_unpinned,
             );
             if left == 0 {
                 log::info!("{line}");

@@ -1999,6 +1999,196 @@ mod tests {
         be.teardown();
     }
 
+    /// RM, refusing the first `refusals` registrations it is asked for the way
+    /// it does when the kernel will not pin the pages long-term: a page in a
+    /// MIGRATE_CMA pageblock it could not migrate out (FOLL_LONGTERM), so
+    /// `os_lock_user_pages` fails and the I/O-memory fallback answers
+    /// NV_ERR_INVALID_ADDRESS. After that it registers like
+    /// [`RegisteringHost`].
+    #[derive(Clone)]
+    struct PinRefusingHost {
+        inner: RegisteringHost,
+        refusals: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl HostDriver for PinRefusingHost {
+        fn ioctl(&self, fd: RawFd, request: u64, arg: &mut [u8]) -> std::result::Result<(), i32> {
+            use std::sync::atomic::Ordering::SeqCst;
+            let free = request & 0xFF == 0x29;
+            if !free
+                && self
+                    .refusals
+                    .fetch_update(SeqCst, SeqCst, |n| n.checked_sub(1))
+                    .is_ok()
+            {
+                self.inner.calls.lock().unwrap().push(request);
+                let at = self.inner.status_at;
+                arg[at..at + 4].copy_from_slice(&0x1eu32.to_le_bytes());
+                return Ok(());
+            }
+            self.inner.ioctl(fd, request, arg)
+        }
+    }
+
+    fn pin_refusing(refusals: usize) -> (PinRefusingHost, NvidiaBackend, u64) {
+        let d = osdesc();
+        let inner = RegisteringHost::new(
+            d.vid_heap.address_at,
+            d.vid_heap_status_at,
+            d.vid_heap_hmemory_at,
+            2,
+        );
+        let host = PinRefusingHost {
+            inner,
+            refusals: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(refusals)),
+        };
+        let (mut be, h) = backend_for_registration(&host.inner);
+        be.set_host(Box::new(host.clone()));
+        (host, be, h)
+    }
+
+    fn heap_rm_status(resp: &[u8]) -> u32 {
+        let body = size_of::<MsgHeader>() + size_of::<IoctlResp>();
+        let st = osdesc().vid_heap_status_at;
+        u32::from_le_bytes(resp[body + st..body + st + 4].try_into().unwrap())
+    }
+
+    /// A pin the kernel refused is usually refused for a moment: the page was
+    /// busy while it was being migrated out of a MIGRATE_CMA pageblock, and
+    /// each attempt keeps what it did migrate. The registration is made again
+    /// rather than the GPU VA being left unmapped.
+    #[test]
+    fn a_registration_whose_pin_was_refused_is_made_again() {
+        let d = osdesc();
+        let (host, mut be, h) = pin_refusing(2);
+
+        let mut resp = vec![0u8; 4096];
+        be.dispatch(
+            &ioctl_msg_with_runs(
+                h,
+                abi::ioctl::NV_ESC_RM_VID_HEAP_CONTROL,
+                &heap_registration(&d, 0xc1d0_0001),
+                &[(1024 * TPAGE, TPAGE), (0, TPAGE)],
+            ),
+            &mut resp,
+        );
+
+        assert_eq!(parse_resp(&resp).status, 0);
+        assert_eq!(
+            heap_rm_status(&resp),
+            0,
+            "the third attempt was answered NV_OK"
+        );
+        assert_eq!(
+            host.inner.calls().len(),
+            3,
+            "two refusals, then the one that held"
+        );
+        assert_eq!(
+            host.inner.seen(),
+            vec![
+                crate::guestmem::fake::mark(1024 * TPAGE),
+                crate::guestmem::fake::mark(0)
+            ],
+            "the attempt that held was given the same guest pages"
+        );
+        assert_eq!(
+            be.registration_count(),
+            1,
+            "the span is held for the object"
+        );
+        assert_eq!(be.registrations_retried, 1);
+        be.teardown();
+    }
+
+    /// A refusal that does not go away is RM's answer, passed on as it stands
+    /// after a bounded number of attempts, and nothing is held for it.
+    #[test]
+    fn a_pin_refused_on_every_attempt_is_passed_on() {
+        let d = osdesc();
+        let (host, mut be, h) = pin_refusing(usize::MAX);
+
+        let mut resp = vec![0u8; 4096];
+        be.dispatch(
+            &ioctl_msg_with_runs(
+                h,
+                abi::ioctl::NV_ESC_RM_VID_HEAP_CONTROL,
+                &heap_registration(&d, 0xc1d0_0001),
+                &[(0, 2 * TPAGE)],
+            ),
+            &mut resp,
+        );
+
+        assert_eq!(parse_resp(&resp).status, 0);
+        assert_eq!(
+            heap_rm_status(&resp),
+            0x1e,
+            "RM's own status reaches the guest"
+        );
+        assert_eq!(
+            host.inner.calls().len(),
+            1 + super::osdesc::PIN_RETRY_DELAYS.len(),
+            "one attempt and one per retry delay, and no more"
+        );
+        assert_eq!(
+            be.registration_count(),
+            0,
+            "nothing was registered, nothing held"
+        );
+        assert_eq!(be.registrations_unpinned, 1);
+        be.teardown();
+    }
+
+    /// Any other refusal is not a pin that might hold a moment later, and is
+    /// not asked again.
+    #[test]
+    fn a_registration_refused_for_another_reason_is_not_made_again() {
+        let d = osdesc();
+        let host = StatusRefusingHost(std::sync::Arc::default(), d.vid_heap_status_at);
+        let inner = RegisteringHost::new(
+            d.vid_heap.address_at,
+            d.vid_heap_status_at,
+            d.vid_heap_hmemory_at,
+            2,
+        );
+        let (mut be, h) = backend_for_registration(&inner);
+        be.set_host(Box::new(host.clone()));
+
+        let mut resp = vec![0u8; 4096];
+        be.dispatch(
+            &ioctl_msg_with_runs(
+                h,
+                abi::ioctl::NV_ESC_RM_VID_HEAP_CONTROL,
+                &heap_registration(&d, 0xc1d0_0001),
+                &[(0, 2 * TPAGE)],
+            ),
+            &mut resp,
+        );
+
+        assert_eq!(
+            heap_rm_status(&resp),
+            0x51,
+            "NV_ERR_NO_MEMORY, as RM said it"
+        );
+        assert_eq!(*host.0.lock().unwrap(), 1, "asked once");
+        assert_eq!(be.registration_count(), 0);
+        be.teardown();
+    }
+
+    /// RM answering NV_ERR_NO_MEMORY to everything, counting the calls.
+    #[derive(Clone)]
+    struct StatusRefusingHost(std::sync::Arc<std::sync::Mutex<usize>>, usize);
+
+    impl HostDriver for StatusRefusingHost {
+        fn ioctl(&self, _fd: RawFd, request: u64, arg: &mut [u8]) -> std::result::Result<(), i32> {
+            if request & 0xFF != 0x29 {
+                *self.0.lock().unwrap() += 1;
+                arg[self.1..self.1 + 4].copy_from_slice(&0x51u32.to_le_bytes());
+            }
+            Ok(())
+        }
+    }
+
     /// A table too long for one message stays in guest memory, and the
     /// message says where: the host still reads exactly the guest's pages.
     #[test]
