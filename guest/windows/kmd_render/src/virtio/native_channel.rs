@@ -674,10 +674,11 @@ impl NativeQueue {
         );
         restore_process(process, native);
         result?;
-        CE_BIND_ENABLED.store(
-            crate::diag::read_config_dword(crate::diag::KnobName::new(b"NvCeBindOn"), 0) == 1,
-            Ordering::Relaxed,
-        );
+        // NvCeBindOn: bit 0 enables the binding, bits 8..12 are subchannel 4's
+        // SET_OBJECT ENGINE field (its engine on the GR runlist; 0 = GR itself).
+        let knob = crate::diag::read_config_dword(crate::diag::KnobName::new(b"NvCeBindOn"), 0);
+        CE_BIND_ENABLED.store(knob & 1 != 0, Ordering::Relaxed);
+        CE_BIND_ENGINE.store((knob >> 8) & 0x1f, Ordering::Relaxed);
         // Last, so no early return can leave the page locked.
         let (fence_view, fence_mdl) = lock_fence_view(progress_cpu);
         crate::diag::record_named_bytes(b"NvQFenceLock", u32::from(fence_view != 0));
@@ -756,7 +757,11 @@ impl NativeQueue {
                         // subchannel the UMD drives, as NVK binds its channel
                         // (subchannel 4 alone left the D3D11 clear failing).
                         for (i, (subchannel, class)) in BINDINGS.iter().enumerate() {
-                            let class = if *subchannel == 4 { copy_class } else { *class };
+                            let class = if *subchannel == 4 {
+                                copy_class | (CE_BIND_ENGINE.load(Ordering::Relaxed) << 16)
+                            } else {
+                                *class
+                            };
                             unsafe {
                                 words
                                     .add(start + 2 * i)
@@ -1220,6 +1225,9 @@ fn zero(base: u64, len: u64) {
 /// creation).
 pub(crate) static CE_BIND_ENABLED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
+
+/// SET_OBJECT ENGINE field for subchannel 4 (NvCeBindOn bits 8..12).
+static CE_BIND_ENGINE: AtomicU32 = AtomicU32::new(0);
 
 /// The IRQL the last subchannel-4 binding attempt ran at (NvCeIrql).
 pub(crate) static CE_BIND_IRQL: AtomicU32 = AtomicU32::new(0xff);
