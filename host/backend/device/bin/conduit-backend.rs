@@ -2439,9 +2439,50 @@ impl NvGpuBackend {
             .set_vram_limit_mib(vram_limit_mib)
             .map_err(|e| anyhow::anyhow!("refusing to start: {e}"))?;
 
+        // The NVIDIA UMD personality: its RM policy (log-only unless
+        // CONDUIT_RM_POLICY says otherwise) and the UMD release lock.
+        let nvidia_umd = std::env::var("CONDUIT_NVIDIA_UMD").as_deref() == Ok("1");
+        nvidia.set_nvidia_umd(nvidia_umd);
+        {
+            use device::nvidia::rmpolicy::{ENV, Mode};
+            let value = std::env::var(ENV).ok();
+            let mode = match Mode::from_env_value(value.as_deref(), nvidia_umd) {
+                Ok(m) => m,
+                Err(m) => {
+                    log::warn!(
+                        "{ENV}={:?} is not off, log or enforce; using {}",
+                        value.unwrap_or_default(),
+                        m.as_str()
+                    );
+                    m
+                }
+            };
+            nvidia.set_rm_policy(mode);
+            if mode != Mode::Off {
+                log::info!(
+                    "RM policy for the NVIDIA UMD personality: {} ({ENV}=log|enforce|off)",
+                    mode.as_str()
+                );
+            }
+        }
+        {
+            use device::nvidia::umd_version::{ENV_PIN, Pin};
+            if let Ok(value) = std::env::var(ENV_PIN) {
+                match Pin::parse(&value) {
+                    Some(pin) => {
+                        log::info!("NVIDIA UMD release check: {ENV_PIN}={value}");
+                        nvidia.set_umd_pin(Some(pin));
+                    }
+                    None => anyhow::bail!(
+                        "refusing to start: {ENV_PIN}={value:?} is neither a release (610.88) nor any"
+                    ),
+                }
+            }
+        }
+
         let nvidia_vram_mib = nvidia.vram_limit_mib();
         let mut config = VirtioGpuNvConfig::new(&version, &gpus, caps, nvidia_vram_mib);
-        if std::env::var("CONDUIT_NVIDIA_UMD").as_deref() == Ok("1") {
+        if nvidia_umd {
             config.set_nvidia_umd();
             log::info!("NVIDIA UMD personality: RTX 5090 PCI identity");
         }

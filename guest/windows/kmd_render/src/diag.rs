@@ -1281,6 +1281,10 @@ pub mod knobs {
     /// 2 = forward NVDA RM controls through the KMD-owned RM client. Read once per
     /// transport generation; the NVIDIA PCI personality's INF install selects 2.
     pub const NVIDIA_UMD: KnobName = KnobName::new(b"NvUmd");
+    /// `NvUmdVersion` (Parameters key, default 0 = not recorded): the NVIDIA UMD
+    /// release the installer staged, `61088` for 610.88. Reported to the host at
+    /// every StartDevice of the NVIDIA personality (`virtio::nvda::check_umd_release`).
+    pub const NVIDIA_UMD_VERSION: KnobName = KnobName::new(b"NvUmdVersion");
     /// `KmdRmSysCache` (default 0). With `KmdRmClient` = 5: what the RM system-memory
     /// primary is made of (read at the service's bring-up; `docs/kmd-rm-client.md` 15.5).
     /// 0 or 1 = WRITE-COMBINED memory (the default: every view of it agrees with dxgkrnl's

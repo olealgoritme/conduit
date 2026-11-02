@@ -244,6 +244,14 @@ pub(super) struct StartSettings {
     /// The guest TSGs' timeslice policy (gpu_sched). None here; the binary
     /// sets its own (default 100 us).
     pub(super) sched: crate::gpu_sched::GuestSched,
+    /// The NVIDIA UMD personality's RM policy (rmpolicy.rs). Off unless the
+    /// binary sets it.
+    pub(super) rm_policy: rmpolicy::Mode,
+    /// The exact Windows NVIDIA UMD version this host accepts, when pinned
+    /// (umd_version.rs). `None` uses the built-in pairs.
+    pub(super) umd_pin: Option<umd_version::Pin>,
+    /// The guest is the NVIDIA UMD personality (`CONDUIT_NVIDIA_UMD=1`).
+    pub(super) nvidia_umd: bool,
 }
 
 impl StartSettings {
@@ -261,6 +269,9 @@ impl StartSettings {
             bounds: bounds::Bounds::NORMAL,
             vram_limit_mib: None,
             sched: crate::gpu_sched::GuestSched::NONE,
+            rm_policy: rmpolicy::Mode::Off,
+            umd_pin: None,
+            nvidia_umd: false,
         }
     }
 }
@@ -327,6 +338,17 @@ pub struct NvidiaBackend {
     /// somebody made on the command line, and this is RM's own rule. A probe
     /// that regresses needs to say which of the two stopped it.
     allow_refused: std::collections::BTreeMap<String, u64>,
+    /// The RM clients and objects this guest made, for the RM policy.
+    rm_owned: rmpolicy::Owned,
+    /// What the RM policy did not allow, by request.
+    rm_misses: rmpolicy::Misses,
+    /// Controls the RM policy answered here instead of forwarding.
+    rm_absorbed: u64,
+    /// What the guest said about its NVIDIA UMDs, and the verdict.
+    umd_report: Option<umd_version::Report>,
+    /// The guest made an RM client without reporting its UMD release, and
+    /// that was logged.
+    umd_unreported_logged: bool,
     /// What the guest-TSG timeslice policy did (sched.rs).
     tsg_sched: sched::TsgSchedStats,
     /// The guest's channel groups (owner file handle, client, TSG), for the
@@ -504,6 +526,11 @@ impl NvidiaBackend {
             uvm_denied: std::collections::HashSet::new(),
             os_events: std::collections::HashMap::new(),
             allow_refused: std::collections::BTreeMap::new(),
+            rm_owned: Default::default(),
+            rm_misses: Default::default(),
+            rm_absorbed: 0,
+            umd_report: None,
+            umd_unreported_logged: false,
             tsg_sched: sched::TsgSchedStats::default(),
             guest_tsgs: Vec::new(),
             abi_refused: std::collections::BTreeMap::new(),
@@ -595,6 +622,21 @@ impl NvidiaBackend {
     /// Safe mode: the blocking timeouts a guest may forward shrink to
     /// [`bounds::Bounds::SAFE`]. The video-memory limit is not decided here: the CLI passes the final number
     /// (`--vram-limit-mib`) and [`Self::set_vram_limit_mib`] enforces it.
+    /// Select the RM policy for the NVIDIA UMD personality (rmpolicy.rs).
+    pub fn set_rm_policy(&mut self, mode: rmpolicy::Mode) {
+        self.start.rm_policy = mode;
+    }
+
+    /// The guest runs NVIDIA's own UMDs (`CONDUIT_NVIDIA_UMD=1`): a guest
+    /// that never reports their release is named in the log.
+    pub fn set_nvidia_umd(&mut self, on: bool) {
+        self.start.nvidia_umd = on;
+    }
+
+    pub fn rm_policy(&self) -> rmpolicy::Mode {
+        self.start.rm_policy
+    }
+
     pub fn set_safe_mode(&mut self, on: bool) {
         self.start.bounds = if on {
             bounds::Bounds::SAFE
@@ -900,6 +942,22 @@ impl NvidiaBackend {
             self.active_maps.len()
         );
         self.tsg_sched.report(&self.start.sched);
+        if !self.rm_misses.is_empty() || self.rm_absorbed > 0 {
+            let verb = match self.start.rm_policy {
+                rmpolicy::Mode::Enforce => "refused",
+                _ => "would refuse",
+            };
+            log::warn!(
+                "NvidiaBackend::teardown: RM policy ({}) {verb}: {}; answered here: {}",
+                self.start.rm_policy.as_str(),
+                if self.rm_misses.is_empty() {
+                    "nothing".to_string()
+                } else {
+                    self.rm_misses.summary()
+                },
+                self.rm_absorbed
+            );
+        }
         if !self.allow_refused.is_empty() {
             log::warn!(
                 "NvidiaBackend::teardown: refused by the RM allowlist: {}",
@@ -1137,6 +1195,7 @@ impl NvidiaBackend {
                 MsgType::ClipboardRequest => "clipboard_request",
                 MsgType::GpuCmd => "gpu_cmd",
                 MsgType::RmResourceImport => "rm_resource_import",
+                MsgType::UmdVersion => "umd_version",
             })
             .or_insert(0) += 1;
         // The handle travels in the header, not the payload -- every message
@@ -1181,6 +1240,7 @@ impl NvidiaBackend {
             MsgType::ClipboardRequest => self.handle_clipboard_request(resp_buf),
             MsgType::GpuCmd => self.handle_gpu_cmd(payload, resp_buf),
             MsgType::RmResourceImport => self.handle_rm_resource_import(payload, resp_buf),
+            MsgType::UmdVersion => self.handle_umd_version(payload, resp_buf),
         }
     }
 }
@@ -1239,11 +1299,13 @@ mod rm_import;
 pub use rm_import::{RmObject, RmPlacement, SurfaceLayout, Tiling};
 mod rm_resource;
 mod rmctrl;
+pub mod rmpolicy;
 mod scanout;
 mod sched;
 mod simple;
 #[cfg(feature = "trace")]
 mod trace;
+pub mod umd_version;
 mod uvm;
 mod vidmem;
 mod window;
