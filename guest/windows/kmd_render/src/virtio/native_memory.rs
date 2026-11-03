@@ -23,6 +23,7 @@ use helios_kmd_logic::native_memory as nm;
 use helios_kmd_logic::native_perf as np;
 use helios_kmd_logic::native_teardown as nt;
 use helios_kmd_logic::nvda as nd;
+use helios_kmd_logic::pt_ring as ptr;
 use helios_kmd_logic::rm_ce_channel as cc;
 use helios_kmd_logic::rm_client as rc;
 use wdk_sys::ntddk::{
@@ -81,6 +82,8 @@ pub mod watch {
     }
 
     pub fn event(va: u64, len: u64, op: u32, detail: u32, process: usize) {
+        // The page-table ring (`NvPtRing`) takes every event; its kinds are these op numbers.
+        crate::ddi::pt_ring::record(op as u8, 0, detail as u16, 0, va, len, process);
         if !covers(va, len) {
             return;
         }
@@ -742,12 +745,16 @@ fn ensure_space(io: &Io<'_>, process: usize) -> Result<u32, Error> {
             return Err(error);
         }
     };
-    let params = cc::virtual_params(
+    let mut params = cc::virtual_params(
         io.client.root,
         space,
         Some(LOW_WINDOW_BASE),
         LOW_WINDOW_END - LOW_WINDOW_BASE,
     );
+    // `NvPtSparse` (default 0, `pt_ring::window_flags`): unmapped VAs of the window read zero
+    // instead of faulting (bit 0 low window, bit 1 high window).
+    let sparse = crate::diag::read_config_dword(crate::diag::KnobName::new(b"NvPtSparse"), 0);
+    sparse_window(&mut params, ptr::window_flags(sparse, false));
     if let Err(error) = io.rm_alloc(nd::H_DEVICE, window, cc::NV50_MEMORY_VIRTUAL, &params) {
         let _ = io.rm_free(nd::H_DEVICE, space);
         return Err(error);
@@ -766,12 +773,13 @@ fn ensure_space(io: &Io<'_>, process: usize) -> Result<u32, Error> {
     // The guard of `STATE.lock()` must end before the block, which locks STATE again.
     let minted = STATE.lock().mint();
     if let Ok(high) = minted {
-        let params = cc::virtual_params(
+        let mut params = cc::virtual_params(
             io.client.root,
             space,
             Some(HIGH_WINDOW_BASE),
             HIGH_WINDOW_END - HIGH_WINDOW_BASE,
         );
+        sparse_window(&mut params, ptr::window_flags(sparse, true));
         match io.rm_alloc(nd::H_DEVICE, high, cc::NV50_MEMORY_VIRTUAL, &params) {
             Ok(_) => {
                 let mut state = STATE.lock();
@@ -798,6 +806,18 @@ fn ensure_space(io: &Io<'_>, process: usize) -> Result<u32, Error> {
         crate::diag::record_named_bytes(b"NvSpaceFree", at);
     }
     Ok(space)
+}
+
+/// OR `extra` into the `NVOS32` flags (+8) of a window's `NV_MEMORY_ALLOCATION_PARAMS`, and
+/// count sparse windows (`NvPtSparseN`).
+fn sparse_window(params: &mut [u8], extra: u32) {
+    if extra == 0 {
+        return;
+    }
+    let flags = rc::get32(params, 8).unwrap_or(0) | extra;
+    params[8..12].copy_from_slice(&flags.to_le_bytes());
+    static N: AtomicU32 = AtomicU32::new(0);
+    crate::diag::record_named_bytes(b"NvPtSparseN", N.fetch_add(1, Ordering::Relaxed) + 1);
 }
 
 /// The low window of a per-process space: [64 KiB, 4 GiB), VidMm's fences
@@ -1638,6 +1658,7 @@ fn invalidate_tlb(io: &Io<'_>, space: u32) {
         Err(_) => false,
     };
     bump(&TLB_RESCUE, b"NvPmTlbInv");
+    crate::ddi::pt_ring::record(ptr::K_TLB_INV, 0, u16::from(!ok), space, 0, 0, 0);
     if !ok {
         bump(&TLB_RESCUE_FAILED, b"NvPmTlbErr");
     }
@@ -1803,6 +1824,7 @@ fn evict_range(
     // `NvEvict`: published by the mirror pass (`publish_hot`).
     EVICTED.fetch_add((foreign.len() + victims.len()) as u32, Ordering::Relaxed);
     for mapping in foreign {
+        crate::ddi::pt_ring::record(ptr::K_EVICT, 0, 0, 0, mapping.piece.va, mapping.piece.len, process);
         let _ = unmap_fixed(io, 0, mapping);
     }
     let failed = || {
@@ -1811,6 +1833,7 @@ fn evict_range(
     };
     for victim in victims {
         let m = victim.mapping;
+        crate::ddi::pt_ring::record(ptr::K_EVICT, 0, 0, victim.id, m.piece.va, m.piece.len, process);
         if unmap_fixed(io, victim.memory, m).is_err() {
             if let Ok(allocation) = STATE.lock().allocation_mut(victim.id) {
                 allocation.poisoned = true;
@@ -1865,6 +1888,7 @@ fn evict_range(
                 }
                 Ok(HostMapping { process, piece, virt: used, desc })
             })();
+            crate::ddi::pt_ring::record(ptr::K_EVICT_REST, 0, u16::from(shown.is_err()), victim.id, va, bytes, process);
             let Ok(shown) = shown else {
                 failed();
                 continue;
@@ -2574,12 +2598,14 @@ fn update_leaf_inner(
     if !affected_old.is_empty() {
         if crate::ddi::hot_path::knob(passive).no_quiesce() {
             crate::ddi::hot_path::count(&crate::ddi::hot_path::QUIESCE_SKIPPED);
+            crate::ddi::pt_ring::record(ptr::K_QUIESCE, 0, 2, id, first_va, len, process);
         } else {
             let started = crate::adapter::foreign_scanout::now_100ns();
             let quiesced = super::native_channel::quiesce(passive, adapter, process);
             crate::ddi::hot_path::note_quiesce(
                 crate::adapter::foreign_scanout::now_100ns().saturating_sub(started),
             );
+            crate::ddi::pt_ring::record(ptr::K_QUIESCE, 0, u16::from(quiesced.is_err()), id, first_va, len, process);
             if quiesced.is_err() {
                 // `NvQuiesceRef`: published by the mirror pass (`publish_hot`).
                 QUIESCE_REFUSED.fetch_add(1, Ordering::Relaxed);

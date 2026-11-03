@@ -677,6 +677,8 @@ pub(crate) fn poll_tick(adapter: &AdapterContext) {
                     };
                     counter.fetch_add(1, Ordering::Relaxed);
                     NAT_LAST_CAUSE.store(cause.code(), Ordering::Relaxed);
+                    // `NvPtRing`: the fault snapshot of the page-table operation ring.
+                    crate::ddi::pt_ring::fault(slot.node, cause.code());
                     timeout_nodes |= node_bit(slot.node);
                 }
                 Action::ForceComplete(_) => {

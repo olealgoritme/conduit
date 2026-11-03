@@ -110,6 +110,7 @@ pub mod windowed_ready;
 pub mod slice_budget;
 pub mod flip_pend_wd;
 pub mod wait_bound;
+pub mod pt_ring;
 pub mod stage_trace;
 pub mod scanout_events;
 pub mod immediate_flip;

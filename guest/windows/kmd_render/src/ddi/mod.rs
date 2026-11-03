@@ -54,6 +54,7 @@ mod lifecycle;
 pub(crate) mod mode_list;
 pub(crate) mod mirror_thread;
 pub(crate) mod onscanout;
+pub(crate) mod pt_ring;
 pub(crate) mod present_foreign;
 pub(crate) mod present_packet;
 pub(crate) mod query_adapter_info;

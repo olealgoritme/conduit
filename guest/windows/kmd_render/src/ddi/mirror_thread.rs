@@ -392,6 +392,8 @@ fn run_pass(mask: u32) -> bool {
     crate::ddi::hot_path::publish();
     // `StgRing` (`StageTrace`): one relaxed load while the knob is 0, rate limited inside.
     crate::ddi::stage_trace::publish();
+    // `NvPtRing` (page-table operation ring): one knob read per 2 s, snapshots when on.
+    crate::ddi::pt_ring::publish();
     publish_own();
     crate::diag::mirror_end_pass();
     let us = (crate::adapter::foreign_scanout::now_100ns().saturating_sub(t0) / 10)
