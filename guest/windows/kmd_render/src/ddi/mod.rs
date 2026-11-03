@@ -54,6 +54,7 @@ mod lifecycle;
 pub(crate) mod mode_list;
 pub(crate) mod mirror_thread;
 pub(crate) mod native_snap;
+pub(crate) mod sem_watch;
 pub(crate) mod onscanout;
 pub(crate) mod pg_check;
 pub(crate) mod pt_ring;

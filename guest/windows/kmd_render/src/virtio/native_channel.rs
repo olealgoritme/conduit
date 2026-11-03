@@ -1299,6 +1299,16 @@ impl NativeQueue {
         Token(self.parts.token)
     }
 
+    /// The creator's process id (diagnosis).
+    pub(crate) fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    /// The compute-only channel's VEID (0 on the context's share).
+    pub(crate) fn veid(&self) -> u32 {
+        self.veid
+    }
+
     /// What `ddi::pg_check` reads after a submission: the GPFIFO VA and entry count, the last
     /// submission's range `(before, after)`, the ring allocation and the process key. `None`
     /// before the first submission. Any IRQL up to DISPATCH (atomics only).
@@ -1806,6 +1816,23 @@ impl CopyChannel {
 
     pub(crate) fn is_dead(&self) -> bool {
         self.dead.load(Ordering::Acquire)
+    }
+
+    /// For hang snapshots: the GPFIFO ring's entries (lo, hi dword pairs, at most `out.len() / 2`
+    /// entries from index 0) copied out under the GP_PUT lock; `(GP_PUT, token, entries)`.
+    /// DISPATCH-safe: volatile reads of the KMD's own view.
+    pub(crate) fn ring_snapshot(&self, out: &mut [u32]) -> (u32, u32, u32) {
+        use helios_kmd_logic::nv_copy::ring;
+        if self.block.va == 0 {
+            return (0, self.parts.token, 0);
+        }
+        let put = self.gp_put.lock();
+        let n = (out.len() / 2).min(ring::ENTRIES as usize);
+        for (i, w) in out[..2 * n].iter_mut().enumerate() {
+            // SAFETY: the ring is the first GPFIFO_BYTES of the live block view.
+            *w = unsafe { ((self.block.va + 4 * i as u64) as *const u32).read_volatile() };
+        }
+        (*put, self.parts.token, n as u32)
     }
 
     /// Append `entries` and the KMD's release of `seq` to the ring and ring the

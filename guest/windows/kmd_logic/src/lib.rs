@@ -37,6 +37,7 @@ pub mod leaf_plan;
 pub mod native_memory;
 pub mod native_perf;
 pub mod native_snap;
+pub mod sem_watch;
 pub mod native_teardown;
 pub mod nv_copy;
 pub mod nvda;

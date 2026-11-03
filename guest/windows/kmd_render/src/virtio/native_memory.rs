@@ -84,7 +84,9 @@ pub mod watch {
     pub fn covers(va: u64, len: u64) -> bool {
         let first = va >> 12;
         let end = va.saturating_add(len.max(1)).saturating_add(0xfff) >> 12;
-        pages().iter().any(|&p| p != u64::MAX && p >= first && p < end)
+        // `NvSemWatch`'s page is watched too (`ddi::sem_watch`).
+        let sem = crate::ddi::sem_watch::page().is_some_and(|p| p >= first && p < end);
+        sem || pages().iter().any(|&p| p != u64::MAX && p >= first && p < end)
     }
 
     pub fn event(va: u64, len: u64, op: u32, detail: u32, process: usize) {
@@ -5367,14 +5369,23 @@ pub fn map_aperture(
             huge: a.huge,
         }
     };
-    let mut mapping = cpu_map(
+    let mapped = cpu_map(
         &io,
         &snapshot,
         0,
         snapshot.size,
         Some(aperture_offset),
         Some(expected_gpa),
-    )?;
+    );
+    {
+        use helios_kmd_logic::sem_watch::map_op;
+        let (op, d) = match &mapped {
+            Ok(_) => (map_op::APERTURE_MAP, (expected_gpa >> 12) as u32),
+            Err(error) => (map_op::APERTURE_MAP_FAIL, 1 + *error as u32),
+        };
+        crate::ddi::sem_watch::note_map(id, op, (aperture_offset >> 12) as u32, d);
+    }
+    let mut mapping = mapped?;
     let view = mapping.view;
     let mut state = st();
     let allocation = state.allocation_mut(id)?;
@@ -5418,7 +5429,14 @@ pub fn unmap_aperture(
         .cpu
         .take()
         .ok_or(Error::Invalid)?;
-    match cpu_unmap_for(&io, memory, &mut mapping) {
+    let unmapped = cpu_unmap_for(&io, memory, &mut mapping);
+    crate::ddi::sem_watch::note_map(
+        id,
+        helios_kmd_logic::sem_watch::map_op::APERTURE_UNMAP,
+        (aperture_offset >> 12) as u32,
+        unmapped.as_ref().err().map_or(0, |e| 1 + *e as u32),
+    );
+    match unmapped {
         Ok(()) => Ok(()),
         Err(error) => {
             // Preserve whatever remains live for a later retry or transport
@@ -5434,6 +5452,7 @@ pub fn unmap_aperture(
 /// or unlock pSystemMem early.
 pub fn destroy(passive: PassiveLevel, adapter: &AdapterContext, id: u32) -> Result<(), Error> {
     crate::ddi::pg_check::forget(id);
+    crate::ddi::sem_watch::note_map(id, helios_kmd_logic::sem_watch::map_op::DESTROY, 0, 0);
     let guard = lock(passive, Kind::Destroy)?;
     let client = st().client()?;
     let io = Io {

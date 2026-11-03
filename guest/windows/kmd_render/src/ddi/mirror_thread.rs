@@ -310,7 +310,7 @@ unsafe extern "C" fn routine(_context: *mut c_void) {
         // else asks for a pass (a hung GPU stops the flips that usually do).
         let snap_watch = crate::ddi::wddm_surface::nvidia_selected();
         let mut wake: wdk_sys::LARGE_INTEGER = unsafe { core::mem::zeroed() };
-        wake.QuadPart = -(SNAP_WAKE_MS * 10_000);
+        wake.QuadPart = -(crate::ddi::sem_watch::wake_ms(SNAP_WAKE_MS) * 10_000);
         // SAFETY: initialised event; a request or stop wakes it (or the snapshot's timeout).
         let woke = unsafe {
             KeWaitForSingleObject(
@@ -369,6 +369,7 @@ fn snap_pass() {
     // SAFETY: as in `run_pass`.
     let adapter = unsafe { &*(a as *const AdapterContext) };
     crate::ddi::native_snap::publish(adapter);
+    crate::ddi::sem_watch::tick(adapter);
     crate::diag::mirror_end_pass();
 }
 
@@ -411,6 +412,7 @@ fn run_pass(mask: u32) -> bool {
         // second, NVIDIA personality only.
         if STOPPING.load(Ordering::Acquire) == 0 {
             crate::ddi::native_snap::publish(adapter);
+            crate::ddi::sem_watch::tick(adapter);
         }
         // `NvHostRmVersion` for the installer: once per transport generation (a few tries at
         // most), a no-op lock check on every other pass.
