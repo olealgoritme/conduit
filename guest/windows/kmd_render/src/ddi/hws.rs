@@ -289,6 +289,24 @@ static TD_EXIT_P: AtomicU32 = AtomicU32::new(0);
 /// `NvTdLive`: invalidations of a running (not exiting) process while one of its queues held
 /// work: applied as before (the UMD owns that ordering), only counted.
 static TD_LIVE: AtomicU32 = AtomicU32::new(0);
+/// `NvTdGate` (bit 0, default 1: `helios_kmd_logic::native_teardown::td_gate_on`): the exit
+/// gate and the EPROCESS reference it takes at CreateContext; 0 turns both off. u32::MAX =
+/// not read yet.
+static TD_GATE: AtomicU32 = AtomicU32::new(u32::MAX);
+
+/// Whether the exit gate is on (`NvTdGate`), read from the service key on first use. PASSIVE.
+pub(crate) fn exit_gate_on() -> bool {
+    let mut knob = TD_GATE.load(Ordering::Relaxed);
+    if knob == u32::MAX {
+        knob = crate::diag::read_config_dword(
+            crate::diag::KnobName::new(b"NvTdGate"),
+            helios_kmd_logic::native_teardown::DEFAULT_TD_GATE,
+        )
+        .min(u32::MAX - 1);
+        TD_GATE.store(knob, Ordering::Relaxed);
+    }
+    helios_kmd_logic::native_teardown::td_gate_on(knob)
+}
 static NAT_INVALIDATED: AtomicU32 = AtomicU32::new(0);
 static NAT_INVALIDATE_ST: AtomicU32 = AtomicU32::new(0);
 static NAT_RESET_ST: AtomicU32 = AtomicU32::new(0);
@@ -375,6 +393,11 @@ pub(crate) fn publish_counters() {
         if n != 0 {
             crate::diag::record_named_bytes(name, n);
         }
+    }
+    // The gate's knob as read (`NvTdGateK`; absent until the first native context).
+    let gate = TD_GATE.load(Ordering::Relaxed);
+    if gate != u32::MAX {
+        crate::diag::record_named_bytes(b"NvTdGateK", gate);
     }
     crate::diag::record_named_bytes(b"HwsNatInval", r(&NAT_INVALIDATED));
     crate::diag::record_named_bytes(b"HwsNatInvSt", r(&NAT_INVALIDATE_ST));
@@ -979,6 +1002,9 @@ const NO_VICTIM: Victim = Victim {
 /// `h_process` is 0 or dxgkrnl's live `hKmdProcess` (DestroyProcess has not run for it).
 pub(crate) unsafe fn exit_gate(adapter: &AdapterContext, h_process: usize) {
     if h_process == 0 || !crate::ddi::wddm_surface::nvidia_selected() {
+        return;
+    }
+    if !exit_gate_on() {
         return;
     }
     // SAFETY: the caller's contract.

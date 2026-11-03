@@ -35,6 +35,17 @@ pub fn is_live_key(key: usize) -> bool {
     key != DEAD_PROCESS
 }
 
+/// `NvTdGate` default: the exit gate (`exit_victim`, `teardown_update`) and the EPROCESS
+/// reference it needs are on.
+pub const DEFAULT_TD_GATE: u32 = 1;
+
+/// Whether the `NvTdGate` knob value `knob` turns the exit gate on (bit 0). Off, the KMD
+/// neither references an EPROCESS at CreateContext nor looks at process exit before an
+/// unmap: teardown runs as in 405.293.
+pub const fn td_gate_on(knob: u32) -> bool {
+    knob & 1 != 0
+}
+
 /// `PsGetProcessExitStatus` of a process that has not begun to exit (`STATUS_PENDING`).
 pub const STATUS_PENDING: i32 = 0x103;
 
@@ -235,6 +246,14 @@ mod tests {
         assert_eq!(retire_owner(0, 0), 0);
         assert!(!is_live_key(DEAD_PROCESS));
         assert!(is_live_key(0) && is_live_key(0x1000));
+    }
+
+    #[test]
+    fn the_gate_knob_defaults_on_and_zero_turns_it_off() {
+        assert!(td_gate_on(DEFAULT_TD_GATE));
+        assert!(!td_gate_on(0));
+        assert!(td_gate_on(3));
+        assert!(!td_gate_on(2), "only bit 0 is the gate");
     }
 
     #[test]

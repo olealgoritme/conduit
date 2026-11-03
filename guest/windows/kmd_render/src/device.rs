@@ -618,6 +618,10 @@ impl ProcessContext {
         if self.system || self.eprocess.load(Ordering::Acquire) != 0 {
             return;
         }
+        // `NvTdGate` 0: no gate, so no EPROCESS reference either.
+        if !crate::ddi::hws::exit_gate_on() {
+            return;
+        }
         // SAFETY: no preconditions; the current process is live while it calls.
         let current = unsafe { IoGetCurrentProcess() } as usize;
         if current == 0 {
@@ -988,6 +992,8 @@ pub unsafe extern "C" fn dxgkddi_create_process(
         if let Some(adapter) = unsafe { (miniport_device_context as *const AdapterContext).as_ref() } {
             reserve_nvidia_va(adapter, args.hDxgkProcess, system);
         }
+        // `NvTdGate` read here (PASSIVE), not first in a paging DDI.
+        let _ = crate::ddi::hws::exit_gate_on();
     }
     STATUS_SUCCESS
 }

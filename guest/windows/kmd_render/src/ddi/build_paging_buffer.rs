@@ -2437,6 +2437,7 @@ unsafe fn teardown_gate(adapter: &AdapterContext, update: &DXGK_BUILDPAGINGBUFFE
         || update.PageTableLevel != 0
         || !crate::ddi::wddm_surface::nvidia_selected()
         || unsafe { KeGetCurrentIrql() } != PASSIVE_LEVEL_IRQL
+        || !crate::ddi::hws::exit_gate_on()
     {
         return;
     }

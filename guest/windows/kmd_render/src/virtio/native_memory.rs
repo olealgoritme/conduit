@@ -5453,7 +5453,7 @@ pub fn destroy(passive: PassiveLevel, adapter: &AdapterContext, id: u32) -> Resu
     // An exiting process's channels stop before its mappings go (`hws::exit_gate`). The
     // keys are live: release_process (under this mutex) drops or retires a process's
     // records before its ProcessContext is freed.
-    {
+    if crate::ddi::hws::exit_gate_on() {
         let mut gated: Vec<usize> = Vec::new();
         for m in mappings.iter() {
             if m.process != 0 && nt::is_live_key(m.process) && !gated.contains(&m.process) {
