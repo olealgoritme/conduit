@@ -2,10 +2,13 @@
 //! writes it (layout and encodings: `helios_kmd_logic::sem_watch`). Off (the default) costs one
 //! relaxed load per hook.
 //!
-//! * Releases (`NvSwR*`): every native HW-queue submission is scanned at submit (PASSIVE, its
+//! * Releases and acquires (`NvSwR*`): every native HW-queue submission (its GPFIFO range) and
+//!   every copy-context channel submission (`nv_copy`, its segments) is queued at submit, at
+//!   any IRQL (submits arrive at DISPATCH), in a lock-free ring
+//!   (`helios_kmd_logic::sem_watch::ScanQueue`); the mirror pass scans them at PASSIVE (the
 //!   GPFIFO entries and segments read as the GPU fetches them, bounded) for semaphore releases
-//!   to the VA; copy-context channel submissions (`nv_copy`, DISPATCH) are queued and scanned
-//!   by the mirror pass; the copy context's CPU executor reports its releases directly.
+//!   to the VA and acquires of it (`a` has `sem_watch::ACQUIRE_BIT`, `b` the value waited for);
+//!   the copy context's CPU executor reports its releases directly.
 //!   Submissions this KMD completes without running anything (an NVDA HW-queue context on a
 //!   node without a channel, an NVDA SubmitCommand context without a channel or record) are
 //!   counted per source: `NvSwDrop<src>` count, `NvSwDropNd<src>` node mask, `NvSwDropT<src>`
@@ -21,8 +24,13 @@
 //!   (`native_memory::watch`, `NvWa*` / `NvWc*`).
 //!
 //! Counters: `NvSwOn` (VA low 32 bits in force), `NvSwSub` native submissions scanned,
-//! `NvSwSeg` segments scanned, `NvSwRdF` segment reads that failed, `NvSwIrql` hooks not at
-//! PASSIVE, `NvSwCq` / `NvSwCqLost` copy submissions queued / lost (queue full).
+//! `NvSwSeg` segments scanned, `NvSwRdF` reads that failed (`NvSwRdNm` not mapped, `NvSwRdEr`
+//! error, `NvSwRdBg` budget; `NvSwRdVa` / `NvSwRdVaH` the last failed VA, `NvSwRdK` its
+//! lookup: hits << 8 | kind of the first), `NvSwIrql` hooks queued above PASSIVE, `NvSwNq` /
+//! `NvSwNqLost` native submissions queued / lost (queue full), `NvSwCq` / `NvSwCqLost` copy
+//! segments queued / lost, `NvSwAcq` acquires of the VA seen, `NvSwSkip` records not scanned
+//! (their process does not map the VA). A pass scans at most `sw::SCAN_PER_PASS` records and
+//! `sw::SCAN_PASS_MS`.
 //! Registry writes happen on the mirror thread only.
 
 use alloc::vec::Vec;
@@ -57,26 +65,23 @@ static LAST_VALUES: SpinLock<[(usize, u64, bool); PROCS]> = SpinLock::new([(0, 0
 static SUBMITS: AtomicU32 = AtomicU32::new(0);
 static SEGMENTS: AtomicU32 = AtomicU32::new(0);
 static READ_FAILS: AtomicU32 = AtomicU32::new(0);
+static READ_NOT_MAPPED: AtomicU32 = AtomicU32::new(0);
+static READ_ERROR: AtomicU32 = AtomicU32::new(0);
+static READ_BUDGET: AtomicU32 = AtomicU32::new(0);
+static READ_LAST_VA: AtomicU64 = AtomicU64::new(0);
 static NOT_PASSIVE: AtomicU32 = AtomicU32::new(0);
+static NATIVE_QUEUED: AtomicU32 = AtomicU32::new(0);
+static NATIVE_LOST: AtomicU32 = AtomicU32::new(0);
 static COPY_QUEUED: AtomicU32 = AtomicU32::new(0);
 static COPY_LOST: AtomicU32 = AtomicU32::new(0);
+static ACQUIRES: AtomicU32 = AtomicU32::new(0);
+static SKIPPED: AtomicU32 = AtomicU32::new(0);
 static DROPS: [AtomicU32; src::COUNT] = [const { AtomicU32::new(0) }; src::COUNT];
 static DROP_NODES: [AtomicU32; src::COUNT] = [const { AtomicU32::new(0) }; src::COUNT];
 static DROP_T: [AtomicU32; src::COUNT] = [const { AtomicU32::new(0) }; src::COUNT];
 
-/// A copy-context submission waiting for the mirror pass's scan.
-#[derive(Clone, Copy)]
-struct CopyJob {
-    process: usize,
-    node: u32,
-    t_ms: u32,
-    n: u32,
-    entries: [(u64, u32); COPY_ENTRIES],
-}
-const COPY_ENTRIES: usize = 16;
-const COPY_JOBS: usize = 32;
-const NO_JOB: CopyJob = CopyJob { process: 0, node: 0, t_ms: 0, n: 0, entries: [(0, 0); COPY_ENTRIES] };
-static COPY_PENDING: SpinLock<([CopyJob; COPY_JOBS], usize)> = SpinLock::new(([NO_JOB; COPY_JOBS], 0));
+/// Submissions waiting for the mirror pass's scan (lock-free: producers at DISPATCH).
+static QUEUE: sw::ScanQueue<{ sw::SCAN_QUEUE }> = sw::ScanQueue::new();
 
 /// The watched VA, if the watch is on. Any IRQL.
 pub(crate) fn target() -> Option<u64> {
@@ -129,8 +134,9 @@ fn scan_segment(
     while done < len {
         let at = va + 4 * u64::from(done);
         let n = ((len - done) as usize).min(words.len()).min(((0x1000 - (at & 0xfff)) / 4) as usize);
-        if crate::ddi::native_snap::read_gpu_words(passive, adapter, process, at, &mut words[..n]) != ns::RD_OK {
-            READ_FAILS.fetch_add(1, Ordering::Relaxed);
+        let status = crate::ddi::native_snap::read_gpu_words(passive, adapter, process, at, &mut words[..n]);
+        if status != ns::RD_OK {
+            read_failed(status, process, at);
             return false;
         }
         for &d in &words[..n] {
@@ -143,84 +149,103 @@ fn scan_segment(
     true
 }
 
+/// A failed read: counted by status, the VA and what the mapping table has there kept.
+fn read_failed(status: u32, process: usize, va: u64) {
+    READ_FAILS.fetch_add(1, Ordering::Relaxed);
+    let counter = match status {
+        ns::RD_NOT_MAPPED => &READ_NOT_MAPPED,
+        ns::RD_BUDGET => &READ_BUDGET,
+        _ => &READ_ERROR,
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
+    if READ_LAST_VA.swap(va, Ordering::Relaxed) != va {
+        let mut hits = [VaHit::default(); 2];
+        let n = nmem::lookup_va(process, va, &mut hits);
+        let kind = if n != 0 { u32::from(hits[0].kind) } else { 0 };
+        LAST_READ_KIND.store((n as u32) << 8 | kind, Ordering::Relaxed);
+    }
+}
+static LAST_READ_KIND: AtomicU32 = AtomicU32::new(0);
+
 fn record_hits(scanner: &ns::Scanner, source: u32, node: u32, chid: u32, who: u32, t: u32) {
     if scanner.hits_seen == 0 {
         return;
     }
     let mut ring = RELEASES.lock();
     for op in scanner.hits() {
-        ring.push([sw::release_word(source, op.kind, node, op.op, chid), op.payload as u32, t, who]);
+        if op.acquire() {
+            ACQUIRES.fetch_add(1, Ordering::Relaxed);
+        }
+        ring.push([sw::op_word(source, op.kind, node, op.op, chid, op.acquire()), op.payload as u32, t, who]);
     }
 }
 
-/// After a successful native `SubmitCommandToHwQueue` (PASSIVE): scan the submission's
-/// segments for releases to the target.
-pub(crate) fn after_native_submit(adapter: &AdapterContext, queue: &crate::virtio::native_channel::NativeQueue) {
-    let Some(target) = target() else {
-        return;
-    };
-    let Some(passive) = PassiveLevel::try_assume() else {
-        NOT_PASSIVE.fetch_add(1, Ordering::Relaxed);
-        return;
-    };
-    let Some(view) = queue.check_view() else {
-        return;
-    };
-    let entries = view.entries.max(1);
-    let span = (view.after % entries + entries - view.before % entries) % entries;
-    let count = span.min(sw::SUBMIT_SEGMENTS);
-    let Some(mut scanner) = heap_scanner() else {
-        return;
-    };
-    let scanner = &mut scanner[0];
-    scanner.set_watch(&[target]);
-    let mut words = [0u32; 256];
-    let mut gp = [0u32; 2];
-    let t = now_ms();
-    let chid = ns::token_chid(queue.token().0);
-    let who = queue.pid();
-    SUBMITS.fetch_add(1, Ordering::Relaxed);
-    for k in 0..count {
-        let index = (view.before + k) % entries;
-        if crate::ddi::native_snap::read_gpu_words(passive, adapter, view.process_key, view.gpfifo_va + 8 * u64::from(index), &mut gp)
-            != ns::RD_OK
-        {
-            READ_FAILS.fetch_add(1, Ordering::Relaxed);
-            return;
-        }
-        let e = ns::gp_entry(gp[0], gp[1]);
-        if e.dwords == 0 {
-            continue;
-        }
-        SEGMENTS.fetch_add(1, Ordering::Relaxed);
-        scan_segment(passive, adapter, scanner, &mut words, view.process_key, e.va, e.dwords, sw::SUBMIT_SEG_DWORDS);
-        record_hits(scanner, src::NATIVE, queue.veid(), chid, who, t);
-    }
-}
-
-/// A copy-context channel submission (`nv_copy::admit`, DISPATCH): queued for the mirror
-/// pass's scan.
-pub(crate) fn note_copy_submit(process: usize, node: u32, entries: &[helios_kmd_logic::nv_copy::GpEntry]) {
+/// After a successful native `SubmitCommandToHwQueue` (any IRQL; DISPATCH in practice): the
+/// submission's GPFIFO range queued for the mirror pass's scan.
+pub(crate) fn after_native_submit(_adapter: &AdapterContext, queue: &crate::virtio::native_channel::NativeQueue) {
     if target().is_none() {
         return;
     }
-    let mut job = NO_JOB;
-    job.process = process;
-    job.node = node;
-    job.t_ms = now_ms();
-    for (slot, e) in job.entries.iter_mut().zip(entries.iter()) {
-        *slot = (e.va, e.dwords);
-        job.n += 1;
+    if PassiveLevel::try_assume().is_none() {
+        NOT_PASSIVE.fetch_add(1, Ordering::Relaxed);
     }
-    let mut pending = COPY_PENDING.lock();
-    if pending.1 >= COPY_JOBS {
-        COPY_LOST.fetch_add(1, Ordering::Relaxed);
+    let Some(view) = queue.check_view() else {
+        return;
+    };
+    let rec = sw::ScanRec {
+        kind: sw::scan_kind::GPFIFO,
+        source: src::NATIVE as u8,
+        node: queue.veid() as u8,
+        chid: ns::token_chid(queue.token().0),
+        pid: queue.pid(),
+        t_ms: now_ms(),
+        process: view.process_key as u64,
+        va: view.gpfifo_va,
+        a: view.before,
+        b: view.after,
+        c: view.entries,
+    };
+    if QUEUE.push(rec) {
+        NATIVE_QUEUED.fetch_add(1, Ordering::Relaxed);
+    } else {
+        NATIVE_LOST.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// A copy-context channel submission (`nv_copy::submit_to_channel`, DISPATCH, under its
+/// lock): its first `sw::COPY_SEGMENTS` segments queued for the mirror pass's scan.
+/// Lock-free.
+pub(crate) fn note_copy_submit(
+    process: usize,
+    node: u32,
+    slot: usize,
+    seq: u64,
+    entries: &[helios_kmd_logic::nv_copy::GpEntry],
+) {
+    if target().is_none() {
         return;
     }
-    let n = pending.1;
-    pending.0[n] = job;
-    pending.1 += 1;
-    COPY_QUEUED.fetch_add(1, Ordering::Relaxed);
+    let t_ms = now_ms();
+    for e in entries.iter().take(sw::COPY_SEGMENTS) {
+        let rec = sw::ScanRec {
+            kind: sw::scan_kind::SEGMENT,
+            source: src::COPY_CHANNEL as u8,
+            node: node as u8,
+            chid: 0,
+            pid: process as u32,
+            t_ms,
+            process: process as u64,
+            va: e.va,
+            a: e.dwords,
+            b: seq as u32,
+            c: slot as u32,
+        };
+        if QUEUE.push(rec) {
+            COPY_QUEUED.fetch_add(1, Ordering::Relaxed);
+        } else {
+            COPY_LOST.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 }
 
 /// The copy context's CPU executor released `payload` at `va` of `process` (PASSIVE).
@@ -297,7 +322,7 @@ pub(crate) fn tick(adapter: &AdapterContext) {
         LAST_SAMPLE_MS.store(now, Ordering::Relaxed);
         sample(passive, adapter, target, now);
     }
-    scan_copy_jobs(passive, adapter, target);
+    scan_queued(passive, adapter, target);
     publish();
 }
 
@@ -353,33 +378,95 @@ fn sample(passive: PassiveLevel, adapter: &AdapterContext, target: u64, now: u32
     }
 }
 
-fn scan_copy_jobs(passive: PassiveLevel, adapter: &AdapterContext, target: u64) {
-    let mut jobs = [NO_JOB; COPY_JOBS];
-    let n = {
-        let mut pending = COPY_PENDING.lock();
-        let n = pending.1;
-        jobs[..n].copy_from_slice(&pending.0[..n]);
-        pending.1 = 0;
-        n
-    };
-    if n == 0 {
-        return;
-    }
+/// The queued submissions (at most `sw::SCAN_PER_PASS` records a pass), scanned for releases
+/// to the target and acquires of it.
+fn scan_queued(passive: PassiveLevel, adapter: &AdapterContext, target: u64) {
     let Some(mut scanner) = heap_scanner() else {
         return;
     };
     let scanner = &mut scanner[0];
-    scanner.set_watch(&[target]);
     let mut words = [0u32; 256];
-    for job in &jobs[..n] {
-        for &(va, dwords) in &job.entries[..job.n as usize] {
-            if dwords == 0 {
-                continue;
-            }
-            SEGMENTS.fetch_add(1, Ordering::Relaxed);
-            scan_segment(passive, adapter, scanner, &mut words, job.process, va, dwords, sw::SUBMIT_SEG_DWORDS);
-            record_hits(scanner, src::COPY_CHANNEL, job.node, 0, job.process as u32, job.t_ms);
+    // A copy submission's segments share one decoder state, as on the channel.
+    let mut copy_key: Option<(u64, u32, u32)> = None;
+    // Whether a process maps the target at all (else its work cannot touch it): the last answer.
+    let mut maps: Option<(u64, bool)> = None;
+    let start = now_ms();
+    for _ in 0..sw::SCAN_PER_PASS {
+        if now_ms().wrapping_sub(start) >= sw::SCAN_PASS_MS {
+            return;
         }
+        let Some(rec) = QUEUE.pop() else {
+            return;
+        };
+        let process = rec.process as usize;
+        let mapped = match maps {
+            Some((p, m)) if p == rec.process => m,
+            _ => {
+                let mut hit = [VaHit::default(); 1];
+                let m = nmem::lookup_va(process, target, &mut hit) != 0;
+                maps = Some((rec.process, m));
+                m
+            }
+        };
+        if !mapped {
+            SKIPPED.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+        match rec.kind {
+            sw::scan_kind::GPFIFO => {
+                copy_key = None;
+                *scanner = ns::Scanner::new(ns::DEFAULT_CLASSES);
+                scanner.set_watch_all(&[target]);
+                scan_gpfifo(passive, adapter, scanner, &mut words, &rec);
+            }
+            sw::scan_kind::SEGMENT => {
+                let key = (rec.process, rec.c, rec.b);
+                if copy_key != Some(key) {
+                    copy_key = Some(key);
+                    *scanner = ns::Scanner::new(ns::DEFAULT_CLASSES);
+                    scanner.set_watch_all(&[target]);
+                }
+                if rec.a == 0 {
+                    continue;
+                }
+                SEGMENTS.fetch_add(1, Ordering::Relaxed);
+                scan_segment(passive, adapter, scanner, &mut words, process, rec.va, rec.a, sw::SUBMIT_SEG_DWORDS);
+                record_hits(scanner, u32::from(rec.source), u32::from(rec.node), rec.c, rec.pid, rec.t_ms);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// A native submission's GPFIFO range `[a, b)` of the ring at `va` (`c` entries), bounded.
+fn scan_gpfifo(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    scanner: &mut ns::Scanner,
+    words: &mut [u32; 256],
+    rec: &sw::ScanRec,
+) {
+    let process = rec.process as usize;
+    let entries = rec.c.max(1);
+    let span = (rec.b % entries + entries - rec.a % entries) % entries;
+    let count = span.min(sw::SUBMIT_SEGMENTS);
+    let mut gp = [0u32; 2];
+    SUBMITS.fetch_add(1, Ordering::Relaxed);
+    for k in 0..count {
+        let index = (rec.a + k) % entries;
+        let at = rec.va + 8 * u64::from(index);
+        let status = crate::ddi::native_snap::read_gpu_words(passive, adapter, process, at, &mut gp);
+        if status != ns::RD_OK {
+            read_failed(status, process, at);
+            return;
+        }
+        let e = ns::gp_entry(gp[0], gp[1]);
+        if e.dwords == 0 {
+            continue;
+        }
+        SEGMENTS.fetch_add(1, Ordering::Relaxed);
+        scan_segment(passive, adapter, scanner, words, process, e.va, e.dwords, sw::SUBMIT_SEG_DWORDS);
+        record_hits(scanner, u32::from(rec.source), u32::from(rec.node), rec.chid, rec.pid, rec.t_ms);
     }
 }
 
@@ -412,6 +499,17 @@ fn publish() {
     crate::diag::record_named_bytes(b"NvSwIrql", r(&NOT_PASSIVE));
     crate::diag::record_named_bytes(b"NvSwCq", r(&COPY_QUEUED));
     crate::diag::record_named_bytes(b"NvSwCqLost", r(&COPY_LOST));
+    crate::diag::record_named_bytes(b"NvSwNq", r(&NATIVE_QUEUED));
+    crate::diag::record_named_bytes(b"NvSwNqLost", r(&NATIVE_LOST));
+    crate::diag::record_named_bytes(b"NvSwAcq", r(&ACQUIRES));
+    crate::diag::record_named_bytes(b"NvSwSkip", r(&SKIPPED));
+    crate::diag::record_named_bytes(b"NvSwRdNm", r(&READ_NOT_MAPPED));
+    crate::diag::record_named_bytes(b"NvSwRdEr", r(&READ_ERROR));
+    crate::diag::record_named_bytes(b"NvSwRdBg", r(&READ_BUDGET));
+    let va = READ_LAST_VA.load(Ordering::Relaxed);
+    crate::diag::record_named_bytes(b"NvSwRdVa", va as u32);
+    crate::diag::record_named_bytes(b"NvSwRdVaH", (va >> 32) as u32);
+    crate::diag::record_named_bytes(b"NvSwRdK", r(&LAST_READ_KIND));
     for s in [src::SOFT_DROP, src::COPY_DROP] {
         let i = s as usize;
         let n = r(&DROPS[i]);

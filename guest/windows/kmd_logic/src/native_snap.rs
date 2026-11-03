@@ -373,6 +373,12 @@ pub const fn release_covers(op: &SemOp, target: u64) -> bool {
         && (op.addr == target || (op.flags & SEM_PAYLOAD64 != 0 && op.addr.wrapping_add(4) == target))
 }
 
+/// Whether the acquire `op` waits on the 4 bytes at `target` (its address, or the upper half
+/// of a 64-bit compare).
+pub const fn acquire_covers(op: &SemOp, target: u64) -> bool {
+    op.acquire() && (op.addr == target || (op.flags & SEM_PAYLOAD64 != 0 && op.addr.wrapping_add(4) == target))
+}
+
 /// The subchannel bindings the D3D UMDs assume on a native graphics channel
 /// (`native_channel::BINDINGS` and the deferred-API object on 5).
 pub const DEFAULT_CLASSES: [u32; 8] = [0xce97, 0xcec0, 0xcd40, 0x902d, 0xcab5, 0x5080, 0, 0];
@@ -449,6 +455,8 @@ pub struct Scanner {
     pub hits: [SemOp; HIT_CAP],
     pub n_hits: u32,
     pub hits_seen: u32,
+    /// Also match acquires of the watched addresses ([`Scanner::set_watch_all`]).
+    pub watch_acquires: bool,
 }
 
 impl Scanner {
@@ -516,6 +524,7 @@ impl Scanner {
             hits: [Z; HIT_CAP],
             n_hits: 0,
             hits_seen: 0,
+            watch_acquires: false,
         }
     }
 
@@ -524,6 +533,14 @@ impl Scanner {
         let n = targets.len().min(WATCH_CAP);
         self.watch[..n].copy_from_slice(&targets[..n]);
         self.n_watch = n as u32;
+        self.watch_acquires = false;
+    }
+
+    /// Match releases and acquires of `targets` from now on (`NvSemWatch`: who writes the
+    /// value and who waits for it).
+    pub fn set_watch_all(&mut self, targets: &[u64]) {
+        self.set_watch(targets);
+        self.watch_acquires = true;
     }
 
     /// This segment's releases to a watched address.
@@ -624,7 +641,8 @@ impl Scanner {
     fn push_sem(&mut self, op: SemOp) {
         self.sems_seen += 1;
         let watched = &self.watch[..(self.n_watch as usize).min(WATCH_CAP)];
-        if watched.iter().any(|t| release_covers(&op, *t)) {
+        let acquires = self.watch_acquires;
+        if watched.iter().any(|t| release_covers(&op, *t) || (acquires && acquire_covers(&op, *t))) {
             self.hits_seen += 1;
             let k = self.n_hits as usize;
             if k < HIT_CAP {
@@ -1480,6 +1498,9 @@ pub mod rel_source {
     pub const NATIVE_RING: u8 = 1;
     /// A copy-context channel's ring (`nv_copy`).
     pub const COPY_RING: u8 = 2;
+    /// A copy-context submission still waiting in the KMD's backlog (not on the ring yet:
+    /// its releases cannot have happened).
+    pub const COPY_BACKLOG: u8 = 3;
 }
 
 /// The scan stopped at the read budget.
@@ -1628,9 +1649,245 @@ pub fn write_releases(w: &mut Writer<'_>, r: &ReleaseScan) {
     w.patch_u32(start, bytes);
 }
 
+// ── the KMD's copy-context channels (`REC_COPY`) ───────────────────────────────────────────
+
+/// One record per copy-context channel (`nv_copy`): where its ring is, what waits in the
+/// backlog, and the semaphore operations of the work not done yet (the ring's pending
+/// entries and the backlog's first submissions), so a hang's "waits on" / "released by"
+/// chain crosses into the copy context.
+///
+/// ```text
+/// copy record:
+///   0 bytes | 4 kind (REC_COPY) | 8 slot | 12 flags (C_*) | 16 process key u64 | 24 token
+///  28 engine type (NV2080_ENGINE_TYPE; 1 graphics) | 32 KMD GP_PUT | 36 consumed index
+///  40 progress u64 | 48 submitted u64 | 56 seen u64 | 64 forced u64
+///  72 backlog submissions | 76 ring entries pending | 80 first backlog seq u64
+///  88 stuck seq u64 (the first not complete; 0 none) | 96 segments | 100 ms without progress
+/// 104 0 | 108 0 | 112 segments [n]
+/// copy segment:
+///   0 VA u64 | 8 dwords | 12 seq (low 32) | 16 source (COPY_SEG_*) | 20 read status
+///  24 scan status | 28 semaphore ops seen | 32 recorded | 36 0 | 40 semaphore ops [n] x SEM_BYTES
+/// ```
+pub const REC_COPY: u32 = 4;
+pub const COPY_FIXED: usize = 112;
+pub const COPY_SEG_FIXED: usize = 40;
+/// Segments recorded per copy channel at most.
+pub const COPY_SEG_CAP: usize = 24;
+/// Semaphore operations recorded per copy segment at most.
+pub const COPY_SEM_CAP: usize = 8;
+/// The most bytes one copy record takes.
+pub const COPY_MAX_BYTES: usize = COPY_FIXED + COPY_SEG_CAP * (COPY_SEG_FIXED + COPY_SEM_CAP * SEM_BYTES);
+
+/// Copy record flags.
+pub const C_DEAD: u32 = 1;
+pub const C_ASYNC: u32 = 2;
+pub const C_IN_GRACE: u32 = 4;
+/// More segments than [`COPY_SEG_CAP`] were not done.
+pub const C_SEGS_TRUNCATED: u32 = 8;
+
+/// Where a copy segment comes from.
+pub const COPY_SEG_PENDING: u32 = 1;
+pub const COPY_SEG_BACKLOG: u32 = 2;
+
+/// A copy record's fixed part.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CopyFields {
+    pub slot: u32,
+    pub flags: u32,
+    pub process: u64,
+    pub token: u32,
+    pub engine: u32,
+    pub put: u32,
+    pub consumed: u32,
+    pub progress: u64,
+    pub submitted: u64,
+    pub seen: u64,
+    pub forced: u64,
+    pub backlog: u32,
+    pub pending: u32,
+    pub backlog_first: u64,
+    pub stuck: u64,
+    pub stall_ms: u32,
+}
+
+/// Write a copy record's fixed part; [`write_copy_segment`]s follow, then [`end_copy`].
+pub fn begin_copy(w: &mut Writer<'_>, c: &CopyFields) -> Mark {
+    let start = w.len();
+    w.u32(0);
+    w.u32(REC_COPY);
+    w.u32(c.slot);
+    w.u32(c.flags);
+    w.u64(c.process);
+    w.u32(c.token);
+    w.u32(c.engine);
+    w.u32(c.put);
+    w.u32(c.consumed);
+    w.u64(c.progress);
+    w.u64(c.submitted);
+    w.u64(c.seen);
+    w.u64(c.forced);
+    w.u32(c.backlog);
+    w.u32(c.pending);
+    w.u64(c.backlog_first);
+    w.u64(c.stuck);
+    let count_at = w.len();
+    w.u32(0);
+    w.u32(c.stall_ms);
+    w.u32(0);
+    w.u32(0);
+    Mark { start, count_at }
+}
+
+/// One not-yet-done segment of a copy channel and its semaphore operations (at most
+/// [`COPY_SEM_CAP`]; acquires are kept first when there are more).
+#[allow(clippy::too_many_arguments)]
+pub fn write_copy_segment(
+    w: &mut Writer<'_>,
+    va: u64,
+    dwords: u32,
+    seq: u64,
+    source: u32,
+    read_status: u32,
+    scan_status: u32,
+    sems_seen: u32,
+    sems: &[SemOp],
+) {
+    let mut keep = [SemOp::default(); COPY_SEM_CAP];
+    let mut n = 0;
+    for pass_acquires in [true, false] {
+        for op in sems.iter().filter(|op| op.acquire() == pass_acquires) {
+            if n < COPY_SEM_CAP {
+                keep[n] = *op;
+                n += 1;
+            }
+        }
+    }
+    // Back in stream order.
+    keep[..n].sort_unstable_by_key(|op| op.at);
+    w.u64(va);
+    w.u32(dwords);
+    w.u32(seq as u32);
+    w.u32(source);
+    w.u32(read_status);
+    w.u32(scan_status);
+    w.u32(sems_seen);
+    w.u32(n as u32);
+    w.u32(0);
+    for op in keep[..n].iter() {
+        write_sem(w, op, u32::MAX);
+    }
+}
+
+/// Close a copy record: its segment count, its flags (truncation is known only now) and size.
+pub fn end_copy(w: &mut Writer<'_>, mark: Mark, segments: u32, flags: u32) {
+    w.patch_u32(mark.count_at, segments);
+    w.patch_u32(mark.start + 12, flags);
+    let bytes = (w.len() - mark.start) as u32;
+    w.patch_u32(mark.start, bytes);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn copy_records_carry_ring_backlog_and_pending_acquires() {
+        let mut buf = [0u8; 4096];
+        let mut w = Writer::new(&mut buf);
+        let c = CopyFields {
+            slot: 2,
+            flags: C_ASYNC,
+            process: 0xffff_8000_1234_0000,
+            token: 0x0005_0041,
+            engine: 0x0b,
+            put: 300,
+            consumed: 250,
+            progress: 17,
+            submitted: 21,
+            seen: 17,
+            forced: 0,
+            backlog: 2,
+            pending: 50,
+            backlog_first: 20,
+            stuck: 18,
+            stall_ms: 4100,
+        };
+        let mark = begin_copy(&mut w, &c);
+        assert_eq!(w.len(), COPY_FIXED);
+        // A host acquire on the graphics queue's value and ten releases: the acquire is kept.
+        let mut sems = [SemOp::default(); 11];
+        sems[0] = SemOp { kind: sem_kind::HOST, op: 0, flags: SEM_ACQUIRE, at: 3, addr: 0x852d008, payload: 0x3d, ..SemOp::default() };
+        for (i, s) in sems[1..].iter_mut().enumerate() {
+            *s = SemOp { kind: sem_kind::COPY, op: 1, at: 10 + i as u32, addr: 0x852d070, payload: 5, ..SemOp::default() };
+        }
+        write_copy_segment(&mut w, 0x406_1200, 360, 18, COPY_SEG_PENDING, RD_OK, scan_status::COMPLETE, 11, &sems);
+        write_copy_segment(&mut w, 0x406_1880, 4, 20, COPY_SEG_BACKLOG, RD_NOT_MAPPED, scan_status::READ_FAILED, 0, &[]);
+        end_copy(&mut w, mark, 2, C_ASYNC | C_SEGS_TRUNCATED);
+        let len = w.len();
+        assert!(!w.overflowed());
+        assert_eq!(len, COPY_FIXED + 2 * COPY_SEG_FIXED + COPY_SEM_CAP * SEM_BYTES);
+        let u32_at = |at: usize| u32::from_le_bytes([buf[at], buf[at + 1], buf[at + 2], buf[at + 3]]);
+        let u64_at = |at: usize| u32_at(at) as u64 | (u32_at(at + 4) as u64) << 32;
+        assert_eq!(u32_at(0) as usize, len);
+        assert_eq!(u32_at(4), REC_COPY);
+        assert_eq!(u32_at(8), 2);
+        assert_eq!(u32_at(12), C_ASYNC | C_SEGS_TRUNCATED);
+        assert_eq!(u64_at(16), 0xffff_8000_1234_0000);
+        assert_eq!((u32_at(32), u32_at(36)), (300, 250));
+        assert_eq!(u64_at(40), 17);
+        assert_eq!(u64_at(48), 21);
+        assert_eq!(u32_at(72), 2);
+        assert_eq!(u32_at(76), 50);
+        assert_eq!(u64_at(80), 20);
+        assert_eq!(u64_at(88), 18);
+        assert_eq!(u32_at(96), 2);
+        assert_eq!(u32_at(100), 4100);
+        let seg = COPY_FIXED;
+        assert_eq!(u64_at(seg), 0x406_1200);
+        assert_eq!(u32_at(seg + 12), 18);
+        assert_eq!(u32_at(seg + 28), 11);
+        assert_eq!(u32_at(seg + 32), COPY_SEM_CAP as u32);
+        // The acquire survived the cap and comes first (stream order).
+        let first = seg + COPY_SEG_FIXED;
+        assert_eq!(buf[first + 3] & SEM_ACQUIRE, SEM_ACQUIRE);
+        assert_eq!(u64_at(first + 16), 0x852d008);
+        assert_eq!(u32_at(first + 32), u32::MAX);
+        let second = seg + COPY_SEG_FIXED + COPY_SEM_CAP * SEM_BYTES;
+        assert_eq!(u32_at(second + 16), COPY_SEG_BACKLOG);
+        assert_eq!(u32_at(second + 20), RD_NOT_MAPPED);
+        assert!(COPY_MAX_BYTES < BLOB_CAP / 8);
+    }
+
+    #[test]
+    fn the_watch_can_match_acquires_too() {
+        // host SEM_ADDR_LO/HI, PAYLOAD_LO/HI, SEM_EXECUTE: ACQUIRE(eq) 5 at 0x852d070, then a
+        // copy release of 5 to it on subchannel 4.
+        let words = [
+            0x2005_e017u32, 0x0852_d070, 0, 5, 0, 0,
+            0x2004_8090, 0, 0x0852_d070, 5, 0, 0x2001_80c0, 0x0000_000c,
+        ];
+        let mut s = Scanner::new(DEFAULT_CLASSES);
+        s.set_watch(&[0x852d070]);
+        s.begin_segment(u32::MAX);
+        for w in words {
+            s.feed(w);
+        }
+        assert_eq!(s.hits().len(), 1);
+        assert!(!s.hits()[0].acquire());
+        let mut s = Scanner::new(DEFAULT_CLASSES);
+        s.set_watch_all(&[0x852d070]);
+        s.begin_segment(u32::MAX);
+        for w in words {
+            s.feed(w);
+        }
+        assert_eq!(s.hits().len(), 2);
+        assert!(s.hits()[0].acquire());
+        assert_eq!(s.hits()[0].payload, 5);
+        assert_eq!(s.hits()[1].payload, 5);
+        // set_watch again turns acquires off.
+        s.set_watch(&[0x852d070]);
+        assert!(!s.watch_acquires);
+    }
 
     #[test]
     fn nop_entries_and_skipping_them() {

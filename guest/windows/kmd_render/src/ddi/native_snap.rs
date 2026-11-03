@@ -26,11 +26,17 @@
 //! and semaphores are read by GPU VA through the KMD's mapping table (`lookup_va`): VidMm's
 //! system pages for a native system-memory allocation, the RM object's CPU view otherwise.
 //!
+//! Each copy-context channel (`nv_copy`) gets a `REC_COPY` record: its GP_PUT, how far the
+//! progress semaphore says the ring is consumed, sequences submitted / seen / forced, the
+//! backlog, and the semaphore operations of its work not done yet (the ring's pending
+//! entries from the first incomplete sequence on, then the backlog's segments). The pending
+//! copy work's acquires join the stuck queues' as release targets.
+//!
 //! The stuck submissions' acquire targets are then looked for in every ring of their process
 //! (`scan_history`): each native queue's last `ns::REL_RING_ENTRIES` GPFIFO entries before its
-//! GP_PUT and each copy-context channel's ring (`nv_copy`) are scanned for releases to them,
-//! and the snapshot's `REC_RELEASES` record names who releases what ("released by" in
-//! snapdec.py), or that nothing in any ring does.
+//! GP_PUT, each copy-context channel's ring and its backlog (work not on the ring yet) are
+//! scanned for releases to them, and the snapshot's `REC_RELEASES` record names who releases
+//! what ("released by" in snapdec.py), or that nothing in any ring does.
 //!
 //! A snapshot is `NvSnapBlob` (REG_BINARY, the latest) and `NvSnapB<seq % 4>` (the last four);
 //! kept apart from those: `NvSnapLong` (the automatic one with the longest stall), `NvSnapErr`
@@ -459,6 +465,8 @@ fn take(passive: PassiveLevel, adapter: &AdapterContext, reason: u32, trigger: u
         write_queue(&mut w, &mut reader, &mut table, scanner, releases, &mut words, c, detail, c.slot.queue == trigger, now);
         records += 1;
     }
+    // The copy-context channels.
+    records += write_copies(&mut w, &mut reader, scanner, releases, &mut words, &mut flags);
     // The VA table, each entry resolved now.
     for e in table.entries[..table.n].iter_mut() {
         reader.resolve(e);
@@ -898,7 +906,180 @@ fn scan_history(
                 return;
             }
         }
+        // The backlog: submissions not on the ring yet (their releases cannot have run).
+        // `gp_index` carries the sequence's low 32 bits.
+        let mut backlog = [(0u64, 0u64, 0u32); 64];
+        let n_back = crate::ddi::nv_copy::snap_backlog(slot, &mut backlog);
+        for &(seq, va, dwords) in backlog[..n_back].iter() {
+            let e = ns::GpEntry { va, dwords, ..ns::GpEntry::default() };
+            scan_one(reader, releases, scanner, words, process, e, token, seq as u32, ns::rel_source::COPY_BACKLOG);
+            if reader.budget_hit {
+                releases.flags |= ns::REL_FLAG_BUDGET;
+                return;
+            }
+        }
     }
+}
+
+/// The `REC_COPY` records of every copy-context channel; how many were written.
+fn write_copies(
+    w: &mut ns::Writer<'_>,
+    reader: &mut Reader<'_>,
+    scanner: &mut ns::Scanner,
+    releases: &mut ns::ReleaseScan,
+    words: &mut [u32],
+    flags: &mut u32,
+) -> u32 {
+    use helios_kmd_logic::nv_copy::ring;
+    let mut ring_words: Vec<u32> = Vec::new();
+    let mut backlog: Vec<(u64, u64, u32)> = Vec::new();
+    if ring_words.try_reserve_exact(2 * ring::ENTRIES as usize).is_err()
+        || backlog.try_reserve_exact(ns::COPY_SEG_CAP).is_err()
+    {
+        return 0;
+    }
+    ring_words.resize(2 * ring::ENTRIES as usize, 0);
+    backlog.resize(ns::COPY_SEG_CAP, (0, 0, 0));
+    let mut records = 0u32;
+    for slot in 0..crate::ddi::nv_copy::SNAP_CHANNELS {
+        let Some(c) = crate::ddi::nv_copy::snap_copy(slot) else {
+            continue;
+        };
+        if w.room() < VA_RESERVE + ns::COPY_MAX_BYTES {
+            *flags |= ns::FLAG_TRUNCATED;
+            break;
+        }
+        let Some((_, _, _, n_entries)) = crate::ddi::nv_copy::snap_ring(slot, &mut ring_words) else {
+            continue;
+        };
+        let done = c.seen.max(c.forced).max(c.progress);
+        let stuck = if c.submitted > done { done + 1 } else { 0 };
+        let mut cflags = 0;
+        for (on, bit) in [(c.dead, ns::C_DEAD), (c.async_engine, ns::C_ASYNC), (c.in_grace, ns::C_IN_GRACE)] {
+            if on {
+                cflags |= bit;
+            }
+        }
+        let fields = ns::CopyFields {
+            slot: slot as u32,
+            flags: cflags,
+            process: c.process as u64,
+            token: c.token,
+            engine: c.engine,
+            put: c.put,
+            consumed: c.consumed,
+            progress: c.progress,
+            submitted: c.submitted,
+            seen: c.seen,
+            forced: c.forced,
+            backlog: c.backlog,
+            pending: c.pending,
+            backlog_first: c.backlog_first,
+            stuck,
+            stall_ms: 0,
+        };
+        let mark = ns::begin_copy(w, &fields);
+        let mut segments = 0u32;
+        // The ring's pending entries, in order; the KMD's own release entries (in its block)
+        // mark where each sequence ends.
+        let mut seq = c.progress + 1;
+        let entries = n_entries.max(1);
+        let pending = c.pending.min(entries);
+        for k in 0..pending {
+            let index = (c.consumed + k) % entries;
+            let e = ns::gp_entry(ring_words[2 * index as usize], ring_words[2 * index as usize + 1]);
+            if e.dwords == 0 {
+                continue;
+            }
+            if e.va >= c.block_gpu && e.va < c.block_gpu + ring::BYTES {
+                if e.va >= c.block_gpu + ring::RELEASE_AT && e.va < c.block_gpu + ring::SEMAPHORE_AT {
+                    seq += 1;
+                }
+                continue;
+            }
+            if segments as usize >= ns::COPY_SEG_CAP {
+                cflags |= ns::C_SEGS_TRUNCATED;
+                break;
+            }
+            if copy_segment(w, reader, scanner, releases, words, c.process, e.va, e.dwords, seq, ns::COPY_SEG_PENDING, true) {
+                segments += 1;
+            }
+        }
+        let n_back = crate::ddi::nv_copy::snap_backlog(slot, &mut backlog);
+        for &(bseq, va, dwords) in backlog[..n_back].iter() {
+            if segments as usize >= ns::COPY_SEG_CAP {
+                cflags |= ns::C_SEGS_TRUNCATED;
+                break;
+            }
+            if copy_segment(w, reader, scanner, releases, words, c.process, va, dwords, bseq, ns::COPY_SEG_BACKLOG, false) {
+                segments += 1;
+            }
+        }
+        if (c.backlog as usize) > n_back || cflags & ns::C_SEGS_TRUNCATED != 0 {
+            cflags |= ns::C_SEGS_TRUNCATED;
+        }
+        ns::end_copy(w, mark, segments, cflags);
+        records += 1;
+        if reader.budget_hit {
+            *flags |= ns::FLAG_BUDGET;
+            break;
+        }
+    }
+    records
+}
+
+/// One not-done copy segment: read, decode, write its semaphore operations; its acquires
+/// become release targets when `targets`. `false` when nothing was written (no room).
+#[allow(clippy::too_many_arguments)]
+fn copy_segment(
+    w: &mut ns::Writer<'_>,
+    reader: &mut Reader<'_>,
+    scanner: &mut ns::Scanner,
+    releases: &mut ns::ReleaseScan,
+    words: &mut [u32],
+    process: usize,
+    va: u64,
+    dwords: u32,
+    seq: u64,
+    source: u32,
+    targets: bool,
+) -> bool {
+    *scanner = ns::Scanner::new(ns::DEFAULT_CLASSES);
+    scanner.begin_segment(u32::MAX);
+    let len = dwords.min(ns::REL_SEG_DWORDS);
+    let mut done = 0u32;
+    let mut read_status = ns::RD_OK;
+    let mut status = ns::scan_status::COMPLETE;
+    'seg: while done < len {
+        let at = va + 4 * u64::from(done);
+        let n = ((len - done) as usize).min(words.len()).min(((0x1000 - (at & 0xfff)) / 4) as usize);
+        let st = reader.words(process, at, &mut words[..n]);
+        if st != ns::RD_OK {
+            read_status = st;
+            status = ns::scan_status::READ_FAILED;
+            break;
+        }
+        for &d in &words[..n] {
+            if !scanner.feed(d) {
+                status = if scanner.ended { ns::scan_status::ENDED } else { ns::scan_status::LOST };
+                break 'seg;
+            }
+        }
+        done += n as u32;
+    }
+    if status == ns::scan_status::COMPLETE && len < dwords {
+        status = ns::scan_status::CAPPED;
+    }
+    if w.room() < ns::COPY_SEG_FIXED + ns::COPY_SEM_CAP * ns::SEM_BYTES + VA_RESERVE {
+        return false;
+    }
+    ns::write_copy_segment(w, va, dwords, seq, source, read_status, status, scanner.sems_seen, scanner.sems());
+    if targets {
+        for sem in scanner.sems().iter().filter(|s| s.acquire()) {
+            releases.add_target(process as u64, sem.addr);
+        }
+    }
+    true
 }
 
 /// One GPFIFO entry's segment of [`scan_history`].
