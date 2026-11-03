@@ -2488,6 +2488,8 @@ impl NvGpuBackend {
         }
         // The event pump below reports fence handles once (docs/SYNC.md).
         config.set_drm_fences();
+        // RmBatch is served by the dispatcher itself, whatever else is on.
+        config.set_rm_batch();
         let mut display_link = None;
         if let Some((mode, link, cursor)) = display {
             config.set_display(mode.width, mode.height, mode.refresh_hz);

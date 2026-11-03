@@ -4055,6 +4055,269 @@ mod tests {
             );
         }
     }
+
+    // ------------------------------------------------------------------
+    // RmBatch (batch.rs): several Ioctls in one round trip.
+    // ------------------------------------------------------------------
+
+    /// A fake host that records each call's parameter bytes, unchanged.
+    #[derive(Clone, Default)]
+    struct BytesHost(std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>);
+
+    impl HostDriver for BytesHost {
+        fn ioctl(&self, _fd: RawFd, _request: u64, arg: &mut [u8]) -> std::result::Result<(), i32> {
+            self.0.lock().unwrap().push(arg.to_vec());
+            Ok(())
+        }
+    }
+
+    impl BytesHost {
+        fn calls(&self) -> Vec<Vec<u8>> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    fn batch_backend(host: &BytesHost) -> (NvidiaBackend, u64) {
+        let mut be = NvidiaBackend::for_test();
+        be.set_host_driver_version(abi::version::DriverVersion::new(615, 71, 9))
+            .expect("615.71.09 has tables");
+        be.set_host(Box::new(host.clone()));
+        let null = std::fs::File::open("/dev/null").expect("/dev/null");
+        let h = be.handles.insert(OwnedFd::from(null));
+        (be, h)
+    }
+
+    /// NVOS00 (RM_FREE): hRoot, hObjectParent, hObjectOld, status (at 12).
+    fn batch_free(h: u64, tag: u32, status: u32) -> Vec<u8> {
+        let mut p = vec![0u8; 16];
+        p[0..4].copy_from_slice(&tag.to_le_bytes());
+        p[4..8].copy_from_slice(&0x4b4d_0001u32.to_le_bytes());
+        p[8..12].copy_from_slice(&(0x4e57_1000 + tag).to_le_bytes());
+        p[12..16].copy_from_slice(&status.to_le_bytes());
+        ioctl_msg(h, abi::ioctl::NV_ESC_RM_FREE, &p)
+    }
+
+    fn batch_entry(req: &[u8], resp_cap: u32, status_at: u32, flags: u32) -> Vec<u8> {
+        use protocol::messages::{RmBatchEntry, rm_batch_pad8};
+        let mut out = Vec::new();
+        append(
+            &mut out,
+            &RmBatchEntry {
+                req_len: req.len() as u32,
+                resp_cap,
+                status_at,
+                flags,
+            },
+        );
+        out.extend_from_slice(req);
+        out.resize(size_of::<RmBatchEntry>() + rm_batch_pad8(req.len()), 0);
+        out
+    }
+
+    fn batch_msg(entries: &[Vec<u8>]) -> Vec<u8> {
+        let mut out = hdr(MsgType::RmBatch, 0);
+        out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        for e in entries {
+            out.extend_from_slice(e);
+        }
+        out
+    }
+
+    /// (len, rm_status, flags, reply bytes) of each entry of a batch reply.
+    fn batch_replies(resp: &[u8], caps: &[u32]) -> Vec<(u32, u32, u32, Vec<u8>)> {
+        use protocol::messages::{RmBatchReply, RmBatchResp, rm_batch_pad8};
+        let mut out = Vec::new();
+        let mut at = size_of::<MsgHeader>() + size_of::<RmBatchResp>();
+        for &cap in caps {
+            let r = read_struct::<RmBatchReply>(resp, at);
+            let body = at + size_of::<RmBatchReply>();
+            out.push((r.len, r.rm_status, r.flags, resp[body..body + r.len as usize].to_vec()));
+            at = body + rm_batch_pad8(cap as usize);
+        }
+        out
+    }
+
+    #[test]
+    fn a_batch_serves_its_entries_in_order_as_single_ioctls() {
+        use protocol::messages::*;
+        let host = BytesHost::default();
+        let (mut be, h) = batch_backend(&host);
+        let a = batch_free(h, 1, 0);
+        let b = batch_free(h, 2, 0);
+        let req = batch_msg(&[
+            batch_entry(&a, 512, RM_BATCH_NO_STATUS, 0),
+            batch_entry(&b, 512, 12, 0),
+        ]);
+        let mut resp = vec![0u8; 4096];
+        let n = be.dispatch(&req, &mut resp);
+        assert_eq!(n, 16 + 8 + 2 * (16 + 512));
+        let top = parse_resp(&resp);
+        assert_eq!(top.msg_type, MsgType::RmBatch as u32);
+        assert_eq!(top.status, 0);
+        let counts = read_struct::<RmBatchResp>(&resp, size_of::<MsgHeader>());
+        assert_eq!((counts.count, counts.served), (2, 2));
+        // Each reply is what the call alone gets.
+        let solo_host = BytesHost::default();
+        let (mut solo, h2) = batch_backend(&solo_host);
+        assert_eq!(h2, h);
+        let mut single = vec![0u8; 512];
+        let n1 = solo.dispatch(&a, &mut single);
+        let got = batch_replies(&resp, &[512, 512]);
+        assert_eq!(got[0].3, single[..n1].to_vec());
+        assert_eq!(got[0].2, RM_BATCH_REPLY_SERVED);
+        assert_eq!(got[1].1, 0, "RM status read at 12");
+        assert_eq!(got[1].2, RM_BATCH_REPLY_SERVED);
+        let calls = host.calls();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0][0], 1);
+        assert_eq!(calls[1][0], 2);
+    }
+
+    #[test]
+    fn a_failed_batch_entry_skips_the_rest_of_its_group_only() {
+        use protocol::messages::*;
+        let host = BytesHost::default();
+        let (mut be, h) = batch_backend(&host);
+        let g = |n: u32| n << 16;
+        // A handle the backend never opened: refused by the host side.
+        let bad = batch_free(h + 100, 1, 0);
+        let req = batch_msg(&[
+            batch_entry(&bad, 64, RM_BATCH_NO_STATUS, RM_BATCH_SKIP_GROUP_ON_FAIL | g(1)),
+            batch_entry(&batch_free(h, 2, 0), 64, RM_BATCH_NO_STATUS, g(1)),
+            batch_entry(&batch_free(h, 3, 0), 64, RM_BATCH_NO_STATUS, g(2)),
+        ]);
+        let mut resp = vec![0u8; 4096];
+        be.dispatch(&req, &mut resp);
+        let counts = read_struct::<RmBatchResp>(&resp, size_of::<MsgHeader>());
+        assert_eq!((counts.count, counts.served), (3, 2));
+        let got = batch_replies(&resp, &[64, 64, 64]);
+        assert_eq!(got[0].2, RM_BATCH_REPLY_SERVED | RM_BATCH_REPLY_FAILED);
+        assert_eq!((got[1].0, got[1].2), (0, 0), "skipped");
+        assert_eq!(got[2].2, RM_BATCH_REPLY_SERVED);
+        let calls = host.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0][0], 3);
+    }
+
+    #[test]
+    fn a_batch_entry_fails_on_rm_s_status_and_abort_stops_the_rest() {
+        use protocol::messages::*;
+        let host = BytesHost::default();
+        let (mut be, h) = batch_backend(&host);
+        // The fake host leaves the parameters as sent: status 0x1f comes back.
+        let req = batch_msg(&[
+            batch_entry(&batch_free(h, 1, 0x1f), 512, 12, RM_BATCH_ABORT_ON_FAIL),
+            batch_entry(&batch_free(h, 2, 0), 512, 12, 5 << 16),
+        ]);
+        let mut resp = vec![0u8; 4096];
+        be.dispatch(&req, &mut resp);
+        let got = batch_replies(&resp, &[512, 512]);
+        assert_eq!(got[0].1, 0x1f);
+        assert_eq!(got[0].2, RM_BATCH_REPLY_SERVED | RM_BATCH_REPLY_FAILED);
+        assert_eq!(got[1].2, 0);
+        assert_eq!(host.calls().len(), 1);
+    }
+
+    #[test]
+    fn a_malformed_batch_serves_nothing() {
+        use protocol::messages::*;
+        let host = BytesHost::default();
+        let (mut be, h) = batch_backend(&host);
+        let a = batch_free(h, 1, 0);
+        let mut resp = vec![0u8; 4096];
+        let mut errno = |req: &[u8], resp: &mut [u8]| {
+            be.dispatch(req, resp);
+            parse_resp(resp).status
+        };
+        // A batch inside a batch.
+        let inner = batch_msg(&[batch_entry(&a, 512, RM_BATCH_NO_STATUS, 0)]);
+        let outer = batch_msg(&[
+            batch_entry(&a, 512, RM_BATCH_NO_STATUS, 0),
+            batch_entry(&inner, 512, RM_BATCH_NO_STATUS, 0),
+        ]);
+        assert_eq!(errno(&outer, &mut resp), -libc::EINVAL);
+        // An Open inside.
+        let req = batch_msg(&[batch_entry(&open_msg(DeviceKind::Ctl), 512, RM_BATCH_NO_STATUS, 0)]);
+        assert_eq!(errno(&req, &mut resp), -libc::EINVAL);
+        // More reply room asked for than there is.
+        let req = batch_msg(&[
+            batch_entry(&a, 4096, RM_BATCH_NO_STATUS, 0),
+            batch_entry(&a, 4096, RM_BATCH_NO_STATUS, 0),
+        ]);
+        assert_eq!(errno(&req, &mut resp), -libc::EINVAL);
+        // Too many entries.
+        let many: Vec<Vec<u8>> = (0..65).map(|_| batch_entry(&a, 16, RM_BATCH_NO_STATUS, 0)).collect();
+        let mut big = vec![0u8; 65 * 64];
+        assert_eq!(errno(&batch_msg(&many), &mut big), -libc::EINVAL);
+        // Unknown entry flags.
+        let req = batch_msg(&[batch_entry(&a, 512, RM_BATCH_NO_STATUS, 1 << 7)]);
+        assert_eq!(errno(&req, &mut resp), -libc::EINVAL);
+        // A truncated entry.
+        let mut req = batch_msg(&[batch_entry(&a, 512, RM_BATCH_NO_STATUS, 0)]);
+        req.truncate(req.len() - 16);
+        assert_eq!(errno(&req, &mut resp), -libc::EINVAL);
+        // A header naming a handle.
+        let mut req = batch_msg(&[batch_entry(&a, 512, RM_BATCH_NO_STATUS, 0)]);
+        req[4..8].copy_from_slice(&7u32.to_le_bytes());
+        assert_eq!(errno(&req, &mut resp), -libc::EINVAL);
+        assert!(host.calls().is_empty(), "{:x?}", host.calls());
+    }
+
+    /// RM's allowlist and the RM policy judge every entry: what is refused
+    /// alone is refused inside a batch, with the same reply, and never
+    /// reaches the host; the entries around it are still served.
+    #[test]
+    fn rm_policy_and_the_allowlist_judge_each_batch_entry() {
+        use protocol::messages::*;
+        for policy in [None, Some(rmpolicy::Mode::Enforce)] {
+            let host = BytesHost::default();
+            let (mut be, h) = batch_backend(&host);
+            let solo_host = BytesHost::default();
+            let (mut solo, _) = batch_backend(&solo_host);
+            if let Some(mode) = policy {
+                be.set_rm_policy(mode);
+                solo.set_rm_policy(mode);
+            }
+            // NV0000_CTRL_CMD_GPUACCT_SET_ACCOUNTING_STATE: privileged in RM,
+            // in no table; under the policy also on a client this guest never made.
+            let mut refused = hdr(MsgType::Ioctl, h);
+            let top = rm_control(0x0000_0b01, 8);
+            append(
+                &mut refused,
+                &IoctlReq {
+                    cmd: abi::ioctl::_IOWR(abi::ioctl::NV_ESC_RM_CONTROL, 32) as u32,
+                    data_len: 32,
+                    nested_offset: 32,
+                    nested_len: 8,
+                    deep_ptr_offset: 0,
+                    deep_len: 0,
+                },
+            );
+            refused.extend_from_slice(&top);
+            refused.extend_from_slice(&[0u8; 8]);
+            let mut single = vec![0u8; 512];
+            let n = solo.dispatch(&refused, &mut single);
+            assert!(solo_host.calls().is_empty(), "refused alone");
+            // A free: served without the policy; under it, on a client this
+            // guest never made, refused as well. Whatever it gets alone.
+            let free = batch_free(h, 2, 0);
+            let mut single_free = vec![0u8; 512];
+            let nf = solo.dispatch(&free, &mut single_free);
+
+            let req = batch_msg(&[batch_entry(&refused, 512, 28, 0), batch_entry(&free, 512, 12, 0)]);
+            let mut resp = vec![0u8; 4096];
+            be.dispatch(&req, &mut resp);
+            let got = batch_replies(&resp, &[512, 512]);
+            assert_eq!(got[0].3, single[..n].to_vec(), "{policy:?}");
+            assert_ne!(got[0].2 & RM_BATCH_REPLY_FAILED, 0);
+            assert_eq!(got[1].3, single_free[..nf].to_vec(), "{policy:?}");
+            // The host heard exactly what it heard from the single calls.
+            assert_eq!(host.calls(), solo_host.calls(), "{policy:?}");
+            assert_eq!(host.calls().len(), usize::from(policy.is_none()));
+        }
+    }
+
 }
 
 /// Explicit sync (docs/SYNC.md): host sync_files in and out of the handle

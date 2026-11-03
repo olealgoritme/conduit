@@ -1210,6 +1210,7 @@ impl NvidiaBackend {
                 MsgType::GpuCmd => "gpu_cmd",
                 MsgType::RmResourceImport => "rm_resource_import",
                 MsgType::UmdVersion => "umd_version",
+                MsgType::RmBatch => "rm_batch",
             })
             .or_insert(0) += 1;
         // The handle travels in the header, not the payload -- every message
@@ -1255,6 +1256,7 @@ impl NvidiaBackend {
             MsgType::GpuCmd => self.handle_gpu_cmd(payload, resp_buf),
             MsgType::RmResourceImport => self.handle_rm_resource_import(payload, resp_buf),
             MsgType::UmdVersion => self.handle_umd_version(payload, resp_buf),
+            MsgType::RmBatch => self.handle_rm_batch(payload, resp_buf),
         }
     }
 }
@@ -1294,6 +1296,7 @@ fn write_struct<T: Copy>(buf: &mut [u8], val: &T) -> usize {
 }
 
 mod aperture;
+mod batch;
 mod bounds;
 mod clipboard;
 mod fence;

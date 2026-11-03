@@ -331,6 +331,12 @@ impl VirtioGpuNvConfig {
         self.features |= protocol::messages::NVGPU_CFG_CURSOR_QUEUE;
     }
 
+    /// Serve `MsgType::RmBatch`: sets [`protocol::messages::NVGPU_CFG_RM_BATCH`].
+    /// The dispatcher always can; the bit tells a guest it may send one.
+    pub fn set_rm_batch(&mut self) {
+        self.features |= protocol::messages::NVGPU_CFG_RM_BATCH;
+    }
+
     /// Turn host fences into guest fences (docs/SYNC.md): sets
     /// [`protocol::messages::NVGPU_CFG_DRM_FENCES`]. Only by a transport that
     /// delivers one-shot fence watches (`take_watch_updates`); without that
@@ -608,6 +614,10 @@ mod tests {
             { cfg.features } & protocol::messages::NVGPU_CFG_CURSOR_QUEUE,
             0
         );
+        // The batch bit is one more bit, the number the Windows KMD tests.
+        let before = { cfg.features };
+        cfg.set_rm_batch();
+        assert_eq!({ cfg.features }, before | (1 << 23));
         assert_eq!(CURSOR_QUEUE, 2);
     }
 }

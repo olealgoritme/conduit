@@ -150,6 +150,15 @@ pub enum MsgType {
     /// backend that does not know the message answers `InvalidMsgType`, which
     /// a guest reads as "not checked".
     UmdVersion = 36,
+    /// Guest → host: several `Ioctl` requests in one round trip, served in
+    /// order as if each had been sent alone (every check, policy and record
+    /// of a single `Ioctl` applies to each). Payload [`RmBatchReq`], then
+    /// `count` entries, each an [`RmBatchEntry`] and its request bytes padded
+    /// to 8; the reply is a header, [`RmBatchResp`] and one [`RmBatchReply`]
+    /// with its reply bytes (padded to 8) per entry. Served only with
+    /// [`NVGPU_CFG_RM_BATCH`]; a batch inside a batch is refused. See
+    /// [`RmBatchEntry::flags`] for how a failed entry skips later ones.
+    RmBatch = 37,
 }
 
 impl MsgType {
@@ -179,6 +188,7 @@ impl MsgType {
             31 => Self::RmResourceImport,
             35 => Self::MmapAt,
             36 => Self::UmdVersion,
+            37 => Self::RmBatch,
             _ => return None,
         })
     }
@@ -1080,6 +1090,89 @@ pub const NVGPU_F_EVENT_PACKED: u32 = 1 << 22;
 /// what it copies out of a buffer by this.
 pub const EVENT_READY_PER_BUFFER_MAX: usize = 32;
 
+/// Device config `features` bit: the backend serves [`MsgType::RmBatch`].
+/// Read from the config, never acked; a guest that does not see it sends one
+/// `Ioctl` per round trip, as before.
+pub const NVGPU_CFG_RM_BATCH: u32 = 1 << 23;
+
+/// The most entries one [`MsgType::RmBatch`] may carry.
+pub const RM_BATCH_MAX_ENTRIES: u32 = 64;
+/// The most reply bytes one batch entry may ask room for.
+pub const RM_BATCH_MAX_RESP: u32 = 4096;
+/// [`RmBatchEntry::status_at`]: the entry has no RM status word to judge.
+pub const RM_BATCH_NO_STATUS: u32 = u32::MAX;
+/// [`RmBatchEntry::flags`]: when this entry fails, the later entries of the
+/// same group (`flags >> 16`) are skipped, not served.
+pub const RM_BATCH_SKIP_GROUP_ON_FAIL: u32 = 1 << 0;
+/// [`RmBatchEntry::flags`]: when this entry fails, every later entry is skipped.
+pub const RM_BATCH_ABORT_ON_FAIL: u32 = 1 << 1;
+/// [`RmBatchReply::flags`]: the entry was served.
+pub const RM_BATCH_REPLY_SERVED: u32 = 1 << 0;
+/// [`RmBatchReply::flags`]: the entry failed (host status nonzero, or RM's
+/// status word nonzero or out of reach of the reply).
+pub const RM_BATCH_REPLY_FAILED: u32 = 1 << 1;
+
+/// Request payload for `MsgType::RmBatch`, following a `MsgHeader` (whose
+/// `handle` is 0). 8 bytes, then `count` entries.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RmBatchReq {
+    /// Entries that follow, 1..=[`RM_BATCH_MAX_ENTRIES`].
+    pub count: u32,
+    /// 0.
+    pub flags: u32,
+}
+
+/// One entry of an `RmBatch` request: this, then `req_len` bytes of a whole
+/// `Ioctl` request (`MsgHeader | IoctlReq | data | nested | deep`), then zero
+/// padding to a multiple of 8. 16 bytes.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RmBatchEntry {
+    pub req_len: u32,
+    /// Reply bytes the guest makes room for, at most [`RM_BATCH_MAX_RESP`].
+    pub resp_cap: u32,
+    /// Where RM's own status word sits in the reply's data block (after
+    /// `MsgHeader | IoctlResp`), or [`RM_BATCH_NO_STATUS`].
+    pub status_at: u32,
+    /// `RM_BATCH_SKIP_GROUP_ON_FAIL | RM_BATCH_ABORT_ON_FAIL`, and the
+    /// entry's group in the high 16 bits.
+    pub flags: u32,
+}
+
+/// Response payload for `MsgType::RmBatch`, following a `MsgHeader` (status
+/// 0 when the batch was well formed): this, then one [`RmBatchReply`] and its
+/// bytes per request entry, in order. 8 bytes.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RmBatchResp {
+    /// Entries answered (always the request's `count`).
+    pub count: u32,
+    /// Entries served (the others were skipped).
+    pub served: u32,
+}
+
+/// One entry's answer: this, then `len` bytes of its reply (exactly what a
+/// single `Ioctl` would have answered), then zero padding to a multiple of 8,
+/// the slot always `resp_cap` bytes long. 16 bytes.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RmBatchReply {
+    /// Reply bytes written; 0 for a skipped entry.
+    pub len: u32,
+    /// RM's status word as read at `status_at`, `u32::MAX` when not read.
+    pub rm_status: u32,
+    /// `RM_BATCH_REPLY_SERVED | RM_BATCH_REPLY_FAILED`.
+    pub flags: u32,
+    /// 0.
+    pub reserved: u32,
+}
+
+/// `n` rounded up to a multiple of 8 (every `RmBatch` slot is).
+pub const fn rm_batch_pad8(n: usize) -> usize {
+    (n + 7) & !7
+}
+
 /// Event-queue payload for `MsgType::DisplayModeList`, following a
 /// `MsgHeader` (handle 0, status 0), then `count` entries. 16 bytes.
 #[repr(C)]
@@ -1659,6 +1752,43 @@ mod tests {
         assert_eq!(NVGPU_CFG_NVIDIA_UMD, 1 << 17);
     }
 
+    /// The batch bit is its own, and the batch structs are the sizes the KMD
+    /// (`kmd_logic::rm_batch`) lays out.
+    #[test]
+    fn rm_batch_layout() {
+        let all = [
+            NVGPU_CFG_DISPLAY,
+            NVGPU_CFG_CURSOR,
+            NVGPU_CFG_VENUS,
+            NVGPU_CFG_DRM_FENCES,
+            NVGPU_CFG_TAKES_INPUT,
+            NVGPU_CFG_RM_IMPORT,
+            NVGPU_CFG_RM_RESOURCE_IMPORT,
+            NVGPU_F_SCANOUT_RELEASE,
+            NVGPU_CFG_GUEST_BLOB,
+            NVGPU_CFG_NVIDIA_UMD,
+            NVGPU_CFG_VENUS_CURSOR,
+            NVGPU_F_SCANOUT_PRESENTED,
+            NVGPU_CFG_CURSOR_QUEUE,
+            NVGPU_F_MODE_LIST,
+            NVGPU_F_EVENT_PACKED,
+        ];
+        for other in all {
+            assert_eq!(NVGPU_CFG_RM_BATCH & other, 0, "{other:#x}");
+        }
+        assert_eq!(NVGPU_CFG_RM_BATCH, 1 << 23);
+        assert_eq!(size_of::<RmBatchReq>(), 8);
+        assert_eq!(size_of::<RmBatchEntry>(), 16);
+        assert_eq!(size_of::<RmBatchResp>(), 8);
+        assert_eq!(size_of::<RmBatchReply>(), 16);
+        assert_eq!(RM_BATCH_MAX_ENTRIES, 64);
+        assert_eq!(RM_BATCH_MAX_RESP, 4096);
+        assert_eq!(rm_batch_pad8(0), 0);
+        assert_eq!(rm_batch_pad8(1), 8);
+        assert_eq!(rm_batch_pad8(16), 16);
+        assert_eq!(rm_batch_pad8(17), 24);
+    }
+
     /// Header, then {scanout, flags, owner_handle, host_handle, seq, 0}.
     #[test]
     fn scanout_released_encodes_after_a_header() {
@@ -1736,7 +1866,9 @@ mod tests {
         assert_eq!(MsgType::from_u32(35), Some(MsgType::MmapAt));
         assert_eq!(MsgType::UmdVersion as u32, 36);
         assert_eq!(MsgType::from_u32(36), Some(MsgType::UmdVersion));
-        assert_eq!(MsgType::from_u32(37), None);
+        assert_eq!(MsgType::RmBatch as u32, 37);
+        assert_eq!(MsgType::from_u32(37), Some(MsgType::RmBatch));
+        assert_eq!(MsgType::from_u32(38), None);
         let modes = [(5120, 1440), (1920, 1080)];
         let mut buf = [0u8; 64];
         assert_eq!(
