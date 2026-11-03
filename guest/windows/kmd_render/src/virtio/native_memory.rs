@@ -171,6 +171,11 @@ static HUGE_REFUSED: AtomicU32 = AtomicU32::new(0);
 static DEFERRED: AtomicU32 = AtomicU32::new(0);
 static TLB_RESCUE: AtomicU32 = AtomicU32::new(0);
 static TLB_RESCUE_FAILED: AtomicU32 = AtomicU32::new(0);
+/// Large-page mappings refused in a row; from [`LARGE_STREAK_LIMIT`] on no more
+/// are tried (until the driver restarts), so a host whose RM refuses them all
+/// costs at most that many extra round trips.
+static LARGE_STREAK: AtomicU32 = AtomicU32::new(0);
+const LARGE_STREAK_LIMIT: u32 = 32;
 
 impl LeafCost {
     const fn new(names: [&'static [u8]; 4]) -> Self {
@@ -1332,11 +1337,18 @@ fn map_fixed_opts(
     if !system_backed {
         let perf = perf();
         let huge = perf.huge_pages() && memory_is_huge(memory);
-        let page = np::map_page_size(piece, perf.big_pages(), huge);
-        if page != np::MAP_PAGE_4K {
+        let mut page = np::map_page_size(piece, perf.big_pages(), huge);
+        if LARGE_STREAK.load(Ordering::Relaxed) >= LARGE_STREAK_LIMIT {
+            // RM refused every large-page mapping lately: each try costs a round trip.
+            page = np::MAP_PAGE_4K;
+        }
+        // Huge, then big pages; RM refusing one (or the fixed virtual object)
+        // steps down, and 4 KiB below is what every mapping was before.
+        while page != np::MAP_PAGE_4K {
             let flags = np::with_page_size(LOCAL_4K_MAP_FLAGS, page) | defer_flag;
             match map_fixed_flags(io, memory, allocation_size, false, space, virt, piece, flags) {
                 Ok(used) => {
+                    LARGE_STREAK.store(0, Ordering::Relaxed);
                     if page == np::MAP_PAGE_HUGE {
                         bump(&MAPPED_HUGE, b"NvPmHuge");
                     } else {
@@ -1347,9 +1359,15 @@ fn map_fixed_opts(
                     }
                     return Ok(used);
                 }
-                // RM refused the page size (or the fixed virtual object): the
-                // 4-KiB mapping below is what every mapping was before.
-                Err(Error::Host) => bump(&LARGE_REFUSED, b"NvPmLgFail"),
+                Err(Error::Host) => {
+                    bump(&LARGE_REFUSED, b"NvPmLgFail");
+                    LARGE_STREAK.fetch_add(1, Ordering::Relaxed);
+                    page = if page == np::MAP_PAGE_HUGE && perf.big_pages() {
+                        np::MAP_PAGE_BIG
+                    } else {
+                        np::MAP_PAGE_4K
+                    };
+                }
                 Err(error) => return Err(error),
             }
         }
