@@ -498,6 +498,9 @@ struct Registry {
     /// Recoveries in progress: while nonzero the queues they picked are used
     /// outside this lock, so no slot may be removed (DestroyHwQueue waits).
     recovering: u32,
+    /// Hang snapshots in progress (`ddi::native_snap`): like `recovering`, they read the
+    /// registered queues outside this lock, so no slot may be removed meanwhile.
+    snapping: u32,
     /// Submit-to-signal latency, indexed by `Detect` (submit, poll, event).
     lat: [LatHist; 3],
 }
@@ -508,6 +511,7 @@ static REGISTRY: SpinLock<Registry> = SpinLock::new(Registry {
     idle_ticks: 0,
     pending_nodes: 0,
     recovering: 0,
+    snapping: 0,
     lat: [LatHist::new(); 3],
 });
 
@@ -563,7 +567,7 @@ fn register_queue(queue: &NativeQueue, node: u32) -> bool {
 /// outside the lock (the caller waits and retries).
 fn try_unregister_queue(queue: usize) -> Result<Option<Slot>, ()> {
     let mut r = REGISTRY.lock();
-    if r.recovering != 0 {
+    if r.recovering != 0 || r.snapping != 0 {
         return Err(());
     }
     Ok(r
@@ -602,6 +606,104 @@ fn restore_slot(saved: Slot) {
     if let Some(slot) = r.slots.iter_mut().find(|slot| slot.queue == 0) {
         *slot = saved;
     }
+}
+
+// ── hang snapshots (`ddi::native_snap`) ─────────────────────────────────────────────────────────
+
+/// Queues a snapshot sees at most.
+pub(crate) const SNAP_SLOTS: usize = MAX_QUEUES;
+
+/// One registered native queue as the hang snapshot samples it.
+#[derive(Clone, Copy)]
+pub(crate) struct SnapSlot {
+    /// `&NativeQueue` as an address (live while registered; pinned by [`snap_slots`]).
+    pub queue: usize,
+    pub index: u32,
+    pub node: u32,
+    pub submitted: u64,
+    pub signalled: u64,
+    /// The progress fence, USERD GP_GET, the KMD's GP_PUT and the error notifier, read now.
+    pub progress: u64,
+    pub gp_get: u32,
+    pub kmd_gp_put: u32,
+    pub error: bool,
+    /// `native_snap::Q_OUTSTANDING | Q_FLAGGED | Q_IN_GRACE | Q_WATCH_DEAD`.
+    pub flags: u32,
+}
+
+pub(crate) const SNAP_EMPTY: SnapSlot = SnapSlot {
+    queue: 0,
+    index: 0,
+    node: 0,
+    submitted: 0,
+    signalled: 0,
+    progress: 0,
+    gp_get: 0,
+    kmd_gp_put: 0,
+    error: false,
+    flags: 0,
+};
+
+/// Sample every registered native queue into `out` under the registry lock (reads only:
+/// nothing is signalled or moved). With `pin` the queues stay registered, and so alive, until
+/// [`snap_unpin`] (DestroyHwQueue waits, as for a recovery). Any IRQL up to DISPATCH.
+pub(crate) fn snap_slots(out: &mut [SnapSlot], pin: bool) -> usize {
+    use helios_kmd_logic::native_snap as ns;
+    let mut r = REGISTRY.lock();
+    let mut n = 0usize;
+    for (i, slot) in r.slots.iter().enumerate().filter(|(_, slot)| slot.queue != 0) {
+        if n >= out.len() {
+            break;
+        }
+        // SAFETY: registered queues are live while their slot is (see `Slot`).
+        let queue = unsafe { &*(slot.queue as *const NativeQueue) };
+        let mut flags = 0;
+        if slot.progress.outstanding() {
+            flags |= ns::Q_OUTSTANDING;
+        }
+        if slot.watch.flagged().is_some() {
+            flags |= ns::Q_FLAGGED;
+        }
+        if slot.watch.in_grace() {
+            flags |= ns::Q_IN_GRACE;
+        }
+        if slot.watch.is_dead() {
+            flags |= ns::Q_WATCH_DEAD;
+        }
+        out[n] = SnapSlot {
+            queue: slot.queue,
+            index: i as u32,
+            node: slot.node,
+            submitted: slot.progress.submitted,
+            signalled: slot.progress.signalled,
+            progress: queue.read_progress(),
+            gp_get: queue.gp_get(),
+            // Lock order registry -> GP_PUT, as the poll's ForceComplete (`mark_dead`).
+            kmd_gp_put: queue.kmd_gp_put(),
+            error: queue.channel_error().is_some(),
+            flags,
+        };
+        n += 1;
+    }
+    if pin {
+        r.snapping += 1;
+    }
+    n
+}
+
+/// End a pinned [`snap_slots`].
+pub(crate) fn snap_unpin() {
+    let mut r = REGISTRY.lock();
+    r.snapping = r.snapping.saturating_sub(1);
+}
+
+/// `(HwsSubmit, HwsPollTick, NvHangMs in force)` for the snapshot header.
+pub(crate) fn snap_counters() -> (u32, u32, u32) {
+    (
+        SUBMITS.load(Ordering::Relaxed),
+        POLL_TICKS.load(Ordering::Relaxed),
+        HANG_MS.load(Ordering::Relaxed),
+    )
 }
 
 /// Raise `DXGK_INTERRUPT_MONITORED_FENCE_SIGNALED` once per node in `nodes`.

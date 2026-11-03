@@ -268,3 +268,52 @@ pub(crate) unsafe fn upt_in(update: &crate::dxgk::DXGK_BUILDPAGINGBUFFER_UPDATEP
         update.hProcess as usize,
     );
 }
+
+/// Diagnosis (`ddi::native_snap`): the latest ring record that changed the mapping at `va`
+/// (a kind `pt::touches` names) of `process` (0 = any; records without a process match any), and the
+/// last-touch table's entry for its 64-KiB chunk: `(record, table (t, kind))`. Atomics only;
+/// empty while the ring is off.
+pub(crate) fn last_touch(va: u64, process: usize) -> (Option<pt::Record>, Option<(u64, u8)>) {
+    if !on() {
+        return (None, None);
+    }
+    let mut best: Option<pt::Record> = None;
+    for i in 0..pt::SLOTS {
+        let seq = SEQ[i].load(Ordering::Acquire);
+        if seq == 0 || best.is_some_and(|b| b.seq >= seq) {
+            continue;
+        }
+        let r = pt::Record {
+            seq,
+            t: TIME[i].load(Ordering::Relaxed),
+            va: VA[i].load(Ordering::Relaxed),
+            len: LEN[i].load(Ordering::Relaxed),
+            w: WORD[i].load(Ordering::Relaxed),
+            process: PROC[i].load(Ordering::Relaxed),
+        };
+        fence(Ordering::Acquire);
+        if SEQ[i].load(Ordering::Relaxed) != seq {
+            continue;
+        }
+        if pt::touches(r.kind())
+            && r.covers(va)
+            && (process == 0 || r.process == 0 || r.process == process as u64)
+        {
+            best = Some(r);
+        }
+    }
+    let chunk = va >> pt::CHUNK_SHIFT;
+    let e = pt::touch_index(chunk);
+    let table = (T_KEY[e].load(Ordering::Relaxed) == chunk + 1).then(|| {
+        (
+            T_TIME[e].load(Ordering::Relaxed),
+            (T_IDX[e].load(Ordering::Relaxed) >> 56) as u8,
+        )
+    });
+    (best, table)
+}
+
+/// Whether the ring records (`NvPtRing`).
+pub(crate) fn recording() -> bool {
+    on()
+}
