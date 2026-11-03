@@ -2225,6 +2225,9 @@ unsafe fn native_paging_operation(
         // SAFETY: dxgkrnl's live operation.
         unsafe { crate::ddi::pt_ring::upt_in(update, native_id) };
         unsafe { watch_update(update, native) };
+        // An exiting process's channels stop before its VAs are unmapped (`hws::exit_gate`).
+        // SAFETY: dxgkrnl's live operation.
+        unsafe { teardown_gate(adapter, update) };
         if !native && crate::ddi::wddm_surface::nvidia_selected() {
             unsafe { foreign_leaf(adapter, update) };
         }
@@ -2417,6 +2420,33 @@ unsafe fn foreign_leaf(adapter: &AdapterContext, update: &DXGK_BUILDPAGINGBUFFER
         crate::diag::record_named_bytes(b"NvFgnWhy", error as u32);
         let failed = FOREIGN_FAIL.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
         crate::diag::record_named_bytes(b"NvFgnFail", failed);
+    }
+}
+
+/// `hws::exit_gate` for a teardown invalidation (`native_teardown::teardown_update`: a
+/// leaf update of a user process with any invalid entry), at PASSIVE only (the gate's
+/// unschedule is a host round trip; native leaf updates are PASSIVE anyway).
+unsafe fn teardown_gate(adapter: &AdapterContext, update: &DXGK_BUILDPAGINGBUFFER_UPDATEPAGETABLE) {
+    if update.pPageTableEntries.is_null()
+        || update.NumPageTableEntries == 0
+        || update.PageTableLevel != 0
+        || !crate::ddi::wddm_surface::nvidia_selected()
+        || unsafe { KeGetCurrentIrql() } != PASSIVE_LEVEL_IRQL
+    {
+        return;
+    }
+    let process = update.hProcess as usize;
+    // SAFETY: dxgkrnl's hKmdProcess from CreateProcess, or null.
+    let system = process == 0 || unsafe { crate::device::ProcessContext::is_system_handle(process) };
+    let count = if update.Flags.Repeat() != 0 { 1 } else { update.NumPageTableEntries as usize };
+    let any_invalid = (0..count).any(|index| {
+        // SAFETY: DXGK supplies Num entries (one with Repeat).
+        let pte = unsafe { core::ptr::read_unaligned(update.pPageTableEntries.add(index)) };
+        unsafe { pte.__bindgen_anon_1.__bindgen_anon_1 }.Valid() == 0
+    });
+    if helios_kmd_logic::native_teardown::teardown_update(process, system, update.PageTableLevel == 0, any_invalid) {
+        // SAFETY: a user process's live hKmdProcess (VidMm updates it before DestroyProcess).
+        unsafe { crate::ddi::hws::exit_gate(adapter, process) };
     }
 }
 

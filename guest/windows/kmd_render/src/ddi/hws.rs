@@ -279,6 +279,16 @@ static NAT_FAULTS: AtomicU32 = AtomicU32::new(0);
 static NAT_HANGS: AtomicU32 = AtomicU32::new(0);
 static NAT_FORCED: AtomicU32 = AtomicU32::new(0);
 static NAT_RECOVERED: AtomicU32 = AtomicU32::new(0);
+/// `NvTdStop`: queues of exiting processes the exit gate stopped (work outstanding) before
+/// VidMm's teardown unmaps of their VAs reached RM.
+static TD_STOPPED: AtomicU32 = AtomicU32::new(0);
+/// `NvTdExit`: teardown invalidations (leaf updates with invalid entries) of processes that
+/// had begun to exit; `NvTdExitP`: such processes.
+static TD_EXIT: AtomicU32 = AtomicU32::new(0);
+static TD_EXIT_P: AtomicU32 = AtomicU32::new(0);
+/// `NvTdLive`: invalidations of a running (not exiting) process while one of its queues held
+/// work: applied as before (the UMD owns that ordering), only counted.
+static TD_LIVE: AtomicU32 = AtomicU32::new(0);
 static NAT_INVALIDATED: AtomicU32 = AtomicU32::new(0);
 static NAT_INVALIDATE_ST: AtomicU32 = AtomicU32::new(0);
 static NAT_RESET_ST: AtomicU32 = AtomicU32::new(0);
@@ -355,6 +365,17 @@ pub(crate) fn publish_counters() {
     crate::diag::record_named_bytes(b"HwsNatHang", r(&NAT_HANGS));
     crate::diag::record_named_bytes(b"HwsNatForce", r(&NAT_FORCED));
     crate::diag::record_named_bytes(b"HwsNatRecov", r(&NAT_RECOVERED));
+    for (name, counter) in [
+        (&b"NvTdStop"[..], &TD_STOPPED),
+        (&b"NvTdExit"[..], &TD_EXIT),
+        (&b"NvTdExitP"[..], &TD_EXIT_P),
+        (&b"NvTdLive"[..], &TD_LIVE),
+    ] {
+        let n = counter.load(Ordering::Relaxed);
+        if n != 0 {
+            crate::diag::record_named_bytes(name, n);
+        }
+    }
     crate::diag::record_named_bytes(b"HwsNatInval", r(&NAT_INVALIDATED));
     crate::diag::record_named_bytes(b"HwsNatInvSt", r(&NAT_INVALIDATE_ST));
     crate::diag::record_named_bytes(b"HwsNatRstSt", r(&NAT_RESET_ST));
@@ -920,6 +941,11 @@ pub(crate) enum Recover {
     /// An adapter reset (`DxgkDdiResetFromTimeout`): every native queue. No
     /// context is invalidated (the adapter reset ends every device anyway).
     All,
+    /// The exit gate ([`exit_gate`]): the contexts of this process key (a
+    /// `ProcessContext` that has begun to exit) whose queues still hold work, before
+    /// VidMm's teardown unmaps of its VAs reach RM. No context is invalidated (the
+    /// process is going; its device ends with it).
+    Exit(usize),
 }
 
 #[derive(Clone, Copy)]
@@ -936,6 +962,65 @@ const NO_VICTIM: Victim = Victim {
     node: 0,
     submitted: 0,
 };
+
+/// The exit gate, before VidMm's invalidation of `h_process`'s VAs reaches RM (a leaf
+/// update with invalid entries, a native allocation's destroy). dxgkrnl tears an exiting
+/// process down allocations first and its contexts last, so VidMm unmaps the VAs while the
+/// process's channels may still hold work: a DWM that exited with submissions outstanding
+/// took host Xid 31 FAULT_PTE (GPC reads) at the surfaces just dropped from its space.
+/// Once the process has begun to exit (`ProcessContext::exiting`), its contexts whose queues
+/// still hold work are stopped first, like a recovery without the context invalidation
+/// ([`Recover::Exit`]: off the runlist, queues dead, progress completed): `NvTdStop`
+/// queues, `NvTdExit` invalidations, `NvTdExitP` processes. A running process is left
+/// alone (the UMD orders its own frees); `NvTdLive` counts its invalidations that came
+/// while one of its queues held work. PASSIVE.
+///
+/// # Safety
+/// `h_process` is 0 or dxgkrnl's live `hKmdProcess` (DestroyProcess has not run for it).
+pub(crate) unsafe fn exit_gate(adapter: &AdapterContext, h_process: usize) {
+    if h_process == 0 || !crate::ddi::wddm_surface::nvidia_selected() {
+        return;
+    }
+    // SAFETY: the caller's contract.
+    if unsafe { crate::device::ProcessContext::is_system_handle(h_process) } {
+        return;
+    }
+    // SAFETY: as above; not the system process.
+    let process = unsafe { &*(h_process as *const crate::device::ProcessContext) };
+    if !process.exiting() {
+        if process_busy(h_process) {
+            TD_LIVE.fetch_add(1, Ordering::Relaxed);
+        }
+        return;
+    }
+    TD_EXIT.fetch_add(1, Ordering::Relaxed);
+    if process.note_exit_seen() {
+        TD_EXIT_P.fetch_add(1, Ordering::Relaxed);
+    }
+    let _ = recover_native(adapter, Recover::Exit(h_process));
+}
+
+/// Whether a live queue of process key `process` holds work (submitted, not complete).
+/// Any IRQL up to DISPATCH.
+fn process_busy(process: usize) -> bool {
+    let r = REGISTRY.lock();
+    r.slots
+        .iter()
+        .filter(|slot| slot.queue != 0 && !slot.watch.is_dead())
+        .any(|slot| {
+            // SAFETY: registered queues are live while their slot is (see `Slot`).
+            let queue = unsafe { &*(slot.queue as *const NativeQueue) };
+            queue.context().is_some_and(|c| {
+                helios_kmd_logic::native_teardown::exit_victim(
+                    c.process_key(),
+                    process,
+                    slot.progress.submitted,
+                    queue.read_progress(),
+                    false,
+                )
+            })
+        })
+}
 
 /// Recover native queues from a fault or hang: every queue of an affected
 /// context is marked dead (no submission reaches its channel again) and its
@@ -966,6 +1051,15 @@ pub(crate) fn recover_native(adapter: &AdapterContext, what: Recover) -> u32 {
                         && (slot.watch.flagged().is_some() || queue.channel_error().is_some())
                 }
                 Recover::Flagged(node) => slot.node == node && slot.watch.flagged().is_some(),
+                Recover::Exit(process) => queue.context().is_some_and(|c| {
+                    helios_kmd_logic::native_teardown::exit_victim(
+                        c.process_key(),
+                        process,
+                        slot.progress.submitted,
+                        queue.read_progress(),
+                        slot.watch.is_dead(),
+                    )
+                }),
             };
             let key = queue.context().map_or(0, |c| c as *const NativeContext as usize);
             if culprit && key != 0 && !contexts[..n_contexts].contains(&key) {
@@ -1003,7 +1097,11 @@ pub(crate) fn recover_native(adapter: &AdapterContext, what: Recover) -> u32 {
         queue.complete_progress(hang::completion_value(v.submitted, queue.read_progress()));
         nodes |= node_bit(v.node);
     }
-    NAT_RECOVERED.fetch_add(count as u32, Ordering::Relaxed);
+    if matches!(what, Recover::Exit(_)) {
+        TD_STOPPED.fetch_add(count as u32, Ordering::Relaxed);
+    } else {
+        NAT_RECOVERED.fetch_add(count as u32, Ordering::Relaxed);
+    }
     if let Some(passive) = crate::irql::PassiveLevel::try_assume() {
         let reset = RC_RESET.load(Ordering::Relaxed) & 1 != 0;
         for (i, v) in victims.iter().enumerate() {
@@ -1021,7 +1119,7 @@ pub(crate) fn recover_native(adapter: &AdapterContext, what: Recover) -> u32 {
                     NAT_RESET_ST.store(native_code(queue.reset_channel(passive)), Ordering::Relaxed);
                 }
             }
-            if what != Recover::All {
+            if matches!(what, Recover::Engine(_) | Recover::Flagged(_)) {
                 invalidate_context(adapter, context.dxg_context());
             }
         }

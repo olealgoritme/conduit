@@ -682,6 +682,8 @@ impl NativeContext {
         process: &mut ProcessContext,
         owner: DeviceOwner,
     ) -> Result<Self, NativeError> {
+        // CreateContext runs in the calling process: the exit gate's EPROCESS (`hws::exit_gate`).
+        process.bind_eprocess();
         let native = ensure_process(passive, adapter, process)?;
         let key = &*process as *const ProcessContext as usize;
         let handles = ObjectHandles::mint()?;

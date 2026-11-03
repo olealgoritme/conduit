@@ -35,6 +35,33 @@ pub fn is_live_key(key: usize) -> bool {
     key != DEAD_PROCESS
 }
 
+/// `PsGetProcessExitStatus` of a process that has not begun to exit (`STATUS_PENDING`).
+pub const STATUS_PENDING: i32 = 0x103;
+
+/// Whether a process whose `PsGetProcessExitStatus` answered `status` has begun to exit.
+/// The kernel sets the exit status before the handle-table rundown that makes dxgkrnl
+/// destroy the process's devices, allocations and VA mappings.
+pub const fn exit_begun(status: i32) -> bool {
+    status != STATUS_PENDING
+}
+
+/// The exit gate (`NvTdStop`): whether a native queue of `queue_process` is stopped before
+/// VidMm's teardown invalidations of `process` reach RM. dxgkrnl tears an exiting process
+/// down allocations first, contexts last: VidMm unmaps the process's VAs while its channels
+/// may still hold work (a DWM that exits with submissions outstanding). Applied as they come,
+/// the unmaps pulled the pages out from under that work and the channel took host Xid 31
+/// FAULT_PTE at the dropped VAs. Only the exiting process's own queues with work outstanding
+/// (`progress < submitted`) and not already recovered are picked; nothing of another process.
+pub fn exit_victim(queue_process: usize, process: usize, submitted: u64, progress: u64, dead: bool) -> bool {
+    process != 0 && is_live_key(process) && queue_process == process && !dead && progress < submitted
+}
+
+/// Whether an `UpdatePageTable` of `process` is a teardown invalidation the exit gate looks
+/// at: a leaf update of a user process (not VidMm's own, `system`) with any invalid entry.
+pub fn teardown_update(process: usize, system: bool, leaf: bool, any_invalid: bool) -> bool {
+    process != 0 && !system && leaf && any_invalid
+}
+
 /// A process's native association.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Slot<T> {
@@ -208,6 +235,40 @@ mod tests {
         assert_eq!(retire_owner(0, 0), 0);
         assert!(!is_live_key(DEAD_PROCESS));
         assert!(is_live_key(0) && is_live_key(0x1000));
+    }
+
+    #[test]
+    fn exit_status_pending_means_running() {
+        assert!(!exit_begun(STATUS_PENDING));
+        assert!(exit_begun(0));
+        assert!(exit_begun(0xC000_013Au32 as i32)); // STATUS_CONTROL_C_EXIT
+        assert!(exit_begun(1));
+    }
+
+    #[test]
+    fn the_exit_gate_stops_only_the_exiting_process_busy_queues() {
+        let dwm = 0xffff_820f_904b_4900usize;
+        let other = 0xffff_820f_8ba1_ff00usize;
+        // Its own queue with work outstanding: stopped.
+        assert!(exit_victim(dwm, dwm, 791, 673, false));
+        // Idle (everything submitted is complete): left alone.
+        assert!(!exit_victim(dwm, dwm, 791, 791, false));
+        // Another process's busy queue: never.
+        assert!(!exit_victim(other, dwm, 791, 673, false));
+        // Already recovered: not again.
+        assert!(!exit_victim(dwm, dwm, 791, 673, true));
+        // The device-wide owner and the dead key name no process.
+        assert!(!exit_victim(0, 0, 5, 1, false));
+        assert!(!exit_victim(DEAD_PROCESS, DEAD_PROCESS, 5, 1, false));
+    }
+
+    #[test]
+    fn only_user_leaf_invalidations_reach_the_exit_gate() {
+        assert!(teardown_update(0x1000, false, true, true));
+        assert!(!teardown_update(0x1000, false, true, false), "all-valid update");
+        assert!(!teardown_update(0x1000, false, false, true), "upper level: RM owns it");
+        assert!(!teardown_update(0x1000, true, true, true), "VidMm's own process");
+        assert!(!teardown_update(0, false, true, true), "no process");
     }
 
     #[test]

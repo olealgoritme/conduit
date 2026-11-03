@@ -5449,6 +5449,22 @@ pub fn destroy(passive: PassiveLevel, adapter: &AdapterContext, id: u32) -> Resu
             allocation.scanout_gem,
         )
     };
+    // An exiting process's channels stop before its mappings go (`hws::exit_gate`). The
+    // keys are live: release_process (under this mutex) drops or retires a process's
+    // records before its ProcessContext is freed.
+    {
+        let mut gated: Vec<usize> = Vec::new();
+        for m in mappings.iter() {
+            if m.process != 0 && nt::is_live_key(m.process) && !gated.contains(&m.process) {
+                if gated.try_reserve(1).is_err() {
+                    break;
+                }
+                gated.push(m.process);
+                // SAFETY: a live process key under the I/O mutex (see above).
+                unsafe { crate::ddi::hws::exit_gate(adapter, m.process) };
+            }
+        }
+    }
     // A CPU view dxgkrnl did not unmap first (an UnmapApertureSegment that came
     // above PASSIVE leaves it, `cpu_host_aperture`) goes here: nothing maps the
     // allocation through the aperture once it is destroyed.
@@ -5524,15 +5540,64 @@ pub fn release_process(passive: PassiveLevel, adapter: &AdapterContext, process:
     if process == 0 {
         return 0;
     }
+    let (kept, retired) = release_process_inner(passive, adapter, process);
+    if kept != 0 && !retired {
+        // An early exit (the mutex, no memory, the transport) left the process's records,
+        // space and foreign ranges under its key: the freed ProcessContext's address,
+        // which the next process can get. Retired here as on the normal path, or that
+        // process inherited the dead one's space and stale mappings. `NvPrRelRetire`.
+        retire_process(process);
+        let n = RELEASE_RETIRED.fetch_add(1, Ordering::Relaxed) + 1;
+        crate::diag::record_named_bytes(b"NvPrRelRetire", n);
+    }
+    kept
+}
+
+/// `NvPrRelRetire`: release_process early exits whose records were retired.
+static RELEASE_RETIRED: AtomicU32 = AtomicU32::new(0);
+
+/// File everything still recorded under `process` under the dead key
+/// (`native_teardown::retire_owner`) and empty its index: the key is a freed
+/// `ProcessContext`'s address that a new process may get.
+fn retire_process(process: usize) {
+    let mut state = st();
+    for allocation in state.allocations.iter_mut() {
+        let mut changed = false;
+        for mapping in allocation.mappings.iter_mut() {
+            let owner = nt::retire_owner(mapping.process, process);
+            changed |= owner != mapping.process;
+            mapping.process = owner;
+        }
+        if changed {
+            allocation
+                .mappings
+                .sort_unstable_by_key(|mapping| (mapping.process, mapping.piece.va));
+        }
+    }
+    for mapping in state.foreign.iter_mut() {
+        mapping.process = nt::retire_owner(mapping.process, process);
+    }
+    for (owner, _) in state.spaces.iter_mut() {
+        *owner = nt::retire_owner(*owner, process);
+    }
+    state.idle_spaces.retain(|p| *p != process);
+    if let Some(at) = state.by_process.iter().position(|(p, _)| *p == process) {
+        state.by_process.swap_remove(at);
+    }
+}
+
+/// [`release_process`]'s work: `(kept, retired)`, retired when what stayed was already
+/// filed under the dead key.
+fn release_process_inner(passive: PassiveLevel, adapter: &AdapterContext, process: usize) -> (u32, bool) {
     let Ok(_guard) = lock(passive, Kind::Process) else {
-        return 1;
+        return (1, false);
     };
     let Ok(client) = st().client() else {
         // No native client: nothing was ever mapped for anyone.
         let mut state = st();
         state.spaces.retain(|(owner, _)| *owner != process);
         state.idle_spaces.retain(|p| *p != process);
-        return 0;
+        return (0, true);
     };
     let io = Io {
         passive,
@@ -5544,14 +5609,14 @@ pub fn release_process(passive: PassiveLevel, adapter: &AdapterContext, process:
         let mut owned = Vec::new();
         let mut candidates = Vec::new();
         if state.candidates(process, &mut candidates).is_err() {
-            return 1;
+            return (1, false);
         }
         for id in candidates {
             let Some(i) = state.index_of(id) else { continue };
             let allocation = &state.allocations[i];
             for mapping in allocation.mappings.iter().filter(|m| m.process == process) {
                 if owned.try_reserve(1).is_err() {
-                    return 1;
+                    return (1, false);
                 }
                 owned.push((allocation.id, allocation.memory, *mapping));
             }
@@ -5563,7 +5628,7 @@ pub fn release_process(passive: PassiveLevel, adapter: &AdapterContext, process:
         let mut state = st();
         let mut mine = Vec::new();
         if mine.try_reserve(state.foreign.len()).is_err() {
-            return 1;
+            return (1, false);
         }
         state.foreign.retain(|m| {
             if m.process == process {
@@ -5575,16 +5640,30 @@ pub fn release_process(passive: PassiveLevel, adapter: &AdapterContext, process:
         });
         mine
     };
+    // The foreign ranges taken out above go back (under the dead key, as for an unmap RM
+    // refused) when nothing of them was unmapped: dropped from the records they stayed
+    // mapped with nothing left to name them.
+    let put_back = |foreign: &[HostMapping]| {
+        let mut state = st();
+        if state.foreign.try_reserve(foreign.len()).is_ok() {
+            state.foreign.extend(foreign.iter().map(|m| HostMapping {
+                process: nt::DEAD_PROCESS,
+                ..*m
+            }));
+        }
+    };
     // Every unmap in as few round trips as `NvPaging` 0x1 allows.
     let mut items = Vec::new();
     if items.try_reserve_exact(foreign.len() + owned.len()).is_err() {
-        return 1;
+        put_back(&foreign);
+        return (1, false);
     }
     items.extend(foreign.iter().map(|m| (0u32, *m, false)));
     items.extend(owned.iter().map(|(_, memory, m)| (*memory, *m, false)));
     let mut results = Vec::new();
     if unmap_many(&io, &items, false, &mut results).is_err() {
-        return 1;
+        put_back(&foreign);
+        return (1, false);
     }
     let (foreign_results, owned_results) = results.split_at(foreign.len());
     for (mapping, result) in foreign.into_iter().zip(foreign_results) {
@@ -5610,7 +5689,7 @@ pub fn release_process(passive: PassiveLevel, adapter: &AdapterContext, process:
     {
         // No memory: nothing is dropped from the records, and the process's
         // space stays (as for a mapping RM would not release).
-        return 1;
+        return (1, false);
     }
     for ((id, _, mapping), result) in owned.iter().zip(owned_results) {
         if result.is_err() {
@@ -5690,7 +5769,7 @@ pub fn release_process(passive: PassiveLevel, adapter: &AdapterContext, process:
             state.by_process.swap_remove(at);
         }
     }
-    kept
+    (kept, true)
 }
 
 /// Drop only guest-owned state after the transport already destroyed every RM

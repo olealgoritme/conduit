@@ -564,6 +564,20 @@ pub struct ProcessContext {
     /// Empty until the first native CreateHwContext. Host calls are made only
     /// after taking the value out of this lock.
     native: crate::sync::SpinLock<crate::virtio::native_channel::NativeProcessState>,
+    /// The process's EPROCESS, taken (and referenced until DestroyProcess) at its first
+    /// native CreateContext, which runs in the calling process (0 = none yet): the exit
+    /// gate asks it whether the process exits. DXGKARG_CREATEPROCESS names no EPROCESS.
+    eprocess: core::sync::atomic::AtomicUsize,
+    /// The exit gate saw this process exiting (`NvTdExitP` counted once).
+    exit_seen: core::sync::atomic::AtomicBool,
+}
+
+extern "system" {
+    /// `PsGetProcessExitStatus`: `STATUS_PENDING` until the process begins to exit. Any IRQL
+    /// (a field read of a referenced EPROCESS).
+    fn PsGetProcessExitStatus(process: *mut c_void) -> NTSTATUS;
+    /// The calling thread's process (`PsGetCurrentProcess`). Any IRQL.
+    fn IoGetCurrentProcess() -> *mut c_void;
 }
 
 impl ProcessContext {
@@ -583,6 +597,48 @@ impl ProcessContext {
         &self,
     ) -> &crate::sync::SpinLock<crate::virtio::native_channel::NativeProcessState> {
         &self.native
+    }
+
+    /// Whether the process has begun to exit (`helios_kmd_logic::native_teardown::exit_begun`);
+    /// false when dxgkrnl gave no EPROCESS. Any IRQL.
+    pub(crate) fn exiting(&self) -> bool {
+        let eprocess = self.eprocess.load(core::sync::atomic::Ordering::Acquire);
+        if eprocess == 0 {
+            return false;
+        }
+        // SAFETY: referenced by `bind_eprocess`, dereferenced in DestroyProcess only.
+        let status = unsafe { PsGetProcessExitStatus(eprocess as *mut c_void) };
+        helios_kmd_logic::native_teardown::exit_begun(status)
+    }
+
+    /// Take the calling process's EPROCESS for the exit gate, once (the first native
+    /// CreateContext, in the process's own context). Not for the system process.
+    pub(crate) fn bind_eprocess(&self) {
+        use core::sync::atomic::Ordering;
+        if self.system || self.eprocess.load(Ordering::Acquire) != 0 {
+            return;
+        }
+        // SAFETY: no preconditions; the current process is live while it calls.
+        let current = unsafe { IoGetCurrentProcess() } as usize;
+        if current == 0 {
+            return;
+        }
+        // SAFETY: a live EPROCESS; the reference is dropped in DestroyProcess or below.
+        unsafe { wdk_sys::ntddk::ObfReferenceObject(current as wdk_sys::PVOID) };
+        if self
+            .eprocess
+            .compare_exchange(0, current, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            // Another thread bound it first.
+            // SAFETY: the reference just taken.
+            unsafe { wdk_sys::ntddk::ObfDereferenceObject(current as wdk_sys::PVOID) };
+        }
+    }
+
+    /// The first time the exit gate saw this process exiting (true once).
+    pub(crate) fn note_exit_seen(&self) -> bool {
+        !self.exit_seen.swap(true, core::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -922,6 +978,8 @@ pub unsafe extern "C" fn dxgkddi_create_process(
         native: crate::sync::SpinLock::new(
             crate::virtio::native_channel::NativeProcessState::Empty,
         ),
+        eprocess: core::sync::atomic::AtomicUsize::new(0),
+        exit_seen: core::sync::atomic::AtomicBool::new(false),
     });
     // Hand the process handle back to Dxgkrnl; reclaimed in destroy_process.
     args.hKmdProcess = Box::into_raw(ctx) as HANDLE;
@@ -1042,7 +1100,13 @@ pub unsafe extern "C" fn dxgkddi_destroy_process(
         }
         // SAFETY: h_process was produced by Box::into_raw in create_process and
         // is destroyed exactly once.
-        drop(unsafe { Box::from_raw(h_process as *mut ProcessContext) });
+        let ctx = unsafe { Box::from_raw(h_process as *mut ProcessContext) };
+        let eprocess = ctx.eprocess.load(core::sync::atomic::Ordering::Acquire);
+        if eprocess != 0 {
+            // SAFETY: the reference `bind_eprocess` took.
+            unsafe { wdk_sys::ntddk::ObfDereferenceObject(eprocess as wdk_sys::PVOID) };
+        }
+        drop(ctx);
     }
     STATUS_SUCCESS
 }
