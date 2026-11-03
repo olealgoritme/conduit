@@ -330,6 +330,15 @@ static NAT_TDR_FAIL: AtomicU32 = AtomicU32::new(0);
 /// `NvHangMs` (u32::MAX until read) and `NvRcReset`, read at CreateHwQueue.
 static HANG_MS: AtomicU32 = AtomicU32::new(u32::MAX);
 static RC_RESET: AtomicU32 = AtomicU32::new(hang::DEFAULT_RC_RESET);
+/// `NvMfKick` (default 1): while a native queue has work outstanding, every poll tick raises
+/// `MONITORED_FENCE_SIGNALED` for its node even when its progress fence did not move.
+/// Native channels have no non-stall interrupt: a monitored fence the GPU releases in the
+/// middle of a submission (a D3D12 fence another queue or a UMD CPU thread waits on) is
+/// otherwise only noticed by dxgkrnl when that queue's progress fence moves, which never
+/// happens if the queue then waits on the CPU thread (NVIDIA's D3D12 cross-queue waits).
+/// Spurious signals are allowed. `NvMfKickN` counts kicked ticks.
+static MF_KICK: AtomicU32 = AtomicU32::new(1);
+static MF_KICKS: AtomicU32 = AtomicU32::new(0);
 
 /// Mirror the `Hws*` counters at PASSIVE (from `publish_nvrm_counters`). Writes
 /// nothing in the default personality.
@@ -348,6 +357,8 @@ pub(crate) fn publish_counters() {
     }
     let r = |c: &AtomicU32| c.load(Ordering::Relaxed);
     crate::diag::record_named_bytes(b"HwsCtxNv", r(&CTX_NATIVE));
+    crate::diag::record_named_bytes(b"NvMfKickN", r(&MF_KICKS));
+    crate::diag::record_named_bytes(b"NvMfKick", r(&MF_KICK));
     crate::diag::record_named_bytes(b"HwsCtxNvFail", r(&CTX_NATIVE_FAIL));
     crate::diag::record_named_bytes(b"HwsCtxBad", r(&CTX_NVDA_BAD));
     crate::diag::record_named_bytes(b"HwsCtxSched", r(&CTX_NVDA_SCHED));
@@ -480,6 +491,8 @@ fn read_recovery_knobs() {
         hang::DEFAULT_RC_RESET,
     );
     RC_RESET.store(rc, Ordering::Relaxed);
+    let kick = crate::diag::read_config_dword(crate::diag::KnobName::new(b"NvMfKick"), 1);
+    MF_KICK.store(kick, Ordering::Relaxed);
     read_suspend_knobs();
 }
 
@@ -872,6 +885,7 @@ pub(crate) fn poll_tick(adapter: &AdapterContext) {
         // Every queue with work outstanding is seen by events; the copy-context
         // channels (`ddi::nv_copy`) are polled only.
         let mut covered = !copy_busy;
+        let mut kick_nodes = 0u32;
         for slot in r.slots.iter_mut().filter(|slot| slot.queue != 0) {
             // SAFETY: a registered queue is live until DestroyHwQueue removed its
             // slot under this lock (see `Slot::queue`).
@@ -921,11 +935,22 @@ pub(crate) fn poll_tick(adapter: &AdapterContext) {
             // A report waiting for its reset keeps the poll alive for the grace
             // fallback, outstanding work or not.
             any_outstanding |= slot.progress.outstanding() || slot.watch.in_grace();
+            if slot.progress.outstanding() && MF_KICK.load(Ordering::Relaxed) != 0 {
+                kick_nodes |= node_bit(slot.node);
+            }
             if slot.progress.outstanding() && !slot.cover.event_driven() {
                 covered = false;
             }
         }
         nodes |= core::mem::take(&mut r.pending_nodes);
+        if kick_nodes & !nodes != 0 {
+            MF_KICKS.fetch_add(1, Ordering::Relaxed);
+        }
+        nodes |= kick_nodes;
+        // A kicked poll keeps the fast period: the waiter's fence may move any time.
+        if kick_nodes != 0 {
+            covered = false;
+        }
         if progressed || !any_outstanding {
             r.idle_ticks = 0;
         } else {
