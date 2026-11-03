@@ -308,6 +308,8 @@ pub const COUNTERS: &[&str] = &[
     "NvHwsEn",
     "NvHwsQSt",
     "HwsCtxNv",
+    "NvMfKickN",
+    "NvMfKick",
     "HwsCtxNvFail",
     "HwsCtxBad",
     "HwsCtxSched",
