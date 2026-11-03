@@ -47,6 +47,52 @@ struct HwQueue {
     native: NativeQueue,
 }
 
+/// `NativeError` discriminant + 1, for the `VkF` codes.
+pub(crate) fn native_code(error: NativeError) -> u32 {
+    match error {
+        NativeError::Invalid => 1,
+        NativeError::Busy => 2,
+        NativeError::NoMemory => 3,
+        NativeError::Unsupported => 4,
+        NativeError::Transport => 5,
+        NativeError::Rm => 6,
+        NativeError::UnbackedRing => 7,
+        NativeError::Dead => 8,
+    }
+}
+
+/// `nc::PrivateError` discriminant + 1, for the `VkF` codes.
+pub(crate) fn private_code(error: native_format::PrivateError) -> u32 {
+    use native_format::PrivateError as E;
+    match error {
+        E::Size => 1,
+        E::Magic => 2,
+        E::Version => 3,
+        E::Node => 4,
+        E::EngineAffinity => 5,
+        E::Flags => 6,
+        E::ClientHint => 7,
+        E::GpfifoVa => 8,
+        E::RingBytes => 9,
+        E::Allocation => 10,
+        E::QueueFlags => 11,
+        E::GpPut => 12,
+        E::ProgressFence => 13,
+    }
+}
+
+/// A refused CreateHwQueue into `VkF`: `reason` (`vk_fail::queue_reason`) with the
+/// detail code in its low byte; answers `status`.
+fn queue_refused(reason: u32, detail: u32, status: NTSTATUS, hint: u32) -> NTSTATUS {
+    crate::ddi::vk_fail::note(
+        helios_kmd_logic::vk_fail::kind::CREATE_HW_QUEUE,
+        reason | (detail & 0xff),
+        status,
+        hint,
+    );
+    status
+}
+
 fn native_status(error: NativeError) -> NTSTATUS {
     match error {
         NativeError::Invalid | NativeError::UnbackedRing => STATUS_INVALID_PARAMETER,
@@ -331,14 +377,23 @@ pub(crate) unsafe fn create_native_queue(
             args.PrivateDriverDataSize as usize,
         )
     };
-    let parsed = match native_format::parse_queue_private(private) {
-        Ok(parsed) => parsed,
-        Err(error) => return native_status(error.into()),
-    };
+    use helios_kmd_logic::vk_fail::{queue_hint, queue_reason as qr};
     // SAFETY: Value is the plain UINT arm of D3DDDI_CREATEHWQUEUEFLAGS.
     let queue_flags = unsafe { args.Flags.__bindgen_anon_1.Value };
+    let parsed = match native_format::parse_queue_private(private) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            return queue_refused(
+                qr::PRIVATE,
+                private_code(error),
+                native_status(error.into()),
+                private.len() as u32,
+            )
+        }
+    };
+    let hint = queue_hint(parsed.kind(), parsed.ring_bytes, queue_flags);
     if args.hHwQueueProgressFence == 0 {
-        return STATUS_NOT_SUPPORTED;
+        return queue_refused(qr::NO_FENCE, 0, STATUS_NOT_SUPPORTED, hint);
     }
     let Some(adapter) = (unsafe { adapter_ptr.as_ref() }) else {
         return STATUS_INVALID_PARAMETER;
@@ -355,7 +410,7 @@ pub(crate) unsafe fn create_native_queue(
         )
     } {
         Some(backing) => backing,
-        None => return STATUS_INVALID_PARAMETER,
+        None => return queue_refused(qr::RING_BACKING, 0, STATUS_INVALID_PARAMETER, hint),
     };
     let passive = unsafe { crate::irql::PassiveLevel::assume() };
     let native = match NativeQueue::create(
@@ -369,7 +424,9 @@ pub(crate) unsafe fn create_native_queue(
         args.HwQueueProgressFenceGPUVirtualAddress,
     ) {
         Ok(queue) => queue,
-        Err(error) => return native_status(error),
+        Err(error) => {
+            return queue_refused(qr::NATIVE, native_code(error), native_status(error), hint)
+        }
     };
     let token = native.token();
     if let Err(error) =
@@ -377,7 +434,7 @@ pub(crate) unsafe fn create_native_queue(
     {
         let mut native = native;
         let _ = native.destroy(passive);
-        return native_status(error.into());
+        return queue_refused(qr::WRITEBACK, private_code(error), native_status(error.into()), hint);
     }
     let queue = Box::new(HwQueue {
         handle: HwHandle {
@@ -430,14 +487,23 @@ pub unsafe extern "C" fn dxgkddi_submit_command_to_hw_queue(
         return STATUS_INVALID_PARAMETER;
     }
     let args = unsafe { &*args };
+    let refused = |reason: u32| {
+        crate::ddi::vk_fail::note(
+            helios_kmd_logic::vk_fail::kind::SUBMIT_HW_QUEUE,
+            reason,
+            STATUS_INVALID_PARAMETER,
+            args.DmaBufferPrivateDataSize,
+        );
+        STATUS_INVALID_PARAMETER
+    };
     let Some(queue) = (unsafe { hw_queue_handle(args.hHwQueue) }) else {
-        return STATUS_INVALID_PARAMETER;
+        return refused(helios_kmd_logic::vk_fail::submit_reason::BAD_HANDLE);
     };
     if queue.handle.adapter != h_adapter as *mut AdapterContext {
-        return STATUS_INVALID_PARAMETER;
+        return refused(helios_kmd_logic::vk_fail::submit_reason::BAD_HANDLE);
     }
     if args.pDmaBufferPrivateData.is_null() {
-        return STATUS_INVALID_PARAMETER;
+        return refused(helios_kmd_logic::vk_fail::submit_reason::NO_PRIVATE);
     }
     // SAFETY: dxgkrnl supplies exactly DmaBufferPrivateDataSize readable bytes.
     // NativeQueue::submit performs only its leaf spinlock and volatile stores;
@@ -458,6 +524,13 @@ pub unsafe extern "C" fn dxgkddi_submit_command_to_hw_queue(
             queue.native.bind_copy_subchannel(passive, args.DmaBufferVirtualAddress);
         }
     }
+    use helios_kmd_logic::vk_fail::{kind, submit_hint, submit_reason};
+    let hint = || {
+        submit_hint(
+            helios_kmd_logic::rm_client::get32(private, 0x78).unwrap_or(0),
+            private.len() as u32,
+        )
+    };
     match queue.native.submit(private) {
         Ok(()) => STATUS_SUCCESS,
         // A recovered queue: its context is (being) invalidated and the channel
@@ -465,9 +538,16 @@ pub unsafe extern "C" fn dxgkddi_submit_command_to_hw_queue(
         // nobody waits on it.
         Err(NativeError::Dead) => {
             queue.native.complete_progress(args.HwQueueProgressFenceId);
+            crate::ddi::vk_fail::note(kind::SUBMIT_HW_QUEUE, submit_reason::DEAD, 0, hint());
             STATUS_SUCCESS
         }
-        Err(error) => native_status(error),
+        Err(error) => {
+            // `Invalid` with a well-sized record: its GP_PUT is out of range or did
+            // not move (`gp_put_advance`).
+            let status = native_status(error);
+            crate::ddi::vk_fail::note(kind::SUBMIT_HW_QUEUE, native_code(error), status, hint());
+            status
+        }
     }
 }
 

@@ -508,7 +508,7 @@ pub fn forward(
                 }
             }
             if pin_id != 0 {
-                return forward_pinned(
+                let n = forward_pinned(
                     passive,
                     adapter,
                     owner,
@@ -519,7 +519,9 @@ pub fn forward(
                     pin_id,
                     rm_status_off,
                 )
-                .map_err(refused);
+                .map_err(refused)?;
+                crate::ddi::vk_fail::note_rm_ioctl(req, resp, n);
+                return Ok(n);
             }
             // A client allocation reserves its slot in the client table first: a full
             // table refuses before the host makes a client nobody tracks.
@@ -544,6 +546,8 @@ pub fn forward(
                 adapter, owner, process, handle, hmode, reserved, req, resp, n,
             );
             after_ioctl(adapter, owner, req, resp, n);
+            // `VkR`: the host's or RM's refusal, with the control / class it names.
+            crate::ddi::vk_fail::note_rm_ioctl(req, resp, n);
             Ok(n)
         }
         MSG_SCANOUT_FLIP => {
@@ -1162,6 +1166,8 @@ pub(crate) fn forward_kmd_batch(
     }
     NVRM_IOCTLS.fetch_add(handles.len() as u32, Ordering::Relaxed);
     let n = ctrl::raw_roundtrip(passive, adapter, req, resp, timeout_ms).map_err(Refusal::Transport)?;
+    // `VkR`: each entry the host or RM refused.
+    crate::ddi::vk_fail::note_rm_batch(req, resp, n);
     Ok((n, epoch))
 }
 

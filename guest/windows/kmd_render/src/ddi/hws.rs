@@ -1067,10 +1067,17 @@ pub unsafe extern "C" fn dxgkddi_create_context(
         flags,
     ) {
         Ok(parsed) => parsed,
-        Err(_) => {
+        Err(error) => {
             // Loud (`HwsCtxBad`), not fatal: the context exists, its queues are
             // refused.
             CTX_NVDA_BAD.fetch_add(1, Ordering::Relaxed);
+            crate::ddi::vk_fail::note(
+                helios_kmd_logic::vk_fail::kind::CREATE_CONTEXT,
+                helios_kmd_logic::vk_fail::context_reason::BAD_PRIVATE
+                    | super::scheduler::private_code(error),
+                0,
+                args.NodeOrdinal,
+            );
             // SAFETY: forwarded unchanged.
             return unsafe {
                 crate::device::create_context_with(h_device, create_context, None, true)
@@ -1089,6 +1096,12 @@ pub unsafe extern "C" fn dxgkddi_create_context(
             }
             Err(status) => {
                 CTX_NATIVE_FAIL.fetch_add(1, Ordering::Relaxed);
+                crate::ddi::vk_fail::note(
+                    helios_kmd_logic::vk_fail::kind::CREATE_CONTEXT,
+                    helios_kmd_logic::vk_fail::context_reason::NATIVE_FAILED,
+                    status,
+                    args.NodeOrdinal,
+                );
                 return status;
             }
         }
@@ -1096,12 +1109,29 @@ pub unsafe extern "C" fn dxgkddi_create_context(
         None
     };
     let is_native = native.is_some();
+    let node = args.NodeOrdinal;
     // SAFETY: both pointers were null-checked above, so this cannot fail and drop
     // the native TSG without its teardown.
     let status =
         unsafe { crate::device::create_context_with(h_device, create_context, native, true) };
     if status != STATUS_SUCCESS {
+        crate::ddi::vk_fail::note(
+            helios_kmd_logic::vk_fail::kind::CREATE_CONTEXT,
+            helios_kmd_logic::vk_fail::context_reason::CREATE_FAILED,
+            status,
+            node,
+        );
         return status;
+    }
+    if !is_native {
+        // A HW-queue context on a node without channel state: its queues will
+        // complete their submissions without running them.
+        crate::ddi::vk_fail::note(
+            helios_kmd_logic::vk_fail::kind::CREATE_CONTEXT,
+            helios_kmd_logic::vk_fail::context_reason::UNBACKED_NODE,
+            0,
+            node,
+        );
     }
     if is_native {
         CTX_NATIVE.fetch_add(1, Ordering::Relaxed);
@@ -1159,6 +1189,14 @@ pub unsafe extern "C" fn dxgkddi_create_hw_queue(
         });
         if legacy {
             context.soft_queues().fetch_add(1, Ordering::AcqRel);
+        } else {
+            // An NVDA queue without a channel: its submissions complete unrun.
+            crate::ddi::vk_fail::note(
+                helios_kmd_logic::vk_fail::kind::SOFT_QUEUE,
+                0x100 | context.node_ordinal(),
+                0,
+                args.PrivateDriverDataSize,
+            );
         }
         args.hHwQueue = Box::into_raw(queue) as HANDLE;
         SOFT_QUEUES.fetch_add(1, Ordering::Relaxed);
@@ -1183,6 +1221,12 @@ pub unsafe extern "C" fn dxgkddi_create_hw_queue(
         .is_some_and(|queue| register_queue(queue, context.node_ordinal()));
     if !registered {
         QUEUE_FULL.fetch_add(1, Ordering::Relaxed);
+        crate::ddi::vk_fail::note(
+            helios_kmd_logic::vk_fail::kind::CREATE_HW_QUEUE,
+            helios_kmd_logic::vk_fail::queue_reason::REGISTRY_FULL,
+            STATUS_INSUFFICIENT_RESOURCES,
+            MAX_QUEUES as u32,
+        );
         // A queue whose completion can never be reported must not exist.
         // SAFETY: the handle just minted; not yet known to dxgkrnl.
         let _ = unsafe { super::scheduler::dxgkddi_destroy_hw_queue(args.hHwQueue) };
@@ -1211,7 +1255,15 @@ pub unsafe extern "C" fn dxgkddi_destroy_hw_queue(h_hw_queue: IN_CONST_HANDLE) -
         match unregister_queue(key) {
             Ok(saved) => saved,
             // A recovery still uses the queue: it must not be freed now.
-            Err(()) => return STATUS_DEVICE_BUSY,
+            Err(()) => {
+                crate::ddi::vk_fail::note(
+                    helios_kmd_logic::vk_fail::kind::DESTROY_HW_QUEUE,
+                    1,
+                    STATUS_DEVICE_BUSY,
+                    0,
+                );
+                return STATUS_DEVICE_BUSY;
+            }
         }
     } else {
         None
@@ -1219,6 +1271,7 @@ pub unsafe extern "C" fn dxgkddi_destroy_hw_queue(h_hw_queue: IN_CONST_HANDLE) -
     // SAFETY: forwarded unchanged.
     let status = unsafe { super::scheduler::dxgkddi_destroy_hw_queue(h_hw_queue) };
     if status != STATUS_SUCCESS {
+        crate::ddi::vk_fail::note(helios_kmd_logic::vk_fail::kind::DESTROY_HW_QUEUE, 2, status, 0);
         // The queue (and its fence storage) still lives; keep reporting it.
         if let Some(saved) = saved {
             restore_slot(saved);
@@ -1298,6 +1351,13 @@ pub unsafe extern "C" fn dxgkddi_submit_command_to_hw_queue(
         let adapter = unsafe { &*(h_adapter as *const AdapterContext) };
         if !queue.legacy {
             // NVDA context on an unbacked node: nothing to run, complete now.
+            crate::ddi::vk_fail::SOFT_NVDA.fetch_add(1, Ordering::Relaxed);
+            crate::ddi::vk_fail::note(
+                helios_kmd_logic::vk_fail::kind::SOFT_QUEUE,
+                queue.node,
+                0,
+                submit.DmaBufferPrivateDataSize,
+            );
             fence_max(cpu as usize, submit.HwQueueProgressFenceId);
             signal_nodes(adapter, node_bit(queue.node));
             return STATUS_SUCCESS;

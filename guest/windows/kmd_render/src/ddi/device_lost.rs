@@ -113,6 +113,24 @@ pub(crate) fn note_cb(id: u32, status: NTSTATUS, hint: u32) {
 }
 
 fn note_failure(id: u32, status: NTSTATUS, hint: u32, now_ms: u32) {
+    // `VkF`: the DDIs a Vulkan ICD drives through dxgkrnl (escapes, HW-queue and copy
+    // submissions record their own, richer entries).
+    if matches!(
+        id,
+        ddi::CREATE_DEVICE
+            | ddi::CREATE_CONTEXT
+            | ddi::DESTROY_CONTEXT
+            | ddi::CREATE_ALLOCATION
+            | ddi::DESTROY_ALLOCATION
+            | ddi::OPEN_ALLOCATION
+            | ddi::CLOSE_ALLOCATION
+            | ddi::SUBMIT_COMMAND
+            | ddi::SUBMIT_COMMAND_VIRTUAL
+            | ddi::RENDER
+            | ddi::BUILD_PAGING_BUFFER
+    ) {
+        crate::ddi::vk_fail::note(helios_kmd_logic::vk_fail::kind::DDI, id, status, hint);
+    }
     let packed = dl::pack_ddi_hint(id, hint);
     // The routine refusals of the query DDIs stay out of the ring (they would push out the
     // entries that matter); everything else, expected or not, goes in.

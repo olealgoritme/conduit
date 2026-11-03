@@ -732,7 +732,25 @@ fn dump_watched_vas(passive: PassiveLevel, adapter: &AdapterContext, h_device: u
 /// Serve one NVDA private buffer. The caller has already matched NVDA_MAGIC.
 /// `h_device` may be zero for NVAPI's adapter-scoped calls. CUDA's two
 /// context-scoped local replies validate both raw WDDM scopes in pure logic.
+/// A non-success answer goes into the `VkF` ring with the escape's function.
 pub fn escape(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    h_device: usize,
+    h_context: usize,
+    buf: &mut [u8],
+) -> NTSTATUS {
+    // Read before the call: the reply overwrites the buffer.
+    let function = rc::get32(buf, nd::NVDA_FUNCTION_AT).unwrap_or(0);
+    let len = buf.len() as u32;
+    let status = escape_inner(passive, adapter, h_device, h_context, buf);
+    if status != STATUS_SUCCESS {
+        crate::ddi::vk_fail::note(helios_kmd_logic::vk_fail::kind::ESCAPE, function, status, len);
+    }
+    status
+}
+
+fn escape_inner(
     passive: PassiveLevel,
     adapter: &AdapterContext,
     h_device: usize,
@@ -754,6 +772,7 @@ pub fn escape(
     crate::ddi::hot_path::FUNCTIONS.note(header.function);
     crate::ddi::hot_path::tick();
     if header.function == WAIT_POLL_FUNCTION {
+        crate::ddi::vk_fail::note_wait_poll(rc::get32(buf, 0x20).unwrap_or(0));
         dump_watched_vas(passive, adapter, h_device);
     }
     // Pure local replies never initialize the KMD RM client and never touch the
@@ -766,6 +785,17 @@ pub fn escape(
     match nd::apply_local(buf, h_device, h_context) {
         Ok(nd::LocalOutcome::Applied) => {
             crate::ddi::hot_path::count(&crate::ddi::hot_path::NVDA_LOCAL);
+            // A locally answered RM control the ICD reads as refused (`VkR`).
+            if let Ok(control) = nd::parse_rm_control(buf) {
+                if control.status != 0 {
+                    crate::ddi::vk_fail::note_rm(
+                        helios_kmd_logic::vk_fail::kind::ESCAPE_RM,
+                        control.cmd,
+                        control.status,
+                        control.h_object,
+                    );
+                }
+            }
             // The Vulkan ICD's per-head query: head 0 is the mode this adapter scans out.
             let (width, height) = adapter.scanout_extent();
             let hz = ((adapter.effective_refresh_mhz() + 500) / 1000).max(1);
@@ -859,6 +889,15 @@ pub fn escape(
             return STATUS_IO_DEVICE_ERROR;
         }
     };
+    if reply.rm_status != 0 {
+        // The escape succeeds; the ICD reads RM's verdict from the buffer.
+        crate::ddi::vk_fail::note_rm(
+            helios_kmd_logic::vk_fail::kind::ESCAPE_RM,
+            control.cmd,
+            reply.rm_status,
+            control.h_object,
+        );
+    }
     match nd::apply_host_reply(buf, &reply) {
         Ok(()) => STATUS_SUCCESS,
         Err(_) => {
