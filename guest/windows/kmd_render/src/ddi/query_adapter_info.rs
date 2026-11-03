@@ -915,6 +915,8 @@ struct SegmentDescriptorSpec {
     populated_from_system_memory: bool,
     application_target: bool,
     local_budget_group: bool,
+    /// `NonLocalBudgetGroup` (bit 20). Rendered by [`Self::write_into_v4`] only.
+    nonlocal_budget_group: bool,
     cpu_access: CpuAccess,
 }
 
@@ -938,6 +940,7 @@ impl SegmentDescriptorSpec {
             populated_from_system_memory: false,
             application_target: false,
             local_budget_group: false,
+            nonlocal_budget_group: false,
             cpu_access: CpuAccess::None,
         }
     }
@@ -965,6 +968,7 @@ impl SegmentDescriptorSpec {
             populated_from_system_memory: false,
             application_target: false,
             local_budget_group: false,
+            nonlocal_budget_group: false,
             cpu_access: CpuAccess::HostAperture {
                 gpa: base,
                 pages: (len / 4096).min(u32::MAX as u64) as u32,
@@ -1011,6 +1015,7 @@ impl SegmentDescriptorSpec {
             // LocalBudgetGroup classifies its residency as local video
             // memory. A dedicated Helios heap needs both.
             local_budget_group: application_target,
+            nonlocal_budget_group: false,
             // CpuVisible claims the union first; the host aperture only gets it
             // when CpuVisible did not. This is the one condition the old code
             // spelled out inline, and the reason `CpuAccess` is an enum.
@@ -1064,6 +1069,9 @@ impl SegmentDescriptorSpec {
                 }
                 if self.local_budget_group {
                     f.set_LocalBudgetGroup(1);
+                }
+                if self.nonlocal_budget_group {
+                    f.set_NonLocalBudgetGroup(1);
                 }
             }
             match self.cpu_access {
@@ -1140,11 +1148,41 @@ impl SegmentDescriptorSpec {
 }
 
 /// Write the viogpu3d-style linear aperture descriptor (paging-buffer host).
+/// `budget_groups` ([`nv_budget_groups`]) puts it in the non-local budget group.
 /// SAFETY: `seg` points to a writable `DXGK_SEGMENTDESCRIPTOR4`.
-unsafe fn write_aperture_descriptor(seg: *mut DXGK_SEGMENTDESCRIPTOR4, knobs: &AdapterKnobs) {
+unsafe fn write_aperture_descriptor(
+    seg: *mut DXGK_SEGMENTDESCRIPTOR4,
+    knobs: &AdapterKnobs,
+    budget_groups: bool,
+) {
     let mut spec = SegmentDescriptorSpec::aperture(knobs.direct_flip);
     spec.application_target = aperture_application_target();
+    spec.nonlocal_budget_group = budget_groups;
     unsafe { spec.write_into_v4(seg) };
+}
+
+/// Knob `NvBudgetGrp` (REG_DWORD, default 1, NVIDIA personality only): the VidMm budget
+/// groups. dxgmms2 puts a segment in budget group 0 (LOCAL) only with `LocalBudgetGroup`, in
+/// group 1 (NON_LOCAL) only with `NonLocalBudgetGroup`, and otherwise in none. With no
+/// `NonLocalBudgetGroup` segment at all it makes LOCAL a system-memory group (half of the
+/// guest's RAM) and never initialises NON_LOCAL, so DXGI reports a LOCAL budget unrelated to
+/// the card and a NON_LOCAL budget of 0; and `VerifyBudgetGroups` refuses an allocation whose
+/// segment set mixes grouped and ungrouped segments, so the flags go on every segment
+/// together. On: the aperture is `NonLocalBudgetGroup`, the memory segment (BAR, or the
+/// paging-RAM segment of the `BarSegMode=0` shape) `LocalBudgetGroup`. 0 restores the old
+/// flags. Read at each QUERYSEGMENT4 (AddAdapter); `NvBudgetGrpOn` mirrors the effective
+/// value (written only in the NVIDIA personality). A rejected flag would fail AddAdapter
+/// (Code 43): set the value to 0 offline to recover.
+///
+/// QUERYSEGMENT3 and the legacy QUERYSEGMENT do not carry the groups: the NVIDIA
+/// personality reports WDDM 3.2, which dxgkrnl queries with QUERYSEGMENT4 only.
+fn nv_budget_groups() -> bool {
+    if !crate::ddi::wddm_surface::nvidia_selected() {
+        return false;
+    }
+    let on = crate::diag::read_config_dword(crate::diag::KnobName::new(b"NvBudgetGrp"), 1) != 0;
+    crate::diag::record_named_bytes(b"NvBudgetGrpOn", u32::from(on));
+    on
 }
 
 /// Test knob `NvApBudget` (default 0, NVIDIA personality only): 1 marks the
@@ -1178,9 +1216,17 @@ unsafe fn write_aperture_descriptor_legacy(seg: *mut DXGK_SEGMENTDESCRIPTOR, kno
 
 /// Write a MEMORY descriptor (`Aperture=0`, holds bits) whose backing lives at
 /// `base` (guest-physical) for `len` bytes.
+/// `budget_groups` ([`nv_budget_groups`]) puts it in the local budget group.
 /// SAFETY: `seg` points to a writable `DXGK_SEGMENTDESCRIPTOR4`.
-unsafe fn write_cpu_host_memory_descriptor(seg: *mut DXGK_SEGMENTDESCRIPTOR4, base: u64, len: u64) {
-    unsafe { SegmentDescriptorSpec::cpu_host_memory(base, len).write_into_v4(seg) };
+unsafe fn write_cpu_host_memory_descriptor(
+    seg: *mut DXGK_SEGMENTDESCRIPTOR4,
+    base: u64,
+    len: u64,
+    budget_groups: bool,
+) {
+    let mut spec = SegmentDescriptorSpec::cpu_host_memory(base, len);
+    spec.local_budget_group |= budget_groups;
+    unsafe { spec.write_into_v4(seg) };
 }
 
 /// BAR descriptor, FULLY KNOB-DRIVEN (AddAdapter shape bisect: both the
@@ -1211,8 +1257,9 @@ unsafe fn write_bar_knob_descriptor(
     len: u64,
     cpu_aperture_len: u64,
     knobs: &AdapterKnobs,
+    budget_groups: bool,
 ) {
-    let spec = SegmentDescriptorSpec::from_bar_flags(
+    let mut spec = SegmentDescriptorSpec::from_bar_flags(
         knobs.bar_seg_flags,
         gpu_base,
         gpa,
@@ -1220,6 +1267,9 @@ unsafe fn write_bar_knob_descriptor(
         cpu_aperture_len,
         super::bar_segment::vidmm_vram_size(knobs).is_some(),
     );
+    // With the budget groups (`NvBudgetGrp`) the memory segment is in the local group
+    // whatever its reported capacity, not only with a `VidMmVramMB` capacity.
+    spec.local_budget_group |= budget_groups;
     unsafe { spec.write_into_v4(seg) };
 }
 
@@ -1300,6 +1350,8 @@ unsafe fn query_segments(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTERIN
         // the two agree, and this counter is what keeps that true.
         let reported = adapter.reported_segment_count();
         let writable = table.len().min(reported);
+        // One read for the whole table: the groups must agree across its segments.
+        let budget_groups = nv_budget_groups();
         if writable != table.len() {
             crate::diag::fault(crate::diag::FaultCounter::SegCntMis, table.len());
         }
@@ -1318,13 +1370,13 @@ unsafe fn query_segments(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTERIN
             };
             match spec {
                 crate::ddi::segment_table::SegmentSpec::Aperture => unsafe {
-                    write_aperture_descriptor(d, &knobs)
+                    write_aperture_descriptor(d, &knobs, budget_groups)
                 },
                 crate::ddi::segment_table::SegmentSpec::RamCpuHost { base, size } => {
                     crate::diag::record(0x0903_0000 | (((base >> 12) as u32) & 0xFFFF));
                     crate::diag::record(0x0904_0000 | (((size >> 12) as u32) & 0xFFFF));
                     // SAFETY: d is a writable descriptor slot (above).
-                    unsafe { write_cpu_host_memory_descriptor(d, base, size) };
+                    unsafe { write_cpu_host_memory_descriptor(d, base, size, budget_groups) };
                 }
                 crate::ddi::segment_table::SegmentSpec::Bar {
                     gpa,
@@ -1347,6 +1399,7 @@ unsafe fn query_segments(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTERIN
                             size,
                             cpu_aperture_size,
                             &knobs,
+                            budget_groups,
                         )
                     };
                 }

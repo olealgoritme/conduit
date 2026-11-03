@@ -49,13 +49,9 @@ pub struct PerfMem(pub u32);
 /// an image!") with no KMD-side refusal. The aperture stays in their segment set
 /// as VidMm's eviction fallback.
 ///
-/// Plus [`PerfMem::CPU_VISIBLE_APERTURE`]: a CPU-visible native allocation in our memory
-/// segment (CpuVisible=0, SupportsCpuHostAperture) makes every D3DKMTLock2 a "complex"
-/// lock that VidMm's paging worker serves by suspending the device's contexts and
-/// evicting; with NVIDIA's UMD the context it suspends can be the very one waiting on the
-/// locking thread (Steel Nomad D3D12: Xid 109 CTX SWITCH TIMEOUT). NVIDIA keeps UMD
-/// CPU-visible allocations in system memory; in the aperture they get a simple lock.
-pub const PERF_MEM_DEFAULT: u32 = PerfMem::GPU_ONLY_VRAM | PerfMem::CPU_VISIBLE_APERTURE;
+/// [`PerfMem::CPU_VISIBLE_APERTURE`] is opt-in and not part of the default: Steel Nomad
+/// D3D12 fails sooner with it.
+pub const PERF_MEM_DEFAULT: u32 = PerfMem::GPU_ONLY_VRAM;
 
 impl PerfMem {
     /// GPU-only allocations are not CpuVisible and prefer the memory segment
@@ -74,7 +70,11 @@ impl PerfMem {
     /// A system-page leaf update that names the pages already mapped there is skipped.
     pub const SKIP_UNCHANGED: u32 = 0x40;
     /// CPU-visible (non-shared, non-GPU-only) native allocations live in the aperture
-    /// segment only (simple CPU locks, no suspend/evict round trips).
+    /// segment only (opt-in). In our memory segment (CpuVisible=0,
+    /// SupportsCpuHostAperture) every D3DKMTLock2 of one is a "complex" lock that VidMm's
+    /// paging worker serves by suspending the device's contexts and evicting; in the
+    /// aperture it is a simple lock, as NVIDIA keeps UMD CPU-visible allocations in
+    /// system memory.
     pub const CPU_VISIBLE_APERTURE: u32 = 0x80;
 
     const fn has(self, bit: u32) -> bool {
@@ -430,9 +430,23 @@ mod tests {
 
     #[test]
     fn gpu_only_records_go_to_video_memory_by_default() {
+        assert_eq!(PERF_MEM_DEFAULT, PerfMem::GPU_ONLY_VRAM);
         assert_eq!(PerfMem(PERF_MEM_DEFAULT).gpu_only_mode(), GpuOnlyMode::VramFirst);
-        assert!(PerfMem(PERF_MEM_DEFAULT).cpu_visible_aperture());
-        // CPU-visible, not shared, not GPU-only: aperture only.
+        // The aperture rule for CPU-visible allocations is opt-in.
+        assert!(!PerfMem(PERF_MEM_DEFAULT).cpu_visible_aperture());
+        assert!(PerfMem(PERF_MEM_DEFAULT | PerfMem::CPU_VISIBLE_APERTURE).cpu_visible_aperture());
+        // CPU-visible, not shared, not GPU-only, default: the old rule (both segments).
+        let p = placement_with(
+            1,
+            Some(2),
+            false,
+            false,
+            false,
+            GpuOnlyMode::VramFirst,
+            PerfMem(PERF_MEM_DEFAULT).cpu_visible_aperture(),
+        );
+        assert_eq!((p.segment, p.supported, p.flags), (2, 0b11, FLAG_CPU_VISIBLE));
+        // With the opt-in bit: aperture only.
         let p = placement_with(1, Some(2), false, false, false, GpuOnlyMode::VramFirst, true);
         assert_eq!((p.segment, p.supported, p.flags), (1, 0b01, FLAG_CPU_VISIBLE));
         // Shared keeps the old rule; GPU-only keeps VRAM.

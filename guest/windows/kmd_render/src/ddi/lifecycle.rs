@@ -606,8 +606,12 @@ pub unsafe extern "C" fn dxgkddi_start_device(
                 .with_venus_client(passive, |v| v.device_local_heap_bytes())
                 .ok()
                 .flatten();
+            // NVIDIA personality: no Venus device-local heap; the card's framebuffer comes
+            // from the host RM instead. `None` in the Helios personality.
+            let rm_framebuffer = super::bar_segment::nvidia_framebuffer(passive, adapter, &knobs);
             super::bar_segment::resolve_vidmm_vram_mb(
                 &mut knobs,
+                rm_framebuffer,
                 device_local_bytes,
                 host_visible_bytes,
                 backend_limit_mb,
@@ -627,7 +631,7 @@ pub unsafe extern "C" fn dxgkddi_start_device(
                 .msi_state
                 .store(0, core::sync::atomic::Ordering::Release);
             adapter.set_virtio(None);
-            super::bar_segment::resolve_vidmm_vram_mb(&mut knobs, None, None, 0);
+            super::bar_segment::resolve_vidmm_vram_mb(&mut knobs, None, None, None, 0);
         }
     }
 

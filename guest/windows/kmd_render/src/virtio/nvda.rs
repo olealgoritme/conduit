@@ -616,6 +616,116 @@ pub fn publish_host_version(passive: PassiveLevel, adapter: &AdapterContext) {
     HOST_VERSION.lock().finish(epoch, ok);
 }
 
+/// `NvFbSt` values: how [`probe_framebuffer`] ended.
+const FB_OK: u32 = 0;
+const FB_NO_TRANSPORT: u32 = 1;
+const FB_BRING_UP: u32 = 2;
+const FB_REFUSED: u32 = 3;
+const FB_UNREADABLE: u32 = 4;
+const FB_NO_MEMORY: u32 = 5;
+
+/// The card's framebuffer as the host RM reports it (`NV2080_CTRL_CMD_FB_GET_INFO_V2`, heap
+/// and RAM sizes), for the NVIDIA personality's VidMm capacity
+/// (`helios_kmd_logic::vidmm_vram::resolve_rm_framebuffer`). StartDevice, after the transport
+/// is installed and before the segment table is built. PASSIVE.
+///
+/// A client of its own, opened and closed here: the same bring-up steps as the shared
+/// session, on a local [`Session`] that never enters `SESSION`, so a failure here cannot
+/// leave the UMDs' session failed for the generation. Closing the control file frees the RM
+/// client and its device and subdevice with it (as `rm_client::cleanup` relies on).
+/// `None` on any failure; the caller then keeps the window fallback. Mirrors `NvFbSt`
+/// (`FB_*`), `NvFbHeapMB` and `NvFbRamMB`.
+#[inline(never)]
+pub fn probe_framebuffer(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+) -> Option<helios_kmd_logic::vidmm_vram::FbInfo> {
+    let epoch = adapter.nvrm_epoch_fast();
+    if epoch == 0 {
+        crate::diag::record_named_bytes(b"NvFbSt", FB_NO_TRANSPORT);
+        return None;
+    }
+    let io = Io {
+        passive,
+        adapter,
+        epoch,
+    };
+    let mut probe = Session::new();
+    probe.epoch = epoch;
+    for step in STEPS {
+        match io.perform(step, &probe) {
+            Ok(out) => probe.apply(step, out),
+            Err(fail) => {
+                probe.failure = Some(rc::Failure { step, fail });
+                break;
+            }
+        }
+    }
+    let (status, info) = match probe.failure {
+        Some(failure) => {
+            crate::diag::record_named_bytes(b"NvFbFail", failure.pack());
+            (FB_BRING_UP, None)
+        }
+        None => fb_info_control(&io, &probe),
+    };
+    io.close_file(probe.gpu);
+    io.close_file(probe.ctl);
+    crate::diag::record_named_bytes(b"NvFbSt", status);
+    if let Some(info) = info {
+        crate::diag::record_named_bytes(b"NvFbHeapMB", info.heap_kib >> 10);
+        crate::diag::record_named_bytes(b"NvFbRamMB", info.ram_kib >> 10);
+    }
+    info
+}
+
+/// `NV2080_CTRL_CMD_FB_GET_INFO_V2` on the probe's subdevice, with each release's list
+/// length in turn until RM takes the block. Heap buffers: this runs under StartDevice.
+fn fb_info_control(
+    io: &Io<'_>,
+    probe: &Session,
+) -> (u32, Option<helios_kmd_logic::vidmm_vram::FbInfo>) {
+    use helios_kmd_logic::vidmm_vram as vv;
+    let longest = vv::fb_info_v2_bytes(vv::FB_INFO_LIST_LENS[0]);
+    let mut params = Vec::new();
+    let mut resp = Vec::new();
+    let resp_len = rc::REPLY_DATA + rc::NVOS54_BYTES + longest + 64;
+    if params.try_reserve_exact(longest).is_err() || resp.try_reserve_exact(resp_len).is_err() {
+        return (FB_NO_MEMORY, None);
+    }
+    params.resize(longest, 0);
+    resp.resize(resp_len, 0);
+    let mut status = FB_REFUSED;
+    for list_len in vv::FB_INFO_LIST_LENS {
+        let Some(n) = vv::build_fb_info_v2(&mut params, list_len) else {
+            continue;
+        };
+        let block = rc::nvos54(probe.root, nd::H_SUBDEVICE, vv::CTRL_FB_GET_INFO_V2, n as u32);
+        let sent = io.exchange(
+            probe.ctl,
+            rc::nv_cmd(rc::ESC_RM_CONTROL, rc::NVOS54_BYTES as u32),
+            &block,
+            &params[..n],
+            &mut resp,
+        );
+        let Ok(len) = sent else {
+            // The transport, not RM: another length will not help.
+            return (FB_REFUSED, None);
+        };
+        // RM refuses a block of another release's size; try the next length.
+        let Some(reply) = resp
+            .get(..len)
+            .and_then(|r| rc::rm_reply(r, rc::NVOS54_STATUS_AT).ok())
+        else {
+            continue;
+        };
+        match vv::parse_fb_info_v2(reply.nested) {
+            Some(info) if info.bytes().is_some() => return (FB_OK, Some(info)),
+            _ => status = FB_UNREADABLE,
+        }
+    }
+    (status, None)
+}
+
 /// Return the shared native-memory client, installing its GPU_DEVICE VA space on
 /// first use. The client belongs to the KMD, never to the escaping process.
 pub fn memory_client(
