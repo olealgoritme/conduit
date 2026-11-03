@@ -25,6 +25,7 @@ pub mod event_ready;
 pub mod external_memory;
 pub mod host_liveness;
 pub mod host_rm_version;
+pub mod hot_path;
 pub mod hws;
 pub mod hw_flip_queue;
 pub mod native_channel;
