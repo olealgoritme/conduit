@@ -34,6 +34,7 @@ pub mod native_completion;
 pub mod native_hang;
 pub mod native_memory;
 pub mod native_perf;
+pub mod native_snap;
 pub mod native_teardown;
 pub mod nv_copy;
 pub mod nvda;
