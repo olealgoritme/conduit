@@ -35,9 +35,20 @@ pub fn is_gpu_only_record(bytes: &[u8]) -> bool {
     nm::get32(bytes, GPU_ONLY_AT).is_some_and(|kind| kind & GPU_ONLY_BIT != 0)
 }
 
-/// The `NvPerfMem` knob (REG_DWORD, default 0 = the old behaviour everywhere).
+/// The `NvPerfMem` knob (REG_DWORD, default [`PERF_MEM_DEFAULT`]; 0 = the old
+/// behaviour everywhere).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct PerfMem(pub u32);
+
+/// `NvPerfMem` when the knob is absent: [`PerfMem::GPU_ONLY_VRAM`]. NVIDIA's KMD
+/// keeps every record with `+0x10` bit 11 in video memory, and the Vulkan ICD
+/// marks its device-local buffers and images that way (67 of the 151 typed
+/// records in the vktest capture, every image among them). Reported CpuVisible instead, VidMm backs
+/// them with system pages (the `NvPgLeafSys` leaf updates): Steel Nomad's
+/// Vulkan timeline ran out of memory for its images ("Could not get memory for
+/// an image!") with no KMD-side refusal. The aperture stays in their segment set
+/// as VidMm's eviction fallback.
+pub const PERF_MEM_DEFAULT: u32 = PerfMem::GPU_ONLY_VRAM;
 
 impl PerfMem {
     /// GPU-only allocations are not CpuVisible and prefer the memory segment
@@ -380,6 +391,13 @@ mod tests {
         let mut r = alloc::vec![0u8; ALLOCATION_PRIVATE_BYTES];
         r[GPU_ONLY_AT..GPU_ONLY_AT + 4].copy_from_slice(&kind.to_le_bytes());
         r
+    }
+
+    #[test]
+    fn gpu_only_records_go_to_video_memory_by_default() {
+        assert_eq!(PerfMem(PERF_MEM_DEFAULT).gpu_only_mode(), GpuOnlyMode::VramFirst);
+        let p = placement(1, Some(2), false, false, true, PerfMem(PERF_MEM_DEFAULT).gpu_only_mode());
+        assert_eq!((p.segment, p.supported, p.flags, p.gpu_only), (2, 0b11, 0, true));
     }
 
     #[test]

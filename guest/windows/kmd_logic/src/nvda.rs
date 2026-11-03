@@ -696,6 +696,55 @@ pub fn apply_local(
                 }
             }
         }
+        0x0700_010c => {
+            // 0x84-byte adapter-scoped NVAPI query: the NVAPI display id at +0x30 to
+            // its display mask, size kept: +0x34 0x100, +0x38 and +0x3c the one-bit
+            // mask (0x100 << k, the `display_index` rule), +0x40 0xffffffff (all 2501
+            // replies of the vktest and L3 captures, ids 0x80061080..87). An id it
+            // cannot name keeps the request's -23 in the second result word.
+            exact(buf, 0x84)?;
+            put32(buf, NVDA_RESULT_AT, 1);
+            let id = rc::get32(buf, 0x30).unwrap_or(0);
+            match display_index(id).filter(|_| id & !7 == NVAPI_DISPLAY_ID_BASE) {
+                Some(k) => {
+                    put32(buf, NVDA_RESULT2_AT, 1);
+                    put32(buf, 0x34, 0x100);
+                    put32(buf, 0x38, 0x100 << k);
+                    put32(buf, 0x3c, 0x100 << k);
+                    put32(buf, 0x40, 0xffff_ffff);
+                }
+                None => put32(buf, NVDA_RESULT2_AT, DISPLAY_UNKNOWN_RESULT2),
+            }
+        }
+        0x0100_0041 => {
+            // 0xac0-byte NVAPI/UMD settings push (`**VN`; a table of 0x24 entries of
+            // 0x40 bytes, ids 1..0x24). The L3 captures (60 pairs) answer a 0x30-byte
+            // reply, result 1 and 0 in the second result word.
+            exact(buf, 0xac0)?;
+            put32(buf, NVDA_SIZE_AT, NVDA_COMMON_HEADER_BYTES as u32);
+            put32(buf, NVDA_RESULT_AT, 1);
+            put32(buf, NVDA_RESULT2_AT, 0);
+        }
+        0x0100_012b => {
+            // 0x38-byte D3D (`NVDX`) request with a 32-bit value at +0x20 (DWM in the
+            // L3 capture, 9 pairs): a 0x30-byte reply, result 1, 0 in the second
+            // result word, +0x20 kept.
+            exact(buf, 0x38)?;
+            put32(buf, NVDA_SIZE_AT, NVDA_COMMON_HEADER_BYTES as u32);
+            put32(buf, NVDA_RESULT_AT, 1);
+            put32(buf, NVDA_RESULT2_AT, 0);
+        }
+        0x0200_0046 => {
+            // 0xac-byte "OCA Data" record of the OpenGL/Vulkan ICD (nvoglv64
+            // 0x1810768c5, `NVDX` tag; its log line "// OCA Data = ShaderType=%s |
+            // ShaderSize=%08d | AppHash=%016llx | UcodeHash=%016llx"): the shader
+            // being run, for an Online Crash Analysis dump. The ICD ignores the
+            // answer; no capture holds one. Taken as a bare 0x30-byte success.
+            exact(buf, 0xac)?;
+            put32(buf, NVDA_SIZE_AT, NVDA_COMMON_HEADER_BYTES as u32);
+            put32(buf, NVDA_RESULT_AT, 1);
+            put32(buf, NVDA_RESULT2_AT, 1);
+        }
         0x0700_0113 => {
             // 0x3c-byte adapter-scoped NVAPI query: the one-bit display mask at +0x34
             // (+0x30 0x100 from the caller) to its NVAPI display id at +0x38 (mask 0x100
@@ -2067,6 +2116,53 @@ mod tests {
         }
         assert_eq!(apply_local(&mut local_request(0x0700_00f1, 0x3f), 0, 0), Err(LocalError::Invalid));
         assert_eq!(apply_local(&mut local_request(0x0700_0113, 0x40), 0, 0), Err(LocalError::Invalid));
+    }
+
+    #[test]
+    fn display_mask_settings_and_oca_escapes_match_the_captures() {
+        for (id, mask) in [
+            (0x8006_1080u32, 0x800u32),
+            (0x8006_1081, 0x400),
+            (0x8006_1082, 0x200),
+            (0x8006_1083, 0x100),
+            (0x8006_1085, 0x4000),
+            (0x8006_1086, 0x2000),
+            (0x8006_1087, 0x1000),
+        ] {
+            let mut buf = local_request(0x0700_010c, 0x84);
+            test_put32(&mut buf, 0x2c, 0xffff_ffe9);
+            test_put32(&mut buf, 0x30, id);
+            for at in (0x34..0x84).step_by(4) {
+                test_put32(&mut buf, at, 0);
+            }
+            assert_eq!(apply_local(&mut buf, 0, 0), Ok(LocalOutcome::Applied));
+            let w = |at: usize| u32::from_le_bytes(buf[at..at + 4].try_into().unwrap());
+            assert_eq!(
+                (w(0x08), w(0x14), w(0x2c), w(0x30), w(0x34), w(0x38), w(0x3c), w(0x40), w(0x44)),
+                (0x84, 1, 1, id, 0x100, mask, mask, 0xffff_ffff, 0),
+                "{id:#x}"
+            );
+        }
+        let mut unknown = local_request(0x0700_010c, 0x84);
+        test_put32(&mut unknown, 0x30, 0x100);
+        assert_eq!(apply_local(&mut unknown, 0, 0), Ok(LocalOutcome::Applied));
+        assert_eq!(&unknown[0x2c..0x30], &0xffff_ffe9u32.to_le_bytes());
+
+        for (function, len, result2) in [
+            (0x0100_0041u32, 0xac0usize, 0u32),
+            (0x0100_012b, 0x38, 0),
+            (0x0200_0046, 0xac, 1),
+        ] {
+            let mut buf = local_request(function, len);
+            test_put32(&mut buf, 0x20, 0x066f_c9b0);
+            assert_eq!(apply_local(&mut buf, 1, 0), Ok(LocalOutcome::Applied));
+            assert_eq!(&buf[0x08..0x0c], &0x30u32.to_le_bytes());
+            assert_eq!(&buf[0x14..0x18], &1u32.to_le_bytes());
+            assert_eq!(&buf[0x20..0x24], &0x066f_c9b0u32.to_le_bytes());
+            assert_eq!(&buf[0x2c..0x30], &result2.to_le_bytes());
+            let mut bad = local_request(function, len - 1);
+            assert_eq!(apply_local(&mut bad, 1, 0), Err(LocalError::Invalid));
+        }
     }
 
     #[test]
