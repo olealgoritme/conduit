@@ -243,6 +243,37 @@ pub(crate) fn destroy_context(h_context: usize) {
     publish_channel();
 }
 
+/// Suspend/ResumeContext of a copy context (`ddi::hws`): `None` when `h_context` has no
+/// channel, else the TSG transition's result. A resume rings the doorbell again for work
+/// submitted while the TSG was off the runlist. PASSIVE.
+///
+/// The channel is used outside `CHANNELS`: dxgkrnl does not destroy a context inside its
+/// own Suspend/ResumeContext, and only DestroyContext frees the channel.
+pub(crate) fn suspend(
+    passive: PassiveLevel,
+    h_context: usize,
+    suspend: bool,
+    timeout_us: u32,
+) -> Option<Result<crate::virtio::native_channel::Step, crate::virtio::native_channel::NativeError>> {
+    if h_context == 0 {
+        return None;
+    }
+    let raw = CHANNELS
+        .lock()
+        .iter()
+        .find(|entry| entry.channel != 0 && entry.context == h_context)
+        .map(|entry| entry.channel)?;
+    // SAFETY: see above; the slot's leaked box stays live until DestroyContext.
+    let channel = unsafe { &*(raw as *const CopyChannel) };
+    Some(if suspend {
+        channel.context().suspend(passive, timeout_us)
+    } else {
+        let result = channel.context().resume(passive);
+        channel.kick();
+        result
+    })
+}
+
 /// `SubmitCommandVirtual` (DISPATCH): a submission on an NVDA context without
 /// native channel state that carries the ICD's copy record. `Some(gate)` makes
 /// its DMA fence wait for the work; `None` leaves the submission as it was.

@@ -18,6 +18,7 @@
 
 #![no_std]
 
+pub mod ctx_suspend;
 pub mod ctxsw_preempt;
 pub mod device_lost;
 pub mod ecl_done;
