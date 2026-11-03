@@ -2493,6 +2493,9 @@ unsafe fn native_update_leaf(
 ) -> Result<(), ()> {
     use helios_kmd_logic::native_memory as native;
 
+    // Registry values outlive the boot: the leaf-update failure values are zeroed
+    // once, before this boot's first can be written.
+    crate::virtio::native_memory::reset_leaf_counters_once(passive);
     let fail = |why: u32| {
         crate::diag::record_named_bytes(b"NvPgLeafWhy", why);
         crate::ddi::pt_ring::note_why(why);
@@ -2527,6 +2530,10 @@ unsafe fn native_update_leaf(
     // VidMm's system pages for a device-local allocation (`update_leaf_system`).
     let device_local = allocation.native_segment != 0;
     let mut system_pfns = Vec::new();
+    // Per page: VidMm placed it in system pages (`update_leaf_system`), for an
+    // update that mixes those with anything else.
+    let mut is_system = Vec::new();
+    is_system.try_reserve_exact(count).map_err(|_| ())?;
     let mut any_other = false;
     let mut segment_noted = false;
     for index in 0..count {
@@ -2541,6 +2548,7 @@ unsafe fn native_update_leaf(
         }
         if bits.Valid() == 0 {
             pieces.push(None);
+            is_system.push(false);
             any_other = true;
             continue;
         }
@@ -2592,7 +2600,9 @@ unsafe fn native_update_leaf(
                 return Err(());
             }
             system_pfns.push(page_address);
+            is_system.push(true);
         } else {
+            is_system.push(false);
             any_other = true;
         }
         // PageAddress is VidMm's segment placement, never a host GPA.  The RM
@@ -2615,15 +2625,19 @@ unsafe fn native_update_leaf(
             .paging_pte_shadow
             .update_leaf(update, allocation.native_segment == 0)
     } {
+        // The CPU-side shadow (for VidMm's virtual transfers) could not take it:
+        // noted, but the GPU mapping is still applied. Returning here left the
+        // range unmapped or stale for the GPU.
         fail(4);
-        return Err(());
+    }
+    if !system_pfns.is_empty() && (any_other || repeat) {
+        // Part system pages, part something else (invalid PTEs, the aperture):
+        // each run of one kind is its own update, in order. Refusing the whole
+        // update (`NvPgLeafWhy` 6) left all of it as it was.
+        return native_update_leaf_runs(passive, adapter, allocation, update, &pieces, &is_system, &system_pfns)
+            .map_err(|why| fail(why));
     }
     if !system_pfns.is_empty() {
-        if any_other || repeat {
-            // Part system pages, part something else: not one descriptor.
-            fail(6);
-            return Err(());
-        }
         return crate::virtio::native_memory::update_leaf_system(
             passive,
             adapter,
@@ -2645,6 +2659,67 @@ unsafe fn native_update_leaf(
         &pieces,
     )
     .map_err(|error| fail(0x200 | (error.ntstatus() as u32 & 0xff)))
+}
+
+/// A native leaf update whose PTEs mix VidMm's system pages with other entries:
+/// every maximal run of one kind goes to `update_leaf_system` (system pages) or
+/// `update_leaf` (the rest: RM memory and invalid PTEs), at its own VA and
+/// allocation offset. All runs are applied; the answer is the first failure's
+/// `NvPgLeafWhy` code.
+fn native_update_leaf_runs(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    allocation: crate::ddi::create_allocation::PagingAllocInfo,
+    update: &DXGK_BUILDPAGINGBUFFER_UPDATEPAGETABLE,
+    pieces: &[Option<helios_kmd_logic::native_memory::MappingPiece>],
+    is_system: &[bool],
+    system_pfns: &[u64],
+) -> Result<(), u32> {
+    let page = helios_kmd_logic::native_memory::PAGE_BYTES;
+    let mut first_error = None;
+    let mut start = 0usize;
+    let mut pfn_at = 0usize;
+    while start < pieces.len() {
+        let system = is_system[start];
+        let mut end = start + 1;
+        while end < pieces.len() && is_system[end] == system {
+            end += 1;
+        }
+        let va = update.FirstPteVirtualAddress + start as u64 * page;
+        let offset = update.AllocationOffsetInBytes + start as u64 * page;
+        let result = if system {
+            let pfns = system_pfns.get(pfn_at..pfn_at + (end - start)).ok_or(0x601u32);
+            pfn_at += end - start;
+            pfns.and_then(|pfns| {
+                crate::virtio::native_memory::update_leaf_system(
+                    passive,
+                    adapter,
+                    allocation.native_id,
+                    update.hProcess as usize,
+                    va,
+                    offset,
+                    pfns,
+                )
+                .map_err(|error| 0x300 | (error.ntstatus() as u32 & 0xff))
+            })
+        } else {
+            crate::virtio::native_memory::update_leaf(
+                passive,
+                adapter,
+                allocation.native_id,
+                update.hProcess as usize,
+                va,
+                offset,
+                &pieces[start..end],
+            )
+            .map_err(|error| 0x200 | (error.ntstatus() as u32 & 0xff))
+        };
+        if let Err(why) = result {
+            first_error.get_or_insert(why);
+        }
+        start = end;
+    }
+    first_error.map_or(Ok(()), Err)
 }
 
 unsafe fn native_transfer(
