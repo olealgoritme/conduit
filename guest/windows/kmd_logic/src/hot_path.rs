@@ -19,6 +19,12 @@
 //!   mapping skips RM's idle-channels call (`NV_ESC_RM_IDLE_CHANNELS`, one host
 //!   round trip that waits for the client's channels). VidMm already orders a
 //!   placement change after the GPU work that uses it.
+//! * [`HotPath::ASYNC_FLIP`] (0x8): a native primary's host `ScanoutFlip` is
+//!   submitted without waiting for its reply (`present_submit`); the reply is
+//!   settled at the next native flip through the flip pipeline
+//!   (`crate::flip_pipeline`), with the same bookkeeping as the round trip's
+//!   return. A full window (2 in flight) or a full queue sends
+//!   that flip the synchronous way.
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -32,6 +38,7 @@ impl HotPath {
     pub const FAST_FLIP: u32 = 0x1;
     pub const SKIP_FOREIGN_UNCHANGED: u32 = 0x2;
     pub const NO_QUIESCE: u32 = 0x4;
+    pub const ASYNC_FLIP: u32 = 0x8;
 
     const fn has(self, bit: u32) -> bool {
         self.0 & bit != 0
@@ -44,6 +51,9 @@ impl HotPath {
     }
     pub const fn no_quiesce(self) -> bool {
         self.has(Self::NO_QUIESCE)
+    }
+    pub const fn async_flip(self) -> bool {
+        self.has(Self::ASYNC_FLIP)
     }
 }
 
@@ -255,6 +265,13 @@ pub fn foreign_update_unchanged(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn async_flip_bit() {
+        assert!(HotPath(0x8).async_flip());
+        assert!(!HotPath(0x7).async_flip());
+        assert!(!HotPath(0x8).fast_flip() && !HotPath(0x8).no_quiesce());
+    }
 
     #[test]
     fn paging_knob_bits() {

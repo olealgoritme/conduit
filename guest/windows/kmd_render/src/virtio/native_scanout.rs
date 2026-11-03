@@ -19,9 +19,19 @@
 //! Counters: `NvScN` flips seen, `NvScOk` sent, `NvScGem` GEM imports,
 //! `NvScFail` failures with `NvScWhy` (the step) and `NvScErr` (its code),
 //! `NvScExt` primaries of another size than the mode.
+//!
+//! With `NvHotPath` 0x8 the `ScanoutFlip` is SUBMITTED (`present_submit`) and the
+//! scanout worker goes on; the reply is settled at the next native flip ([`settle`])
+//! through a `flip_pipeline::Pipeline` of window 2, with the
+//! bookkeeping the round trip's return does (`note_async_result`). A full window
+//! or queue sends that flip the synchronous way. `NvScAsN` submitted, `NvScAsAck`
+//! taken, `NvScAsFail` refused, `NvScAsTmo` timed out, `NvScAsSync` sent
+//! synchronously for a full window or queue.
 
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
+use helios_kmd_logic::flip_pipeline::{self as fp, Ack, Pipeline, Settled};
 
 use helios_kmd_logic::foreign_resource::MOD_NVIDIA_BLOCK_LINEAR_BASE;
 use helios_kmd_logic::foreign_scanout::{Layout, FOURCC_XRGB8888};
@@ -60,6 +70,18 @@ static GEMS: AtomicU32 = AtomicU32::new(0);
 static FAILS: AtomicU32 = AtomicU32::new(0);
 static EXTENT: AtomicU32 = AtomicU32::new(0);
 
+/// The pipelined native flips (`NvHotPath` 0x8): at most this many in flight.
+const ASYNC_WINDOW: u8 = 2;
+/// How long the host gets to answer one (100 ns), as the round trip's timeout.
+const ASYNC_TIMEOUT_100NS: u64 = TIMEOUT_MS * 10_000;
+static PIPE: SpinLock<Pipeline> = SpinLock::new(Pipeline::new());
+static CELLS: [AtomicU64; fp::MAX_CELLS] = [const { AtomicU64::new(0) }; fp::MAX_CELLS];
+static AS_SENT: AtomicU32 = AtomicU32::new(0);
+static AS_ACK: AtomicU32 = AtomicU32::new(0);
+static AS_FAIL: AtomicU32 = AtomicU32::new(0);
+static AS_TMO: AtomicU32 = AtomicU32::new(0);
+static AS_SYNC: AtomicU32 = AtomicU32::new(0);
+
 /// Which step failed (`NvScWhy`).
 #[derive(Clone, Copy)]
 enum Step {
@@ -81,6 +103,94 @@ pub(crate) fn publish_hot() {
     if flips != 0 {
         crate::diag::record_named_bytes(b"NvScN", flips);
         crate::diag::record_named_bytes(b"NvScOk", SENT.load(Ordering::Relaxed));
+    }
+    let sent = AS_SENT.load(Ordering::Relaxed);
+    if sent != 0 || AS_SYNC.load(Ordering::Relaxed) != 0 {
+        let r = |a: &AtomicU32| a.load(Ordering::Relaxed);
+        crate::diag::record_named_bytes(b"NvScAsN", sent);
+        crate::diag::record_named_bytes(b"NvScAsAck", r(&AS_ACK));
+        crate::diag::record_named_bytes(b"NvScAsFail", r(&AS_FAIL));
+        crate::diag::record_named_bytes(b"NvScAsTmo", r(&AS_TMO));
+        crate::diag::record_named_bytes(b"NvScAsSync", r(&AS_SYNC));
+    }
+}
+
+/// Settle the pipelined native flips whose answers came (or whose time ran out): the
+/// release book and the source are told what the round trip's return would have told
+/// them. PASSIVE, on the scanout worker only (before each native flip, under the
+/// scanout lifecycle lock, where the round trip's return ran: a settled flip can
+/// restore the desktop source). The last flip before an idle desktop is settled at the
+/// next one; until then the source's lapse runs from its mint, as it does for a flip
+/// in flight. One lock check while nothing is in flight.
+pub(crate) fn settle(adapter: &AdapterContext) {
+    use super::foreign_scanout::{note_async_result, AsyncResult};
+    let t = crate::adapter::foreign_scanout::now_100ns();
+    let mut words = [0u64; fp::MAX_CELLS];
+    for (w, c) in words.iter_mut().zip(CELLS.iter()) {
+        *w = c.load(Ordering::Acquire);
+    }
+    let batch = {
+        let mut g = PIPE.lock();
+        if g.occupied() == 0 {
+            return;
+        }
+        g.settle_all(&words, t, ASYNC_TIMEOUT_100NS)
+    };
+    for item in batch.iter() {
+        match item.settled {
+            Settled::Pending | Settled::Orphaned { .. } => {}
+            Settled::Acked { slot, ack } => {
+                let r = if ack == Ack::Taken {
+                    AS_ACK.fetch_add(1, Ordering::Relaxed);
+                    SENT.fetch_add(1, Ordering::Relaxed);
+                    AsyncResult::Taken
+                } else {
+                    AS_FAIL.fetch_add(1, Ordering::Relaxed);
+                    fail(Step::Present, 0x100);
+                    AsyncResult::Failed
+                };
+                note_async_result(adapter, slot.seq, slot.generation, r);
+            }
+            Settled::TimedOut { slot } => {
+                AS_TMO.fetch_add(1, Ordering::Relaxed);
+                fail(Step::Present, 0x200);
+                note_async_result(adapter, slot.seq, slot.generation, AsyncResult::TimedOut);
+            }
+            Settled::Late { slot, ack } => {
+                let r = if ack == Ack::Taken {
+                    AsyncResult::LateTaken
+                } else {
+                    AsyncResult::LateFailed
+                };
+                note_async_result(adapter, slot.seq, slot.generation, r);
+            }
+        }
+    }
+}
+
+/// Submit the flip of `gem` without waiting (`NvHotPath` 0x8). `None`: the window or
+/// the queue is full and nothing was sent (send it the synchronous way); `Some(ok)`:
+/// submitted, or refused before the ring.
+fn present_async(passive: PassiveLevel, adapter: &AdapterContext, drm: u32, gem: u32, epoch: u64) -> Option<bool> {
+    use super::foreign_scanout::{present_submit, PresentRefusal};
+    settle(adapter);
+    let i = {
+        let mut g = PIPE.lock();
+        if g.window() != ASYNC_WINDOW {
+            g.set_window(ASYNC_WINDOW);
+        }
+        g.free_slot()?
+    };
+    let at = crate::adapter::foreign_scanout::now_100ns();
+    match present_submit(passive, adapter, KMD, drm, gem, &CELLS[i]) {
+        Ok((seq, generation)) => {
+            // The only submitter is the scanout worker: cell `i` is still free.
+            let _ = PIPE.lock().begin_at(i, seq, at, generation, epoch, 0, false);
+            AS_SENT.fetch_add(1, Ordering::Relaxed);
+            Some(true)
+        }
+        Err(PresentRefusal::Device(super::VirtioError::QueueFull)) => None,
+        Err(_) => Some(false),
     }
 }
 
@@ -179,6 +289,22 @@ fn show(adapter: &AdapterContext, native_id: u32, mode: (u32, u32)) {
             helios_kmd_logic::foreign_scanout::SetError::Layout(_) => 2,
         });
         return;
+    }
+    // `NvHotPath` 0x8: submitted, settled later (`settle`); `NvScOk` then counts at the answer.
+    if crate::ddi::hot_path::knob(passive).async_flip() {
+        match present_async(passive, adapter, drm, gem, epoch) {
+            Some(true) => return,
+            Some(false) => {
+                fail(Step::Present, 0x300);
+                return;
+            }
+            None => {
+                AS_SYNC.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    } else if PIPE.lock().occupied() != 0 {
+        // The knob went off with flips in flight (a StartDevice re-read): settle them.
+        settle(adapter);
     }
     match crate::virtio::foreign_scanout::present_within(passive, adapter, KMD, drm, gem, TIMEOUT_MS) {
         Ok(_) => {
