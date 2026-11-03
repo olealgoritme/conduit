@@ -53,6 +53,7 @@ pub(crate) mod hwfq;
 mod lifecycle;
 pub(crate) mod mode_list;
 pub(crate) mod mirror_thread;
+pub(crate) mod native_snap;
 pub(crate) mod onscanout;
 pub(crate) mod pt_ring;
 pub(crate) mod present_foreign;

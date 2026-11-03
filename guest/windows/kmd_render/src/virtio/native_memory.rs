@@ -5361,3 +5361,109 @@ pub fn forget(passive: PassiveLevel) {
         unlock_pins(&mut allocation.pins);
     }
 }
+
+/// What [`lookup_va`] found mapped at a VA (diagnosis: `ddi::native_snap`).
+#[derive(Clone, Copy, Default)]
+pub struct VaHit {
+    pub process: usize,
+    /// 1 a native allocation's RM memory, 2 VidMm's system pages of a native allocation
+    /// (an OS-descriptor mapping), 3 a non-native allocation's system pages (`foreign`).
+    pub kind: u8,
+    pub id: u32,
+    pub memory: u32,
+    pub size: u64,
+    pub piece_va: u64,
+    pub piece_len: u64,
+    pub memory_offset: u64,
+    /// The physical address of the byte at the VA for kinds 2 and 3 (0 = unknown).
+    pub physical: u64,
+    /// VidMm's last residency notification (`notify_residency`): the physical address.
+    pub resident: Option<u64>,
+    pub system_memory: bool,
+    pub poisoned: bool,
+    pub huge: bool,
+}
+
+/// Diagnosis (`ddi::native_snap`, `NvSnapVa`): every mapping this KMD made that covers `va`
+/// in `process`'s space (0 = in any process), up to `out.len()`. Read-only: one state lock,
+/// no host call; any IRQL up to DISPATCH. Returns how many were written.
+pub fn lookup_va(process: usize, va: u64, out: &mut [VaHit]) -> usize {
+    let state = st();
+    let mut n = 0usize;
+    let covers = |m: &HostMapping| {
+        (process == 0 || m.process == process)
+            && va >= m.piece.va
+            && m.piece.end().is_some_and(|end| va < end)
+    };
+    let mut visit = |allocation: &Allocation, n: &mut usize| {
+        for m in allocation.mappings.iter().filter(|m| covers(m)) {
+            if *n >= out.len() {
+                return;
+            }
+            let delta = va - m.piece.va;
+            let physical = if m.desc != 0 {
+                state
+                    .descs
+                    .pfns(m.desc)
+                    .and_then(|pfns| pfns.get((delta >> 12) as usize).copied())
+                    .map_or(0, |pfn| (pfn << 12) | (va & 0xfff))
+            } else {
+                0
+            };
+            out[*n] = VaHit {
+                process: m.process,
+                kind: if m.desc != 0 { 2 } else { 1 },
+                id: allocation.id,
+                memory: allocation.memory,
+                size: allocation.size,
+                piece_va: m.piece.va,
+                piece_len: m.piece.len,
+                memory_offset: m.piece.memory_offset,
+                physical,
+                resident: allocation.resident.map(|(pa, _)| pa),
+                system_memory: allocation.system_memory != 0,
+                poisoned: allocation.poisoned,
+                huge: allocation.huge,
+            };
+            *n += 1;
+        }
+    };
+    let indexed = process != 0 && !state.index_broken;
+    if indexed {
+        let ids = state
+            .by_process
+            .iter()
+            .find(|(p, _)| *p == process)
+            .map_or(&[][..], |(_, ids)| ids.as_slice());
+        for id in ids {
+            if let Some(i) = state.index_of(*id) {
+                visit(&state.allocations[i], &mut n);
+            }
+        }
+    } else {
+        for allocation in state.allocations.iter() {
+            visit(allocation, &mut n);
+        }
+    }
+    for m in state.foreign.iter().filter(|m| covers(m)) {
+        if n >= out.len() {
+            break;
+        }
+        let delta = va - m.piece.va;
+        let physical = state
+            .descs
+            .pfns(m.desc)
+            .and_then(|pfns| pfns.get((delta >> 12) as usize).copied())
+            .map_or(0, |pfn| (pfn << 12) | (va & 0xfff));
+        out[n] = VaHit {
+            process: m.process,
+            kind: 3,
+            piece_va: m.piece.va,
+            piece_len: m.piece.len,
+            physical,
+            ..VaHit::default()
+        };
+        n += 1;
+    }
+    n
+}

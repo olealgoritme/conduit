@@ -514,6 +514,9 @@ pub(crate) struct NativeContext {
     veids: AtomicU64,
     /// `NvPreempt`: the TSG's preemption modes, set once, and its GfxP buffers.
     preempt: Preempt,
+    /// The TSG's hardware id (`NVA06C_CTRL_CMD_GET_INFO`), asked once by a hang snapshot
+    /// (`ddi::native_snap`); u32::MAX = not asked yet.
+    hw_tsg: AtomicU32,
 }
 
 /// A TSG's preemption state (`NvPreempt`, `helios_kmd_logic::ctxsw_preempt`): the gate
@@ -581,6 +584,25 @@ impl NativeContext {
         self.owner
     }
 
+    /// The TSG's hardware id (the `TSGID` a host Xid 109 names), asked of RM once and kept;
+    /// 0xffff when RM refused. PASSIVE (`ddi::native_snap`).
+    pub(crate) fn hw_tsg_id(&self, passive: PassiveLevel) -> u32 {
+        let known = self.hw_tsg.load(Ordering::Relaxed);
+        if known != u32::MAX {
+            return known;
+        }
+        let tsg = self.tsg;
+        let mut id = 0xffffu32;
+        let _ = self.with_client(passive, |io, client| {
+            let mut info = [0u8; 4];
+            io.control(client, tsg, helios_kmd_logic::ctxsw_preempt::CTRL_TSG_GET_INFO, &mut info)?;
+            id = u32::from_le_bytes(info);
+            Ok(())
+        });
+        self.hw_tsg.store(id, Ordering::Relaxed);
+        id
+    }
+
     /// The process key native memory files this context's mappings under.
     pub(crate) fn process_key(&self) -> usize {
         self.process as usize
@@ -639,6 +661,7 @@ impl NativeContext {
             graphics_queues: AtomicU32::new(0),
             veids: AtomicU64::new(0),
             preempt: Preempt::default(),
+            hw_tsg: AtomicU32::new(u32::MAX),
         })
     }
 
@@ -828,6 +851,39 @@ pub(crate) struct NativeQueue {
     /// share), and whether the queue counts as the context's graphics queue.
     veid: u32,
     graphics: bool,
+    /// The GPFIFO ring's GPU VA, and the process id of the queue's creator (diagnosis:
+    /// `ddi::native_snap`).
+    gpfifo_va: u64,
+    pid: u32,
+}
+
+/// What a hang snapshot (`ddi::native_snap`) records of one native queue, read without a host
+/// call (`NativeQueue::snap`).
+pub(crate) struct QueueSnap {
+    pub pid: u32,
+    pub token: u32,
+    pub veid: u32,
+    pub graphics: bool,
+    pub dead: bool,
+    pub copy_bound: bool,
+    pub kmd_gp_put: u32,
+    pub userd: [u32; helios_kmd_logic::native_snap::USERD_DWORDS],
+    pub notifier_info32: u32,
+    pub notifier_word: u32,
+    pub ring_entries: u32,
+    pub gpfifo_va: u64,
+    pub fence_now: u64,
+    pub fence_gpu: u64,
+    pub channel: u32,
+    pub tsg: u32,
+    pub ctxshare: u32,
+    pub process_key: usize,
+    pub context_key: usize,
+}
+
+extern "system" {
+    /// `PsGetCurrentProcessId()`: any IRQL.
+    fn PsGetCurrentProcessId() -> *mut c_void;
 }
 
 impl NativeQueue {
@@ -960,6 +1016,10 @@ impl NativeQueue {
             dead: core::sync::atomic::AtomicBool::new(false),
             veid,
             graphics,
+            gpfifo_va: queue.gpfifo_va,
+            // SAFETY: a scalar read of the current process id (CreateHwQueue runs in the
+            // creating process).
+            pid: unsafe { PsGetCurrentProcessId() } as usize as u32,
         })
     }
 
@@ -1145,6 +1205,109 @@ impl NativeQueue {
 
     pub(crate) fn token(&self) -> Token {
         Token(self.parts.token)
+    }
+
+    /// The KMD's GP_PUT (the GP_PUT lock). Any IRQL up to DISPATCH.
+    pub(crate) fn kmd_gp_put(&self) -> u32 {
+        *self.gp_put.lock()
+    }
+
+    /// The queue's state for a hang snapshot: USERD, the error notifier, the progress fence,
+    /// handles. No host call; the GP_PUT lock for the KMD's GP_PUT. Any IRQL up to DISPATCH.
+    pub(crate) fn snap(&self) -> QueueSnap {
+        use helios_kmd_logic::native_snap::USERD_DWORDS;
+        let ctl = self.parts.ctl.va;
+        let mut userd = [0u32; USERD_DWORDS];
+        let (mut info32, mut word) = (0, 0);
+        if ctl != 0 {
+            for (i, v) in userd.iter_mut().enumerate() {
+                // SAFETY: the queue's live control view (CTL_BYTES, non-paged); USERD's
+                // first 256 bytes lie inside it at USERD_OFFSET.
+                *v = unsafe { ((ctl + cc::USERD_OFFSET + 4 * i as u64) as *const u32).read_volatile() };
+            }
+            // SAFETY: as in `channel_error`.
+            unsafe {
+                info32 = ((ctl + helios_kmd_logic::native_hang::ERROR_INFO32_AT) as *const u32).read_volatile();
+                word = ((ctl + helios_kmd_logic::native_hang::ERROR_WORD_AT) as *const u32).read_volatile();
+            }
+        }
+        let context = self.context();
+        QueueSnap {
+            pid: self.pid,
+            token: self.parts.token,
+            veid: self.veid,
+            graphics: self.graphics,
+            dead: self.dead.load(Ordering::Acquire),
+            copy_bound: self.copy_bound.load(Ordering::Relaxed),
+            kmd_gp_put: *self.gp_put.lock(),
+            userd,
+            notifier_info32: info32,
+            notifier_word: word,
+            ring_entries: self.ring_bytes / 8,
+            gpfifo_va: self.gpfifo_va,
+            fence_now: self.read_progress(),
+            fence_gpu: self._progress_fence_gpu,
+            channel: match (self.parts.handles, self.parts.channel_allocated) {
+                (Some(handles), true) => handles.at(5),
+                _ => 0,
+            },
+            tsg: context.map_or(0, |c| c.tsg),
+            ctxshare: context.map_or(0, |c| c.ctxshare),
+            process_key: context.map_or(0, |c| c.process_key()),
+            context_key: context.map_or(0, |c| c as *const NativeContext as usize),
+        }
+    }
+
+    /// Read `out.len()` GPFIFO entries from ring index `first` on (wrapping) through the
+    /// KMD's CPU view of the ring's allocation. `(lo, hi)` per entry; a native-snapshot read
+    /// status (`helios_kmd_logic::native_snap::RD_*`). PASSIVE.
+    pub(crate) fn snap_ring(
+        &self,
+        passive: PassiveLevel,
+        adapter: &AdapterContext,
+        first: u32,
+        out: &mut [(u32, u32)],
+    ) -> u32 {
+        use helios_kmd_logic::native_snap as ns;
+        let entries = self.ring_bytes / 8;
+        if entries == 0 || self.ring_id == 0 {
+            return ns::RD_NOT_MAPPED;
+        }
+        let mut done = 0usize;
+        while done < out.len() {
+            let index = (first + done as u32) % entries;
+            let run = (out.len() - done).min((entries - index) as usize);
+            let mut words = [0u32; 2 * ns::WINDOW];
+            let n = run.min(ns::WINDOW);
+            // SAFETY: PASSIVE; the closure copies at most `n` entries out.
+            let read = unsafe {
+                super::native_memory::with_cpu_range(
+                    passive,
+                    adapter,
+                    self.ring_id,
+                    self.ring_offset + u64::from(index) * 8,
+                    n as u64 * 8,
+                    |relative, native, len| {
+                        let at = relative as usize / 4;
+                        let k = (len as usize / 4).min((2 * n).saturating_sub(at));
+                        for i in 0..k {
+                            words[at + i] = (native as *const u32).add(i).read_volatile();
+                        }
+                        true
+                    },
+                )
+            };
+            match read {
+                Ok(true) => {}
+                Ok(false) => return ns::RD_NOT_MAPPED,
+                Err(_) => return ns::RD_ERROR,
+            }
+            for i in 0..n {
+                out[done + i] = (words[2 * i], words[2 * i + 1]);
+            }
+            done += n;
+        }
+        ns::RD_OK
     }
 
     /// DISPATCH-safe: one spinlock and three volatile stores/barriers.  No RM
