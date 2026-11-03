@@ -2290,6 +2290,9 @@ const NV_SHM_ID_APERTURE: u8 = SHM_ID_APERTURE;
 struct NvGpuBackend {
     nvidia: Arc<Mutex<NvidiaBackend>>,
     mem: Option<GuestMemoryAtomic<GuestMemoryMmap>>,
+    /// The long-term pin of all guest RAM (`CONDUIT_PIN_GUEST_RAM`, on by
+    /// default for the NVIDIA UMD personality), fed each memory table.
+    guest_pin: Option<Arc<device::guestpin::Shared>>,
     event_idx: bool,
     config: VirtioGpuNvConfig,
     /// Started on the first message, because the event queue and guest memory
@@ -2482,6 +2485,16 @@ impl NvGpuBackend {
 
         let nvidia_vram_mib = nvidia.vram_limit_mib();
         let mut config = VirtioGpuNvConfig::new(&version, &gpus, caps, nvidia_vram_mib);
+        let guest_pin = {
+            use device::guestpin::{ENV, enabled};
+            let value = std::env::var(ENV).ok();
+            let on = enabled(value.as_deref(), nvidia_umd);
+            log::info!(
+                "guest RAM pin: {} ({ENV}=1|0; default on for the NVIDIA UMD personality)",
+                if on { "on" } else { "off" }
+            );
+            on.then(Arc::<device::guestpin::Shared>::default)
+        };
         if nvidia_umd {
             config.set_nvidia_umd();
             log::info!("NVIDIA UMD personality: RTX 5090 PCI identity");
@@ -2511,6 +2524,7 @@ impl NvGpuBackend {
         Ok(Self {
             nvidia: Arc::new(Mutex::new(nvidia)),
             mem: None,
+            guest_pin,
             event_idx: false,
             // Phase A forwards ioctls only. nvidia-smi needs no mapping at all
             // -- 100 ioctls and one mmap in the captured trace -- so a guest
@@ -3097,6 +3111,24 @@ impl VhostUserBackendMut for NvGpuBackend {
             .lock()
             .unwrap()
             .set_guest_ram(Box::new(VhostGuestRam(mem.clone())));
+        // Pin all of it once, so a registration never has to migrate a guest
+        // page out of a CMA pageblock (see `device::guestpin`). A region
+        // already pinned is skipped, so a table sent again costs nothing.
+        if let Some(pin) = &self.guest_pin {
+            let ranges = mem
+                .memory()
+                .iter()
+                .filter_map(|r| {
+                    let f = r.file_offset()?;
+                    Some(device::guestpin::FileRange {
+                        fd: f.file().try_clone().ok()?.into(),
+                        offset: f.start(),
+                        len: r.len(),
+                    })
+                })
+                .collect();
+            pin.pin_async(ranges);
+        }
         self.mem = Some(mem);
         Ok(())
     }
