@@ -28,6 +28,8 @@
 //! 2/3 foreign map ok/failed, 4 foreign drop, 5/6 native video-memory map ok/failed, 7/8
 //! system-page map ok/failed, 10 RM unmap, 11 a native leaf update ended (detail = its
 //! `leaf_stage`: 0xfe mapped, 0xff nothing to change, else the stage it failed at).
+//! 27 / 28: a leaf update left something unapplied / repaired stale bookkeeping
+//! ([`K_LEAF_FAIL`], [`K_LEAF_FIX`]).
 
 /// Slots in the driver's ring.
 pub const SLOTS: usize = 4096;
@@ -85,6 +87,27 @@ pub const K_QUIESCE: u8 = 25;
 /// A native channel fault or hang was reported (`HwsNatFault` / `HwsNatHang`; detail = the
 /// node, aux = the `native_hang::Cause` code).
 pub const K_FAULT: u8 = 26;
+/// A native leaf update left part of VidMm's request unapplied (detail = the leaf stage,
+/// aux = `site << 8 | Error`): the range is unmapped or stale while VidMm believes it mapped.
+/// `NvLfFail` counts them; a clean run has none.
+pub const K_LEAF_FAIL: u8 = 27;
+/// A native leaf update repaired the driver's own record of the range and went on (detail =
+/// what: [`FIX_UNMAP`], [`FIX_OVERLAP`], [`FIX_POISON`], [`FIX_RETRY`]; aux = the allocation
+/// id). `NvLfFixN` counts them.
+pub const K_LEAF_FIX: u8 = 28;
+
+// `K_LEAF_FIX` details.
+/// RM refused to unmap a recorded mapping: its virtual object was freed instead and the
+/// record dropped.
+pub const FIX_UNMAP: u16 = 1;
+/// Recorded mappings overlapped each other: the later one was dropped unseen.
+pub const FIX_OVERLAP: u16 = 2;
+/// The allocation was marked poisoned by an earlier failure: updated anyway.
+pub const FIX_POISON: u16 = 3;
+/// RM refused a map and a smaller shape of it was mapped instead.
+pub const FIX_RETRY: u16 = 4;
+/// The outside part of a dropped mapping could not be shown again (stays unmapped).
+pub const FIX_LOST_REST: u16 = 5;
 
 // `K_UPT_IN` flags.
 pub const UPT_NATIVE: u8 = 1 << 0;
@@ -118,6 +141,7 @@ pub const fn touches(kind: u8) -> bool {
             | K_UPT_IN
             | K_EVICT
             | K_EVICT_REST
+            | K_LEAF_FAIL
     )
 }
 
@@ -358,7 +382,8 @@ mod tests {
         for k in [K_MAP_VID, K_UNMAP, K_MAP_SYS, K_FOREIGN_DROP, K_EVICT, K_UPT_IN] {
             assert!(touches(k), "{k}");
         }
-        for k in [K_LEAF_DONE, K_UPT_OUT, K_TLB_INV, K_QUIESCE, K_FAULT] {
+        assert!(touches(K_LEAF_FAIL));
+        for k in [K_LEAF_DONE, K_UPT_OUT, K_TLB_INV, K_QUIESCE, K_FAULT, K_LEAF_FIX] {
             assert!(!touches(k), "{k}");
         }
     }

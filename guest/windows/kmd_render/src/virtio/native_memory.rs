@@ -13,7 +13,6 @@
 //! is never held over a host round trip, an MDL operation, or an allocation.
 
 use alloc::boxed::Box;
-use alloc::vec;
 use alloc::vec::Vec;
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -21,6 +20,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use helios_kmd_logic::ce_route as cr;
 use helios_kmd_logic::desc_cache::{DescTable, Released};
 use helios_kmd_logic::hot_path::Paging;
+use helios_kmd_logic::leaf_plan as lp;
 use helios_kmd_logic::rm_batch as rb;
 use helios_kmd_logic::native_memory as nm;
 use helios_kmd_logic::native_perf as np;
@@ -655,6 +655,9 @@ pub enum Error {
     NoMemory,
     Host,
     WrongAddress,
+    /// No longer produced (leaf updates repair overlapping records); kept so the
+    /// published error numbers (`NvLfErr`, `NvFailE*`) keep their values.
+    #[allow(dead_code)]
     Overlap,
     Poisoned,
 }
@@ -1840,18 +1843,6 @@ fn rm_error_code(error: rc::RmError) -> u32 {
     }
 }
 
-fn map_fixed(
-    io: &Io<'_>,
-    memory: u32,
-    allocation_size: u64,
-    system_backed: bool,
-    space: u32,
-    virt: u32,
-    piece: nm::MappingPiece,
-) -> Result<u32, Error> {
-    map_fixed_opts(io, memory, allocation_size, system_backed, space, virt, piece, false)
-}
-
 /// Whether the RM memory `memory` of a native allocation has 2-MiB pages. Takes
 /// STATE: never call it with a STATE guard alive.
 fn memory_is_huge(memory: u32) -> bool {
@@ -1861,8 +1852,8 @@ fn memory_is_huge(memory: u32) -> bool {
         .any(|a| a.memory == memory && a.huge)
 }
 
-/// [`map_fixed`] with the RM page size the piece allows (NvPerfMem 0x08 big,
-/// 0x10 huge pages for video memory; a large-page mapping RM refuses is made
+/// Map `piece` of RM memory `memory` at its exact VA in `space` with the RM
+/// page size the piece allows (NvPerfMem 0x08 big, 0x10 huge pages for video memory; a large-page mapping RM refuses is made
 /// again with 4-KiB pages) and, with `defer`, the TLB invalidate left to a later
 /// operation of the same leaf update (NvPerfMem 0x20).
 #[allow(clippy::too_many_arguments)]
@@ -1889,7 +1880,7 @@ fn map_fixed_opts(
         // steps down, and 4 KiB below is what every mapping was before.
         while page != np::MAP_PAGE_4K {
             let flags = np::with_page_size(LOCAL_4K_MAP_FLAGS, page) | defer_flag;
-            match map_fixed_flags(io, memory, allocation_size, false, space, virt, piece, flags) {
+            match map_fixed_flags(io, memory, allocation_size, false, space, virt, piece, flags, false) {
                 Ok(used) => {
                     LARGE_STREAK.store(0, Ordering::Relaxed);
                     if page == np::MAP_PAGE_HUGE {
@@ -1921,7 +1912,7 @@ fn map_fixed_opts(
         LOCAL_4K_MAP_FLAGS
     };
     let flags = base | defer_flag;
-    let used = map_fixed_flags(io, memory, allocation_size, system_backed, space, virt, piece, flags)?;
+    let used = map_fixed_flags(io, memory, allocation_size, system_backed, space, virt, piece, flags, false)?;
     if defer {
         bump(&DEFERRED, b"NvPmDefer");
     }
@@ -1938,6 +1929,7 @@ fn map_fixed_flags(
     virt: u32,
     piece: nm::MappingPiece,
     flags: u32,
+    force_4k_virtual: bool,
 ) -> Result<u32, Error> {
     nm::validate_piece(piece, allocation_size).map_err(|_| Error::Invalid)?;
     let end = piece.end().ok_or(Error::Invalid)?;
@@ -1945,8 +1937,9 @@ fn map_fixed_flags(
         return map_in_window(io, memory, window, flags, piece);
     }
     // System pages map with 4-KiB PTEs at VidMm's 4-KiB-aligned VAs: their virtual
-    // object must be 4-KiB-paged, or RM aligns it down to the big page.
-    let params = if system_backed {
+    // object must be 4-KiB-paged, or RM aligns it down to the big page. A retry of
+    // a refused video-memory map asks for the same (`map_retry`).
+    let params = if system_backed || force_4k_virtual {
         cc::virtual_params_4k(io.client.root, space, Some(piece.va), piece.len)
     } else {
         cc::virtual_params(io.client.root, space, Some(piece.va), piece.len)
@@ -2101,6 +2094,12 @@ fn unmap_fixed(io: &Io<'_>, memory: u32, mapping: HostMapping) -> Result<(), Err
 /// [`unmap_fixed`]; with `defer` the TLB invalidate is left to a later operation
 /// of the same leaf update (NvPerfMem 0x20).
 fn unmap_fixed_opts(io: &Io<'_>, memory: u32, mapping: HostMapping, defer: bool) -> Result<(), Error> {
+    unmap_fixed_ex(io, memory, mapping, defer).map_err(|(_, error)| error)
+}
+
+/// [`unmap_fixed_opts`] that tells an unmap RM refused (`(true, _)`: the mapping
+/// may still be there, nothing was freed) from a failure after it (`(false, _)`).
+fn unmap_fixed_ex(io: &Io<'_>, memory: u32, mapping: HostMapping, defer: bool) -> Result<(), (bool, Error)> {
     watch::event(mapping.piece.va, mapping.piece.len, 10, 0, mapping.process);
     let memory = if mapping.desc != 0 { mapping.desc } else { memory };
     let mut block = nm::nvos47_unmap(
@@ -2116,24 +2115,41 @@ fn unmap_fixed_opts(io: &Io<'_>, memory: u32, mapping: HostMapping, defer: bool)
         bump(&DEFERRED, b"NvPmDefer");
     }
     let mut response = [0u8; REPLY_MAX];
-    let n = io.exchange(
-        io.client.ctl,
-        rc::nv_cmd(cc::ESC_RM_UNMAP_MEMORY_DMA, cc::NVOS47_BYTES as u32),
-        &block,
-        &[],
-        &mut response,
-    )?;
-    rc::rm_reply(response.get(..n).ok_or(Error::Host)?, cc::NVOS47_STATUS_AT)
-        .map_err(|_| Error::Host)?;
+    let n = io
+        .exchange(
+            io.client.ctl,
+            rc::nv_cmd(cc::ESC_RM_UNMAP_MEMORY_DMA, cc::NVOS47_BYTES as u32),
+            &block,
+            &[],
+            &mut response,
+        )
+        .map_err(|e| (true, e))?;
+    rc::rm_reply(response.get(..n).ok_or((true, Error::Host))?, cc::NVOS47_STATUS_AT)
+        .map_err(|_| (true, Error::Host))?;
     // The space's low window outlives its mappings (`release_process`).
     if !is_window(mapping.virt) {
-        io.rm_free(nd::H_DEVICE, mapping.virt)?;
+        io.rm_free(nd::H_DEVICE, mapping.virt).map_err(|e| (false, e))?;
     }
     if mapping.desc != 0 {
         // Freed unless another mapping shows it or it is kept idle (`NvPaging` 0x2).
-        release_desc(io, mapping.desc)?;
+        release_desc(io, mapping.desc).map_err(|e| (false, e))?;
     }
     Ok(())
+}
+
+/// A recorded mapping RM would not unmap (or whose unmap's fate is unknown): its
+/// virtual object is freed, which takes whatever it still maps with it, and its
+/// descriptor reference dropped, so the record can go and the VA be mapped
+/// again. A window mapping cannot be freed this way; a map over it is refused
+/// and counted then. Best effort (`NvLfFixN`).
+fn forget_refused(io: &Io<'_>, mapping: HostMapping, id: u32) {
+    if !is_window(mapping.virt) {
+        let _ = io.rm_free(nd::H_DEVICE, mapping.virt);
+    }
+    if mapping.desc != 0 {
+        let _ = release_desc(io, mapping.desc);
+    }
+    leaf_fix(ptr::FIX_UNMAP, id, mapping.piece.va, mapping.piece.len, mapping.process);
 }
 
 /// An explicit TLB invalidate of `space` (`NV0080_CTRL_CMD_DMA_INVALIDATE_TLB`),
@@ -2720,23 +2736,55 @@ fn finish_desc_job(
 /// `NvPaging` 0x1; with `abort` the first failure stops the rest (as a loop of
 /// [`unmap_fixed_opts`] that returns at its first error does).
 fn unmap_many(io: &Io<'_>, items: &[(u32, HostMapping, bool)], abort: bool, out: &mut Vec<Result<(), Error>>) -> Result<(), Error> {
+    let mut refused = Vec::new();
+    unmap_many_ex(io, items, abort, out, &mut refused)
+}
+
+/// [`unmap_many`] that also tells, per item, whether the unmap itself was refused
+/// or not attempted (`refused[i]`: the mapping may still be there and nothing of
+/// it was freed) rather than failing after it.
+fn unmap_many_ex(
+    io: &Io<'_>,
+    items: &[(u32, HostMapping, bool)],
+    abort: bool,
+    out: &mut Vec<Result<(), Error>>,
+    refused: &mut Vec<bool>,
+) -> Result<(), Error> {
     out.clear();
+    refused.clear();
     out.try_reserve_exact(items.len()).map_err(|_| Error::NoMemory)?;
+    refused.try_reserve_exact(items.len()).map_err(|_| Error::NoMemory)?;
     let mut done = 0;
     if batch_on(io) && !items.is_empty() {
-        done = unmap_many_batched(io, items, abort, out);
+        done = unmap_many_batched(io, items, abort, out, refused);
     }
     for (memory, mapping, defer) in &items[done..] {
         if abort && out.iter().any(|r| r.is_err()) {
             out.push(Err(Error::Host));
+            refused.push(true);
             continue;
         }
-        out.push(unmap_fixed_opts(io, *memory, *mapping, *defer));
+        match unmap_fixed_ex(io, *memory, *mapping, *defer) {
+            Ok(()) => {
+                out.push(Ok(()));
+                refused.push(false);
+            }
+            Err((was_refused, error)) => {
+                out.push(Err(error));
+                refused.push(was_refused);
+            }
+        }
     }
     Ok(())
 }
 
-fn unmap_many_batched(io: &Io<'_>, items: &[(u32, HostMapping, bool)], abort: bool, out: &mut Vec<Result<(), Error>>) -> usize {
+fn unmap_many_batched(
+    io: &Io<'_>,
+    items: &[(u32, HostMapping, bool)],
+    abort: bool,
+    out: &mut Vec<Result<(), Error>>,
+    refused: &mut Vec<bool>,
+) -> usize {
     struct Plan {
         at_unmap: usize,
         at_virt: Option<usize>,
@@ -2820,6 +2868,7 @@ fn unmap_many_batched(io: &Io<'_>, items: &[(u32, HostMapping, bool)], abort: bo
             Err(BatchFailure::Indeterminate(error)) => {
                 for _ in plans.drain(..) {
                     out.push(Err(error));
+                    refused.push(true);
                     done += 1;
                 }
                 continue;
@@ -2830,6 +2879,7 @@ fn unmap_many_batched(io: &Io<'_>, items: &[(u32, HostMapping, bool)], abort: bo
             done += 1;
             if !entry_ok(&resp, caps, plan.at_unmap) {
                 out.push(Err(Error::Host));
+                refused.push(true);
                 continue;
             }
             watch::event(m.piece.va, m.piece.len, 10, 0, m.process);
@@ -2850,6 +2900,7 @@ fn unmap_many_batched(io: &Io<'_>, items: &[(u32, HostMapping, bool)], abort: bo
                 }
             }
             out.push(result);
+            refused.push(false);
         }
     }
     done
@@ -2935,19 +2986,52 @@ pub fn writeback_open(id: u32, bytes: &mut [u8]) -> Result<(), Error> {
 static EVICTED: AtomicU32 = AtomicU32::new(0);
 static EVICT_FAILED: AtomicU32 = AtomicU32::new(0);
 
+/// Which mappings [`evict_range`] drops.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Evict {
+    /// Every allocation's but this one's, and the foreign ranges.
+    Others(u32),
+    /// Every allocation's and the foreign ranges.
+    All,
+    /// This allocation's only (a leaf update of its own range).
+    Only(u32),
+}
+
+impl Evict {
+    fn takes(self, id: u32) -> bool {
+        match self {
+            Self::Others(keep) => id != keep,
+            Self::All => true,
+            Self::Only(only) => id == only,
+        }
+    }
+
+    fn foreign(self) -> bool {
+        !matches!(self, Self::Only(_))
+    }
+}
+
 /// Drop every mapping of `process` in `[first_va, first_va + len)` that VidMm's
-/// page table no longer shows there: foreign ranges and other allocations
-/// (`keep` excepted). The parts of a dropped mapping outside the range are
-/// mapped again (RM unmaps whole objects); one that cannot be stays unmapped,
-/// as if VidMm had not written it yet. Callers hold the RM lock.
+/// page table no longer shows there (`which`: foreign ranges and other
+/// allocations, or the updated allocation's own). The parts of a dropped
+/// mapping outside the range are mapped again (RM unmaps whole objects), as
+/// what they showed: the RM memory at the same offset, or the same system
+/// pages. A recorded mapping RM will not unmap has its virtual object freed
+/// instead (`forget_refused`); records that overlap each other keep the first
+/// (`leaf_plan::overlapping_entries`). A part that cannot be shown again stays
+/// unmapped and is counted (`NvEvictFail`, `NvLfFail`). With `defer` the unmaps
+/// defer their TLB invalidates; the answer is whether one is still owed (no
+/// later non-deferred operation here settled it). Callers hold the RM lock.
+#[allow(clippy::too_many_arguments)]
 fn evict_range(
     io: &Io<'_>,
     space: u32,
     process: usize,
     first_va: u64,
     len: u64,
-    keep: Option<u32>,
-) -> Result<(), Error> {
+    which: Evict,
+    defer: bool,
+) -> Result<bool, Error> {
     // NvEvictOff=1 (test knob): leave other mappings alone, as before eviction.
     static EVICT_OFF: AtomicU32 = AtomicU32::new(u32::MAX);
     let mut off = EVICT_OFF.load(Ordering::Relaxed);
@@ -2955,10 +3039,9 @@ fn evict_range(
         off = crate::diag::read_config_dword(crate::diag::KnobName::new(b"NvEvictOff"), 0);
         EVICT_OFF.store(off, Ordering::Relaxed);
     }
-    if off == 1 {
-        return Ok(());
+    if off == 1 && which.foreign() {
+        return Ok(false);
     }
-    let end = first_va.checked_add(len).ok_or(Error::Invalid)?;
     let hit = |m: &HostMapping| {
         m.process == process && nm::ranges_overlap(m.piece.va, m.piece.len, first_va, len)
     };
@@ -2973,17 +3056,25 @@ fn evict_range(
     let mut candidates = Vec::new();
     let (foreign, victims) = {
         let mut state = st();
-        // Only this process's allocations can map here (`by_process`).
-        state.candidates(process, &mut candidates)?;
         let mut foreign = Vec::new();
-        if state.foreign.iter().any(|m| hit(m)) {
-            foreign.try_reserve(state.foreign.len()).map_err(|_| Error::NoMemory)?;
-            foreign.extend(state.foreign.iter().copied().filter(|m| hit(m)));
-            state.foreign.retain(|m| !hit(m));
-        }
         let mut victims = Vec::new();
         let mut emptied = false;
-        for &id in candidates.iter().filter(|id| Some(**id) != keep) {
+        match which {
+            Evict::Only(id) => {
+                candidates.try_reserve(1).map_err(|_| Error::NoMemory)?;
+                candidates.push(id);
+            }
+            _ => {
+                // Only this process's allocations can map here (`by_process`).
+                state.candidates(process, &mut candidates)?;
+                if state.foreign.iter().any(|m| hit(m)) {
+                    foreign.try_reserve(state.foreign.len()).map_err(|_| Error::NoMemory)?;
+                    foreign.extend(state.foreign.iter().copied().filter(|m| hit(m)));
+                    state.foreign.retain(|m| !hit(m));
+                }
+            }
+        }
+        for &id in candidates.iter().filter(|id| which.takes(**id)) {
             let Some(index) = state.index_of(id) else {
                 emptied = true;
                 continue;
@@ -3017,10 +3108,13 @@ fn evict_range(
         (foreign, victims)
     };
     if foreign.is_empty() && victims.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
-    // `NvEvict`: published by the mirror pass (`publish_hot`).
-    EVICTED.fetch_add((foreign.len() + victims.len()) as u32, Ordering::Relaxed);
+    let own = !which.foreign();
+    if !own {
+        // `NvEvict`: published by the mirror pass (`publish_hot`).
+        EVICTED.fetch_add((foreign.len() + victims.len()) as u32, Ordering::Relaxed);
+    }
     for mapping in foreign.iter() {
         crate::ddi::pt_ring::record(ptr::K_EVICT, 0, 0, 0, mapping.piece.va, mapping.piece.len, process);
     }
@@ -3034,83 +3128,246 @@ fn evict_range(
         .try_reserve_exact(foreign.len() + victims.len())
         .map_err(|_| Error::NoMemory)?;
     items.extend(foreign.iter().map(|m| (0u32, *m, false)));
-    items.extend(victims.iter().map(|v| (v.memory, v.mapping, false)));
+    items.extend(victims.iter().map(|v| (v.memory, v.mapping, defer)));
     let mut results = Vec::new();
-    unmap_many(io, &items, false, &mut results)?;
-    for (victim, unmapped) in victims.into_iter().zip(results.into_iter().skip(foreign.len())) {
+    let mut refused = Vec::new();
+    unmap_many_ex(io, &items, false, &mut results, &mut refused)?;
+    let mut pending = false;
+    for (k, mapping) in foreign.iter().enumerate() {
+        if results.get(k).is_some_and(|r| r.is_err()) && refused.get(k).copied().unwrap_or(true) {
+            forget_refused(io, *mapping, 0);
+        }
+    }
+    // The outside parts of every dropped mapping: (victim, piece, distance).
+    let mut rests: Vec<(usize, nm::MappingPiece, u64)> = Vec::new();
+    for (v, victim) in victims.iter().enumerate() {
+        let k = foreign.len() + v;
         let m = victim.mapping;
-        crate::ddi::pt_ring::record(ptr::K_EVICT, 0, 0, victim.id, m.piece.va, m.piece.len, process);
-        if unmapped.is_err() {
-            if let Ok(allocation) = st().allocation_mut(victim.id) {
-                allocation.poisoned = true;
-            }
-            failed();
-            continue;
+        if !own {
+            crate::ddi::pt_ring::record(ptr::K_EVICT, 0, 0, victim.id, m.piece.va, m.piece.len, process);
         }
-        let Some(m_end) = m.piece.end() else {
-            continue;
-        };
-        let mut rest = [None, None];
-        if m.piece.va < first_va {
-            rest[0] = Some((m.piece.va, first_va - m.piece.va));
-        }
-        if m_end > end {
-            rest[1] = Some((end, m_end - end));
-        }
-        for (va, bytes) in rest.into_iter().flatten() {
-            let delta = va - m.piece.va;
-            let piece = nm::MappingPiece {
-                va,
-                memory_offset: m.piece.memory_offset + delta,
-                len: bytes,
-            };
-            let shown = (|| -> Result<HostMapping, Error> {
-                if m.desc == 0 {
-                    let virt = st().mint()?;
-                    let used = map_fixed(io, victim.memory, victim.size, victim.system_backed, space, virt, piece)?;
-                    return Ok(HostMapping { process, piece, virt: used, desc: 0 });
+        match results.get(k) {
+            Some(Ok(())) => pending |= defer,
+            _ => {
+                if refused.get(k).copied().unwrap_or(true) {
+                    forget_refused(io, m, victim.id);
                 }
+            }
+        }
+        for (piece, delta) in lp::outside_parts(m.piece, first_va, len).into_iter().flatten() {
+            rests.try_reserve(1).map_err(|_| Error::NoMemory)?;
+            rests.push((v, piece, delta));
+        }
+    }
+    if !rests.is_empty() {
+        let pieces: Vec<nm::MappingPiece> = rests.iter().map(|r| r.1).collect();
+        for drop_at in lp::overlapping_entries(&pieces).into_iter().rev() {
+            let (v, piece, _) = rests.remove(drop_at);
+            leaf_fix(ptr::FIX_OVERLAP, victims[v].id, piece.va, piece.len, process);
+        }
+    }
+    let mut shown_all: Vec<(u32, HostMapping)> = Vec::new();
+    for (v, piece, delta) in rests {
+        let victim = &victims[v];
+        let m = victim.mapping;
+        let (va, bytes) = (piece.va, piece.len);
+        let shown = if m.desc == 0 {
+            let mut made = Vec::new();
+            let result = map_retry(
+                io,
+                victim.memory,
+                victim.size,
+                victim.system_backed,
+                space,
+                piece,
+                false,
+                process,
+                victim.id,
+                &mut made,
+            );
+            if !made.is_empty() {
+                pending = false;
+            }
+            for mapping in made {
+                if shown_all.try_reserve(1).is_ok() {
+                    shown_all.push((victim.id, mapping));
+                } else {
+                    let _ = unmap_fixed(io, victim.memory, mapping);
+                }
+            }
+            result.map(|_| ())
+        } else {
+            (|| -> Result<(), Error> {
                 let pfns = victim.pfns.as_ref().ok_or(Error::Invalid)?;
                 let first = (delta / nm::PAGE_BYTES) as usize;
                 let count = (bytes / nm::PAGE_BYTES) as usize;
                 let sub = pfns.get(first..first + count).ok_or(Error::Invalid)?;
                 let job = DescJob { va, pfns: sub, defer: false };
                 let (used, desc) = map_desc_single(io, victim.id, space, &job).map_err(|(_, e)| e)?;
-                Ok(HostMapping { process, piece, virt: used, desc })
-            })();
-            crate::ddi::pt_ring::record(ptr::K_EVICT_REST, 0, u16::from(shown.is_err()), victim.id, va, bytes, process);
-            let Ok(shown) = shown else {
-                failed();
-                continue;
-            };
-            let recorded = {
-                let mut state = st();
-                let recorded = match state.allocation_mut(victim.id) {
-                    Ok(allocation) => {
-                        if allocation.mappings.try_reserve(1).is_ok() {
-                            allocation.mappings.push(shown);
-                            allocation
-                                .mappings
-                                .sort_unstable_by_key(|mapping| (mapping.process, mapping.piece.va));
-                            true
-                        } else {
-                            false
-                        }
-                    }
-                    Err(_) => false,
-                };
-                if recorded {
-                    state.note_mapped(process, victim.id);
+                pending = false;
+                let mapping = HostMapping { process, piece, virt: used, desc };
+                if shown_all.try_reserve(1).is_err() {
+                    let _ = unmap_fixed(io, 0, mapping);
+                    return Err(Error::NoMemory);
                 }
-                recorded
+                shown_all.push((victim.id, mapping));
+                Ok(())
+            })()
+        };
+        crate::ddi::pt_ring::record(ptr::K_EVICT_REST, 0, u16::from(shown.is_err()), victim.id, va, bytes, process);
+        if let Err(error) = shown {
+            failed();
+            leaf_fail(0, 7, error, va, bytes, process);
+        }
+    }
+    // Every shown part recorded under one STATE hold.
+    let mut lost = Vec::new();
+    {
+        let mut state = st();
+        for (id, mapping) in shown_all.iter().copied() {
+            let recorded = match state.allocation_mut(id) {
+                Ok(allocation) => {
+                    if allocation.mappings.try_reserve(1).is_ok() {
+                        allocation.mappings.push(mapping);
+                        allocation
+                            .mappings
+                            .sort_unstable_by_key(|mapping| (mapping.process, mapping.piece.va));
+                        true
+                    } else {
+                        false
+                    }
+                }
+                Err(_) => false,
             };
-            if !recorded {
-                let _ = unmap_fixed(io, victim.memory, shown);
-                failed();
+            if recorded {
+                state.note_mapped(process, id);
+            } else if lost.try_reserve(1).is_ok() {
+                lost.push((id, mapping));
             }
         }
     }
-    Ok(())
+    for (id, mapping) in lost {
+        let memory = st().allocation(id).map(|a| a.memory).unwrap_or(0);
+        let _ = unmap_fixed(io, memory, mapping);
+        failed();
+    }
+    Ok(pending)
+}
+
+/// Map `piece` of the RM memory `memory` at its exact VA (`map_fixed_opts`). A
+/// refusal is tried again with a 4-KiB-paged virtual object and 4-KiB PTEs for
+/// the whole piece, then cut at every 64 KiB, then at every 4 KiB (at most
+/// `leaf_plan::RETRY_PAGES_MAX` pages): a stale RM object at part of the range,
+/// or a VA RM will not place a big-page object at, then costs only that part.
+/// Every mapping made is appended to `out`; a part still refused is counted
+/// (`NvLfFail`, ring `K_LEAF_FAIL`) and the answer is its error. `Ok(true)` when
+/// the one mapping made deferred its TLB invalidate.
+#[allow(clippy::too_many_arguments)]
+fn map_retry(
+    io: &Io<'_>,
+    memory: u32,
+    size: u64,
+    system_backed: bool,
+    space: u32,
+    piece: nm::MappingPiece,
+    defer: bool,
+    process: usize,
+    id: u32,
+    out: &mut Vec<HostMapping>,
+) -> Result<bool, Error> {
+    out.try_reserve(1).map_err(|_| Error::NoMemory)?;
+    let virt = st().mint()?;
+    let first = map_fixed_opts(io, memory, size, system_backed, space, virt, piece, defer);
+    watch::event(
+        piece.va,
+        piece.len,
+        if first.is_ok() { 5 } else { 6 },
+        first.as_ref().err().map_or(0, |e| *e as u32),
+        process,
+    );
+    let error = match first {
+        Ok(used) => {
+            out.push(HostMapping { process, piece, virt: used, desc: 0 });
+            return Ok(defer);
+        }
+        Err(error) => error,
+    };
+    note_failed_map(piece.va, 1, error);
+    {
+        // Who collided: the process key, the allocation, its space and how many
+        // allocations / tracked mappings of this process exist.
+        let state = st();
+        let tracked = state
+            .allocations
+            .iter()
+            .flat_map(|a| a.mappings.iter())
+            .filter(|m| m.process == process)
+            .count();
+        crate::diag::record_named_bytes(b"NvMapProc", process as u32);
+        crate::diag::record_named_bytes(b"NvMapId", id);
+        crate::diag::record_named_bytes(b"NvMapSpace", space);
+        crate::diag::record_named_bytes(b"NvMapTracked", tracked as u32);
+        crate::diag::record_named_bytes(b"NvMapSpaces", state.spaces.len() as u32);
+    }
+    if matches!(error, Error::Invalid | Error::NoMemory) {
+        // The piece itself is not mappable (outside the memory) or no handle is
+        // left: no other shape helps.
+        leaf_fail(13, 1, error, piece.va, piece.len, process);
+        return Err(error);
+    }
+    let flags = if system_backed { cc::MAP_FLAGS_SYSMEM } else { LOCAL_4K_MAP_FLAGS };
+    let try_4k = |p: nm::MappingPiece, out: &mut Vec<HostMapping>| -> Result<(), Error> {
+        out.try_reserve(1).map_err(|_| Error::NoMemory)?;
+        let virt = st().mint()?;
+        let used = map_fixed_flags(io, memory, size, system_backed, space, virt, p, flags, true)?;
+        watch::event(p.va, p.len, 5, 0, process);
+        out.push(HostMapping { process, piece: p, virt: used, desc: 0 });
+        Ok(())
+    };
+    let mut pending: Vec<nm::MappingPiece> = Vec::new();
+    let mut last = match try_4k(piece, out) {
+        Ok(()) => {
+            leaf_fix(ptr::FIX_RETRY, id, piece.va, piece.len, process);
+            return Ok(false);
+        }
+        Err(error) => {
+            pending.try_reserve(1).map_err(|_| Error::NoMemory)?;
+            pending.push(piece);
+            error
+        }
+    };
+    for unit in [lp::BIG_PAGE, nm::PAGE_BYTES] {
+        let pages: u64 = pending.iter().map(|p| p.len / nm::PAGE_BYTES).sum();
+        if unit == nm::PAGE_BYTES && pages > lp::RETRY_PAGES_MAX {
+            break;
+        }
+        let mut next = Vec::new();
+        for p in pending.iter().copied() {
+            let parts = lp::split_at(p, unit);
+            if parts.len() <= 1 {
+                // Already this small: tried as it is.
+                next.try_reserve(1).map_err(|_| Error::NoMemory)?;
+                next.push(p);
+                continue;
+            }
+            for sub in parts {
+                if let Err(error) = try_4k(sub, out) {
+                    last = error;
+                    next.try_reserve(1).map_err(|_| Error::NoMemory)?;
+                    next.push(sub);
+                }
+            }
+        }
+        pending = next;
+        if pending.is_empty() {
+            leaf_fix(ptr::FIX_RETRY, id, piece.va, piece.len, process);
+            return Ok(false);
+        }
+    }
+    for p in pending {
+        leaf_fail(13, 1, last, p.va, p.len, process);
+    }
+    Err(last)
 }
 
 /// A leaf update whose PTEs place a device-local native allocation in SYSTEM
@@ -3175,6 +3432,10 @@ pub fn update_leaf_system(
     SYSTEM_COST.note(start, trips);
     if let Some(watch) = watch {
         watch.done();
+    }
+    if verify_on() {
+        let expect: Vec<lp::Expect> = pfns.iter().map(|p| lp::Expect::Page(*p)).collect();
+        verify_leaf(id, process, first_va, &expect);
     }
     result
 }
@@ -3276,71 +3537,120 @@ fn update_leaf_system_inner(
     let mut made = Vec::new();
     ph(watch, Phase::Build);
     map_descs(&io, id, space, &jobs, &mut made)?;
-    ph(watch, Phase::Book);
-    // Every made mapping is recorded under ONE STATE hold and the list sorted
-    // once (it was a hold, a push and a sort of the allocation's whole list per
-    // chunk). One that cannot be recorded (no memory, the allocation gone) is
-    // taken down again, as before.
-    let as_mapping = |chunk: &np::SystemChunk, virt: u32, desc: u32| HostMapping {
-        process,
-        piece: nm::MappingPiece {
-            va: chunk.va,
-            memory_offset: chunk.memory_offset,
-            len: chunk.bytes(),
-        },
-        virt,
-        desc,
+    // Every mapping made: (piece, virtual object, descriptor). A refused chunk is
+    // tried again in smaller descriptors (16 pages, then single pages, at most
+    // 128 of those): RM refused large ones before, and one page it will not pin
+    // should not cost the chunk's other pages. What is still refused stays
+    // unmapped and is counted (`NvLfFail`).
+    let mut ok: Vec<(nm::MappingPiece, u32, u32)> = Vec::new();
+    ok.try_reserve_exact(chunks.len()).map_err(|_| Error::NoMemory)?;
+    let mut refused: Vec<(usize, usize, Error)> = Vec::new();
+    let mut pending = false;
+    let piece_of = |first: usize, pages: usize| nm::MappingPiece {
+        va: first_va + first as u64 * nm::PAGE_BYTES,
+        memory_offset: allocation_offset + first as u64 * nm::PAGE_BYTES,
+        len: pages as u64 * nm::PAGE_BYTES,
     };
-    let ok_count = made.iter().filter(|r| r.is_ok()).count();
-    let recorded_all = ok_count != 0 && {
-        let mut state = st();
-        let pushed = match state.allocation_mut(id) {
-            Ok(allocation) => {
-                let room = allocation.mappings.try_reserve(ok_count).is_ok();
-                if room {
-                    for (chunk, result) in chunks.iter().zip(&made) {
-                        if let Ok((virt, desc)) = result {
-                            allocation.mappings.push(as_mapping(chunk, *virt, *desc));
-                        }
-                    }
-                    allocation
-                        .mappings
-                        .sort_unstable_by_key(|mapping| (mapping.process, mapping.piece.va));
-                }
-                room
-            }
-            Err(_) => false,
-        };
-        if pushed {
-            state.note_mapped(process, id);
-        }
-        pushed
-    };
-    let mut first_error = None;
-    let mut deferred = false;
-    let mut last_ok = false;
     for ((chunk, job), result) in chunks.iter().zip(&jobs).zip(made) {
-        let recorded = result.map_err(|(stage, error)| why(stage, error)).and_then(|(virt, desc)| {
-            if recorded_all {
-                return Ok(());
+        match result {
+            Ok((virt, desc)) => {
+                pending = job.defer;
+                watch::event(chunk.va, chunk.bytes(), 7, 0, process);
+                ok.push((piece_of(chunk.first, chunk.pages), virt, desc));
             }
-            let _ = unmap_fixed(&io, 0, as_mapping(chunk, virt, desc));
-            Err(Error::NoMemory)
-        });
-        last_ok = recorded.is_ok();
-        match recorded {
-            Err(error) => {
+            Err((stage, error)) => {
+                let error = why(stage, error);
                 note_failed_map(chunk.va, 2, error);
                 watch::event(chunk.va, chunk.bytes(), 8, error as u32, process);
-                first_error.get_or_insert(error);
-            }
-            Ok(()) => {
-                deferred |= job.defer;
-                watch::event(chunk.va, chunk.bytes(), 7, 0, process);
+                refused.try_reserve(1).map_err(|_| Error::NoMemory)?;
+                refused.push((chunk.first, chunk.pages, error));
             }
         }
     }
-    if deferred && !last_ok {
+    for sub_pages in [16usize, 1] {
+        if refused.is_empty() {
+            break;
+        }
+        let total: usize = refused.iter().map(|r| r.1).sum();
+        if sub_pages == 1 && total > 128 {
+            break;
+        }
+        let mut next = Vec::new();
+        for (first, pages, error) in core::mem::take(&mut refused) {
+            if pages <= sub_pages {
+                next.try_reserve(1).map_err(|_| Error::NoMemory)?;
+                next.push((first, pages, error));
+                continue;
+            }
+            let subs = np::system_chunks(0, 0, pages, sub_pages);
+            let mut sub_jobs = Vec::new();
+            sub_jobs.try_reserve_exact(subs.len()).map_err(|_| Error::NoMemory)?;
+            for sub in subs.iter() {
+                let at = first + sub.first;
+                sub_jobs.push(DescJob {
+                    va: first_va + at as u64 * nm::PAGE_BYTES,
+                    pfns: pfns.get(at..at + sub.pages).ok_or(Error::Invalid)?,
+                    defer: false,
+                });
+            }
+            let mut sub_made = Vec::new();
+            map_descs(&io, id, space, &sub_jobs, &mut sub_made)?;
+            for (sub, result) in subs.iter().zip(sub_made) {
+                let at = first + sub.first;
+                match result {
+                    Ok((virt, desc)) => {
+                        pending = false;
+                        ok.try_reserve(1).map_err(|_| Error::NoMemory)?;
+                        ok.push((piece_of(at, sub.pages), virt, desc));
+                        let p = piece_of(at, sub.pages);
+                        watch::event(p.va, p.len, 7, 0, process);
+                        leaf_fix(ptr::FIX_RETRY, id, p.va, p.len, process);
+                    }
+                    Err((stage, error)) => {
+                        next.try_reserve(1).map_err(|_| Error::NoMemory)?;
+                        next.push((at, sub.pages, why(stage, error)));
+                    }
+                }
+            }
+        }
+        refused = next;
+    }
+    let mut first_error = None;
+    for (first, pages, error) in refused {
+        let p = piece_of(first, pages);
+        leaf_fail(14, 2, error, p.va, p.len, process);
+        first_error.get_or_insert(error);
+    }
+    ph(watch, Phase::Book);
+    // Every made mapping is recorded under ONE STATE hold and the list sorted
+    // once. One that cannot be recorded (no memory, the allocation gone) is
+    // taken down again.
+    let recorded_all = !ok.is_empty() && {
+        let mut state = st();
+        let room = state
+            .allocation_mut(id)
+            .is_ok_and(|allocation| allocation.mappings.try_reserve(ok.len()).is_ok());
+        if room {
+            if let Ok(allocation) = state.allocation_mut(id) {
+                for (piece, virt, desc) in ok.iter().copied() {
+                    allocation.mappings.push(HostMapping { process, piece, virt, desc });
+                }
+                allocation
+                    .mappings
+                    .sort_unstable_by_key(|mapping| (mapping.process, mapping.piece.va));
+            }
+            state.note_mapped(process, id);
+        }
+        room
+    };
+    if !ok.is_empty() && !recorded_all {
+        for (piece, virt, desc) in ok.iter().copied() {
+            let _ = unmap_fixed(&io, 0, HostMapping { process, piece, virt, desc });
+            leaf_fail(14, 2, Error::NoMemory, piece.va, piece.len, process);
+        }
+        first_error.get_or_insert(Error::NoMemory);
+    }
+    if pending {
         // The last chunk would have invalidated for the deferred ones.
         invalidate_tlb(&io, space);
     }
@@ -3418,7 +3728,7 @@ pub fn update_foreign_leaf(
     }
     let space = ensure_space(&io, process)?;
     // Native allocations VidMm no longer shows here (see `update_leaf`).
-    evict_range(&io, space, process, first_va, len, None)
+    evict_range(&io, space, process, first_va, len, Evict::All, false)
         .inspect_err(|e| note_failed_map(first_va, 3, *e))?;
     let piece = nm::MappingPiece {
         va: first_va,
@@ -3583,18 +3893,10 @@ pub fn patch_gpu_bytes(
     }
 }
 
-/// Apply one native leaf update.  Non-leaf updates deliberately have no host
-/// operation.  Invalid PTEs unmap.  A changed live mapping is refused until the
-/// parent marks that address space idle; unmapping and fresh mapping remain
-/// synchronous, so a following FLUSH_TLB has no deferred work.
-/// Where the last `update_leaf` stopped (`leaf_stage`): counted per stage on an
-/// error (`NvLf<stage>`), and a watch event (op 11, detail = stage; 0xff = no
-/// change needed, 0xfe = mapped) for watched pages.
-static LEAF_STAGE: AtomicU32 = AtomicU32::new(0);
-
-/// `NvLfPad`: leaf-update pages past the end of the RM memory (VidMm's padding),
-/// skipped; `NvLfPadOff` / `NvLfPadSz` the last one's offset and the memory size
-/// (4-KiB pages).
+/// `NvLfPad`: leaf-update pages past the end of the RM memory (VidMm's padding);
+/// `NvLfPadOff` / `NvLfPadSz` the last one's offset and the memory size (4-KiB
+/// pages). Mapped to the zero page under `NvLfPadMap` (default on), else left
+/// unmapped.
 fn note_padding(offset: u64, size: u64) {
     static N: AtomicU32 = AtomicU32::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed) + 1;
@@ -3605,10 +3907,205 @@ fn note_padding(offset: u64, size: u64) {
     }
 }
 
-fn leaf_stage(stage: u32) {
-    LEAF_STAGE.store(stage, Ordering::Relaxed);
+/// The leaf-update failure values. Registry values outlive a boot, so a counter
+/// that did not move this boot would still show an old boot's number (`NvLf5`
+/// = 0x16, `NvLfb` = 7, `NvLfd` = 2 stood unchanged from 405.273 to 405.290):
+/// they are zeroed once, at the first native leaf update of the boot.
+const LEAF_COUNTERS: [&[u8]; 34] = [
+    b"NvLf0", b"NvLf1", b"NvLf2", b"NvLf3", b"NvLf4", b"NvLf5", b"NvLf6", b"NvLf7",
+    b"NvLf8", b"NvLf9", b"NvLfa", b"NvLfb", b"NvLfc", b"NvLfd", b"NvLfe", b"NvLff",
+    b"NvLfErr", b"NvLfVa", b"NvLfOff", b"NvLfFail", b"NvLfFailVa", b"NvLfFailWhy",
+    b"NvLfFixN", b"NvLfFixWhy", b"NvLfMismatch", b"NvLfMisVa", b"NvLfRej",
+    b"NvPgLeafWhy", b"NvPgFail", b"NvPgFailN", b"NvSysWhy", b"NvSysErr", b"NvEvictFail",
+    b"NvLfPad",
+];
+
+/// Zero [`LEAF_COUNTERS`] once per boot (PASSIVE; the first native leaf update).
+pub fn reset_leaf_counters_once(_passive: PassiveLevel) {
+    static DONE: AtomicU32 = AtomicU32::new(0);
+    if DONE.swap(1, Ordering::Relaxed) != 0 {
+        return;
+    }
+    for name in LEAF_COUNTERS {
+        crate::diag::record_named_force(name, 0);
+    }
 }
 
+static LEAF_FAILS: AtomicU32 = AtomicU32::new(0);
+static LEAF_FIXES: AtomicU32 = AtomicU32::new(0);
+static LEAF_MISMATCH: AtomicU32 = AtomicU32::new(0);
+
+/// Part of a leaf update (or a mapping an eviction had to show again) is NOT
+/// what VidMm's page table says: `[va, va + len)` stays unmapped or stale.
+/// `NvLfFail` counts them (0 on a clean run), `NvLfFailVa` the last VA (4-KiB
+/// page), `NvLfFailWhy` = stage << 16 | site << 8 | Error (site: 1 video-memory
+/// map, 2 system-page descriptor, 4 a PTE naming nothing mappable, 6 padding to
+/// the zero page, 7 an evicted mapping's outside part); ring `K_LEAF_FAIL`.
+fn leaf_fail(stage: u32, site: u32, error: Error, va: u64, len: u64, process: usize) {
+    let n = LEAF_FAILS.fetch_add(1, Ordering::Relaxed) + 1;
+    crate::diag::record_named_bytes(b"NvLfFail", n);
+    crate::diag::record_named_bytes(b"NvLfFailVa", (va >> 12) as u32);
+    crate::diag::record_named_bytes(b"NvLfFailWhy", (stage << 16) | (site << 8) | error as u32);
+    crate::ddi::pt_ring::record(ptr::K_LEAF_FAIL, 0, stage as u16, (site << 8) | error as u32, va, len, process);
+}
+
+/// The driver's record of a range was repaired (or a refused map made in a
+/// smaller shape) and the update went on: `NvLfFixN`, `NvLfFixWhy` = the last
+/// `pt_ring::FIX_*`; ring `K_LEAF_FIX`.
+fn leaf_fix(what: u16, id: u32, va: u64, len: u64, process: usize) {
+    let n = LEAF_FIXES.fetch_add(1, Ordering::Relaxed) + 1;
+    crate::diag::record_named_bytes(b"NvLfFixN", n);
+    crate::diag::record_named_bytes(b"NvLfFixWhy", u32::from(what));
+    crate::ddi::pt_ring::record(ptr::K_LEAF_FIX, 0, what, id, va, len, process);
+}
+
+/// `NvLfPadMap` (REG_DWORD, default 1): VidMm's padding pages (valid PTEs past
+/// the end of the RM memory) map to one zero page (`leaf_plan::pad_map_on`).
+fn pad_map() -> bool {
+    static VALUE: AtomicU32 = AtomicU32::new(u32::MAX);
+    let mut value = VALUE.load(Ordering::Relaxed);
+    if value == u32::MAX {
+        value = crate::diag::read_config_dword(crate::diag::KnobName::new(b"NvLfPadMap"), 1);
+        if value == u32::MAX {
+            value = 1;
+        }
+        VALUE.store(value, Ordering::Relaxed);
+    }
+    lp::pad_map_on(value)
+}
+
+/// `NvLfVerify` (REG_DWORD, default 0): after every native leaf update, compare
+/// the driver's record of the range (what it had RM map) with VidMm's PTEs
+/// page by page (`leaf_plan::mismatches`); `NvLfMismatch` counts the updates
+/// that differ, `NvLfMisVa` the last one's VA (4-KiB page). RM's own PTEs hold
+/// host physical addresses and cannot be compared with guest pages directly.
+fn verify_on() -> bool {
+    static VALUE: AtomicU32 = AtomicU32::new(u32::MAX);
+    let mut value = VALUE.load(Ordering::Relaxed);
+    if value == u32::MAX {
+        value = crate::diag::read_config_dword(crate::diag::KnobName::new(b"NvLfVerify"), 0);
+        if value == u32::MAX {
+            value = 0;
+        }
+        VALUE.store(value, Ordering::Relaxed);
+    }
+    value != 0
+}
+
+/// [`verify_on`]'s check of allocation `id` in `process` against `expect`.
+fn verify_leaf(id: u32, process: usize, first_va: u64, expect: &[lp::Expect]) {
+    let bad = {
+        let state = st();
+        let Ok(allocation) = state.allocation(id) else { return };
+        let len = expect.len() as u64 * nm::PAGE_BYTES;
+        let mut recorded = Vec::new();
+        for m in allocation
+            .mappings
+            .iter()
+            .filter(|m| m.process == process && nm::ranges_overlap(m.piece.va, m.piece.len, first_va, len))
+        {
+            let shown = if m.desc == 0 {
+                lp::Shown::Memory
+            } else {
+                state.descs.pfns(m.desc).map_or(lp::Shown::Unknown, lp::Shown::Pages)
+            };
+            if recorded.try_reserve(1).is_err() {
+                return;
+            }
+            recorded.push((m.piece, shown));
+        }
+        lp::mismatches(&recorded, first_va, expect)
+    };
+    if bad != 0 {
+        let n = LEAF_MISMATCH.fetch_add(1, Ordering::Relaxed) + 1;
+        crate::diag::record_named_bytes(b"NvLfMismatch", n);
+        crate::diag::record_named_bytes(b"NvLfMisVa", (first_va >> 12) as u32);
+        crate::ddi::pt_ring::record(ptr::K_LEAF_FAIL, 1, 0xee, bad, first_va, expect.len() as u64 * nm::PAGE_BYTES, process);
+    }
+}
+
+/// One zeroed, never-freed system page for padding mappings (`NvLfPadMap`):
+/// its page frame number, `None` when it cannot be had. PASSIVE.
+fn zero_pfn(_passive: PassiveLevel) -> Option<u64> {
+    static PFN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    let pfn = PFN.load(Ordering::Relaxed);
+    if pfn == u64::MAX {
+        return None;
+    }
+    if pfn != 0 {
+        return Some(pfn);
+    }
+    let mut highest: PHYSICAL_ADDRESS = unsafe { core::mem::zeroed() };
+    highest.QuadPart = i64::MAX;
+    // SAFETY: PASSIVE (the token); one page of non-paged, physically contiguous
+    // memory, deliberately never freed (padding mappings may outlive anything).
+    let va = unsafe { wdk_sys::ntddk::MmAllocateContiguousMemory(nm::PAGE_BYTES, highest) };
+    if va.is_null() {
+        PFN.store(u64::MAX, Ordering::Relaxed);
+        return None;
+    }
+    // SAFETY: `va` owns the page just allocated.
+    unsafe { core::ptr::write_bytes(va.cast::<u8>(), 0, nm::PAGE_BYTES as usize) };
+    // SAFETY: a valid non-paged kernel address.
+    let physical = unsafe { wdk_sys::ntddk::MmGetPhysicalAddress(va).QuadPart } as u64;
+    let pfn = physical >> 12;
+    if pfn == 0 {
+        PFN.store(u64::MAX, Ordering::Relaxed);
+        return None;
+    }
+    PFN.store(pfn, Ordering::Relaxed);
+    Some(pfn)
+}
+
+/// Padding pages mapped to the zero page at most per run (one host mmap each).
+const PAD_PAGES_MAX: u64 = 512;
+
+/// Map VidMm's padding `pad` (pages past the RM memory's end) of allocation `id`
+/// to the zero page: an OS descriptor that lists the page once per 4 KiB. The
+/// mapping is recorded like a system-page one (its descriptor owned by `id`),
+/// so every later update, eviction and teardown handles it as such.
+#[allow(clippy::too_many_arguments)]
+fn map_padding(
+    io: &Io<'_>,
+    id: u32,
+    space: u32,
+    process: usize,
+    pad: nm::MappingPiece,
+    out: &mut Vec<HostMapping>,
+) -> Result<(), Error> {
+    let pages = pad.len / nm::PAGE_BYTES;
+    if pages > PAD_PAGES_MAX {
+        return Err(Error::Unsupported);
+    }
+    let pfn = zero_pfn(io.passive).ok_or(Error::NoMemory)?;
+    let mut pfns = Vec::new();
+    pfns.try_reserve_exact(pages as usize).map_err(|_| Error::NoMemory)?;
+    pfns.resize(pages as usize, pfn);
+    out.try_reserve(1).map_err(|_| Error::NoMemory)?;
+    let job = DescJob { va: pad.va, pfns: &pfns, defer: false };
+    let (virt, desc) = map_desc_single(io, id, space, &job).map_err(|(_, e)| e)?;
+    watch::event(pad.va, pad.len, 7, 0x9a, process);
+    out.push(HostMapping { process, piece: pad, virt, desc });
+    Ok(())
+}
+
+/// Apply one native leaf update of allocation `id`'s RM memory: after it the
+/// process's GPU VA range `[first_va, first_va + pages)` shows exactly what
+/// VidMm's PTEs say (`pieces[i]` = page `i`, `None` = invalid PTE: unmapped).
+/// Non-leaf updates deliberately have no host operation.
+///
+/// The page table is the truth; the driver's record of what it mapped before
+/// is repaired, never trusted to veto the update (`helios_kmd_logic::leaf_plan`
+/// has the failure shapes that did). Whatever another allocation or a foreign
+/// range still holds there goes, then this allocation's own old mappings in
+/// the range (their outside parts shown again as what they were), then the new
+/// pieces are mapped; a refused map is tried again in smaller shapes. Only a
+/// part RM refuses in every shape is left unmapped, and counted loudly
+/// (`NvLfFail`, ring `K_LEAF_FAIL`); `Err` then.
+///
+/// Counted per stage on an error (`NvLf<stage>`, `NvLfErr`, `NvLfVa`, `NvLfOff`),
+/// and a watch / ring event op 11 with detail = the stage (0xff = no change
+/// needed, 0xfe = mapped).
 pub fn update_leaf(
     passive: PassiveLevel,
     adapter: &AdapterContext,
@@ -3637,6 +4134,23 @@ pub fn update_leaf(
     if let Some(watch) = watch {
         watch.done();
     }
+    if verify_on() {
+        let size = st().allocation(id).map(|a| a.size).unwrap_or(0);
+        let expect: Vec<lp::Expect> = pieces
+            .iter()
+            .map(|p| match p {
+                None => lp::Expect::Unmapped,
+                Some(p) => {
+                    if p.memory_end().is_none_or(|e| e > size) {
+                        lp::Expect::Any
+                    } else {
+                        lp::Expect::Memory(p.memory_offset)
+                    }
+                }
+            })
+            .collect();
+        verify_leaf(id, process, first_va, &expect);
+    }
     result
 }
 
@@ -3654,24 +4168,32 @@ fn update_leaf_staged(
     kind: Kind,
     watch: &mut Option<Watch>,
 ) -> Result<(), Error> {
-    leaf_stage(1);
-    let result =
-        update_leaf_inner(passive, adapter, id, process, first_va, allocation_offset, pieces, kind, watch);
-    let stage = LEAF_STAGE.load(Ordering::Relaxed);
+    reset_leaf_counters_once(passive);
+    // Per call, not a global: a stage another thread wrote was reported before.
+    let mut stage = 1u32;
+    let result = update_leaf_inner(
+        passive,
+        adapter,
+        id,
+        process,
+        first_va,
+        allocation_offset,
+        pieces,
+        kind,
+        watch,
+        &mut stage,
+    );
     let len = pieces.len() as u64 * nm::PAGE_BYTES;
-    match result {
-        Ok(()) => watch::event(first_va, len, 11, stage, process),
-        Err(error) => {
-            watch::event(first_va, len, 11, stage, process);
-            static COUNTS: [AtomicU32; 16] = [const { AtomicU32::new(0) }; 16];
-            let k = (stage as usize).min(15);
-            let n = COUNTS[k].fetch_add(1, Ordering::Relaxed) + 1;
-            let digit = if k < 10 { b'0' + k as u8 } else { b'a' + k as u8 - 10 };
-            crate::diag::record_named_bytes(&[b'N', b'v', b'L', b'f', digit], n);
-            crate::diag::record_named_bytes(b"NvLfErr", (stage << 8) | error as u32);
-            crate::diag::record_named_bytes(b"NvLfVa", (first_va >> 12) as u32);
-            crate::diag::record_named_bytes(b"NvLfOff", (allocation_offset >> 12) as u32);
-        }
+    watch::event(first_va, len, 11, stage, process);
+    if let Err(error) = result {
+        static COUNTS: [AtomicU32; 16] = [const { AtomicU32::new(0) }; 16];
+        let k = (stage as usize).min(15);
+        let n = COUNTS[k].fetch_add(1, Ordering::Relaxed) + 1;
+        let digit = if k < 10 { b'0' + k as u8 } else { b'a' + k as u8 - 10 };
+        crate::diag::record_named_bytes(&[b'N', b'v', b'L', b'f', digit], n);
+        crate::diag::record_named_bytes(b"NvLfErr", (stage << 8) | error as u32);
+        crate::diag::record_named_bytes(b"NvLfVa", (first_va >> 12) as u32);
+        crate::diag::record_named_bytes(b"NvLfOff", (allocation_offset >> 12) as u32);
     }
     result
 }
@@ -3687,6 +4209,7 @@ fn update_leaf_inner(
     pieces: &[Option<nm::MappingPiece>],
     kind: Kind,
     watch: &mut Option<Watch>,
+    stage: &mut u32,
 ) -> Result<(), Error> {
     let _guard = lock(passive, kind)?;
     let client = st().client()?;
@@ -3696,135 +4219,61 @@ fn update_leaf_inner(
         client,
     };
     ph(watch, Phase::Other);
-    leaf_stage(2);
+    *stage = 2;
     let count = pieces.len() as u64;
     let len = count.checked_mul(nm::PAGE_BYTES).ok_or(Error::Invalid)?;
     // Only this process's mappings of the allocation that overlap the update are
-    // copied out (pieces that do not overlap it never reach the span compared or
-    // changed below); the allocation's whole list is not cloned.
-    let mut old_process: Vec<HostMapping> = Vec::new();
+    // copied out; the allocation's whole list is not cloned.
+    let mut recorded: Vec<lp::Recorded> = Vec::new();
     let (memory, size, system_backed) = {
         let state = st();
         let allocation = state.allocation(id)?;
-        if allocation.poisoned || allocation.epoch != client.epoch {
+        // Another client's memory: nothing of it can be mapped in this one.
+        if allocation.epoch != client.epoch {
             return Err(Error::Poisoned);
         }
         let hit = |m: &&HostMapping| {
             m.process == process && nm::ranges_overlap(m.piece.va, m.piece.len, first_va, len)
         };
         let n = allocation.mappings.iter().filter(hit).count();
-        old_process.try_reserve_exact(n).map_err(|_| Error::NoMemory)?;
-        old_process.extend(allocation.mappings.iter().filter(hit).copied());
+        recorded.try_reserve_exact(n).map_err(|_| Error::NoMemory)?;
+        recorded.extend(
+            allocation
+                .mappings
+                .iter()
+                .filter(hit)
+                .map(|m| lp::Recorded { piece: m.piece, system: m.desc != 0 }),
+        );
         (allocation.memory, allocation.size, allocation.system_memory != 0)
     };
-    if pieces.iter().any(|p| p.is_some()) {
+    *stage = 4;
+    let plan = lp::plan_leaf(first_va, allocation_offset, size, pieces).map_err(|_| Error::Invalid)?;
+    if !plan.map.is_empty() || !plan.pad.is_empty() {
         // Placed in video memory: VidMm's system pages for it are its to free, so
         // its idle OS descriptors go (`helios_kmd_logic::desc_cache`).
         ph(watch, Phase::Unmap);
         drop_idle_descs_of(&io, id);
     }
-    leaf_stage(3);
+    *stage = 3;
     ph(watch, Phase::Space);
     let space = ensure_space(&io, process)?;
     ph(watch, Phase::Other);
-    leaf_stage(4);
-    if count == 0 || first_va & (nm::PAGE_BYTES - 1) != 0 {
-        return Err(Error::Invalid);
-    }
-    let mut new = Vec::new();
-    new.try_reserve_exact(pieces.len() + 2)
-        .map_err(|_| Error::NoMemory)?;
-    for (index, piece) in pieces.iter().enumerate() {
-        if let Some(piece) = piece {
-            let expected = nm::MappingPiece {
-                va: first_va + index as u64 * nm::PAGE_BYTES,
-                memory_offset: allocation_offset + index as u64 * nm::PAGE_BYTES,
-                len: nm::PAGE_BYTES,
-            };
-            if *piece != expected {
-                return Err(Error::Invalid);
-            }
-            // VidMm maps an allocation's VA range in its own granularity: the
-            // pages past the RM memory's end are its padding, which nothing
-            // reads. Map what exists; refusing the whole update left offset 0
-            // unmapped too (CE writes faulted at the allocation's first page).
-            if piece.memory_end().is_none_or(|end| end > size) {
-                note_padding(piece.memory_offset, size);
-                continue;
-            }
-            leaf_stage(5);
-            nm::validate_piece(*piece, size).map_err(|_| Error::Invalid)?;
-            leaf_stage(4);
-            new.push(*piece);
-        }
-    }
-    nm::coalesce(&mut new);
-
-    let mut old_pieces: Vec<nm::MappingPiece> = Vec::new();
-    old_pieces
-        .try_reserve_exact(old_process.len())
-        .map_err(|_| Error::NoMemory)?;
-    old_pieces.extend(old_process.iter().map(|m| m.piece));
-    leaf_stage(6);
-    let unmapped =
-        nm::replace_range(&old_pieces, first_va, len, None, size).map_err(|_| Error::Invalid)?;
-    leaf_stage(7);
-    let mut final_pieces = unmapped.pieces;
-    for piece in new.iter().copied() {
-        final_pieces = nm::replace_range(&final_pieces, piece.va, piece.len, Some(piece), size)
-            .map_err(|_| Error::Overlap)?
-            .pieces;
-    }
-    // No coalescing across updates: every existing piece is one live RM virtual
-    // object. VidMm fills a large allocation one page table (2 MiB of VA) per
-    // call; merging the new piece into the previous call's neighbour remapped
-    // the merged range while the neighbour's object still held its part, and RM
-    // refused the fixed VA (NV_ERR_INSUFFICIENT_RESOURCES).
-    final_pieces.sort_unstable_by_key(|piece| piece.va);
 
     // GPU VAs are per process: only this process's other mappings can collide.
     // The page table VidMm writes is the truth: whatever another allocation or
     // a foreign range still holds at these VAs is gone from VidMm's view, so it
     // goes from RM's too (RM refused the new fixed mapping over the stale one:
     // NV_ERR_INVALID_ARGUMENT, and the GPU faulted on the unmapped range).
-    leaf_stage(8);
+    *stage = 8;
     ph(watch, Phase::Evict);
-    evict_range(&io, space, process, first_va, len, Some(id))?;
+    evict_range(&io, space, process, first_va, len, Evict::Others(id), false)?;
     ph(watch, Phase::Other);
-    leaf_stage(9);
-
-    let affected_old: Vec<HostMapping> = old_process
-        .iter()
-        .copied()
-        .filter(|m| nm::ranges_overlap(m.piece.va, m.piece.len, first_va, len))
-        .collect();
-    let update_end = first_va.checked_add(len).ok_or(Error::Invalid)?;
-    let span_start = affected_old
-        .iter()
-        .map(|m| m.piece.va)
-        .min()
-        .unwrap_or(first_va)
-        .min(first_va);
-    let span_end = affected_old
-        .iter()
-        .filter_map(|m| m.piece.end())
-        .max()
-        .unwrap_or(update_end)
-        .max(update_end);
-    let affected_new: Vec<nm::MappingPiece> = final_pieces
-        .iter()
-        .copied()
-        .filter(|piece| piece.va < span_end && span_start < piece.end().unwrap_or(piece.va))
-        .collect();
-    if affected_old
-        .iter()
-        .map(|m| m.piece)
-        .eq(affected_new.iter().copied())
-    {
-        leaf_stage(0xff);
+    *stage = 9;
+    if lp::unchanged(&recorded, first_va, len, &plan) {
+        *stage = 0xff;
         return Ok(());
     }
-    leaf_stage(10);
+    *stage = 10;
 
     // Replacing a live mapping: VidMm only changes an allocation's placement once
     // no GPU work that uses it is outstanding (it waits for the paging and
@@ -3833,7 +4282,7 @@ fn update_leaf_inner(
     // system pages and video memory skipped (NvPgLeafWhy 0x311).
     // `NvHotPath` 0x4 skips it (`HpQuiSkip`); otherwise it is timed (`HpQuiN`, `HpQuiUs`,
     // `HpQuiMaxUs`): one host round trip that waits for the client's channels.
-    if !affected_old.is_empty() {
+    if !recorded.is_empty() {
         ph(watch, Phase::Quiesce);
         if crate::ddi::hot_path::knob(passive).no_quiesce() {
             crate::ddi::hot_path::count(&crate::ddi::hot_path::QUIESCE_SKIPPED);
@@ -3852,167 +4301,89 @@ fn update_leaf_inner(
         }
     }
 
-    ph(watch, Phase::Other);
-    // Mint handles before tearing down anything.  A local handle-space
-    // exhaustion therefore cannot strand the old mapping.
-    let mut planned = Vec::new();
-    planned
-        .try_reserve_exact(affected_new.len())
-        .map_err(|_| Error::NoMemory)?;
-    for piece in affected_new.iter().copied() {
-        planned.push((piece, st().mint()?));
-    }
-    leaf_stage(11);
-    // NvPerfMem 0x20: every unmap and map of this update but the last defers its
-    // TLB invalidate; the last one's invalidate covers them all. An update that
-    // fails after a deferred operation invalidates explicitly.
+    // This allocation's old mappings in the range go; their parts outside it are
+    // shown again as what they were (RM memory at the same offset, or the same
+    // system pages). NvPerfMem 0x20: the unmaps and every map but the last defer
+    // their TLB invalidate; one owed at the end is made explicitly.
+    *stage = 11;
+    let pad_on = pad_map();
+    let operations = plan.map.len() + if pad_on { plan.pad.len() } else { 0 };
     let defer_on = perf().tlb_defer();
-    let operations = affected_old.len() + planned.len();
-    let mut deferred = false;
-    // Every unmap in as few round trips as the batch allows (`NvPaging` 0x1); the
-    // first failure stops the rest, as the one-by-one loop did.
-    let mut items = Vec::new();
-    items
-        .try_reserve_exact(affected_old.len())
-        .map_err(|_| Error::NoMemory)?;
-    for (index, mapping) in affected_old.iter().copied().enumerate() {
-        items.push((memory, mapping, np::defer_tlb(defer_on, index, operations)));
-    }
-    let mut unmapped = Vec::new();
     ph(watch, Phase::Unmap);
-    unmap_many(&io, &items, true, &mut unmapped)?;
+    let mut pending = evict_range(&io, space, process, first_va, len, Evict::Only(id), defer_on && operations != 0)?;
     ph(watch, Phase::Build);
-    for (item, result) in items.iter().zip(&unmapped) {
-        if result.is_err() {
-            if deferred {
-                invalidate_tlb(&io, space);
-            }
-            st().allocation_mut(id)?.poisoned = true;
-            return Err(Error::Poisoned);
-        }
-        deferred |= item.2;
-    }
-    leaf_stage(13);
 
-    let mut made = Vec::new();
-    for (index, (piece, virt)) in planned.iter().copied().enumerate() {
-        let defer = np::defer_tlb(defer_on, affected_old.len() + index, operations);
-        let mapped = map_fixed_opts(&io, memory, size, system_backed, space, virt, piece, defer);
-        if mapped.is_ok() {
-            deferred |= defer;
+    *stage = 13;
+    let mut made: Vec<HostMapping> = Vec::new();
+    let mut first_error = None;
+    for (index, piece) in plan.map.iter().copied().enumerate() {
+        let defer = np::defer_tlb(defer_on, index, operations);
+        let before = made.len();
+        let result = map_retry(&io, memory, size, system_backed, space, piece, defer, process, id, &mut made);
+        if made.len() != before {
+            pending = matches!(result, Ok(true));
         }
-        watch::event(
-            piece.va,
-            piece.len,
-            if mapped.is_ok() { 5 } else { 6 },
-            mapped.as_ref().err().map_or(0, |e| *e as u32),
-            process,
-        );
-        if let Err(error) = mapped {
-            note_failed_map(piece.va, 1, error);
-            // Who collided: the process key, the allocation, its space and how
-            // many allocations / tracked mappings of this process exist.
-            {
-                let state = st();
-                let tracked = state
-                    .allocations
-                    .iter()
-                    .flat_map(|a| a.mappings.iter())
-                    .filter(|m| m.process == process)
-                    .count();
-                crate::diag::record_named_bytes(b"NvMapProc", process as u32);
-                crate::diag::record_named_bytes(b"NvMapId", id);
-                crate::diag::record_named_bytes(b"NvMapSpace", space);
-                crate::diag::record_named_bytes(b"NvMapTracked", tracked as u32);
-                crate::diag::record_named_bytes(b"NvMapSpaces", state.spaces.len() as u32);
-            }
-            for mapping in made.iter().copied() {
-                let _ = unmap_fixed(&io, memory, mapping);
-            }
-            // Best-effort rollback.  If it cannot be completed, poison this
-            // allocation: no success may be reported against a guessed map set.
-            let mut rollback = Vec::new();
-            let mut rollback_ok = true;
-            for old_mapping in affected_old.iter().copied() {
-                if old_mapping.desc != 0 {
-                    // Its descriptor is gone with the unmap; nothing to restore.
-                    rollback_ok = false;
-                    break;
-                }
-                let virt = match st().mint() {
-                    Ok(v) => v,
-                    Err(_) => {
-                        rollback_ok = false;
-                        break;
-                    }
-                };
-                let Ok(virt) = map_fixed(
-                    &io,
-                    memory,
-                    size,
-                    system_backed,
-                    space,
-                    virt,
-                    old_mapping.piece,
-                ) else {
-                    rollback_ok = false;
-                    break;
-                };
-                rollback.push(HostMapping {
-                    virt,
-                    ..old_mapping
-                });
-            }
-            if !rollback_ok {
-                if deferred {
-                    invalidate_tlb(&io, space);
-                }
-                st().allocation_mut(id)?.poisoned = true;
-                return Err(Error::Poisoned);
-            }
-            let mut state = st();
-            let allocation = state.allocation_mut(id)?;
-            allocation.mappings.retain(|mapping| {
-                !(mapping.process == process
-                    && mapping.piece.va < span_end
-                    && span_start < mapping.piece.end().unwrap_or(mapping.piece.va))
-            });
-            let restored = !rollback.is_empty();
-            allocation.mappings.extend(rollback);
-            allocation
-                .mappings
-                .sort_unstable_by_key(|mapping| (mapping.process, mapping.piece.va));
-            if restored {
-                state.note_mapped(process, id);
-            }
-            return Err(error);
+        if let Err(error) = result {
+            first_error.get_or_insert(error);
         }
-        made.push(HostMapping {
-            process,
-            piece,
-            // The window's handle when the piece went into the low window.
-            virt: mapped.unwrap_or(virt),
-            desc: 0,
-        });
+    }
+    for pad in plan.pad.iter().copied() {
+        note_padding(pad.memory_offset, size);
+        if !pad_on {
+            continue;
+        }
+        match map_padding(&io, id, space, process, pad, &mut made) {
+            Ok(()) => pending = false,
+            Err(error) => {
+                watch::event(pad.va, pad.len, 8, error as u32, process);
+                leaf_fail(13, 6, error, pad.va, pad.len, process);
+            }
+        }
+    }
+    if plan.rejected != 0 {
+        crate::diag::record_named_bytes(b"NvLfRej", plan.rejected);
+        leaf_fail(4, 4, Error::Invalid, first_va, len, process);
+        first_error.get_or_insert(Error::Invalid);
+    }
+    if pending {
+        // The last operation would have invalidated for the deferred ones.
+        invalidate_tlb(&io, space);
     }
 
     ph(watch, Phase::Book);
-    let mut state = st();
-    let allocation = state.allocation_mut(id)?;
-    allocation.mappings.retain(|mapping| {
-        !(mapping.process == process
-            && nm::ranges_overlap(mapping.piece.va, mapping.piece.len, first_va, len))
-    });
-    let any = !made.is_empty();
-    allocation.mappings.extend(made);
-    allocation
-        .mappings
-        .sort_unstable_by_key(|mapping| (mapping.process, mapping.piece.va));
-    if any {
-        state.note_mapped(process, id);
+    let orphaned = {
+        let mut state = st();
+        let room = state
+            .allocation_mut(id)
+            .is_ok_and(|allocation| allocation.mappings.try_reserve(made.len()).is_ok());
+        if room {
+            let any = !made.is_empty();
+            if let Ok(allocation) = state.allocation_mut(id) {
+                allocation.mappings.extend(made.drain(..));
+                allocation
+                    .mappings
+                    .sort_unstable_by_key(|mapping| (mapping.process, mapping.piece.va));
+            }
+            if any {
+                state.note_mapped(process, id);
+            }
+            Vec::new()
+        } else {
+            // Gone meanwhile (or no memory to record): what was made comes down.
+            made
+        }
+    };
+    if !orphaned.is_empty() {
+        for mapping in orphaned.iter().copied() {
+            let _ = unmap_fixed(&io, memory, mapping);
+            leaf_fail(13, if mapping.desc != 0 { 6 } else { 1 }, Error::NoMemory, mapping.piece.va, mapping.piece.len, process);
+        }
+        first_error.get_or_insert(Error::NoMemory);
     }
-    leaf_stage(0xfe);
-    Ok(())
+    if first_error.is_none() {
+        *stage = 0xfe;
+    }
+    first_error.map_or(Ok(()), Err)
 }
 
 /// Mark whether an address space has been quiesced for a live replacement.
