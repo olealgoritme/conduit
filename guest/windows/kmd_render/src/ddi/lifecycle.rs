@@ -224,6 +224,8 @@ fn reread_cached_knobs() {
     crate::ddi::stall_diag::reread_knobs();
     // `EscWaitMs`, and the stopping flag back down: a new generation begins (v334).
     crate::ddi::escape_wait::reread_knobs();
+    // `NvHotPath` (`HpKnob`) and `NvHotPubMs`; the hot-path census starts over.
+    crate::ddi::hot_path::reread_knobs();
     // `RmGateMs` (default 6000, 0 = never): the RM gates' lost-fire valve, mirrored `RmGateMsEff`.
     crate::virtio::gpu::RMG_EXPIRE_MS.store(
         helios_kmd_logic::rm_fence_present::clamp_gate_expire_ms(crate::diag::read_config_dword(

@@ -2215,6 +2215,7 @@ unsafe fn native_paging_operation(
     note: &mut PagingNote,
 ) -> Option<NTSTATUS> {
     if let PagingOperation::UpdatePageTable(update) = operation {
+        crate::ddi::hot_path::count(&crate::ddi::hot_path::PT_ALL);
         // Not this driver's RM memory (dxgkrnl's fences, legacy allocations):
         // mirror its system pages into the process's RM VA space too.
         let native = unsafe { paging_alloc_info(adapter, update.hAllocation) }
@@ -2237,6 +2238,9 @@ unsafe fn native_paging_operation(
     if allocation.native_id == 0 {
         return None;
     }
+    // The hot-path block's mirror pass, once per `NvHotPubMs` (`ddi::hot_path`); native
+    // allocations only, so the default personality asks for no extra pass.
+    crate::ddi::hot_path::tick();
     note.describe(operation, allocation.native_segment);
 
     if let PagingOperation::NotifyResidency(n) = operation {
@@ -2261,6 +2265,7 @@ unsafe fn native_paging_operation(
     if let PagingOperation::UpdatePageTable(update) = operation {
         if update.PageTableLevel != 0 {
             // RM owns every non-leaf level of its GPU_DEVICE VA space.
+            crate::ddi::hot_path::count(&crate::ddi::hot_path::PT_UPPER);
             note.result = dl::paging_result::PTE;
             return Some(STATUS_SUCCESS);
         }
@@ -2377,7 +2382,9 @@ unsafe fn foreign_leaf(adapter: &AdapterContext, update: &DXGK_BUILDPAGINGBUFFER
         pfns.clear();
     }
     let passive = unsafe { PassiveLevel::assume() };
-    let n = FOREIGN_LEAF.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+    // `NvFgnN` is published by the mirror pass (`publish_hot`), `HpPtFgn*` with it.
+    FOREIGN_LEAF.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    crate::ddi::hot_path::count(&crate::ddi::hot_path::PT_FOREIGN);
     if let Err(error) = crate::virtio::native_memory::update_foreign_leaf(
         passive,
         adapter,
@@ -2389,9 +2396,6 @@ unsafe fn foreign_leaf(adapter: &AdapterContext, update: &DXGK_BUILDPAGINGBUFFER
         crate::diag::record_named_bytes(b"NvFgnWhy", error as u32);
         let failed = FOREIGN_FAIL.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
         crate::diag::record_named_bytes(b"NvFgnFail", failed);
-    }
-    if n % 64 == 1 {
-        crate::diag::record_named_bytes(b"NvFgnN", n);
     }
 }
 
@@ -2422,6 +2426,43 @@ unsafe fn watch_update(update: &DXGK_BUILDPAGINGBUFFER_UPDATEPAGETABLE, native: 
 
 static FOREIGN_LEAF: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 static FOREIGN_FAIL: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// `NvPgLeafSys`: 1 once VidMm's own process updated a native leaf (0 = never).
+static LEAF_SYSTEM_SEEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// `NvPgLeafSeg`: the last segment a native leaf update named that is not the
+/// allocation's own (`u32::MAX` = none yet: not written).
+static LEAF_SEGMENT_LAST: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// `BuildPagingBuffer` calls (`PgCalls`), for `ddi::hot_path`'s rate. Any IRQL.
+pub(crate) fn paging_call_count() -> u32 {
+    PAGING_CALL_COUNT.load(Ordering::Relaxed)
+}
+
+/// The native paging values that were written per leaf update before, now
+/// written by the registry mirror's pass (`ddi::hot_path::publish`), same names:
+/// `NvPgLeafInSys` / `NvPgLeafInApt` / `NvPgLeafInSeg` (native leaf updates by
+/// where VidMm placed the allocation), `NvPgLeafSys`, `NvPgLeafSeg`, `NvFgnN`
+/// (foreign leaf updates). Values that never moved are not written. PASSIVE.
+pub(crate) fn publish_hot() {
+    use core::sync::atomic::Ordering::Relaxed;
+    use crate::diag::record_named_bytes as rec;
+    for (name, counter) in [
+        (&b"NvPgLeafInSys"[..], &LEAF_IN_SYSTEM),
+        (&b"NvPgLeafInApt"[..], &LEAF_IN_APERTURE),
+        (&b"NvPgLeafInSeg"[..], &LEAF_IN_SEGMENT),
+        (&b"NvFgnN"[..], &FOREIGN_LEAF),
+        (&b"NvPgLeafSys"[..], &LEAF_SYSTEM_SEEN),
+    ] {
+        let n = counter.load(Relaxed);
+        if n != 0 {
+            rec(name, n);
+        }
+    }
+    let segment = LEAF_SEGMENT_LAST.load(Relaxed);
+    if segment != u32::MAX {
+        rec(b"NvPgLeafSeg", segment);
+    }
+}
 
 unsafe fn native_update_leaf(
     passive: PassiveLevel,
@@ -2445,7 +2486,9 @@ unsafe fn native_update_leaf(
     // 0x10E (VIDEO_MEMORY_MANAGEMENT_INTERNAL, 0xB) on the first page-in.
     // SAFETY: dxgkrnl's hKmdProcess from CreateProcess, or null.
     if unsafe { crate::device::ProcessContext::is_system_handle(update.hProcess as usize) } {
-        crate::diag::record_named_bytes(b"NvPgLeafSys", 1);
+        // `NvPgLeafSys` (1 once seen): published by the mirror pass, not per update.
+        LEAF_SYSTEM_SEEN.store(1, core::sync::atomic::Ordering::Relaxed);
+        crate::ddi::hot_path::count(&crate::ddi::hot_path::PT_SYSTEM);
         // Its system-memory pages are still recorded: VidMm's virtual transfers
         // name them by this paging-process VA (`native_virtual_transfer`
         // resolves them here; without them every transfer was refused).
@@ -2454,6 +2497,7 @@ unsafe fn native_update_leaf(
         }
         return Ok(());
     }
+    crate::ddi::hot_path::count(&crate::ddi::hot_path::PT_NATIVE);
     let count = update.NumPageTableEntries as usize;
     let mut pieces = Vec::new();
     pieces.try_reserve_exact(count).map_err(|_| ())?;
@@ -2494,10 +2538,10 @@ unsafe fn native_update_leaf(
         // aperture. Refusing that failed every NVIDIA D3D11 page-in.
         let segment = bits.Segment() as u32;
         if segment != allocation.native_segment && !segment_noted {
-            // Once per update: a diag write per PTE cost up to 512 deferred
-            // registry writes for one system-page leaf update.
+            // Once per update, and only into an atomic: the mirror pass publishes
+            // `NvPgLeafSeg` (a deferred registry write per leaf update before).
             segment_noted = true;
-            crate::diag::record_named_bytes(b"NvPgLeafSeg", segment);
+            LEAF_SEGMENT_LAST.store(segment, core::sync::atomic::Ordering::Relaxed);
         }
         if index == 0 {
             // Where VidMm placed native allocations, per leaf update: system
@@ -2507,13 +2551,8 @@ unsafe fn native_update_leaf(
                 crate::ddi::gpummu::APERTURE_SEGMENT_ID => &LEAF_IN_APERTURE,
                 _ => &LEAF_IN_SEGMENT,
             };
-            let n = counter.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
-            let name: &[u8] = match segment {
-                0 => b"NvPgLeafInSys",
-                crate::ddi::gpummu::APERTURE_SEGMENT_ID => b"NvPgLeafInApt",
-                _ => b"NvPgLeafInSeg",
-            };
-            crate::diag::record_named_bytes(name, n);
+            // `NvPgLeafIn*`: published by the mirror pass (`publish_hot`).
+            counter.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         }
         if !native_segment_matches(allocation, segment)
             && segment != 0

@@ -380,11 +380,8 @@ fn publish_channel() {
 /// The HPD worker (PASSIVE): run the CPU fallback's jobs in order, each fence's
 /// DPC asked for as its job completes; and mirror the channel counters.
 pub(crate) fn service(passive: PassiveLevel, adapter: &AdapterContext) {
-    static LAST_SUBMITTED: AtomicU32 = AtomicU32::new(0);
-    let submitted = SUBMITTED.load(Ordering::Relaxed);
-    if LAST_SUBMITTED.swap(submitted, Ordering::Relaxed) != submitted {
-        publish_channel();
-    }
+    // `NvCcx*` / `NvCc*` are written by the registry mirror's pass (`publish_hot`), not
+    // by this worker pass (23 deferred writes per pass while the copy context ran).
     if ADMITTED.load(Ordering::Relaxed) == 0 {
         return;
     }
@@ -410,7 +407,15 @@ pub(crate) fn service(passive: PassiveLevel, adapter: &AdapterContext) {
             break;
         }
     }
-    if ran > 0 {
+}
+
+/// The copy context's counters (`NvCcx*`, `NvCc*`), from the registry mirror's pass
+/// (`ddi::hot_path::publish`). Nothing before the first channel or job. PASSIVE.
+pub(crate) fn publish_hot() {
+    if MADE.load(Ordering::Relaxed) != 0 || MAKE_FAILED.load(Ordering::Relaxed) != 0 {
+        publish_channel();
+    }
+    if ADMITTED.load(Ordering::Relaxed) != 0 {
         publish();
     }
 }

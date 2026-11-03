@@ -45,6 +45,7 @@ pub(crate) mod guest_blob;
 pub(crate) mod copy_queue;
 pub(crate) mod gpummu;
 pub(crate) mod hpd;
+pub(crate) mod hot_path;
 pub(crate) mod hws;
 pub(crate) mod interrupt;
 pub(crate) mod mpo3;

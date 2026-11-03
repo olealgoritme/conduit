@@ -748,6 +748,11 @@ pub fn escape(
     };
     ESCAPES.fetch_add(1, Ordering::Relaxed);
     LAST_FUNCTION.store(header.function, Ordering::Relaxed);
+    // `HpNvda*` and the function census (`ddi::hot_path`): atomics, plus a mirror-pass
+    // request once per `NvHotPubMs`.
+    crate::ddi::hot_path::count(&crate::ddi::hot_path::NVDA);
+    crate::ddi::hot_path::FUNCTIONS.note(header.function);
+    crate::ddi::hot_path::tick();
     if header.function == WAIT_POLL_FUNCTION {
         dump_watched_vas(passive, adapter, h_device);
     }
@@ -755,10 +760,12 @@ pub fn escape(
     // transport. This also returns shortened 0x30 replies directly, while the
     // backing buffer still has its original (larger) length.
     if header.function == nd::NVDA_FN_USER_SHARED && buf.len() == nd::NVDA_FN_USER_SHARED_BYTES {
+        crate::ddi::hot_path::count(&crate::ddi::hot_path::NVDA_LOCAL);
         return user_shared_block(buf);
     }
     match nd::apply_local(buf, h_device, h_context) {
         Ok(nd::LocalOutcome::Applied) => {
+            crate::ddi::hot_path::count(&crate::ddi::hot_path::NVDA_LOCAL);
             // The Vulkan ICD's per-head query: head 0 is the mode this adapter scans out.
             let (width, height) = adapter.scanout_extent();
             let hz = ((adapter.effective_refresh_mhz() + 500) / 1000).max(1);
@@ -797,6 +804,9 @@ pub fn escape(
     if persona() != nd::Persona::Forward {
         return STATUS_NOT_IMPLEMENTED;
     }
+    // `HpNvFwd*` and the RM control census: which controls cost a host round trip.
+    crate::ddi::hot_path::count(&crate::ddi::hot_path::NVDA_FORWARD);
+    crate::ddi::hot_path::CONTROLS.note(control.cmd);
     let ready = match ensure_ready(passive, adapter) {
         Ok(ready) => ready,
         Err(error) => {

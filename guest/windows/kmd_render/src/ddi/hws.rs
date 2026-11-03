@@ -265,6 +265,15 @@ static RC_RESET: AtomicU32 = AtomicU32::new(hang::DEFAULT_RC_RESET);
 
 /// Mirror the `Hws*` counters at PASSIVE (from `publish_nvrm_counters`). Writes
 /// nothing in the default personality.
+/// Native HW-queue submissions (`HwsSubmit`) and software ones (`HwsSoftSub`), for
+/// `ddi::hot_path`'s rates. Any IRQL.
+pub(crate) fn submit_counts() -> (u32, u32) {
+    (
+        SUBMITS.load(Ordering::Relaxed),
+        SOFT_SUBMITS.load(Ordering::Relaxed),
+    )
+}
+
 pub(crate) fn publish_counters() {
     if !crate::ddi::wddm_surface::nvidia_selected() {
         return;
@@ -1308,6 +1317,8 @@ pub unsafe extern "C" fn dxgkddi_submit_command_to_hw_queue(
     SUBMIT_SUM_100NS.fetch_add(took, Ordering::Relaxed);
     SUBMIT_MAX_100NS.fetch_max(u32::try_from(took).unwrap_or(u32::MAX), Ordering::Relaxed);
     SUBMITS.fetch_add(1, Ordering::Relaxed);
+    // The hot-path block's mirror pass, once per `NvHotPubMs` (`ddi::hot_path`).
+    crate::ddi::hot_path::tick_at(rung);
     // SAFETY: validated by the submit above (non-null args, our queue, our adapter).
     let args = unsafe { &*args };
     let adapter = unsafe { &*(h_adapter as *const AdapterContext) };

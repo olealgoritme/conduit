@@ -74,6 +74,16 @@ enum Step {
     Present = 9,
 }
 
+/// `NvScN` (flips seen) and `NvScOk` (sent), written by the registry mirror's pass
+/// (`ddi::hot_path::publish`) instead of every 64th flip. PASSIVE.
+pub(crate) fn publish_hot() {
+    let flips = FLIPS.load(Ordering::Relaxed);
+    if flips != 0 {
+        crate::diag::record_named_bytes(b"NvScN", flips);
+        crate::diag::record_named_bytes(b"NvScOk", SENT.load(Ordering::Relaxed));
+    }
+}
+
 fn fail(step: Step, code: u32) {
     let n = FAILS.fetch_add(1, Ordering::Relaxed) + 1;
     crate::diag::record_named_bytes(b"NvScFail", n);
@@ -85,10 +95,8 @@ fn fail(step: Step, code: u32) {
 /// the host can, and complete the flip either way. Runs on the scanout worker
 /// (PASSIVE) under the scanout lifecycle lock.
 pub(crate) fn program(adapter: &AdapterContext, native_id: u32, primary_address: u64, mode: (u32, u32)) {
-    let n = FLIPS.fetch_add(1, Ordering::Relaxed) + 1;
-    if n == 1 || n % 64 == 0 {
-        crate::diag::record_named_bytes(b"NvScN", n);
-    }
+    // `NvScN`: published by the mirror pass (`publish_hot`).
+    FLIPS.fetch_add(1, Ordering::Relaxed);
     // Whatever was on screen before is not any more.
     crate::virtio::rm_client::sysmem_flip::other_source(adapter);
     crate::virtio::foreign_flip::other_source(adapter);
@@ -115,26 +123,45 @@ fn show(adapter: &AdapterContext, native_id: u32, mode: (u32, u32)) {
         crate::diag::record_named_bytes(b"NvScWH", (s.width << 16) | (s.height & 0xffff));
         return;
     }
-    let prepared = native_memory::with_io(passive, adapter, |io| {
-        let drm = drm_file(io)?;
-        // Read again under the I/O mutex: the allocation may have been destroyed
-        // (or given a GEM) since `scanout_source` above.
-        let current = native_memory::scanout_source(native_id)?;
-        let gem = if current.gem != 0 {
-            current.gem
-        } else {
-            let gem = import(io, drm, &current)?;
-            if let Err(error) = native_memory::set_scanout_gem(native_id, gem) {
-                // Nothing would ever close it.
-                close_gem(io, drm, gem);
-                return Err(error);
-            }
-            let g = GEMS.fetch_add(1, Ordering::Relaxed) + 1;
-            crate::diag::record_named_bytes(b"NvScGem", g);
-            gem
-        };
-        Ok((drm, gem, io.client.epoch))
-    });
+    // `NvHotPath` 0x1: a primary already imported on this epoch's DRM file needs no
+    // host call to prepare, so it does not wait for the native I/O mutex, which a
+    // leaf update holds across its host round trips (`HpFlipFast` / `HpFlipSlow`).
+    // The GEM can be closed by a destroy right after this read exactly as after the
+    // mutex is released below; the host then refuses the flip (`NvScFail`).
+    let fast = if crate::ddi::hot_path::knob(passive).fast_flip() {
+        native_memory::scanout_imported(native_id).and_then(|(gem, epoch)| {
+            let f = FILES.lock();
+            (f.epoch == epoch && f.drm != 0).then_some((f.drm, gem, epoch))
+        })
+    } else {
+        None
+    };
+    let prepared = if let Some(ready) = fast {
+        crate::ddi::hot_path::count(&crate::ddi::hot_path::FLIP_FAST);
+        Ok(ready)
+    } else {
+        crate::ddi::hot_path::count(&crate::ddi::hot_path::FLIP_SLOW);
+        native_memory::with_io(passive, adapter, |io| {
+            let drm = drm_file(io)?;
+            // Read again under the I/O mutex: the allocation may have been destroyed
+            // (or given a GEM) since `scanout_source` above.
+            let current = native_memory::scanout_source(native_id)?;
+            let gem = if current.gem != 0 {
+                current.gem
+            } else {
+                let gem = import(io, drm, &current)?;
+                if let Err(error) = native_memory::set_scanout_gem(native_id, gem) {
+                    // Nothing would ever close it.
+                    close_gem(io, drm, gem);
+                    return Err(error);
+                }
+                let g = GEMS.fetch_add(1, Ordering::Relaxed) + 1;
+                crate::diag::record_named_bytes(b"NvScGem", g);
+                gem
+            };
+            Ok((drm, gem, io.client.epoch))
+        })
+    };
     let Ok((drm, gem, epoch)) = prepared else {
         return;
     };
@@ -155,10 +182,8 @@ fn show(adapter: &AdapterContext, native_id: u32, mode: (u32, u32)) {
     }
     match crate::virtio::foreign_scanout::present_within(passive, adapter, KMD, drm, gem, TIMEOUT_MS) {
         Ok(_) => {
-            let n = SENT.fetch_add(1, Ordering::Relaxed) + 1;
-            if n == 1 || n % 64 == 0 {
-                crate::diag::record_named_bytes(b"NvScOk", n);
-            }
+            // `NvScOk`: published by the mirror pass (`publish_hot`).
+            SENT.fetch_add(1, Ordering::Relaxed);
         }
         Err(_) => fail(Step::Present, 0),
     }

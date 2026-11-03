@@ -3206,6 +3206,21 @@ pub(crate) unsafe fn native_ring_backing(
 static NV_ALIGN_LARGE: AtomicU32 = AtomicU32::new(0);
 /// `NvPmGpuOnly`: native allocations placed by the GPU-only rule (NvPerfMem 0x01/0x02).
 static NV_GPU_ONLY: AtomicU32 = AtomicU32::new(0);
+/// `NvAlSeg`: the preferred segment of the last native allocation (`u32::MAX` = none yet).
+static NV_AL_SEG: AtomicU32 = AtomicU32::new(u32::MAX);
+
+/// `NvAlSeg` and `NvAlignLg`, written per native allocation before, now by the
+/// registry mirror's pass (`ddi::hot_path::publish`). PASSIVE.
+pub(crate) fn publish_hot() {
+    let segment = NV_AL_SEG.load(Ordering::Relaxed);
+    if segment != u32::MAX {
+        crate::diag::record_named_bytes(b"NvAlSeg", segment);
+    }
+    let large = NV_ALIGN_LARGE.load(Ordering::Relaxed);
+    if large != 0 {
+        crate::diag::record_named_bytes(b"NvAlignLg", large);
+    }
+}
 
 /// NvAlignOff=1 (test knob): every native allocation keeps 4-KiB alignment.
 fn nvgl_alignment_off() -> bool {
@@ -3383,13 +3398,14 @@ unsafe fn create_native_one(
             crate::diag::record_named_bytes(b"NvPmGpuOnly", n);
         }
     }
-    crate::diag::record_named_bytes(b"NvAlSeg", segment);
+    // `NvAlSeg`: published by the mirror pass (`publish_hot`), not per allocation.
+    NV_AL_SEG.store(segment, Ordering::Relaxed);
     info.SupportedWriteSegmentSet = supported;
     unsafe {
         info.__bindgen_anon_1.Alignment = large_page_alignment.unwrap_or(PAGE as u32) as UINT;
         if large_page_alignment.is_some() {
-            let n = NV_ALIGN_LARGE.fetch_add(1, Ordering::Relaxed) + 1;
-            crate::diag::record_named_bytes(b"NvAlignLg", n);
+            // `NvAlignLg`: published by the mirror pass (`publish_hot`).
+            NV_ALIGN_LARGE.fetch_add(1, Ordering::Relaxed);
         }
         info.PreferredSegment
             .__bindgen_anon_1

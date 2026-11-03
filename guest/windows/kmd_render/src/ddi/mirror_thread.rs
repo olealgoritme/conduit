@@ -387,6 +387,9 @@ fn run_pass(mask: u32) -> bool {
     // The MPO3 / hardware flip queue counters (their DDIs run at DIRQL and only count).
     crate::ddi::mpo3::publish();
     crate::ddi::hwfq::publish();
+    // The hot-path cost block (`Hp*`) and the values the paging / allocation paths used to
+    // write per call (`ddi::hot_path`): rates over the window since the last pass.
+    crate::ddi::hot_path::publish();
     // `StgRing` (`StageTrace`): one relaxed load while the knob is 0, rate limited inside.
     crate::ddi::stage_trace::publish();
     publish_own();

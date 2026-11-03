@@ -142,6 +142,24 @@ fn round_trips() -> u32 {
     ROUND_TRIPS.load(Ordering::Relaxed)
 }
 
+/// Native-memory host round trips so far (`ddi::hot_path`'s `HpMemRtPs`). Any IRQL.
+pub(crate) fn round_trip_count() -> u32 {
+    round_trips()
+}
+
+/// `NvEvict` and `NvQuiesceRef`, written by the registry mirror's pass
+/// (`ddi::hot_path::publish`) instead of on every eviction / refusal. PASSIVE.
+pub(crate) fn publish_hot() {
+    let evicted = EVICTED.load(Ordering::Relaxed);
+    if evicted != 0 {
+        crate::diag::record_named_bytes(b"NvEvict", evicted);
+    }
+    let refused = QUIESCE_REFUSED.load(Ordering::Relaxed);
+    if refused != 0 {
+        crate::diag::record_named_bytes(b"NvQuiesceRef", refused);
+    }
+}
+
 /// Leaf-update cost counters (`NvPm*`), published on the first update and every
 /// 64th: `NvPmUpd`/`NvPmRt`/`NvPmUs` video-memory updates, their round trips and
 /// microseconds, `NvPmMaxUs` the longest; `NvPmSys*` the same for system-page
@@ -1653,6 +1671,20 @@ pub fn scanout_source(id: u32) -> Result<ScanoutSource, Error> {
     })
 }
 
+/// The GEM handle and client epoch of a primary already imported for scanout on
+/// the live client (`None`: not imported, poisoned, another epoch, no client).
+/// STATE spinlock only, no I/O mutex: `native_scanout`'s flip fast path
+/// (`NvHotPath` 0x1).
+pub fn scanout_imported(id: u32) -> Option<(u32, u64)> {
+    let state = STATE.lock();
+    let client = state.client.as_ref()?;
+    let a = state.allocation(id).ok()?;
+    if a.scanout_gem == 0 || a.poisoned || a.epoch != client.epoch || a.surface.is_none() {
+        return None;
+    }
+    Some((a.scanout_gem, client.epoch))
+}
+
 /// The width and height of an allocation's 2D picture (DescribeAllocation).
 pub fn surface_extent(id: u32) -> Option<(u32, u32)> {
     let state = STATE.lock();
@@ -1768,9 +1800,8 @@ fn evict_range(
     if foreign.is_empty() && victims.is_empty() {
         return Ok(());
     }
-    let n = EVICTED.fetch_add((foreign.len() + victims.len()) as u32, Ordering::Relaxed)
-        + (foreign.len() + victims.len()) as u32;
-    crate::diag::record_named_bytes(b"NvEvict", n);
+    // `NvEvict`: published by the mirror pass (`publish_hot`).
+    EVICTED.fetch_add((foreign.len() + victims.len()) as u32, Ordering::Relaxed);
     for mapping in foreign {
         let _ = unmap_fixed(io, 0, mapping);
     }
@@ -2120,6 +2151,17 @@ pub fn update_foreign_leaf(
         client,
     };
     let len = pages.checked_mul(nm::PAGE_BYTES).ok_or(Error::Invalid)?;
+    // `NvHotPath` 0x2: VidMm writes the pages that are mapped there already (a
+    // re-residency, a page-table rebuild): nothing to unmap or map (`HpFgnSkip`).
+    // A live foreign mapping means nothing else was mapped over it since: every
+    // native update evicts the foreign mappings in its range.
+    if crate::ddi::hot_path::knob(passive).skip_foreign_unchanged()
+        && foreign_mapping_unchanged(process, first_va, len, pfns)
+    {
+        crate::ddi::hot_path::count(&crate::ddi::hot_path::FOREIGN_SKIPPED);
+        watch::event(first_va, len, 2, 0x80, process);
+        return Ok(());
+    }
     let stale: Vec<HostMapping> = {
         let mut state = STATE.lock();
         let mut stale = Vec::new();
@@ -2172,6 +2214,17 @@ pub fn update_foreign_leaf(
         virt: used,
         desc,
     };
+    // The descriptor's pages, for the unchanged check above (`NvHotPath` 0x2 only;
+    // dropped with the descriptor by `unmap_fixed_opts`). Best effort.
+    let kept = if crate::ddi::hot_path::knob(passive).skip_foreign_unchanged() {
+        let mut copy = Vec::new();
+        if copy.try_reserve_exact(pfns.len()).is_ok() {
+            copy.extend_from_slice(pfns);
+        }
+        copy
+    } else {
+        Vec::new()
+    };
     let mut state = STATE.lock();
     if state.foreign.try_reserve(1).is_err() {
         drop(state);
@@ -2179,7 +2232,47 @@ pub fn update_foreign_leaf(
         return Err(Error::NoMemory);
     }
     state.foreign.push(mapping);
+    if !kept.is_empty() && state.desc_pfns.try_reserve(1).is_ok() {
+        state.desc_pfns.push((desc, kept));
+    }
     Ok(())
+}
+
+/// Whether `process`'s foreign mappings over `[first_va, first_va + len)` are exactly
+/// one mapping of exactly that range whose descriptor holds exactly `pfns`
+/// (`helios_kmd_logic::hot_path::foreign_update_unchanged`).
+fn foreign_mapping_unchanged(process: usize, first_va: u64, len: u64, pfns: &[u64]) -> bool {
+    let state = STATE.lock();
+    let mut overlapping: [(nm::MappingPiece, Option<&[u64]>); 2] = [(
+        nm::MappingPiece {
+            va: 0,
+            memory_offset: 0,
+            len: 0,
+        },
+        None,
+    ); 2];
+    let mut n = 0usize;
+    for m in state
+        .foreign
+        .iter()
+        .filter(|m| m.process == process && nm::ranges_overlap(m.piece.va, m.piece.len, first_va, len))
+    {
+        if n == overlapping.len() {
+            return false;
+        }
+        let pages = if m.desc != 0 {
+            state
+                .desc_pfns
+                .iter()
+                .find(|(desc, _)| *desc == m.desc)
+                .map(|(_, pages)| pages.as_slice())
+        } else {
+            None
+        };
+        overlapping[n] = (m.piece, pages);
+        n += 1;
+    }
+    helios_kmd_logic::hot_path::foreign_update_unchanged(&overlapping[..n], first_va, len, pfns)
 }
 
 /// CPU access to `len` bytes at GPU VA `va` of `process` exactly as the GPU
@@ -2476,11 +2569,22 @@ fn update_leaf_inner(
     // context fences first), so RM's idle-channels quiesce is only a belt on
     // top. It is best effort: its refusal (Busy) had VidMm's every move between
     // system pages and video memory skipped (NvPgLeafWhy 0x311).
-    if !affected_old.is_empty()
-        && super::native_channel::quiesce(passive, adapter, process).is_err()
-    {
-        let n = QUIESCE_REFUSED.fetch_add(1, Ordering::Relaxed) + 1;
-        crate::diag::record_named_bytes(b"NvQuiesceRef", n);
+    // `NvHotPath` 0x4 skips it (`HpQuiSkip`); otherwise it is timed (`HpQuiN`, `HpQuiUs`,
+    // `HpQuiMaxUs`): one host round trip that waits for the client's channels.
+    if !affected_old.is_empty() {
+        if crate::ddi::hot_path::knob(passive).no_quiesce() {
+            crate::ddi::hot_path::count(&crate::ddi::hot_path::QUIESCE_SKIPPED);
+        } else {
+            let started = crate::adapter::foreign_scanout::now_100ns();
+            let quiesced = super::native_channel::quiesce(passive, adapter, process);
+            crate::ddi::hot_path::note_quiesce(
+                crate::adapter::foreign_scanout::now_100ns().saturating_sub(started),
+            );
+            if quiesced.is_err() {
+                // `NvQuiesceRef`: published by the mirror pass (`publish_hot`).
+                QUIESCE_REFUSED.fetch_add(1, Ordering::Relaxed);
+            }
+        }
     }
 
     // Mint handles before tearing down anything.  A local handle-space

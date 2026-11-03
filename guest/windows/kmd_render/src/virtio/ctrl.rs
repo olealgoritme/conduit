@@ -652,6 +652,8 @@ pub fn raw_roundtrip(
     let wait_ms = hl::wait_ms(admit, timeout_ms);
     let result = raw_roundtrip_once(passive, adapter, req, resp_out, wait_ms);
     let now = crate::adapter::foreign_scanout::now_100ns();
+    // `HpRm*` (`ddi::hot_path`): every admitted host RM round trip and its wait.
+    crate::ddi::hot_path::note_rm_trip(now.saturating_sub(start));
     match result {
         Ok(_) => {
             if HOST_LIVENESS.lock().on_reply(now) {

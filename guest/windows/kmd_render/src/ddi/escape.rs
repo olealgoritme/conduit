@@ -286,6 +286,8 @@ pub unsafe extern "C" fn dxgkddi_escape(
     if h_adapter.is_null() || escape.is_null() {
         return STATUS_INVALID_PARAMETER;
     }
+    // `HpEscN` / `HpEscPs` (`ddi::hot_path`): one relaxed increment.
+    crate::ddi::hot_path::count(&crate::ddi::hot_path::ESCAPES);
     // The escape scope (v334, `ddi::escape_wait`): from here to the return every wait this thread
     // makes is bounded by `EscWaitMs` and gives up when the thread is terminating or the device
     // is stopping, so a user process can never hold the device (or itself) in a kernel wait that
