@@ -112,6 +112,12 @@ pub const NVGPU_CFG_VENUS_CURSOR: u32 = 1 << 18;
 /// cursor commands there when the device also has the queue (`kmd_render/src/virtio/gpu/
 /// cursor_ring.rs`) and `HwCursorQ` is not 0.
 pub const NVGPU_CFG_CURSOR_QUEUE: u32 = 1 << 20;
+/// `NVGPU_CFG_RM_BATCH` (config `features` bit 23): the host serves `RmBatch` (message
+/// type 37), several RM `Ioctl`s in one round trip, each served as if sent alone
+/// (`host/backend/device/src/nvidia/batch.rs`). The KMD's paging path uses it under
+/// `NvPaging` 0x1 (`helios_kmd_logic::rm_batch`); without the bit it sends one call per
+/// round trip.
+pub const NVGPU_CFG_RM_BATCH: u32 = 1 << 23;
 
 // ── Device status bits (VirtIO spec §2.1) ──────────────────────────────────
 pub const VIRTIO_STATUS_ACKNOWLEDGE: u8 = 1;
@@ -135,3 +141,31 @@ pub const VIRTIO_PCI_CAP_SHARED_MEMORY_CFG: u8 = 8;
 /// PCI device identity for the virtio-gpu device (OVERVIEW.md / TRANSPORT.md).
 pub const VIRTIO_PCI_VENDOR_ID: u16 = 0x1AF4;
 pub const VIRTIO_GPU_PCI_DEVICE_ID: u16 = 0x1050;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The config bits the KMD reads are the host's numbers
+    /// (`host/backend/protocol/src/messages.rs`) and do not collide.
+    #[test]
+    fn config_bits_are_the_host_s_and_distinct() {
+        let bits = [
+            NVGPU_CFG_CURSOR,
+            NVGPU_CFG_GUEST_BLOB,
+            NVGPU_CFG_VENUS_CURSOR,
+            NVGPU_CFG_CURSOR_QUEUE,
+            NVGPU_CFG_RM_BATCH,
+        ];
+        for (i, a) in bits.iter().enumerate() {
+            assert_eq!(a.count_ones(), 1);
+            for b in &bits[i + 1..] {
+                assert_eq!(a & b, 0);
+            }
+        }
+        assert_eq!(NVGPU_CFG_RM_BATCH, 1 << 23);
+        assert_eq!(NVGPU_CFG_CURSOR_QUEUE, 1 << 20);
+        // Not a virtio feature bit this driver acks.
+        assert_eq!(u64::from(NVGPU_CFG_RM_BATCH) & CONDUIT_OPTIONAL_FEATURES, 0);
+    }
+}

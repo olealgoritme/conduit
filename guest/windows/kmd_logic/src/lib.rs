@@ -68,6 +68,8 @@ pub mod rm_resource_import;
 pub mod umd_version;
 pub mod page_runs;
 pub mod rm_client;
+pub mod rm_batch;
+pub mod desc_cache;
 pub mod rm_present;
 pub mod rm_refresh;
 pub mod rm_blt;

@@ -47,6 +47,34 @@ impl HotPath {
     }
 }
 
+/// The `NvPaging` knob (REG_DWORD, default 0): the cheaper page-table update
+/// paths of `kmd_render` `virtio/native_memory.rs`. With 0 every update makes
+/// its RM calls one round trip each and frees each OS descriptor at its unmap,
+/// as before the knob existed.
+///
+/// * [`Paging::BATCH`] (0x1): the RM calls of one system-page or foreign leaf
+///   update (descriptor, virtual object, map; unmaps and frees) go to the host
+///   as one `RmBatch` (`crate::rm_batch`), only when the host's config features
+///   carry `NVGPU_CFG_RM_BATCH`; a host that refuses a batch gets single calls.
+/// * [`Paging::DESC_CACHE`] (0x2): an OS descriptor whose last mapping went is
+///   kept (up to `NvDescCacheMax`, default 256) and reused for the same pages
+///   (`crate::desc_cache`). Sharing a mapped descriptor for the same pages is
+///   always on: it is the same RM object either way.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Paging(pub u32);
+
+impl Paging {
+    pub const BATCH: u32 = 0x1;
+    pub const DESC_CACHE: u32 = 0x2;
+
+    pub const fn batch(self) -> bool {
+        self.0 & Self::BATCH != 0
+    }
+    pub const fn desc_cache(self) -> bool {
+        self.0 & Self::DESC_CACHE != 0
+    }
+}
+
 /// The default period of the mirror pass the hot paths ask for (`NvHotPubMs`).
 pub const DEFAULT_PUBLISH_MS: u32 = 1_000;
 /// A window shorter than this keeps the previous rates (a pass someone else asked
@@ -227,6 +255,14 @@ pub fn foreign_update_unchanged(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn paging_knob_bits() {
+        assert!(!Paging(0).batch() && !Paging(0).desc_cache());
+        assert!(Paging(1).batch() && !Paging(1).desc_cache());
+        assert!(!Paging(2).batch() && Paging(2).desc_cache());
+        assert!(Paging(3).batch() && Paging(3).desc_cache());
+    }
 
     #[test]
     fn knob_bits() {
