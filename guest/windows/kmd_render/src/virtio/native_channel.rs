@@ -525,6 +525,9 @@ pub(crate) struct NativeContext {
     /// The TSG's hardware id (`NVA06C_CTRL_CMD_GET_INFO`), asked once by a hang snapshot
     /// (`ddi::native_snap`); u32::MAX = not asked yet.
     hw_tsg: AtomicU32,
+    /// The TSG's engine (`NV2080_ENGINE_TYPE`): graphics, or an async copy engine for the
+    /// copy context's channel (`CopyChannel`).
+    engine: u32,
 }
 
 /// A TSG's preemption state (`NvPreempt`, `helios_kmd_logic::ctxsw_preempt`): the gate
@@ -682,6 +685,23 @@ impl NativeContext {
         process: &mut ProcessContext,
         owner: DeviceOwner,
     ) -> Result<Self, NativeError> {
+        Self::create_on(passive, adapter, process, owner, false)
+    }
+
+    /// The TSG's engine (`NV2080_ENGINE_TYPE`).
+    pub(crate) fn engine(&self) -> u32 {
+        self.engine
+    }
+
+    /// `async_copy`: a TSG on an asynchronous copy engine (`pg_channel::pick_engine`, its own
+    /// runlist) instead of graphics.
+    fn create_on(
+        passive: PassiveLevel,
+        adapter: &AdapterContext,
+        process: &mut ProcessContext,
+        owner: DeviceOwner,
+        async_copy: bool,
+    ) -> Result<Self, NativeError> {
         // CreateContext runs in the calling process: the exit gate's EPROCESS (`hws::exit_gate`).
         process.bind_eprocess();
         let native = ensure_process(passive, adapter, process)?;
@@ -694,14 +714,18 @@ impl NativeContext {
             adapter,
             epoch: native.epoch,
         };
+        let mut engine = cc::ENGINE_GRAPHICS;
         let result = (|| {
             validate_blackwell(io, &native.client)?;
+            if async_copy {
+                engine = pg_channel::pick_engine(io, &native.client)?;
+            }
             io.alloc(
                 &native.client,
                 nd::H_DEVICE,
                 tsg,
                 cc::KEPLER_CHANNEL_GROUP_A,
-                &cc::channel_group_params(native.vaspace, cc::ENGINE_GRAPHICS),
+                &cc::channel_group_params(native.vaspace, engine),
             )?;
             if let Err(error) = io.alloc(
                 &native.client,
@@ -740,6 +764,7 @@ impl NativeContext {
             veids: AtomicU64::new(0),
             preempt: Preempt::default(),
             hw_tsg: AtomicU32::new(u32::MAX),
+            engine,
         })
     }
 
@@ -1598,15 +1623,24 @@ fn take_veid(veids: &AtomicU64) -> Option<u32> {
     }
 }
 
-/// The Vulkan ICD's node-3 copy context's own channel (`ddi::nv_copy`). The
+/// The NVIDIA UMDs' node-3 copy context's own channel (`ddi::nv_copy`). The
 /// context submits with `SubmitCommand` and the work in its private data as
 /// GPFIFO entries (`helios_kmd_logic::nv_copy`); NVIDIA's KMD runs them on a
-/// copy channel of its own, and so does this one: a native TSG and GR-runlist
-/// channel in the process's VA space, built like a native queue's
-/// (`create_queue_objects`: the graphics copy engine on subchannel 4, the
-/// deferred-API object), over a KMD-owned system-memory block (`nv::ring`)
-/// that holds the GPFIFO ring, one release segment per submission and the
-/// progress semaphore the KMD's release segment writes.
+/// copy channel of its own, and so does this one, in the process's VA space, over a
+/// KMD-owned system-memory block (`nv::ring`) that holds the GPFIFO ring, one release
+/// segment per submission, the progress semaphore the KMD's release segment writes and
+/// the init segment.
+///
+/// Engine (`NvCcxEng`, `nv_copy::engine`): by default a TSG and channel on an asynchronous
+/// copy engine (its own runlist, like node 3's `DXGK_ENGINE_TYPE_COPY`), its first GPFIFO
+/// entry binding the copy class to subchannel 4 (`nv::set_object_segment`). The old form
+/// (`NvCcxEng=1`, and the fallback when no async copy engine takes the channel) is a TSG
+/// and channel on the graphics runlist built like a native queue's (`create_queue_objects`:
+/// the GRCE object on subchannel 4): it only runs when GR switches to it, so an app TSG
+/// holding GR while it waits for a release in this channel's work never lets it run.
+///
+/// Ring room comes from the progress semaphore (`nv::RingTrack`), never USERD GP_GET:
+/// GB20x under GSP does not write GP_GET back.
 pub(crate) struct CopyChannel {
     context: NativeContext,
     parts: QueueParts,
@@ -1616,7 +1650,7 @@ pub(crate) struct CopyChannel {
     block_virtual: bool,
     block: CpuView,
     block_gpu: u64,
-    gp_put: SpinLock<u32>,
+    gp_put: SpinLock<helios_kmd_logic::nv_copy::RingTrack>,
     dead: core::sync::atomic::AtomicBool,
 }
 
@@ -1627,9 +1661,13 @@ impl CopyChannel {
         adapter: &AdapterContext,
         process: &mut ProcessContext,
         owner: DeviceOwner,
+        async_copy: bool,
     ) -> Result<Self, NativeError> {
         let block_handles = ObjectHandles::mint()?;
-        let context = NativeContext::create(passive, adapter, process, owner)?;
+        let context = NativeContext::create_on(passive, adapter, process, owner, async_copy).map_err(|error| {
+            crate::diag::record_named_bytes(b"NvCcxErr", 0x8000 | error as u32);
+            error
+        })?;
         let mut channel = Self {
             context,
             parts: QueueParts::default(),
@@ -1638,7 +1676,7 @@ impl CopyChannel {
             block_virtual: false,
             block: CpuView::default(),
             block_gpu: 0,
-            gp_put: SpinLock::new(0),
+            gp_put: SpinLock::new(helios_kmd_logic::nv_copy::RingTrack::new()),
             dead: core::sync::atomic::AtomicBool::new(false),
         };
         // NvCcxErr: 0 built, else 0x100 | the error of the step that failed.
@@ -1650,7 +1688,28 @@ impl CopyChannel {
         crate::diag::record_named_bytes(b"NvCcxErr", 0);
         crate::diag::record_named_bytes(b"NvCcxVa", (channel.block_gpu >> 12) as u32);
         crate::diag::record_named_bytes(b"NvCcxTok", channel.parts.token);
+        crate::diag::record_named_bytes(b"NvCcxEngT", channel.context.engine());
         Ok(channel)
+    }
+
+    /// The work-submit token (its low bits the host channel id an Xid names).
+    pub(crate) fn token(&self) -> u32 {
+        self.parts.token
+    }
+
+    /// The block's GPU VA in the process's space.
+    pub(crate) fn block_gpu(&self) -> u64 {
+        self.block_gpu
+    }
+
+    /// Whether the channel runs on an async copy engine (else graphics).
+    pub(crate) fn is_async(&self) -> bool {
+        self.context.engine() != cc::ENGINE_GRAPHICS
+    }
+
+    /// The channel's engine (`NV2080_ENGINE_TYPE`).
+    pub(crate) fn engine(&self) -> u32 {
+        self.context.engine()
     }
 
     fn build(&mut self, passive: PassiveLevel, adapter: &AdapterContext) -> Result<(), NativeError> {
@@ -1734,16 +1793,54 @@ impl CopyChannel {
             ring_bytes: ring::GPFIFO_BYTES,
             allocation: 0,
         };
-        let result = create_queue_objects(
-            io,
-            client,
-            &self.context,
-            native.vaspace,
-            &queue,
-            &mut self.parts,
-        );
+        let result = if self.context.engine() == cc::ENGINE_GRAPHICS {
+            create_queue_objects(
+                io,
+                client,
+                &self.context,
+                native.vaspace,
+                &queue,
+                &mut self.parts,
+            )
+        } else {
+            create_copy_objects(io, client, &self.context, &queue, &mut self.parts)
+        };
         file_leftovers(self.context.process_key(), native.epoch, &mut self.parts.left);
-        result
+        result?;
+        if self.context.engine() != cc::ENGINE_GRAPHICS {
+            self.write_init();
+        }
+        Ok(())
+    }
+
+    /// The async channel's first GPFIFO entry: `SET_OBJECT` of the copy class on
+    /// subchannel 4 (the ICD's segments drive it without binding it). Written once at build,
+    /// before any submission; it runs ahead of the first sequence.
+    fn write_init(&self) {
+        use helios_kmd_logic::nv_copy::{self as nv, ring};
+        let words = nv::set_object_segment(cp::Gen::Gb202.classes().copy);
+        for (i, word) in words.iter().enumerate() {
+            // SAFETY: inside the block's kernel view (`INIT_AT` + INIT_DWORDS).
+            unsafe { write32(self.block.va + ring::INIT_AT + 4 * i as u64, *word) };
+        }
+        let mut track = self.gp_put.lock();
+        let at = self.block.va + u64::from(track.put()) * 8;
+        let (lo, hi) = nv::GpEntry {
+            va: self.block_gpu + ring::INIT_AT,
+            dwords: ring::INIT_DWORDS,
+        }
+        .encode();
+        // SAFETY: entry `put` (0) of the ring at the block's start.
+        unsafe {
+            write32(at, lo);
+            write32(at + 4, hi);
+        }
+        let put = track.advance_init(1);
+        full_barrier();
+        // SAFETY: as `submit`: USERD GP_PUT, then the doorbell.
+        unsafe { write32(self.parts.ctl.va + cc::USERD_OFFSET + u64::from(cp::USERD_GP_PUT), put) };
+        full_barrier();
+        unsafe { write32(self.parts.usermode.va + u64::from(cp::DOORBELL_OFFSET), self.parts.token) };
     }
 
     /// The process key native memory files the process's mappings under.
@@ -1781,14 +1878,19 @@ impl CopyChannel {
         unsafe { ((self.block.va + ring::SEMAPHORE_AT) as *const u64).read_volatile() }
     }
 
-    /// USERD GP_GET. Any IRQL; 0 unmapped.
-    pub(crate) fn gp_get(&self) -> u32 {
-        let ctl = self.parts.ctl.va;
-        if ctl == 0 {
-            return 0;
-        }
-        // SAFETY: as `NativeQueue::gp_get`.
-        unsafe { ((ctl + cc::USERD_OFFSET + u64::from(cp::USERD_GP_GET)) as *const u32).read_volatile() }
+    /// How far the channel consumed its ring: the GP_PUT after the release entry of the
+    /// last completed sequence (`nv::RingTrack`; USERD GP_GET is not written back on GB20x).
+    /// Any IRQL up to DISPATCH (the GP_PUT lock).
+    pub(crate) fn consumed(&self) -> u32 {
+        let progress = self.progress();
+        self.gp_put.lock().consumed(progress)
+    }
+
+    /// `(GP_PUT, consumed, entries pending)` for a hang snapshot. DISPATCH-safe.
+    pub(crate) fn ring_state(&self) -> (u32, u32, u32) {
+        let progress = self.progress();
+        let track = self.gp_put.lock();
+        (track.put(), track.consumed(progress), track.pending(progress))
     }
 
     /// The channel's error notifier. Any IRQL.
@@ -1826,13 +1928,13 @@ impl CopyChannel {
         if self.block.va == 0 {
             return (0, self.parts.token, 0);
         }
-        let put = self.gp_put.lock();
+        let track = self.gp_put.lock();
         let n = (out.len() / 2).min(ring::ENTRIES as usize);
         for (i, w) in out[..2 * n].iter_mut().enumerate() {
             // SAFETY: the ring is the first GPFIFO_BYTES of the live block view.
             *w = unsafe { ((self.block.va + 4 * i as u64) as *const u32).read_volatile() };
         }
-        (*put, self.parts.token, n as u32)
+        (track.put(), self.parts.token, n as u32)
     }
 
     /// Append `entries` and the KMD's release of `seq` to the ring and ring the
@@ -1850,12 +1952,13 @@ impl CopyChannel {
         if ctl == 0 || doorbell == 0 || self.parts.token == 0 || self.block.va == 0 {
             return Err(NativeError::Transport);
         }
-        let mut put = self.gp_put.lock();
+        let progress = self.progress();
+        let mut track = self.gp_put.lock();
         if self.dead.load(Ordering::Acquire) {
             return Err(NativeError::Dead);
         }
         let need = entries.len() as u32 + 1;
-        if need > ring::MAX_SUBMIT_ENTRIES || ring::room(*put, self.gp_get()) < need {
+        if need > ring::MAX_SUBMIT_ENTRIES || track.room(progress) < need {
             return Err(NativeError::Busy);
         }
         // The release segment for this sequence.
@@ -1865,7 +1968,7 @@ impl CopyChannel {
             // SAFETY: inside the block's kernel view (`release_offset` + 28 bytes).
             unsafe { write32(self.block.va + release_off + 4 * i as u64, *word) };
         }
-        let mut position = *put;
+        let mut position = track.put();
         let release_entry = nv::GpEntry {
             va: self.block_gpu + release_off,
             dwords: nv::RELEASE_DWORDS as u32,
@@ -1885,7 +1988,8 @@ impl CopyChannel {
         unsafe { write32(ctl + cc::USERD_OFFSET + u64::from(cp::USERD_GP_PUT), position) };
         full_barrier();
         unsafe { write32(doorbell + u64::from(cp::DOORBELL_OFFSET), self.parts.token) };
-        *put = position;
+        let put = track.advance(seq, need);
+        debug_assert_eq!(put, position);
         Ok(())
     }
 
@@ -1946,6 +2050,108 @@ fn note_channel(token: u32, gpfifo_va: u64, space: u32) {
     crate::diag::record_named_bytes(&[b'N', b'v', b'C', b'h', b'T', digit], token);
     crate::diag::record_named_bytes(&[b'N', b'v', b'C', b'h', b'V', digit], (gpfifo_va >> 12) as u32);
     crate::diag::record_named_bytes(&[b'N', b'v', b'C', b'h', b'S', digit], space);
+}
+
+/// The objects of the copy context's channel on an asynchronous copy engine (`CopyChannel`,
+/// `context` a TSG on that engine): USERD and the doorbell as for a native queue, the GPFIFO
+/// channel on the engine in the TSG's context share, BIND, the copy object, the work-submit
+/// token, and the TSG on the runlist. The order of `pg_channel::build` (the proven async-CE
+/// bring-up), in the process's VA space.
+fn create_copy_objects(
+    io: Io<'_>,
+    client: &NativeClient,
+    context: &NativeContext,
+    queue: &nc::QueuePrivate,
+    parts: &mut QueueParts,
+) -> Result<(), NativeError> {
+    let tsg = context.tsg;
+    let engine = context.engine();
+    let handles = parts.handles.ok_or(NativeError::Invalid)?;
+    let result = (|| {
+        crate::diag::record_named_bytes(b"NvCcxStep", 1);
+        io.alloc(
+            client,
+            nd::H_DEVICE,
+            handles.at(3),
+            cc::NV01_MEMORY_SYSTEM,
+            &helios_kmd_logic::rm_sysmem::params(
+                client.root,
+                helios_kmd_logic::rm_sysmem::Cache::Cached,
+                cc::CTL_BYTES,
+            ),
+        )?;
+        parts.ctl_allocated = true;
+        parts.ctl = cpu_map(
+            io,
+            client,
+            nd::H_DEVICE,
+            handles.at(3),
+            cc::MapNode::Ctl,
+            cc::CTL_BYTES,
+            _MEMORY_CACHING_TYPE::MmCached,
+        )?;
+        zero(parts.ctl.va, cc::CTL_BYTES);
+        crate::diag::record_named_bytes(b"NvCcxStep", 2);
+        io.alloc(
+            client,
+            nd::H_SUBDEVICE,
+            handles.at(4),
+            cp::Gen::Gb202.classes().usermode,
+            &cc::usermode_params(),
+        )?;
+        parts.usermode_allocated = true;
+        parts.usermode = cpu_map(
+            io,
+            client,
+            nd::H_SUBDEVICE,
+            handles.at(4),
+            cc::MapNode::Gpu,
+            cp::USERMODE_BYTES,
+            _MEMORY_CACHING_TYPE::MmNonCached,
+        )?;
+        crate::diag::record_named_bytes(b"NvCcxStep", 3);
+        let channel = cc::channel_params(&cc::ChannelDesc {
+            h_ctl: handles.at(3),
+            gpfifo_va: queue.gpfifo_va,
+            entries: queue.entries(),
+            h_ctxshare: context.ctxshare,
+            userd_offset: cc::USERD_OFFSET,
+            engine_type: engine,
+            flags: 0,
+        });
+        io.alloc(client, tsg, handles.at(5), cp::Gen::Gb202.classes().gpfifo, &channel)?;
+        parts.channel_allocated = true;
+        crate::diag::record_named_bytes(b"NvCcxStep", 4);
+        let mut bind = cc::bind_params(engine);
+        io.control(client, handles.at(5), cc::CTRL_BIND, &mut bind)?;
+        crate::diag::record_named_bytes(b"NvCcxStep", 5);
+        io.alloc(
+            client,
+            handles.at(5),
+            handles.at(8),
+            cp::Gen::Gb202.classes().copy,
+            &cc::ce_object_params(engine),
+        )?;
+        crate::diag::record_named_bytes(b"NvCcxStep", 6);
+        let mut index = cc::token_notif_index_params();
+        io.control(client, handles.at(5), cc::CTRL_SET_WORK_SUBMIT_TOKEN_NOTIF_INDEX, &mut index)?;
+        let mut token = cc::token_params();
+        io.control(client, handles.at(5), cc::CTRL_GET_WORK_SUBMIT_TOKEN, &mut token)?;
+        parts.token = cc::parse_token(&token)
+            .filter(|token| token.0 != 0)
+            .ok_or(NativeError::Transport)?
+            .0;
+        crate::diag::record_named_bytes(b"NvCcxStep", 7);
+        note_channel(parts.token, queue.gpfifo_va, context.ctxshare);
+        context.transition(io, client, Sched::channel_ready, None)?;
+        crate::diag::record_named_bytes(b"NvCcxStep", 8);
+        Ok(())
+    })();
+    if let Err(error) = result {
+        let _ = parts.destroy(io, client, tsg);
+        return Err(error);
+    }
+    Ok(())
 }
 
 fn create_queue_objects(

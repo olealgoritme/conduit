@@ -16,6 +16,19 @@
 //! faulted or hung channel (`native_hang::Watch`: report, then after the grace
 //! the channel is dead and its outstanding sequences complete).
 //!
+//! The channel's engine (`NvCcxEng`, read at CreateContext, `nv_copy::engine`): 0 / unset
+//! an asynchronous copy engine with its own runlist (what node 3, a `DXGK_ENGINE_TYPE_COPY`
+//! node, is on NVIDIA's KMD), falling back to the graphics-runlist channel when no async copy
+//! engine takes it; 1 the graphics-runlist channel (GRCE on subchannel 4, a TSG of its own on
+//! GR's runlist: Steel Nomad D3D12 deadlocked on it, its gfx TSG holding GR in an acquire of
+//! a value this channel's work releases); 2 the async engine only. `NvCcxEngUsed` the last
+//! built (1 graphics, 2 async), `NvCcxAsyncFail` async builds that failed, `NvCcxEngT` its
+//! engine type, `NvCcxStep` the async bring-up's last step.
+//!
+//! Ring room comes from the progress semaphore (`nv_copy::RingTrack`): USERD GP_GET is never
+//! written back on GB20x, and read from there a ring that had once taken ~1023 entries
+//! looked full for good, so every later submission waited in the backlog forever.
+//!
 //! `NvCcCpu=1` (test knob, read at CreateContext): when the channel could not be
 //! built, is dead or its ring is full, the HPD worker runs the work on the CPU
 //! instead ([`service`], through `native_memory::patch_gpu_bytes`).
@@ -120,6 +133,7 @@ fn reject(reason: u32, hint: u32) {
 }
 /// `NvCcCpu`: the CPU fallback is enabled.
 static CPU_FALLBACK: AtomicU32 = AtomicU32::new(0);
+static ASYNC_FAILED: AtomicU32 = AtomicU32::new(0);
 
 static MADE: AtomicU32 = AtomicU32::new(0);
 static MAKE_FAILED: AtomicU32 = AtomicU32::new(0);
@@ -183,13 +197,37 @@ pub(crate) unsafe fn create_channel(h_device: *mut core::ffi::c_void, h_context:
     let passive = unsafe { PassiveLevel::assume() };
     let knob = crate::diag::read_config_dword(crate::diag::KnobName::new(b"NvCcCpu"), 0);
     CPU_FALLBACK.store(u32::from(knob == 1), Ordering::Relaxed);
-    let made = (|| {
+    let mode = logic::engine::mode(crate::diag::read_config_dword(crate::diag::KnobName::new(b"NvCcxEng"), 0));
+    let build = |async_copy: bool| {
         let device = unsafe { crate::device::DeviceHandleRef::from_raw(h_device) }?;
         let adapter = device.adapter()?;
         let owner = crate::virtio::gpu::DeviceOwner::new(h_device as usize)?;
         let process = unsafe { device.native_process_ptr().as_mut() }?;
-        CopyChannel::create(passive, adapter, process, owner).ok()
-    })();
+        CopyChannel::create(passive, adapter, process, owner, async_copy).ok()
+    };
+    let made = match mode {
+        logic::engine::Mode::Graphics => build(false),
+        logic::engine::Mode::Async | logic::engine::Mode::AsyncOnly => {
+            let made = build(true);
+            if made.is_none() {
+                let n = ASYNC_FAILED.fetch_add(1, Ordering::Relaxed) + 1;
+                crate::diag::record_named_bytes(b"NvCcxAsyncFail", n);
+            }
+            if made.is_none() && mode == logic::engine::Mode::Async {
+                build(false)
+            } else {
+                made
+            }
+        }
+    };
+    if let Some(channel) = made.as_ref() {
+        let used = if channel.is_async() {
+            logic::engine::USED_ASYNC
+        } else {
+            logic::engine::USED_GRAPHICS
+        };
+        crate::diag::record_named_bytes(b"NvCcxEngUsed", used);
+    }
     let Some(channel) = made else {
         let n = MAKE_FAILED.fetch_add(1, Ordering::Relaxed) + 1;
         crate::diag::record_named_bytes(b"NvCcxMkFail", n);
@@ -224,6 +262,80 @@ pub(crate) unsafe fn create_channel(h_device: *mut core::ffi::c_void, h_context:
 
 /// Channel slots for hang snapshots (`ddi::native_snap`).
 pub(crate) const SNAP_CHANNELS: usize = CHANNELS_MAX;
+
+/// One copy channel's state for a hang snapshot (`ddi::native_snap`, `REC_COPY`).
+#[derive(Clone, Copy, Default)]
+pub(crate) struct CopySnap {
+    pub process: usize,
+    pub token: u32,
+    pub engine: u32,
+    pub async_engine: bool,
+    pub dead: bool,
+    pub in_grace: bool,
+    /// The KMD block's GPU VA (the release entries live there).
+    pub block_gpu: u64,
+    pub put: u32,
+    pub consumed: u32,
+    pub pending: u32,
+    pub progress: u64,
+    pub submitted: u64,
+    pub seen: u64,
+    pub forced: u64,
+    /// Backlog submissions of this channel, the first one's sequence.
+    pub backlog: u32,
+    pub backlog_first: u64,
+}
+
+/// Slot `index`'s channel state; `None` for an empty slot. DISPATCH-safe.
+pub(crate) fn snap_copy(index: usize) -> Option<CopySnap> {
+    let channels = CHANNELS.lock();
+    let entry = channels.get(index).filter(|entry| entry.channel != 0)?;
+    // SAFETY: as in `gate_ready`.
+    let channel = unsafe { &*(entry.channel as *const CopyChannel) };
+    let (put, consumed, pending) = channel.ring_state();
+    let (backlog, backlog_first) = {
+        let backlog = BACKLOG.lock();
+        let mine = backlog.iter().filter(|p| p.slot == index);
+        let first = backlog.iter().find(|p| p.slot == index).map_or(0, |p| p.seq);
+        (mine.count() as u32, first)
+    };
+    Some(CopySnap {
+        process: channel.process_key(),
+        token: channel.token(),
+        engine: channel.engine(),
+        async_engine: channel.is_async(),
+        dead: channel.is_dead(),
+        in_grace: entry.watch.in_grace(),
+        block_gpu: channel.block_gpu(),
+        put,
+        consumed,
+        pending,
+        progress: channel.progress(),
+        submitted: entry.submitted,
+        seen: entry.seen,
+        forced: entry.forced,
+        backlog,
+        backlog_first,
+    })
+}
+
+/// Slot `index`'s backlog segments, in order: `(seq, va, dwords)` into `out`; how many.
+/// DISPATCH-safe.
+pub(crate) fn snap_backlog(index: usize, out: &mut [(u64, u64, u32)]) -> usize {
+    let _channels = CHANNELS.lock();
+    let backlog = BACKLOG.lock();
+    let mut n = 0;
+    for p in backlog.iter().filter(|p| p.slot == index) {
+        for e in p.entries.iter() {
+            if n >= out.len() {
+                return n;
+            }
+            out[n] = (p.seq, e.va, e.dwords);
+            n += 1;
+        }
+    }
+    n
+}
 
 /// Slot `index`'s channel ring for a hang snapshot: `(process key, GP_PUT, token, entries)`
 /// with the entries in `out` (`CopyChannel::ring_snapshot`); `None` for an empty slot.
@@ -370,8 +482,7 @@ pub(crate) unsafe fn admit(
             return None;
         }
         entries.extend(record.entries(private));
-        crate::ddi::sem_watch::note_copy_submit(process, submit.NodeOrdinal, &entries);
-        match submit_to_channel(h_context, entries) {
+        match submit_to_channel(h_context, entries, (process, submit.NodeOrdinal)) {
             Ok(gate) => {
                 SUBMITTED.fetch_add(1, Ordering::Relaxed);
                 crate::ddi::hws::kick_poll(adapter);
@@ -428,7 +539,7 @@ pub(crate) unsafe fn admit(
 /// ring, or (ring full, or earlier submissions still waiting) into the backlog the
 /// HWS poll drains. `Ok(gate)`, or the `copy_reason` it could not be taken for.
 /// DISPATCH.
-fn submit_to_channel(h_context: usize, entries: Vec<logic::GpEntry>) -> Result<u64, u32> {
+fn submit_to_channel(h_context: usize, entries: Vec<logic::GpEntry>, who: (usize, u32)) -> Result<u64, u32> {
     use helios_kmd_logic::vk_fail::copy_reason as why;
     let mut channels = CHANNELS.lock();
     let Some((slot, entry)) = channels
@@ -441,6 +552,8 @@ fn submit_to_channel(h_context: usize, entries: Vec<logic::GpEntry>) -> Result<u
     // SAFETY: as in `gate_ready`.
     let channel = unsafe { &*(entry.channel as *const CopyChannel) };
     let seq = entry.submitted + 1;
+    // `NvSemWatch`: queued for the mirror pass's scan (lock-free; nothing when off).
+    crate::ddi::sem_watch::note_copy_submit(who.0, who.1, slot, seq, &entries);
     let mut backlog = BACKLOG.lock();
     let waiting = backlog.iter().any(|p| p.slot == slot);
     if !waiting {
@@ -555,7 +668,7 @@ pub(crate) fn poll(adapter: &AdapterContext, now: u64, hang_timeout: Option<u64>
                 now,
                 outstanding: busy,
                 progress: value,
-                gp_get: channel.gp_get(),
+                gp_get: channel.consumed(),
                 error: channel.channel_error(),
             };
             match entry.watch.tick(sample, hang_timeout) {

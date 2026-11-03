@@ -208,7 +208,7 @@ pub(crate) fn ensure(
 
 /// The copy engine for the channel: `GET_ENGINES_V2`, `CE_GET_CAPS_V2` of each copy engine,
 /// `rm_ce_channel::pick_engine` (an async one that writes system memory).
-fn pick_engine(io: Io<'_>, client: &NativeClient) -> Result<u32, NativeError> {
+pub(super) fn pick_engine(io: Io<'_>, client: &NativeClient) -> Result<u32, NativeError> {
     let mut list = [0u8; cc::ENGINES_BYTES];
     io.control(client, nd::H_SUBDEVICE, cc::CTRL_GET_ENGINES_V2, &mut list)?;
     let mut types = [0u32; cc::MAX_CAPS_QUERIES];

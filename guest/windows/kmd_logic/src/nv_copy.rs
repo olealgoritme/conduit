@@ -283,6 +283,12 @@ pub mod ring {
     // sequence comes round.
     const _: () = assert!(((ENTRIES - 1) as u64) / 2 < RELEASE_SLOTS);
 
+    /// The async-CE channel's init segment (`SET_OBJECT` of the copy class on
+    /// subchannel 4, [`super::set_object_segment`]): its first GPFIFO entry.
+    pub const INIT_AT: u64 = SEMAPHORE_AT + 0x100;
+    pub const INIT_DWORDS: u32 = 2;
+    const _: () = assert!(INIT_AT + 4 * INIT_DWORDS as u64 <= BYTES);
+
     /// The release slot's offset in the block for sequence `seq`.
     pub const fn release_offset(seq: u64) -> u64 {
         RELEASE_AT + (seq % RELEASE_SLOTS) * RELEASE_SLOT_BYTES
@@ -294,6 +300,125 @@ pub mod ring {
         let used = (put + ENTRIES - get % ENTRIES) % ENTRIES;
         ENTRIES - 1 - used
     }
+}
+
+/// Where the KMD's copy channel is in its ring, without USERD `GP_GET` (GB20x under GSP never
+/// writes it back: read from USERD it stays 0, so a ring that once took ~1023 entries looked
+/// full for good and every later submission waited in the backlog forever). The channel runs
+/// its ring in order and every submission ends with the KMD's release of its sequence, so the
+/// progress semaphore names how far the ring is consumed: the GP_PUT after that sequence's
+/// release entry, kept per sequence here (fewer than [`ring::RELEASE_SLOTS`] are ever in
+/// flight: each takes two entries or more of a 1023-entry ring).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RingTrack {
+    put: u32,
+    /// GP_PUT after each sequence's release entry, by `seq % RELEASE_SLOTS`.
+    ends: [u16; ring::RELEASE_SLOTS as usize],
+    /// The newest sequence on the ring (0 = none yet).
+    last: u64,
+}
+
+impl Default for RingTrack {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RingTrack {
+    pub const fn new() -> Self {
+        Self {
+            put: 0,
+            ends: [0; ring::RELEASE_SLOTS as usize],
+            last: 0,
+        }
+    }
+
+    /// The KMD's GP_PUT.
+    pub const fn put(&self) -> u32 {
+        self.put
+    }
+
+    /// The newest sequence on the ring.
+    pub const fn last(&self) -> u64 {
+        self.last
+    }
+
+    /// The ring index the channel is done with, given its progress semaphore `completed`.
+    /// Before the first sequence completes, 0 (entries written before it, such as the init
+    /// segment, count as not consumed). A `completed` older than the per-sequence window
+    /// cannot be placed: the answer is the one that leaves no room.
+    pub fn consumed(&self, completed: u64) -> u32 {
+        if completed == 0 || self.last == 0 {
+            return 0;
+        }
+        let c = if completed > self.last { self.last } else { completed };
+        if self.last - c >= ring::RELEASE_SLOTS {
+            return (self.put + 1) % ring::ENTRIES;
+        }
+        u32::from(self.ends[(c % ring::RELEASE_SLOTS) as usize])
+    }
+
+    /// Free entries with the channel at `completed`.
+    pub fn room(&self, completed: u64) -> u32 {
+        ring::room(self.put, self.consumed(completed))
+    }
+
+    /// Entries pending on the ring (written, not yet consumed) at `completed`.
+    pub fn pending(&self, completed: u64) -> u32 {
+        ring::ENTRIES - 1 - self.room(completed)
+    }
+
+    /// `n` entries written ahead of any sequence (the init segment); the new GP_PUT.
+    pub fn advance_init(&mut self, n: u32) -> u32 {
+        self.put = (self.put + n) % ring::ENTRIES;
+        self.put
+    }
+
+    /// `n` entries written for `seq` (its segments and its release, the last of them); the
+    /// new GP_PUT. Sequences arrive in order.
+    pub fn advance(&mut self, seq: u64, n: u32) -> u32 {
+        self.put = (self.put + n) % ring::ENTRIES;
+        self.ends[(seq % ring::RELEASE_SLOTS) as usize] = self.put as u16;
+        self.last = seq;
+        self.put
+    }
+}
+
+/// The init segment of an async copy-engine channel: `SET_OBJECT(copy_class)` on subchannel 4,
+/// where the ICD's segments drive the copy class without binding it (a graphics channel's
+/// subchannel 4 is the GRCE object RM binds; an async CE channel needs it bound).
+pub const fn set_object_segment(copy_class: u32) -> [u32; ring::INIT_DWORDS as usize] {
+    // INC, one dword, subchannel 4, method 0 (SET_OBJECT).
+    [0x2001_8000, copy_class]
+}
+
+/// `NvCcxEng`: which engine the KMD's copy channel runs on.
+pub mod engine {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Mode {
+        /// An asynchronous copy engine (its own runlist, its own TSG), as NVIDIA's node 3
+        /// (`DXGK_ENGINE_TYPE_COPY`) is; the graphics channel when that cannot be built.
+        Async,
+        /// The asynchronous copy engine or nothing (the CPU fallback / rejection).
+        AsyncOnly,
+        /// A graphics channel (GRCE on subchannel 4) in a TSG of its own on the graphics
+        /// runlist: it runs only when the GR engine switches to it, so an app TSG that holds
+        /// GR waiting for a value this channel releases deadlocks both.
+        Graphics,
+    }
+
+    /// The knob's value (unset / 0 = [`Mode::Async`]).
+    pub const fn mode(knob: u32) -> Mode {
+        match knob {
+            1 => Mode::Graphics,
+            2 => Mode::AsyncOnly,
+            _ => Mode::Async,
+        }
+    }
+
+    /// `NvCcxEngUsed`: what a built channel runs on.
+    pub const USED_GRAPHICS: u32 = 1;
+    pub const USED_ASYNC: u32 = 2;
 }
 
 /// LAUNCH_DMA for the KMD's release: a one-word semaphore release
@@ -690,6 +815,91 @@ mod tests {
             ring::RELEASE_AT + ring::RELEASE_SLOT_BYTES
         );
         assert!(ring::release_offset(511) + ring::RELEASE_SLOT_BYTES <= ring::SEMAPHORE_AT);
+    }
+
+    #[test]
+    fn the_ring_is_consumed_by_completed_sequence_not_gp_get() {
+        let mut t = RingTrack::new();
+        assert_eq!(t.room(0), ring::ENTRIES - 1);
+        // GB20x never writes USERD GP_GET back: with GP_GET pinned at 0 the old room check
+        // refused everything once ~1023 entries had gone through, whatever had completed.
+        let mut seq = 0u64;
+        let mut completed = 0u64;
+        for _ in 0..10_000 {
+            seq += 1;
+            let need = 1 + (seq % 300) as u32;
+            if t.room(completed) < need {
+                // The channel catches up.
+                completed = t.last();
+                assert_eq!(t.room(completed), ring::ENTRIES - 1);
+            }
+            assert!(t.room(completed) >= need);
+            t.advance(seq, need);
+        }
+        assert!(t.put() < ring::ENTRIES);
+        // The old check, `room(put, GP_GET)` with GP_GET read as 0: once put is past
+        // 1023 - need it refuses with nothing outstanding, and nothing ever changes it.
+        let mut t = RingTrack::new();
+        t.advance(1, 1000);
+        assert_eq!(t.room(1), ring::ENTRIES - 1);
+        assert!(ring::room(t.put(), 0) < 30);
+    }
+
+    #[test]
+    fn ring_track_partial_progress_and_stale_values() {
+        let mut t = RingTrack::new();
+        // The async channel's init segment: not consumed until a sequence completes.
+        assert_eq!(t.advance_init(1), 1);
+        assert_eq!(t.room(0), ring::ENTRIES - 2);
+        t.advance(1, 3); // put 4
+        t.advance(2, 5); // put 9
+        t.advance(3, 2); // put 11
+        assert_eq!(t.consumed(0), 0);
+        assert_eq!(t.consumed(1), 4);
+        assert_eq!(t.consumed(2), 9);
+        assert_eq!(t.consumed(3), 11);
+        // A value past the newest sequence (cannot happen) clamps.
+        assert_eq!(t.consumed(9), 11);
+        assert_eq!(t.pending(1), 7);
+        assert_eq!(t.pending(3), 0);
+        // Wrap: the ends wrap with the ring.
+        let mut t = RingTrack::new();
+        t.advance(1, 1000);
+        t.advance(2, 100);
+        assert_eq!(t.put(), 76);
+        assert_eq!(t.consumed(1), 1000);
+        assert_eq!(t.room(1), ring::ENTRIES - 1 - 100);
+        // A completed value older than the window leaves no room.
+        let mut t = RingTrack::new();
+        for s in 1..=600u64 {
+            t.advance(s, 1);
+        }
+        assert_eq!(t.room(600 - ring::RELEASE_SLOTS), 0);
+        assert_eq!(t.room(600 - ring::RELEASE_SLOTS + 1), ring::ENTRIES - 1 - (ring::RELEASE_SLOTS as u32 - 1));
+    }
+
+    #[test]
+    fn set_object_segment_binds_subchannel_four() {
+        let seg = set_object_segment(0xcab5);
+        // The host method decoder ignores it (method 0 < 0x100), nothing runs.
+        let (got, stats) = ops(&seg);
+        assert!(got.is_empty());
+        assert_eq!(stats, DecodeStats::default());
+        // Header fields: INC, count 1, subchannel 4, method 0.
+        assert_eq!(seg[0] >> 29, 1);
+        assert_eq!((seg[0] >> 16) & 0x1fff, 1);
+        assert_eq!((seg[0] >> 13) & 7, COPY_SUBCHANNEL);
+        assert_eq!(seg[0] & 0xfff, 0);
+        assert_eq!(seg[1], 0xcab5);
+        assert!(ring::INIT_AT >= ring::SEMAPHORE_AT + 8);
+    }
+
+    #[test]
+    fn engine_knob() {
+        assert_eq!(engine::mode(0), engine::Mode::Async);
+        assert_eq!(engine::mode(u32::MAX), engine::Mode::Async);
+        assert_eq!(engine::mode(1), engine::Mode::Graphics);
+        assert_eq!(engine::mode(2), engine::Mode::AsyncOnly);
     }
 
     #[test]
