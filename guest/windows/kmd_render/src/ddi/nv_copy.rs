@@ -144,6 +144,13 @@ static FAILED: AtomicU32 = AtomicU32::new(0);
 static FAILED_VA: AtomicU32 = AtomicU32::new(0);
 static NO_RECORD: AtomicU32 = AtomicU32::new(0);
 static FULL: AtomicU32 = AtomicU32::new(0);
+/// Submissions on an NVDA SubmitCommand context with no channel (any context but the Vulkan
+/// ICD's node-3 copy context) while the CPU fallback is off: completed without anything run.
+/// `NvCcxSilent` count, `NvCcxSilentNd` the nodes seen (bit mask), `NvCcxSilentRec` how many
+/// carried a copy record (work, and semaphore releases, that never ran).
+static SILENT: AtomicU32 = AtomicU32::new(0);
+static SILENT_NODES: AtomicU32 = AtomicU32::new(0);
+static SILENT_RECORD: AtomicU32 = AtomicU32::new(0);
 
 /// Whether a WDDM pending entry's GDI gate is satisfied: a copy-context
 /// sequence once its channel's semaphore (or the CPU fallback) reached it, any
@@ -213,6 +220,20 @@ pub(crate) unsafe fn create_channel(h_device: *mut core::ffi::c_void, h_context:
     }
     let n = MADE.fetch_add(1, Ordering::Relaxed) + 1;
     crate::diag::record_named_bytes(b"NvCcxMade", n);
+}
+
+/// Channel slots for hang snapshots (`ddi::native_snap`).
+pub(crate) const SNAP_CHANNELS: usize = CHANNELS_MAX;
+
+/// Slot `index`'s channel ring for a hang snapshot: `(process key, GP_PUT, token, entries)`
+/// with the entries in `out` (`CopyChannel::ring_snapshot`); `None` for an empty slot.
+pub(crate) fn snap_ring(index: usize, out: &mut [u32]) -> Option<(usize, u32, u32, u32)> {
+    let channels = CHANNELS.lock();
+    let entry = channels.get(index).filter(|entry| entry.channel != 0)?;
+    // SAFETY: as in `gate_ready`.
+    let channel = unsafe { &*(entry.channel as *const CopyChannel) };
+    let (put, token, n) = channel.ring_snapshot(out);
+    Some((channel.process_key(), put, token, n))
 }
 
 /// DestroyContext (PASSIVE): free the context's channel, if it has one.
@@ -298,6 +319,22 @@ pub(crate) unsafe fn admit(
         .iter()
         .any(|entry| entry.channel != 0 && entry.context == h_context);
     if !has_channel && CPU_FALLBACK.load(Ordering::Relaxed) == 0 {
+        // No channel and no fallback: whatever the buffer holds completes unrun.
+        SILENT.fetch_add(1, Ordering::Relaxed);
+        SILENT_NODES.fetch_or(1u32.checked_shl(submit.NodeOrdinal).unwrap_or(0), Ordering::Relaxed);
+        if !submit.pDmaBufferPrivateData.is_null() && submit.DmaBufferPrivateDataSize != 0 {
+            // SAFETY: dxgkrnl's private data, DmaBufferPrivateDataSize bytes, for this call.
+            let private = unsafe {
+                core::slice::from_raw_parts(
+                    submit.pDmaBufferPrivateData as *const u8,
+                    submit.DmaBufferPrivateDataSize as usize,
+                )
+            };
+            if logic::find_record(private, submit.DmaBufferSize).is_ok_and(|r| r.segments(private) != 0) {
+                SILENT_RECORD.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        crate::ddi::sem_watch::note_drop(helios_kmd_logic::sem_watch::src::COPY_DROP, submit.NodeOrdinal);
         return None;
     }
     if submit.pDmaBufferPrivateData.is_null() || submit.DmaBufferPrivateDataSize == 0 {
@@ -315,6 +352,7 @@ pub(crate) unsafe fn admit(
         Ok(record) => record,
         Err(error) => {
             NO_RECORD.fetch_add(1, Ordering::Relaxed);
+            crate::ddi::sem_watch::note_drop(helios_kmd_logic::sem_watch::src::COPY_DROP, submit.NodeOrdinal);
             // The DMA fence completes at once and the work never runs.
             reject(why::NO_RECORD, error.code() << 24 | (private.len() as u32 & 0xff_ffff));
             return None;
@@ -332,6 +370,7 @@ pub(crate) unsafe fn admit(
             return None;
         }
         entries.extend(record.entries(private));
+        crate::ddi::sem_watch::note_copy_submit(process, submit.NodeOrdinal, &entries);
         match submit_to_channel(h_context, entries) {
             Ok(gate) => {
                 SUBMITTED.fetch_add(1, Ordering::Relaxed);
@@ -341,6 +380,7 @@ pub(crate) unsafe fn admit(
             Err(reason) => {
                 if CPU_FALLBACK.load(Ordering::Relaxed) == 0 {
                     NONE.fetch_add(1, Ordering::Relaxed);
+                    crate::ddi::sem_watch::note_drop(helios_kmd_logic::sem_watch::src::COPY_DROP, submit.NodeOrdinal);
                     reject(reason, segments as u32);
                     return None;
                 }
@@ -349,6 +389,7 @@ pub(crate) unsafe fn admit(
     }
     if CPU_FALLBACK.load(Ordering::Relaxed) == 0 {
         NONE.fetch_add(1, Ordering::Relaxed);
+        crate::ddi::sem_watch::note_drop(helios_kmd_logic::sem_watch::src::COPY_DROP, submit.NodeOrdinal);
         reject(why::NO_CHANNEL, segments as u32);
         return None;
     }
@@ -597,6 +638,12 @@ pub(crate) fn publish_hot() {
     if MADE.load(Ordering::Relaxed) != 0 || MAKE_FAILED.load(Ordering::Relaxed) != 0 {
         publish_channel();
     }
+    let silent = SILENT.load(Ordering::Relaxed);
+    if silent != 0 {
+        crate::diag::record_named_bytes(b"NvCcxSilent", silent);
+        crate::diag::record_named_bytes(b"NvCcxSilentNd", SILENT_NODES.load(Ordering::Relaxed));
+        crate::diag::record_named_bytes(b"NvCcxSilentRec", SILENT_RECORD.load(Ordering::Relaxed));
+    }
     if ADMITTED.load(Ordering::Relaxed) != 0 {
         publish();
     }
@@ -751,6 +798,7 @@ fn execute(
                 4
             };
             if write_bytes(passive, adapter, process, va, &bytes[..len]) {
+                crate::ddi::sem_watch::note_cpu_release(process, va, payload);
                 RELEASES.fetch_add(1, Ordering::Relaxed);
             } else {
                 fail(va);

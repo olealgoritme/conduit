@@ -361,6 +361,17 @@ pub mod scan_status {
 
 pub const SEM_CAP: usize = 16;
 pub const REF_CAP: usize = 48;
+/// Watched semaphore addresses a scanner matches releases against ([`Scanner::set_watch`]).
+pub const WATCH_CAP: usize = 8;
+/// Matching releases kept per segment ([`Scanner::hits`]), apart from the `SEM_CAP` record.
+pub const HIT_CAP: usize = 8;
+
+/// Whether the release `op` writes the 4 bytes at `target`: its address, or the upper half
+/// of a 64-bit payload.
+pub const fn release_covers(op: &SemOp, target: u64) -> bool {
+    !op.acquire()
+        && (op.addr == target || (op.flags & SEM_PAYLOAD64 != 0 && op.addr.wrapping_add(4) == target))
+}
 
 /// The subchannel bindings the D3D UMDs assume on a native graphics channel
 /// (`native_channel::BINDINGS` and the deferred-API object on 5).
@@ -431,6 +442,13 @@ pub struct Scanner {
     pub tail_aligned: u32,
     pub mme_calls: u32,
     pub headers: u32,
+    /// Watched addresses ([`Scanner::set_watch`], kept across segments) and the releases to
+    /// them in this segment, however many other semaphore operations it has.
+    pub watch: [u64; WATCH_CAP],
+    pub n_watch: u32,
+    pub hits: [SemOp; HIT_CAP],
+    pub n_hits: u32,
+    pub hits_seen: u32,
 }
 
 impl Scanner {
@@ -493,7 +511,24 @@ impl Scanner {
             tail_aligned: u32::MAX,
             mme_calls: 0,
             headers: 0,
+            watch: [0; WATCH_CAP],
+            n_watch: 0,
+            hits: [Z; HIT_CAP],
+            n_hits: 0,
+            hits_seen: 0,
         }
+    }
+
+    /// Match releases against `targets` (the first [`WATCH_CAP`]) from now on.
+    pub fn set_watch(&mut self, targets: &[u64]) {
+        let n = targets.len().min(WATCH_CAP);
+        self.watch[..n].copy_from_slice(&targets[..n]);
+        self.n_watch = n as u32;
+    }
+
+    /// This segment's releases to a watched address.
+    pub fn hits(&self) -> &[SemOp] {
+        &self.hits[..(self.n_hits as usize).min(HIT_CAP)]
     }
 
     /// Start a new segment: the per-segment outputs are cleared, the method state
@@ -513,6 +548,8 @@ impl Scanner {
         self.tail_aligned = u32::MAX;
         self.mme_calls = 0;
         self.headers = 0;
+        self.n_hits = 0;
+        self.hits_seen = 0;
     }
 
     pub const fn position(&self) -> u32 {
@@ -586,6 +623,18 @@ impl Scanner {
 
     fn push_sem(&mut self, op: SemOp) {
         self.sems_seen += 1;
+        let watched = &self.watch[..(self.n_watch as usize).min(WATCH_CAP)];
+        if watched.iter().any(|t| release_covers(&op, *t)) {
+            self.hits_seen += 1;
+            let k = self.n_hits as usize;
+            if k < HIT_CAP {
+                self.hits[k] = op;
+                self.n_hits += 1;
+            } else {
+                // Full: the latest replaces the last (the newest payload matters most).
+                self.hits[HIT_CAP - 1] = op;
+            }
+        }
         let n = self.n_sems as usize;
         if n < SEM_CAP {
             self.sems[n] = op;
@@ -1408,6 +1457,177 @@ pub fn write_ref(w: &mut Writer<'_>, r: &AddrRef, va_index: u32) {
     w.u32(r.class);
 }
 
+// ── the ring-history release scan (`REC_RELEASES`) ─────────────────────────────────────────
+
+/// A record of who releases the stuck submissions' acquire targets: every native queue's ring
+/// (the last [`REL_RING_ENTRIES`] GPFIFO entries before its GP_PUT) and every copy channel's
+/// ring of the same process, scanned for releases to those addresses.
+pub const REC_RELEASES: u32 = 3;
+pub const REL_TARGET_CAP: usize = WATCH_CAP;
+pub const REL_CAP: usize = 64;
+pub const REL_FIXED: usize = 40;
+pub const REL_TARGET_BYTES: usize = 16;
+pub const REL_BYTES: usize = 56;
+pub const REL_MAX_BYTES: usize = REL_FIXED + REL_TARGET_CAP * REL_TARGET_BYTES + REL_CAP * REL_BYTES;
+/// GPFIFO entries of one ring scanned back from GP_PUT.
+pub const REL_RING_ENTRIES: u32 = 2048;
+/// Dwords of one segment scanned.
+pub const REL_SEG_DWORDS: u32 = 4096;
+
+/// Where a release was found.
+pub mod rel_source {
+    /// A native HW queue's GPFIFO ring.
+    pub const NATIVE_RING: u8 = 1;
+    /// A copy-context channel's ring (`nv_copy`).
+    pub const COPY_RING: u8 = 2;
+}
+
+/// The scan stopped at the read budget.
+pub const REL_FLAG_BUDGET: u32 = 1;
+/// More releases than [`REL_CAP`]: the latest ones replaced the last slot.
+pub const REL_FLAG_FULL: u32 = 2;
+/// A segment read failed (memory reused, unmapped).
+pub const REL_FLAG_READ_FAILED: u32 = 4;
+
+/// One release to a target found in a ring.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Release {
+    pub process: u64,
+    pub target: u64,
+    pub op: SemOp,
+    pub seg_va: u64,
+    pub token: u32,
+    pub gp_index: u32,
+    pub source: u8,
+}
+
+/// The targets and what the scan found.
+pub struct ReleaseScan {
+    pub targets: [(u64, u64); REL_TARGET_CAP],
+    pub n_targets: usize,
+    pub hits: [Release; REL_CAP],
+    pub n_hits: usize,
+    pub hits_seen: u32,
+    pub queues: u32,
+    pub segments: u32,
+    pub entries: u32,
+    pub flags: u32,
+}
+
+impl Default for ReleaseScan {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ReleaseScan {
+    pub const fn new() -> Self {
+        const R: Release = Release {
+            process: 0,
+            target: 0,
+            op: SemOp { kind: 0, subch: 0, op: 0, flags: 0, word: 0, at: 0, class: 0, addr: 0, payload: 0 },
+            seg_va: 0,
+            token: 0,
+            gp_index: 0,
+            source: 0,
+        };
+        Self {
+            targets: [(0, 0); REL_TARGET_CAP],
+            n_targets: 0,
+            hits: [R; REL_CAP],
+            n_hits: 0,
+            hits_seen: 0,
+            queues: 0,
+            segments: 0,
+            entries: 0,
+            flags: 0,
+        }
+    }
+
+    /// Add (process, va) unless known or full; `false` when full.
+    pub fn add_target(&mut self, process: u64, va: u64) -> bool {
+        if self.targets[..self.n_targets].contains(&(process, va)) {
+            return true;
+        }
+        if self.n_targets >= REL_TARGET_CAP {
+            return false;
+        }
+        self.targets[self.n_targets] = (process, va);
+        self.n_targets += 1;
+        true
+    }
+
+    /// The target addresses of `process` (for [`Scanner::set_watch`]).
+    pub fn targets_of(&self, process: u64) -> ([u64; REL_TARGET_CAP], usize) {
+        let mut out = [0u64; REL_TARGET_CAP];
+        let mut n = 0;
+        for (p, va) in self.targets[..self.n_targets].iter() {
+            if *p == process && !out[..n].contains(va) {
+                out[n] = *va;
+                n += 1;
+            }
+        }
+        (out, n)
+    }
+
+    /// Record the scanner's hits of one segment.
+    pub fn note(&mut self, process: u64, hits: &[SemOp], seen: u32, seg_va: u64, token: u32, gp_index: u32, source: u8) {
+        self.hits_seen += seen;
+        if seen as usize > hits.len() {
+            self.flags |= REL_FLAG_FULL;
+        }
+        for op in hits {
+            let target = self.targets[..self.n_targets]
+                .iter()
+                .find(|(p, va)| *p == process && release_covers(op, *va))
+                .map_or(op.addr, |(_, va)| *va);
+            let r = Release { process, target, op: *op, seg_va, token, gp_index, source };
+            if self.n_hits < REL_CAP {
+                self.hits[self.n_hits] = r;
+                self.n_hits += 1;
+            } else {
+                self.flags |= REL_FLAG_FULL;
+                self.hits[REL_CAP - 1] = r;
+            }
+        }
+    }
+}
+
+/// The release record (written only when there were targets).
+pub fn write_releases(w: &mut Writer<'_>, r: &ReleaseScan) {
+    let start = w.len();
+    w.u32(0);
+    w.u32(REC_RELEASES);
+    w.u32(r.n_targets as u32);
+    w.u32(r.n_hits as u32);
+    w.u32(r.hits_seen);
+    w.u32(r.flags);
+    w.u32(r.queues);
+    w.u32(r.segments);
+    w.u32(r.entries);
+    w.u32(0);
+    for (p, va) in r.targets[..r.n_targets].iter() {
+        w.u64(*p);
+        w.u64(*va);
+    }
+    for h in r.hits[..r.n_hits].iter() {
+        w.u64(h.process);
+        w.u64(h.target);
+        w.u64(h.op.addr);
+        w.u64(h.op.payload);
+        w.u64(h.seg_va);
+        w.u32(h.token);
+        w.u32(h.gp_index);
+        w.u32(h.op.at);
+        w.u8(h.op.kind);
+        w.u8(h.op.op);
+        w.u8(h.op.flags);
+        w.u8(h.source);
+    }
+    let bytes = (w.len() - start) as u32;
+    w.patch_u32(start, bytes);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1441,6 +1661,63 @@ mod tests {
                 break;
             }
         }
+    }
+
+    #[test]
+    fn watched_releases_beyond_the_sem_cap() {
+        let mut s = Scanner::new(DEFAULT_CLASSES);
+        s.set_watch(&[0x852d070, 0x5000_0004]);
+        s.begin_segment(u32::MAX);
+        // 20 unrelated releases fill the SEM_CAP record, then one to the target.
+        for i in 0..20u32 {
+            feed_all(&mut s, &[inc(0, 0x5c, 5), 0x1000 + 8 * i, 0, i, 0, 1]);
+        }
+        feed_all(&mut s, &[inc(0, 0x5c, 5), 0x852d070, 0, 5, 0, 1]);
+        // An acquire of the target is not a hit.
+        feed_all(&mut s, &[inc(0, 0x5c, 5), 0x852d070, 0, 6, 0, 0]);
+        // A 64-bit release whose upper half is the second target.
+        feed_all(&mut s, &[inc(0, 0x5c, 5), 0x5000_0000, 0, 7, 0, (1 << 24) | 1]);
+        assert_eq!(s.sems().len(), SEM_CAP);
+        assert_eq!(s.hits_seen, 2);
+        let hits = s.hits();
+        assert_eq!(hits.len(), 2);
+        assert_eq!((hits[0].addr, hits[0].payload), (0x852d070, 5));
+        assert_eq!(hits[1].addr, 0x5000_0000);
+        // The next segment starts with no hits, the watch stays.
+        s.begin_segment(u32::MAX);
+        assert!(s.hits().is_empty());
+        assert_eq!(s.n_watch, 2);
+    }
+
+    #[test]
+    fn release_record_layout() {
+        let mut r = ReleaseScan::new();
+        assert!(r.add_target(0xaa, 0x852d070));
+        assert!(r.add_target(0xaa, 0x852d070));
+        assert!(r.add_target(0xbb, 0x1000));
+        assert_eq!(r.n_targets, 2);
+        let (t, n) = r.targets_of(0xaa);
+        assert_eq!(&t[..n], &[0x852d070]);
+        let op = SemOp { kind: sem_kind::HOST, op: 1, addr: 0x852d070, payload: 4, at: 11, ..SemOp::default() };
+        r.note(0xaa, &[op], 1, 0x82cd200, 0x4000_0031, 99, rel_source::NATIVE_RING);
+        let mut buf = [0u8; 1024];
+        let mut w = Writer::new(&mut buf);
+        write_releases(&mut w, &r);
+        let len = w.len();
+        assert_eq!(len, REL_FIXED + 2 * REL_TARGET_BYTES + REL_BYTES);
+        let u32_at = |at: usize| u32::from_le_bytes(buf[at..at + 4].try_into().unwrap());
+        let u64_at = |at: usize| u64::from_le_bytes(buf[at..at + 8].try_into().unwrap());
+        assert_eq!(u32_at(0) as usize, len);
+        assert_eq!(u32_at(4), REC_RELEASES);
+        assert_eq!((u32_at(8), u32_at(12), u32_at(16)), (2, 1, 1));
+        let h = REL_FIXED + 2 * REL_TARGET_BYTES;
+        assert_eq!(u64_at(h), 0xaa);
+        assert_eq!(u64_at(h + 8), 0x852d070);
+        assert_eq!(u64_at(h + 24), 4);
+        assert_eq!(u64_at(h + 32), 0x82cd200);
+        assert_eq!((u32_at(h + 40), u32_at(h + 44), u32_at(h + 48)), (0x4000_0031, 99, 11));
+        assert_eq!(&buf[h + 52..h + 56], &[sem_kind::HOST, 1, 0, rel_source::NATIVE_RING]);
+        assert!(REL_MAX_BYTES >= len);
     }
 
     #[test]

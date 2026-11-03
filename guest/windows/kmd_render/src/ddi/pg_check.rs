@@ -69,6 +69,7 @@ fn seq() -> u32 {
 
 /// Record native allocation `id`'s placement after a leaf update. Any IRQL.
 pub(crate) fn note_place(id: u32, place: u32) {
+    crate::ddi::sem_watch::note_paging(id, pc::op_word(pc::op::LEAF, place, pc::dir::NONE, pc::path::NONE, 0));
     if !knob().any() {
         return;
     }
@@ -77,6 +78,7 @@ pub(crate) fn note_place(id: u32, place: u32) {
 
 /// Record native allocation `id`'s last content operation. Any IRQL.
 pub(crate) fn note_op(id: u32, op: u32, dir: u32, path: u32) {
+    crate::ddi::sem_watch::note_paging(id, pc::op_word(op, pc::place::UNKNOWN, dir, path, 0));
     if !knob().any() {
         return;
     }

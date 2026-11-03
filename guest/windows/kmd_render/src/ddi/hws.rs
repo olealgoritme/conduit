@@ -1688,6 +1688,7 @@ pub unsafe extern "C" fn dxgkddi_submit_command_to_hw_queue(
         if !queue.legacy {
             // NVDA context on an unbacked node: nothing to run, complete now.
             crate::ddi::vk_fail::SOFT_NVDA.fetch_add(1, Ordering::Relaxed);
+            crate::ddi::sem_watch::note_drop(helios_kmd_logic::sem_watch::src::SOFT_DROP, queue.node);
             crate::ddi::vk_fail::note(
                 helios_kmd_logic::vk_fail::kind::SOFT_QUEUE,
                 queue.node,
@@ -1723,6 +1724,12 @@ pub unsafe extern "C" fn dxgkddi_submit_command_to_hw_queue(
     let key = unsafe { super::scheduler::native_queue_of(args.hHwQueue) }
         .map_or(0, |queue| queue as *const NativeQueue as usize);
     after_submit(adapter, key, Some(args.HwQueueProgressFenceId), 0);
+    // `NvSemWatch`: the submission's releases to the watched VA (`ddi::sem_watch`).
+    if crate::ddi::sem_watch::target().is_some() {
+        if let Some(queue) = unsafe { super::scheduler::native_queue_of(args.hHwQueue) } {
+            crate::ddi::sem_watch::after_native_submit(adapter, queue);
+        }
+    }
     // `NvPgCheck` 0x2: the submission's entries as the GPU fetches them (`ddi::pg_check`).
     if crate::ddi::pg_check::knob().submit() {
         if let Some(queue) = unsafe { super::scheduler::native_queue_of(args.hHwQueue) } {

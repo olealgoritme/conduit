@@ -26,6 +26,12 @@
 //! and semaphores are read by GPU VA through the KMD's mapping table (`lookup_va`): VidMm's
 //! system pages for a native system-memory allocation, the RM object's CPU view otherwise.
 //!
+//! The stuck submissions' acquire targets are then looked for in every ring of their process
+//! (`scan_history`): each native queue's last `ns::REL_RING_ENTRIES` GPFIFO entries before its
+//! GP_PUT and each copy-context channel's ring (`nv_copy`) are scanned for releases to them,
+//! and the snapshot's `REC_RELEASES` record names who releases what ("released by" in
+//! snapdec.py), or that nothing in any ring does.
+//!
 //! A snapshot is `NvSnapBlob` (REG_BINARY, the latest) and `NvSnapB<seq % 4>` (the last four);
 //! kept apart from those: `NvSnapLong` (the automatic one with the longest stall), `NvSnapErr`
 //! (the first error-notifier one) and `NvSnapPre` (the automatic one before it). With `NvSnapN` (snapshots), `NvSnapT` (interrupt time, ms), `NvSnapWhy` (reason | the
@@ -58,7 +64,7 @@ use crate::virtio::native_memory::{self as nmem, VaHit};
 /// The watch and the knobs run at most this often (ms).
 const TICK_MS: u32 = 1_000;
 /// The blob's room kept for the VA table.
-const VA_RESERVE: usize = ns::VA_FIXED + ns::VA_TABLE_CAP * ns::VA_BYTES;
+const VA_RESERVE: usize = ns::VA_FIXED + ns::VA_TABLE_CAP * ns::VA_BYTES + ns::REL_MAX_BYTES;
 /// One fully detailed queue record at most.
 const QUEUE_MAX_BYTES: usize = ns::QREC_FIXED
     + ns::MAX_SEGMENTS
@@ -384,6 +390,14 @@ fn take(passive: PassiveLevel, adapter: &AdapterContext, reason: u32, trigger: u
     }
     scanner.push(ns::Scanner::new(ns::DEFAULT_CLASSES));
     let scanner = &mut scanner[0];
+    // The stuck submissions' acquire targets, and who releases them in the rings' history.
+    let mut releases: Vec<ns::ReleaseScan> = Vec::new();
+    if releases.try_reserve_exact(1).is_err() {
+        crate::diag::record_named_bytes(b"NvSnapFail", FAILS.fetch_add(1, Ordering::Relaxed) + 1);
+        return;
+    }
+    releases.push(ns::ReleaseScan::new());
+    let releases = &mut releases[0];
 
     // Phase 1: the queues pinned, their own state copied.
     let Some(mut slots) = heap(hws::SNAP_SLOTS, hws::SNAP_EMPTY) else {
@@ -442,7 +456,7 @@ fn take(passive: PassiveLevel, adapter: &AdapterContext, reason: u32, trigger: u
         if !full_room {
             flags |= ns::FLAG_TRUNCATED;
         }
-        write_queue(&mut w, &mut reader, &mut table, scanner, &mut words, c, detail, c.slot.queue == trigger, now);
+        write_queue(&mut w, &mut reader, &mut table, scanner, releases, &mut words, c, detail, c.slot.queue == trigger, now);
         records += 1;
     }
     // The VA table, each entry resolved now.
@@ -455,6 +469,16 @@ fn take(passive: PassiveLevel, adapter: &AdapterContext, reason: u32, trigger: u
     ns::write_va_table(&mut w, table.used(), crate::ddi::pt_ring::recording());
     if reader.budget_hit {
         flags |= ns::FLAG_BUDGET;
+    }
+    if releases.n_targets != 0 {
+        let mut history = Reader {
+            passive,
+            adapter,
+            deadline: crate::adapter::foreign_scanout::now_100ns() + ns::READ_BUDGET_100NS,
+            budget_hit: false,
+        };
+        scan_history(&mut history, &copied, releases, scanner, &mut words);
+        ns::write_releases(&mut w, releases);
     }
     if w.overflowed() {
         flags |= ns::FLAG_TRUNCATED;
@@ -521,6 +545,7 @@ fn write_queue(
     reader: &mut Reader<'_>,
     table: &mut ns::VaTable<'_>,
     scanner: &mut ns::Scanner,
+    releases: &mut ns::ReleaseScan,
     words: &mut [u32],
     c: &Copied,
     detail: bool,
@@ -651,6 +676,12 @@ fn write_queue(
             };
             write_segment(w, reader, table, scanner, words, process, entry, index, sflags);
             segments += 1;
+            // A stuck submission's acquires: whose release would let it go on.
+            if stuck.is_some() && sflags & ns::S_FOCUS != 0 {
+                for sem in scanner.sems().iter().filter(|s| s.acquire()) {
+                    releases.add_target(process as u64, sem.addr);
+                }
+            }
         }
     }
     ns::end_queue(w, mark, segments);
@@ -792,6 +823,120 @@ fn write_segment(
         ns::write_ref(w, r, i);
     }
     ns::end_segment(w, mark);
+}
+
+/// Every native queue's and copy channel's ring of a target's process, scanned back from GP_PUT
+/// ([`ns::REL_RING_ENTRIES`] entries, [`ns::REL_SEG_DWORDS`] per segment) for releases to the
+/// targets. Old entries' pushbuffer memory may since hold newer commands: a hit names the
+/// command that is there now. PASSIVE.
+fn scan_history(
+    reader: &mut Reader<'_>,
+    copied: &[Copied],
+    releases: &mut ns::ReleaseScan,
+    scanner: &mut ns::Scanner,
+    words: &mut [u32],
+) {
+    for c in copied.iter() {
+        let s = &c.snap;
+        let process = s.process_key;
+        let (targets, n) = releases.targets_of(process as u64);
+        if n == 0 || s.gpfifo_va == 0 {
+            continue;
+        }
+        releases.queues += 1;
+        *scanner = ns::Scanner::new(ns::DEFAULT_CLASSES);
+        scanner.set_watch(&targets[..n]);
+        let entries = s.ring_entries.max(1);
+        let count = entries.min(ns::REL_RING_ENTRIES);
+        let start = (s.kmd_gp_put % entries + entries - count) % entries;
+        let mut k = 0u32;
+        while k < count {
+            let index = (start + k) % entries;
+            let run = (count - k).min(64).min(entries - index);
+            let mut gp = [0u32; 128];
+            if reader.words(process, s.gpfifo_va + 8 * u64::from(index), &mut gp[..2 * run as usize]) != ns::RD_OK {
+                releases.flags |= ns::REL_FLAG_READ_FAILED;
+                break;
+            }
+            for i in 0..run {
+                let e = ns::gp_entry(gp[2 * i as usize], gp[2 * i as usize + 1]);
+                scan_one(reader, releases, scanner, words, process, e, s.token, index + i, ns::rel_source::NATIVE_RING);
+            }
+            if reader.budget_hit {
+                releases.flags |= ns::REL_FLAG_BUDGET;
+                return;
+            }
+            k += run;
+        }
+    }
+    // The copy contexts' channels (`nv_copy`): their rings live in the KMD's own block.
+    let mut ring: Vec<u32> = Vec::new();
+    let ring_words = 2 * helios_kmd_logic::nv_copy::ring::ENTRIES as usize;
+    if ring.try_reserve_exact(ring_words).is_err() {
+        return;
+    }
+    ring.resize(ring_words, 0);
+    for slot in 0..crate::ddi::nv_copy::SNAP_CHANNELS {
+        let Some((process, put, token, n_entries)) = crate::ddi::nv_copy::snap_ring(slot, &mut ring) else {
+            continue;
+        };
+        let (targets, n) = releases.targets_of(process as u64);
+        if n == 0 || n_entries == 0 {
+            continue;
+        }
+        releases.queues += 1;
+        *scanner = ns::Scanner::new(ns::DEFAULT_CLASSES);
+        scanner.set_watch(&targets[..n]);
+        let count = n_entries.min(ns::REL_RING_ENTRIES);
+        let start = (put % n_entries + n_entries - count) % n_entries;
+        for k in 0..count {
+            let index = (start + k) % n_entries;
+            let e = ns::gp_entry(ring[2 * index as usize], ring[2 * index as usize + 1]);
+            scan_one(reader, releases, scanner, words, process, e, token, index, ns::rel_source::COPY_RING);
+            if reader.budget_hit {
+                releases.flags |= ns::REL_FLAG_BUDGET;
+                return;
+            }
+        }
+    }
+}
+
+/// One GPFIFO entry's segment of [`scan_history`].
+#[allow(clippy::too_many_arguments)]
+fn scan_one(
+    reader: &mut Reader<'_>,
+    releases: &mut ns::ReleaseScan,
+    scanner: &mut ns::Scanner,
+    words: &mut [u32],
+    process: usize,
+    e: ns::GpEntry,
+    token: u32,
+    index: u32,
+    source: u8,
+) {
+    if e.dwords == 0 {
+        return;
+    }
+    releases.entries += 1;
+    scanner.begin_segment(u32::MAX);
+    let len = e.dwords.min(ns::REL_SEG_DWORDS);
+    let mut done = 0u32;
+    'seg: while done < len {
+        let va = e.va + 4 * u64::from(done);
+        let n = ((len - done) as usize).min(words.len()).min(((0x1000 - (va & 0xfff)) / 4) as usize);
+        if reader.words(process, va, &mut words[..n]) != ns::RD_OK {
+            releases.flags |= ns::REL_FLAG_READ_FAILED;
+            break;
+        }
+        for &d in &words[..n] {
+            if !scanner.feed(d) {
+                break 'seg;
+            }
+        }
+        done += n as u32;
+    }
+    releases.segments += 1;
+    releases.note(process as u64, scanner.hits(), scanner.hits_seen, e.va, token, index, source);
 }
 
 /// `NvSnapVa`: what is mapped at `page << 12` in any process. PASSIVE.
