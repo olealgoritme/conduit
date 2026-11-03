@@ -58,6 +58,10 @@ pub(crate) const BAR_UNPLACED: u64 = u64::MAX;
 struct AllocationContext {
     /// [`ALLOCATION_CTX_MAGIC`] — must be the FIRST field (paging-DDI cast check).
     magic: u32,
+    /// Nonzero only for a native 610.88 RM-backed allocation.  Such an
+    /// allocation has no Venus resource and is serviced by native_memory.rs.
+    native_id: u32,
+    native_segment: u32,
     ctx_id: u32,
     resource_id: u32,
     /// The transport generation this allocation (and so `resource_id`) belongs
@@ -206,6 +210,10 @@ struct AllocationContext {
     dedicated_present_buffer: bool,
     /// Nonzero only for a registered VidMm tracker allocation.
     vidmm_tracker_cookie: u32,
+    /// A native (NVDA) allocation dxgkrnl has passed to OpenAllocation (its
+    /// writeback ran). One destroyed without it was refused by dxgkrnl/VidMm after
+    /// CreateAllocation succeeded here (`NvAlNoOpen`).
+    native_opened: AtomicU32,
     /// The layout of the foreign (NVK-on-RM) resource this allocation adopted,
     /// recorded at create time; `None` for every other allocation. Immutable.
     /// The KMD's scan-out copy imports such a source as an explicit-modifier
@@ -715,6 +723,8 @@ pub unsafe fn present_alloc_diag(h: HANDLE) -> Option<PresentAllocDiag> {
 /// service content/placement ops against the CPU-visible BAR segment.
 #[derive(Clone, Copy)]
 pub(crate) struct PagingAllocInfo {
+    pub native_id: u32,
+    pub native_segment: u32,
     pub resource_id: u32,
     pub size: u64,
     /// Where `size` came from. Carried so the aperture path can eventually
@@ -845,11 +855,32 @@ unsafe fn take_open_ctx(h: HANDLE) -> Option<Box<OpenAllocationContext>> {
 /// As [`resolve_alloc`].
 unsafe fn describe_alloc_info(h: HANDLE) -> Option<DescribeInfo> {
     let ctx = unsafe { resolve_alloc(h) }?;
+    // A native (NVDA) allocation describes the picture its record names: DWM's
+    // primaries on NVIDIA's UMD are the mode's size, as NVIDIA's KMD answers.
+    if ctx.native_id != 0 {
+        if let Some((width, height)) = crate::virtio::native_memory::surface_extent(ctx.native_id) {
+            return Some(DescribeInfo {
+                width,
+                height,
+                format: 0,
+            });
+        }
+    }
     Some(DescribeInfo {
         width: ctx.width,
         height: ctx.height,
         format: ctx.format,
     })
+}
+
+/// The native-memory id and the address Windows paired with a `SetVidPnSourceAddress`
+/// handle that is a native (NVDA) allocation of the current transport generation.
+///
+/// # Safety
+/// Same contract as [`scanout_alloc_info`].
+pub(crate) unsafe fn native_scanout_id(adapter: &AdapterContext, h: HANDLE) -> Option<(u32, u64)> {
+    let ctx = unsafe { resolve_current_alloc(adapter, h) }?;
+    (ctx.native_id != 0).then(|| (ctx.native_id, ctx.vidpn_primary_address.load(Ordering::Acquire)))
 }
 
 /// Resolve a paging-op `hAllocation` (the handle this driver returned from
@@ -867,6 +898,8 @@ pub(crate) unsafe fn paging_alloc_info(
 ) -> Option<PagingAllocInfo> {
     let ctx = unsafe { resolve_current_alloc(adapter, h) }?;
     Some(PagingAllocInfo {
+        native_id: ctx.native_id,
+        native_segment: ctx.native_segment,
         resource_id: ctx.resource_id,
         size: ctx.size as u64,
         size_provenance: ctx.size_provenance,
@@ -2323,6 +2356,32 @@ unsafe fn destroy_allocation_ctx(
     }
     adapter.producer.remove_allocation(allocation_handle);
     adapter.vidmm_trackers.remove(ctx.vidmm_tracker_cookie);
+    if ctx.native_id != 0 {
+        if crate::virtio::nvda::enabled() && ctx.native_opened.load(Ordering::Relaxed) == 0 {
+            // `NvAlNoOpen` / `NvAlNoOpMb`: dxgkrnl destroyed a native allocation it
+            // never opened: VidMm refused it after this driver's CreateAllocation
+            // succeeded (no KMD-side failure, no `VkF` entry), e.g. its segment
+            // set or commit. `NvAlNoOpMb` is the last one's size in MiB.
+            NV_AL_NO_OPEN.fetch_add(1, Ordering::Relaxed);
+            NV_AL_NO_OPEN_MB.store(((ctx.size as u64) >> 20).min(u64::from(u32::MAX)) as u32, Ordering::Relaxed);
+        }
+        unregister_scanout_allocation_handle(allocation_handle);
+        let _ = adapter.retire_scanout_allocation(passive, allocation_handle, 0);
+        let result = if adapter.is_current_generation(ctx.serial) {
+            crate::virtio::native_memory::destroy(passive, adapter, ctx.native_id)
+        } else {
+            crate::virtio::native_memory::discard(ctx.native_id)
+        };
+        if result.is_ok() {
+            drop(ctx);
+        } else {
+            // An unconfirmed RM unmap/free keeps the native record and every
+            // page pin.  Retain the small handle context too; never unlock the
+            // pSystemMem pages while the host may still name them.
+            core::mem::forget(ctx);
+        }
+        return;
+    }
     // An allocation of an OLDER transport generation (created before a StopDevice
     // and destroyed after the next StartDevice, or while no transport is up).
     // Everything below is keyed by `ctx.resource_id` / `ctx.venus_memory_id` and
@@ -2927,7 +2986,8 @@ fn build_backing(
             ) {
                 // Clear it now when the copy engine is up and free (best effort, never waits for
                 // the channel: otherwise the first mapping clears it before any write).
-                let _ = crate::virtio::rm_client::ce_vram::ce_surface(passive, adapter, rm.resource_id);
+                let _ =
+                    crate::virtio::rm_client::ce_vram::ce_surface(passive, adapter, rm.resource_id);
                 return Ok(CreatedBacking {
                     resource_id: rm.resource_id,
                     venus_memory_id: 0,
@@ -3123,10 +3183,328 @@ fn build_backing(
     }
 }
 
-/// Create the virtio blob for one allocation and fill its VidMm metadata. On
-/// failure nothing is stored (the caller unwinds prior allocations).
-/// [`create_one_inner`], plus the `ShPhRet` breadcrumb: the status returned for an allocation of
-/// the placeholder shape (identity-less STANDARD), success included.
+/// Resolve a CreateHwQueue GPFIFO allocation to its live native backing. The
+/// runtime handle is authenticated against our allocation before the exact ring
+/// range is checked by native-memory.
+pub(crate) unsafe fn native_ring_backing(
+    adapter: &AdapterContext,
+    _owner: crate::virtio::gpu::DeviceOwner,
+    process: usize,
+    allocation: u32,
+    gpfifo_va: u64,
+    ring_bytes: u64,
+) -> Option<crate::virtio::native_channel::NativeRingBacking> {
+    let dxg = adapter.dxgkrnl().ok()?;
+    let passive = unsafe { crate::irql::PassiveLevel::assume() };
+    use helios_kmd_logic::producer_completion::Error as RefError;
+    crate::adapter::producer::with_allocation_reference(passive, dxg, allocation, false, |handle| {
+        // SAFETY: the global handle data of an allocation is the hAllocation
+        // this driver returned from CreateAllocation; resolve_alloc checks its
+        // magic before trusting any field.
+        let ctx = unsafe { resolve_alloc(handle as HANDLE) }.ok_or(RefError::Invalid)?;
+        if ctx.native_id == 0 {
+            return Err(RefError::Invalid);
+        }
+        crate::virtio::native_memory::ring_backing(ctx.native_id, process, gpfifo_va, ring_bytes)
+            .map_err(|_| RefError::Invalid)
+    })
+    .ok()
+}
+
+/// Create one native 610.88 allocation.  This is deliberately entered before
+/// the Helios/Venus parser: the 586-byte NVDA record is a different ABI and no
+/// GEM, blob, or Venus identity is manufactured for it.
+/// `NvAlignLg`: native Vulkan allocations given a 64-KiB or 2-MiB alignment.
+static NV_ALIGN_LARGE: AtomicU32 = AtomicU32::new(0);
+/// `NvPmGpuOnly`: native allocations placed by the GPU-only rule (NvPerfMem 0x01/0x02).
+static NV_GPU_ONLY: AtomicU32 = AtomicU32::new(0);
+/// `NvAlSeg`: the preferred segment of the last native allocation (`u32::MAX` = none yet).
+static NV_AL_SEG: AtomicU32 = AtomicU32::new(u32::MAX);
+static NV_AL_NO_OPEN: AtomicU32 = AtomicU32::new(0);
+static NV_AL_NO_OPEN_MB: AtomicU32 = AtomicU32::new(0);
+
+/// `NvAlSeg` and `NvAlignLg`, written per native allocation before, now by the
+/// registry mirror's pass (`ddi::hot_path::publish`). PASSIVE.
+pub(crate) fn publish_hot() {
+    let segment = NV_AL_SEG.load(Ordering::Relaxed);
+    if segment != u32::MAX {
+        crate::diag::record_named_bytes(b"NvAlSeg", segment);
+    }
+    let large = NV_ALIGN_LARGE.load(Ordering::Relaxed);
+    if large != 0 {
+        crate::diag::record_named_bytes(b"NvAlignLg", large);
+    }
+    let mismatched = NVGL_SIZE_MISMATCH.load(Ordering::Relaxed);
+    if mismatched != 0 {
+        crate::diag::record_named_bytes(b"NvGlSzMis", mismatched);
+    }
+    if NVGL_BIG[2].load(Ordering::Relaxed) != 0 {
+        for (name, cell) in [(&b"NvGlBigD0"[..], &NVGL_BIG[0]), (&b"NvGlBig116"[..], &NVGL_BIG[1]), (&b"NvGlBigSz"[..], &NVGL_BIG[2])] {
+            crate::diag::record_named_bytes(name, cell.load(Ordering::Relaxed));
+        }
+    }
+    let unopened = NV_AL_NO_OPEN.load(Ordering::Relaxed);
+    if unopened != 0 {
+        crate::diag::record_named_bytes(b"NvAlNoOpen", unopened);
+        crate::diag::record_named_bytes(b"NvAlNoOpMb", NV_AL_NO_OPEN_MB.load(Ordering::Relaxed));
+    }
+}
+
+static NVGL_SIZE_MISMATCH: AtomicU32 = AtomicU32::new(0);
+/// The last Vulkan record of 32 MiB and more: its +0xd0 units, +0x116 bytes >> 16
+/// and the size this KMD gave it >> 16 (`NvGlBigD0` / `NvGlBig116` / `NvGlBigSz`),
+/// and how many records had a +0x116 that disagreed with +0xd0/+0xcc
+/// (`NvGlSzMis`, the ICD's 32-MiB chunks). Published by the mirror pass.
+static NVGL_BIG: [AtomicU32; 3] = [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)];
+
+fn note_nvgl_size(bytes: &[u8], size: u64) {
+    use helios_kmd_logic::native_memory as native;
+    if native::nvgl_size_from_bytes(bytes) {
+        NVGL_SIZE_MISMATCH.fetch_add(1, Ordering::Relaxed);
+    }
+    let units = native::get32(bytes, native::SIZE_UNITS_AT).unwrap_or(0);
+    let requested = native::get64(bytes, native::NVGL_BYTE_SIZE_AT).unwrap_or(0);
+    if size >= 32 << 20 || requested >= 32 << 20 || units >= 0x200 {
+        NVGL_BIG[0].store(units, Ordering::Relaxed);
+        NVGL_BIG[1].store((requested >> 16).min(u64::from(u32::MAX)) as u32, Ordering::Relaxed);
+        NVGL_BIG[2].store((size >> 16).min(u64::from(u32::MAX)) as u32, Ordering::Relaxed);
+    }
+}
+
+/// NvAlignOff=1 (test knob): every native allocation keeps 4-KiB alignment.
+fn nvgl_alignment_off() -> bool {
+    static OFF: AtomicU32 = AtomicU32::new(u32::MAX);
+    let mut off = OFF.load(Ordering::Relaxed);
+    if off == u32::MAX {
+        off = crate::diag::read_config_dword(crate::diag::KnobName::new(b"NvAlignOff"), 0);
+        OFF.store(off, Ordering::Relaxed);
+    }
+    off == 1
+}
+
+unsafe fn create_native_one(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    info: &mut DXGK_ALLOCATIONINFO,
+) -> Result<(), NTSTATUS> {
+    use helios_kmd_logic::native_memory as native;
+
+    let len = info.PrivateDriverDataSize as usize;
+    if info.pPrivateDriverData.is_null() || len < native::ALLOCATION_PRIVATE_BYTES {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    // SAFETY: dxgkrnl owns this writable per-allocation buffer for the call;
+    // create/writeback both use the authoritative byte length above.
+    let bytes = unsafe { core::slice::from_raw_parts_mut(info.pPrivateDriverData as *mut u8, len) };
+    let private = native::parse_allocation_private(bytes).map_err(|error| {
+        // Why the record was refused (PrivateError discriminant + 1).
+        let code = match error {
+            native::PrivateError::Short => 1,
+            native::PrivateError::BadMagic => 2,
+            native::PrivateError::BadVersion => 3,
+            native::PrivateError::BadDeclaredSize => 4,
+            native::PrivateError::SizeZero => 5,
+            native::PrivateError::SizeOverflow => 6,
+            native::PrivateError::SystemMemoryAlignment => 7,
+            native::PrivateError::UnsupportedKind(_) => 8,
+            native::PrivateError::UnsupportedTiling(_) => 9,
+            native::PrivateError::UnsupportedCompression(_) => 10,
+        };
+        crate::diag::record_named_bytes(b"NvAlParse", code);
+        (code, error)
+    });
+    let private = private.map_err(|(code, error)| {
+        let status = match error {
+            native::PrivateError::UnsupportedKind(_)
+            | native::PrivateError::UnsupportedTiling(_)
+            | native::PrivateError::UnsupportedCompression(_) => STATUS_NOT_SUPPORTED,
+            _ => STATUS_INVALID_PARAMETER,
+        };
+        // `VkF`: the refused field's value (kind / tiling / compression) as the hint.
+        let value = match error {
+            native::PrivateError::UnsupportedKind(v)
+            | native::PrivateError::UnsupportedTiling(v)
+            | native::PrivateError::UnsupportedCompression(v) => v,
+            _ => native::allocation_units(bytes).unwrap_or(0) as u32,
+        };
+        crate::ddi::vk_fail::note(
+            helios_kmd_logic::vk_fail::kind::CREATE_ALLOCATION,
+            helios_kmd_logic::vk_fail::alloc_code::PARSE | code,
+            status,
+            value,
+        );
+        status
+    })?;
+    let shared = native::is_shared_record(bytes);
+    if native::is_nvgl_record(bytes) {
+        note_nvgl_size(bytes, private.size);
+    }
+    // CUDA's memory over its own user pages (D3DKMT pSystemMem): VidMm backs it
+    // with those pages, the GPU reaches them through the system-page mappings.
+    let user_memory = native::is_cuda_system_memory(bytes);
+    // `NvPerfMem` (helios_kmd_logic::native_perf): read from the input record,
+    // before `create` writes the writeback over it.
+    let perf = crate::virtio::native_memory::perf();
+    let gpu_only = helios_kmd_logic::native_perf::is_gpu_only_record(bytes);
+    // Large-page Vulkan records get NVIDIA's 64-KiB / 2-MiB alignment, and with
+    // NvPerfMem 0x04 GPU-only D3D and CUDA records too. The test knob
+    // NvAlignOff=1 keeps every native allocation at 4 KiB.
+    let large_page_alignment = if !nvgl_alignment_off() {
+        helios_kmd_logic::native_perf::large_page_alignment(
+            bytes,
+            private.size,
+            private.system_memory != 0 || user_memory,
+            perf.align_large(),
+        )
+    } else {
+        None
+    };
+    let created = crate::virtio::native_memory::create(passive, adapter, &private, bytes)
+        .map_err(|error| {
+            // Which native-memory error refused it (Error discriminant + 1), and where.
+            let step = crate::virtio::native_memory::last_step();
+            crate::diag::record_named_bytes(b"NvAlCreate", 1 + error as u32);
+            crate::diag::record_named_bytes(b"NvAlStep", step);
+            crate::ddi::vk_fail::note(
+                helios_kmd_logic::vk_fail::kind::CREATE_ALLOCATION,
+                helios_kmd_logic::vk_fail::alloc_code::CREATE | (1 + error as u32) | (step & 0xffff) << 16,
+                error.ntstatus(),
+                (private.size >> 16) as u32,
+            );
+            error.ntstatus()
+        })?;
+    let Ok(size) = SIZE_T::try_from(created.size) else {
+        let _ = crate::virtio::native_memory::destroy(passive, adapter, created.id);
+        return Err(STATUS_NO_MEMORY);
+    };
+    let size = round_up_page(size);
+    let ctx = Box::new(AllocationContext {
+        magic: ALLOCATION_CTX_MAGIC,
+        native_id: created.id,
+        native_segment: created.segment,
+        ctx_id: 0,
+        resource_id: 0,
+        serial: adapter.current_transport_serial().unwrap_or(0),
+        owns_resource: false,
+        venus_memory_id: 0,
+        venus_image_id: 0,
+        scanout_copy_image_id: core::sync::atomic::AtomicU64::new(0),
+        scanout_copy_memory_id: core::sync::atomic::AtomicU64::new(0),
+        scanout_copy_conversion_image_id: core::sync::atomic::AtomicU64::new(0),
+        scanout_copy_conversion_memory_id: core::sync::atomic::AtomicU64::new(0),
+        scanout_copy_conversion_init_pool_id: core::sync::atomic::AtomicU64::new(0),
+        scanout_copy_pool_id: core::sync::atomic::AtomicU64::new(0),
+        scanout_copy_command_buffer_id: core::sync::atomic::AtomicU64::new(0),
+        scanout_copy_target_image_id: core::sync::atomic::AtomicU64::new(0),
+        scanout_copy_last_fence: core::sync::atomic::AtomicU64::new(0),
+        scanout_copy_owns_source_alias: AtomicU32::new(0),
+        vidpn_primary_address: AtomicU64::new(0),
+        vidpn_primary_segment: AtomicU32::new(0),
+        vidpn_primary_flags: AtomicU32::new(0),
+        vidpn_present_epoch: AtomicU64::new(helios_kmd_logic::scanout_lease::NO_LEASE),
+        vidpn_frame_watermark: AtomicU64::new(0),
+        vidpn_snap_resid: AtomicU32::new(0),
+        vidpn_snap_width: AtomicU32::new(0),
+        vidpn_snap_height: AtomicU32::new(0),
+        vidpn_snap_pitch: AtomicU32::new(0),
+        vidpn_snap_dxgi_format: AtomicU32::new(0),
+        vidpn_snap_plane_offset: AtomicU32::new(0),
+        vidpn_snap_alloc_size: AtomicU64::new(0),
+        size,
+        width: 0,
+        height: 0,
+        format: 0,
+        bind_flags: 0,
+        pitch: 0,
+        dxgi_format: 0,
+        direct_scanout: false,
+        primary_tagged: false,
+        plane_offset: 0,
+        venus_alloc_size: 0,
+        memory_type_index: 0,
+        bar_placed: core::sync::atomic::AtomicU64::new(BAR_UNPLACED),
+        bar_eligible: false,
+        size_provenance: BackingSize::HostAuthoritative(created.size),
+        system_backing_policy: SystemBackingPolicy::None,
+        dedicated_present_buffer: false,
+        vidmm_tracker_cookie: 0,
+        native_opened: AtomicU32::new(0),
+        foreign: None,
+    });
+    if adapter
+        .producer
+        .register_allocation((&*ctx as *const AllocationContext) as usize)
+        .is_err()
+    {
+        let _ = crate::virtio::native_memory::destroy(passive, adapter, created.id);
+        return Err(STATUS_INSUFFICIENT_RESOURCES);
+    }
+    info.hAllocation = Box::into_raw(ctx) as HANDLE;
+    info.Size = size;
+    info.PitchAlignedSize = size;
+    info.EvictionSegmentSet = 0;
+    info.HintedBank.__bindgen_anon_1.Value = 0;
+    info.AllocationPriority = D3DDDI_ALLOCATIONPRIORITY_NORMAL;
+    info.pAllocationUsageHint = core::ptr::null_mut();
+    // Segment sets are 1-based bitmasks (bit 0 = segment 1). Device-local RM
+    // memory sits in the BAR segment the adapter reports; system-memory backed
+    // allocations in the aperture segment. The old `1 << segment` named a
+    // segment that does not exist (and system memory got an empty set), so
+    // VidMm refused the allocation after CreateAllocation/OpenAllocation
+    // succeeded: the first NVIDIA D3D11 allocation failed INVALID_PARAMETER.
+    // CPU-visible allocations: WDDM requires every CPU-accessible allocation in a
+    // non-CPU-accessible memory segment (the BAR) to also list an aperture
+    // segment, as `vidmm_placement` does for the default path. GPU-only records
+    // (NvPerfMem 0x01/0x02) are not CpuVisible and stay in the memory segment
+    // (`native_perf::placement`; with the knob off this is the old rule).
+    let placement = helios_kmd_logic::native_perf::placement_with(
+        crate::ddi::gpummu::APERTURE_SEGMENT_ID,
+        adapter.segment_table().and_then(|table| table.bar_seg_id()),
+        created.system_memory != 0 || user_memory,
+        shared,
+        gpu_only,
+        perf.gpu_only_mode(),
+        perf.cpu_visible_aperture(),
+    );
+    let segment = placement.segment;
+    let supported = placement.supported;
+    if placement.gpu_only {
+        // NvPmGpuOnly: native allocations placed by the GPU-only rule.
+        let n = NV_GPU_ONLY.fetch_add(1, Ordering::Relaxed) + 1;
+        if helios_kmd_logic::native_perf::publish_due(n) {
+            crate::diag::record_named_bytes(b"NvPmGpuOnly", n);
+        }
+    }
+    // `NvAlSeg`: published by the mirror pass (`publish_hot`), not per allocation.
+    NV_AL_SEG.store(segment, Ordering::Relaxed);
+    info.SupportedWriteSegmentSet = supported;
+    unsafe {
+        info.__bindgen_anon_1.Alignment = large_page_alignment.unwrap_or(PAGE as u32) as UINT;
+        if large_page_alignment.is_some() {
+            // `NvAlignLg`: published by the mirror pass (`publish_hot`).
+            NV_ALIGN_LARGE.fetch_add(1, Ordering::Relaxed);
+        }
+        info.PreferredSegment
+            .__bindgen_anon_1
+            .__bindgen_anon_1
+            .set_SegmentId0(segment);
+        info.__bindgen_anon_2.SupportedReadSegmentSet = supported;
+        info.__bindgen_anon_3.MaximumRenamingListLength = 0;
+        info.__bindgen_anon_3.PhysicalAdapterIndex = 0;
+        // pSystemMem is VidMm's existing cached system backing, so Lock2 uses
+        // that exact user VA (CpuVisible | Cached | ExistingSysMem).
+        // Device-local memory is CPU visible (uncached/write-combined) through
+        // the NVOS33/window aperture path, without a WB cache alias. A shareable
+        // allocation is not CpuVisible: dxgkrnl refuses a shareable CpuVisible
+        // allocation unless its segments are all aperture ("Shareable can only
+        // be used in combination with CpuVisible if the supported segment set
+        // contains exclusively aperture segments"): DWM's DDisplay primary
+        // failed INVALID_PARAMETER and DWM fail-fast as out of memory.
+        info.__bindgen_anon_4.FlagsWddm2.__bindgen_anon_1.Value = placement.flags;
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 unsafe fn create_one(
     passive: PassiveLevel,
@@ -3188,6 +3566,14 @@ unsafe fn create_one_inner(
     // kept rather than deleted.
     let write_target = info.pPrivateDriverData as *const u8;
     let write_target_len = info.PrivateDriverDataSize as usize;
+    // NVDA allocation data is always per-allocation.  Never substitute the
+    // larger resource-level buffer (which can be the UMD adapter template).
+    if crate::virtio::nvda::enabled() && !write_target.is_null() && write_target_len >= 4 {
+        let magic = unsafe { core::ptr::read_unaligned(write_target as *const u32) };
+        if u32::from_le(magic) == helios_kmd_logic::nvda::NVDA_MAGIC {
+            return unsafe { create_native_one(passive, adapter, info) };
+        }
+    }
     let mut priv_ptr = write_target;
     let mut priv_len = write_target_len;
     if !resource_private.is_null() && (resource_private_size as usize) > priv_len {
@@ -3261,7 +3647,11 @@ unsafe fn create_one_inner(
     );
     let placeholder_verdict = helios_kmd_logic::shared_placeholder::decide(&placeholder_input);
     *shape = helios_kmd_logic::shared_placeholder::is_identityless_standard(&placeholder_input);
-    crate::ddi::shared_placeholder::note_verdict(&placeholder_input, placeholder_verdict, placeholder_at);
+    crate::ddi::shared_placeholder::note_verdict(
+        &placeholder_input,
+        placeholder_verdict,
+        placeholder_at,
+    );
     let placeholder = match placeholder_verdict {
         helios_kmd_logic::shared_placeholder::Verdict::Placeholder => true,
         helios_kmd_logic::shared_placeholder::Verdict::Existing(_) => false,
@@ -3511,11 +3901,18 @@ unsafe fn create_one_inner(
     // property of an unrelated field.
     // `RvOff` 0x4000: CDD's CPU-written GDI surfaces stay in the aperture (`ddi/aperture_pages.rs`).
     let aperture_surface = ap.kind == HELIOS_WDDM_ALLOC_KIND_STANDARD
-        && crate::ddi::aperture_pages::wants((meta.misc_flags >> 24) & 0xF, (meta.misc_flags >> 20) & 0xF);
+        && crate::ddi::aperture_pages::wants(
+            (meta.misc_flags >> 24) & 0xF,
+            (meta.misc_flags >> 20) & 0xF,
+        );
     {
-        use helios_kmd_logic::rm_standard::{GDI_LOOKUPTABLE, GDI_STAGING_CPUVISIBLE, STD_GDISURFACE};
+        use helios_kmd_logic::rm_standard::{
+            GDI_LOOKUPTABLE, GDI_STAGING_CPUVISIBLE, STD_GDISURFACE,
+        };
         let (std_type, gdi_type) = ((meta.misc_flags >> 24) & 0xF, (meta.misc_flags >> 20) & 0xF);
-        if std_type == STD_GDISURFACE && (gdi_type == GDI_STAGING_CPUVISIBLE || gdi_type == GDI_LOOKUPTABLE) {
+        if std_type == STD_GDISURFACE
+            && (gdi_type == GDI_STAGING_CPUVISIBLE || gdi_type == GDI_LOOKUPTABLE)
+        {
             crate::ddi::aperture_pages::note_created(resource_id, aperture_surface);
         }
     }
@@ -3539,6 +3936,8 @@ unsafe fn create_one_inner(
 
     let ctx = Box::new(AllocationContext {
         magic: ALLOCATION_CTX_MAGIC,
+        native_id: 0,
+        native_segment: 0,
         ctx_id: ap.ctx_id,
         resource_id,
         serial: adapter.current_transport_serial().unwrap_or(0),
@@ -3585,6 +3984,7 @@ unsafe fn create_one_inner(
         system_backing_policy,
         dedicated_present_buffer,
         vidmm_tracker_cookie: 0,
+        native_opened: AtomicU32::new(0),
         foreign: match foreign_backing {
             ForeignBacking::Adopted(layout) => Some(layout),
             ForeignBacking::No => None,
@@ -3633,7 +4033,10 @@ unsafe fn create_one_inner(
     if producer_created == 1 || producer_created % 64 == 0 {
         crate::diag::record_named_bytes(b"PrCreate", producer_created);
         crate::diag::record_named_bytes(b"PrCreateLo", info.hAllocation as usize as u32);
-        crate::diag::record_named_bytes(b"PrCreateHi", (info.hAllocation as usize as u64 >> 32) as u32);
+        crate::diag::record_named_bytes(
+            b"PrCreateHi",
+            (info.hAllocation as usize as u64 >> 32) as u32,
+        );
     }
     // Register AFTER the Box is leaked, so the pointer published here is the
     // one dxgkrnl will hand back.
@@ -4031,6 +4434,62 @@ unsafe fn fail_open(
 /// `D3DKMTCreateAllocation` fails with the open status. For each open-info entry
 /// return a miniport-owned, device-specific tracking handle as required by the
 /// DDI contract.
+/// NvOpenWb: native records rewritten at open; NvOpenWbErr: refused (no
+/// context, not native, or no stored values).
+static OPEN_WRITEBACKS: AtomicU32 = AtomicU32::new(0);
+static OPEN_WRITEBACK_ERRORS: AtomicU32 = AtomicU32::new(0);
+
+/// Re-apply the create-time NVDA record values for a native allocation being
+/// opened (see the call site). Anything that is not an NVDA record of one of
+/// our native allocations is left untouched.
+///
+/// # Safety
+/// `info` is an entry of dxgkrnl's live `DXGKARG_OPENALLOCATION` array.
+unsafe fn native_open_writeback(
+    passive: crate::irql::PassiveLevel,
+    dxg: &crate::dxgk::DXGKRNL_INTERFACE,
+    info: &mut DXGK_OPENALLOCATIONINFO,
+) {
+    use helios_kmd_logic::native_memory as native;
+    if !crate::virtio::nvda::enabled() {
+        return;
+    }
+    let len = info.PrivateDriverDataSize as usize;
+    if info.pPrivateDriverData.is_null() || len < native::ALLOCATION_PRIVATE_BYTES {
+        return;
+    }
+    // SAFETY: dxgkrnl's writable per-allocation buffer of `len` bytes for this call.
+    let bytes = unsafe { core::slice::from_raw_parts_mut(info.pPrivateDriverData as *mut u8, len) };
+    if !native::is_nvda_allocation(bytes) {
+        return;
+    }
+    let native_id = crate::adapter::producer::with_allocation_reference(
+        passive,
+        dxg,
+        info.hAllocation,
+        false,
+        |global| {
+            // SAFETY: the create-time handle data is the AllocationContext this
+            // driver returned; resolve_alloc checks its magic first.
+            Ok(unsafe { resolve_alloc(global as HANDLE) }.map_or(0, |ctx| {
+                ctx.native_opened.store(1, Ordering::Relaxed);
+                ctx.native_id
+            }))
+        },
+    )
+    .unwrap_or(0);
+    let done = native_id != 0 && crate::virtio::native_memory::writeback_open(native_id, bytes).is_ok();
+    let (counter, name): (&AtomicU32, &[u8]) = if done {
+        (&OPEN_WRITEBACKS, &b"NvOpenWb"[..])
+    } else {
+        (&OPEN_WRITEBACK_ERRORS, &b"NvOpenWbErr"[..])
+    };
+    let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+    if n == 1 || n % 64 == 0 {
+        crate::diag::record_named_bytes(name, n);
+    }
+}
+
 pub unsafe extern "C" fn dxgkddi_open_allocation(
     h_device: IN_CONST_HANDLE,
     open_allocation: IN_CONST_PDXGKARG_OPENALLOCATION,
@@ -4088,6 +4547,10 @@ pub unsafe extern "C" fn dxgkddi_open_allocation(
         let info = unsafe { &mut *args.pOpenAllocation.add(i) };
         crate::diag::record(0x0C21_0000 | ((info.PrivateDriverDataSize as u32).min(0xFFFF)));
         crate::diag::record(0x0C35_0000 | ((info.hAllocation as usize as u32) & 0xFFFF));
+        // NVDA records: the UMD receives the record OpenAllocation leaves, not
+        // the one CreateAllocation wrote (dxgkrnl refills it from the caller's
+        // input before this call and copies only this one back).
+        unsafe { native_open_writeback(passive, dxg, info) };
 
         // Capture the backing venus identity + geometry from the open-time
         // private data (the create-time `HeliosWddmAllocPrivate` write-back or a
@@ -4307,11 +4770,13 @@ pub unsafe extern "C" fn dxgkddi_open_allocation(
             dxg,
             info.hAllocation,
             false,
-            |global| adapter.producer.register_open(
-                (&*open as *const OpenAllocationContext) as usize,
-                creator_process,
-                global,
-            ),
+            |global| {
+                adapter.producer.register_open(
+                    (&*open as *const OpenAllocationContext) as usize,
+                    creator_process,
+                    global,
+                )
+            },
         );
         if let Err(error) = registered {
             crate::adapter::producer::REFUSED.fetch_add(1, Ordering::Relaxed);

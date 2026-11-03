@@ -33,6 +33,7 @@ use wdk_alloc::WdkAllocator;
 static GLOBAL_ALLOCATOR: WdkAllocator = WdkAllocator;
 
 mod adapter;
+mod admin;
 mod ddi;
 mod device;
 // TEMPORARY: post-start bring-up tracer to locate the AddAdapter failure.
@@ -76,6 +77,11 @@ pub unsafe extern "system" fn driver_entry(
     // SAFETY: pointers are valid for the call; `init` outlives the call on this
     // stack frame, and DxgkInitialize copies what it needs.
     let status = unsafe { DxgkInitialize(driver_object, registry_path, &mut init) };
+    if status >= 0 {
+        // WDM control-device dispatch is installed only after the display
+        // miniport registration succeeded. No dxgkrnl DDI slots are affected.
+        unsafe { admin::install_dispatch(driver_object) };
+    }
     diag::record(0x0D00_0002);
     diag::record(status as u32);
     status
@@ -100,7 +106,8 @@ fn build_ddi_table() -> DRIVER_INITIALIZATION_DATA {
     // bits and `GetNodeMetadata.GpuMmuSupported` in `query_adapter_info.rs` — which
     // is why all four now read the one `SURFACE` value. The struct ABI we bindgen is
     // the 26100/WDDM-3.2 shape regardless of the level reported here.
-    data.Version = crate::ddi::wddm_surface::SURFACE.ddi_interface_version();
+    crate::ddi::wddm_surface::select_at_driver_entry();
+    data.Version = crate::ddi::wddm_surface::surface().ddi_interface_version();
 
     // ── PnP / power lifecycle (Phase 1, real) ──────────────────────────────
     data.DxgkDdiAddDevice = Some(ddi::dxgkddi_add_device);
@@ -163,12 +170,16 @@ fn build_ddi_table() -> DRIVER_INITIALIZATION_DATA {
     data.DxgkDdiQueryDependentEngineGroup = Some(ddi::dxgkddi_query_dependent_engine_group);
     data.DxgkDdiQueryEngineStatus = Some(ddi::traced::query_engine_status);
     data.DxgkDdiResetEngine = Some(ddi::traced::reset_engine);
-    data.DxgkDdiCreateHwContext = Some(ddi::dxgkddi_create_hw_context);
-    data.DxgkDdiDestroyHwContext = Some(ddi::dxgkddi_destroy_hw_context);
-    data.DxgkDdiCreateHwQueue = Some(ddi::dxgkddi_create_hw_queue);
-    data.DxgkDdiDestroyHwQueue = Some(ddi::dxgkddi_destroy_hw_queue);
-    data.DxgkDdiSubmitCommandToHwQueue = Some(ddi::dxgkddi_submit_command_to_hw_queue);
-    data.DxgkDdiSwitchToHwContextList = Some(ddi::dxgkddi_switch_to_hw_context_list);
+    // The NVIDIA personality registers its own hardware-scheduling set at the end
+    // of this function (`register_nvidia_hws`), after every shared slot is filled.
+    if !crate::ddi::wddm_surface::nvidia_selected() {
+        data.DxgkDdiCreateHwContext = Some(ddi::dxgkddi_create_hw_context);
+        data.DxgkDdiDestroyHwContext = Some(ddi::dxgkddi_destroy_hw_context);
+        data.DxgkDdiCreateHwQueue = Some(ddi::dxgkddi_create_hw_queue);
+        data.DxgkDdiDestroyHwQueue = Some(ddi::dxgkddi_destroy_hw_queue);
+        data.DxgkDdiSubmitCommandToHwQueue = Some(ddi::dxgkddi_submit_command_to_hw_queue);
+        data.DxgkDdiSwitchToHwContextList = Some(ddi::dxgkddi_switch_to_hw_context_list);
+    }
     data.DxgkDdiPresentToHwQueue = Some(ddi::dxgkddi_present_to_hw_queue);
     data.DxgkDdiCancelCommand = Some(ddi::dxgkddi_cancel_command);
     data.DxgkDdiCalibrateGpuClock = Some(ddi::dxgkddi_calibrate_gpu_clock);
@@ -220,5 +231,65 @@ fn build_ddi_table() -> DRIVER_INITIALIZATION_DATA {
     data.DxgkDdiControlInterrupt = Some(ddi::traced::control_interrupt);
     data.DxgkDdiQueryCurrentFence = Some(ddi::dxgkddi_query_current_fence);
 
+    if crate::ddi::wddm_surface::nvidia_selected() {
+        register_nvidia_hws(&mut data);
+        // MPO3, as NVIDIA's KMD: at WDDM 3.2 DWM flips through it (`ddi::mpo3`).
+        if ddi::mpo3::select_at_driver_entry() & ddi::mpo3::PART_DDIS != 0 {
+            data.DxgkDdiGetMultiPlaneOverlayCaps = Some(ddi::mpo3::get_multi_plane_overlay_caps);
+            data.DxgkDdiGetPostCompositionCaps = Some(ddi::mpo3::get_post_composition_caps);
+            data.DxgkDdiCheckMultiPlaneOverlaySupport3 =
+                Some(ddi::mpo3::check_multi_plane_overlay_support3);
+            data.DxgkDdiSetVidPnSourceAddressWithMultiPlaneOverlay3 =
+                Some(ddi::mpo3::set_vidpn_source_address_with_multi_plane_overlay3);
+            if ddi::mpo3::part(ddi::mpo3::PART_HWFQ) {
+                data.DxgkDdiSetFlipQueueLogBuffer = Some(ddi::hwfq::set_flip_queue_log_buffer);
+                data.DxgkDdiUpdateFlipQueueLog = Some(ddi::hwfq::update_flip_queue_log);
+                data.DxgkDdiSetInterruptTargetPresentId =
+                    Some(ddi::hwfq::set_interrupt_target_present_id);
+                data.DxgkDdiCancelFlips = Some(ddi::hwfq::cancel_flips);
+                data.DxgkDdiControlInterrupt3 = Some(ddi::hwfq::control_interrupt3);
+            }
+            if ddi::mpo3::part(ddi::mpo3::PART_LEGACY) {
+                data.DxgkDdiSetVidPnSourceAddressWithMultiPlaneOverlay =
+                    Some(ddi::mpo3::set_vidpn_source_address_with_multi_plane_overlay);
+                data.DxgkDdiSetVidPnSourceAddressWithMultiPlaneOverlay2 =
+                    Some(ddi::mpo3::set_vidpn_source_address_with_multi_plane_overlay2);
+                data.DxgkDdiCheckMultiPlaneOverlaySupport =
+                    Some(ddi::mpo3::check_multi_plane_overlay_support);
+                data.DxgkDdiCheckMultiPlaneOverlaySupport2 =
+                    Some(ddi::mpo3::check_multi_plane_overlay_support2);
+                data.DxgkDdiPostMultiPlaneOverlayPresent =
+                    Some(ddi::mpo3::post_multi_plane_overlay_present);
+            }
+        }
+    }
+
     data
+}
+
+/// The NVIDIA personality's WDDM 2.7 hardware-scheduling DDIs (`ddi::hws`), the
+/// set NVIDIA's 610.88 KMD registers: context-based (`CreateContext` hands the
+/// hHwContext to `CreateHwQueue`), so `CreateHwContext`, `DestroyHwContext` and
+/// `SwitchToHwContextList` stay NULL. `DestroyContext` keeps the shared entry,
+/// which tears a native TSG down first. `PresentToHwQueue` is not in NVIDIA's
+/// table either, and ours only refuses, so it is left NULL here: a registered
+/// refusing slot would invite dxgkrnl to route HW-queue presents into a failure.
+fn register_nvidia_hws(data: &mut DRIVER_INITIALIZATION_DATA) {
+    use ddi::hws;
+    data.DxgkDdiPresentToHwQueue = None;
+    data.DxgkDdiCreateContext = Some(ddi::traced::hws_create_context);
+    data.DxgkDdiCreateHwQueue = Some(hws::dxgkddi_create_hw_queue);
+    data.DxgkDdiDestroyHwQueue = Some(hws::dxgkddi_destroy_hw_queue);
+    data.DxgkDdiSubmitCommandToHwQueue = Some(hws::dxgkddi_submit_command_to_hw_queue);
+    data.DxgkDdiSetupPriorityBands = Some(hws::dxgkddi_setup_priority_bands);
+    data.DxgkDdiSetSchedulingLogBuffer = Some(hws::dxgkddi_set_scheduling_log_buffer);
+    data.DxgkDdiSetContextSchedulingProperties =
+        Some(hws::dxgkddi_set_context_scheduling_properties);
+    data.DxgkDdiSuspendContext = Some(hws::dxgkddi_suspend_context);
+    data.DxgkDdiResumeContext = Some(hws::dxgkddi_resume_context);
+    data.DxgkDdiResetHwEngine = Some(hws::dxgkddi_reset_hw_engine);
+    data.DxgkDdiResumeHwEngine = Some(hws::dxgkddi_resume_hw_engine);
+    data.DxgkDdiValidateSubmitCommand = Some(hws::dxgkddi_validate_submit_command);
+    data.DxgkDdiSignalMonitoredFence = Some(hws::dxgkddi_signal_monitored_fence);
+    data.DxgkDdiNotifyContextPriorityChange = Some(hws::dxgkddi_notify_context_priority_change);
 }

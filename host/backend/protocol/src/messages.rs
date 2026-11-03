@@ -141,6 +141,24 @@ pub enum MsgType {
     /// [`NVGPU_CFG_RM_RESOURCE_IMPORT`]. See docs/VENUS.md "RM-export
     /// resources in a second process".
     RmResourceImport = 31,
+    /// Guest → host: map device memory at an exact shared-window offset.
+    /// Used by the native Windows WDDM CPU aperture, where placement is not
+    /// optional and an RM-chosen alternative would be incorrect.
+    MmapAt = 35,
+    /// Guest → host: the release of NVIDIA's own user-mode drivers the guest
+    /// was installed with, which must be the host RM's ([`UmdVersion`]). A
+    /// backend that does not know the message answers `InvalidMsgType`, which
+    /// a guest reads as "not checked".
+    UmdVersion = 36,
+    /// Guest → host: several `Ioctl` requests in one round trip, served in
+    /// order as if each had been sent alone (every check, policy and record
+    /// of a single `Ioctl` applies to each). Payload [`RmBatchReq`], then
+    /// `count` entries, each an [`RmBatchEntry`] and its request bytes padded
+    /// to 8; the reply is a header, [`RmBatchResp`] and one [`RmBatchReply`]
+    /// with its reply bytes (padded to 8) per entry. Served only with
+    /// [`NVGPU_CFG_RM_BATCH`]; a batch inside a batch is refused. See
+    /// [`RmBatchEntry::flags`] for how a failed entry skips later ones.
+    RmBatch = 37,
 }
 
 impl MsgType {
@@ -168,6 +186,9 @@ impl MsgType {
             34 => Self::DisplayModeList,
             30 => Self::GpuCmd,
             31 => Self::RmResourceImport,
+            35 => Self::MmapAt,
+            36 => Self::UmdVersion,
+            37 => Self::RmBatch,
             _ => return None,
         })
     }
@@ -362,6 +383,19 @@ pub struct MmapReq {
     pub padding: u32,
 }
 
+/// Request payload for `MsgType::MmapAt`, following a `MsgHeader`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MmapAtReq {
+    pub size: u64,
+    /// RM mapping cookie, as in `MmapReq::offset`.
+    pub offset: u64,
+    /// Exact byte offset within the shared window, not a hint.
+    pub window_offset: u64,
+    pub prot: u32,
+    pub padding: u32,
+}
+
 /// Response payload for `MsgType::Mmap`, following a `MsgHeader`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -474,12 +508,16 @@ pub const NVGPU_CFG_RM_RESOURCE_IMPORT: u32 = 1 << 14;
 /// [`NVGPU_F_SCANOUT_RELEASE`]).
 pub const NVGPU_CFG_GUEST_BLOB: u32 = 1 << 16;
 
+/// Device config `features` bit: present the captured RTX 5090 PCI identity
+/// instead of Conduit's virtio identity. Set only with `CONDUIT_NVIDIA_UMD=1`.
+pub const NVGPU_CFG_NVIDIA_UMD: u32 = 1 << 17;
+
 /// Device config `features` bit, only together with [`NVGPU_CFG_VENUS`] and
 /// [`NVGPU_CFG_CURSOR`]: the backend serves
 /// [`crate::venus::CMD_SET_CURSOR_BLOB`], a Windows guest's hardware cursor
 /// as a Venus blob (docs/SCANOUT.md "Hardware cursor, Windows guests").
-/// Set whenever Venus and the cursor plane both are. Bit 17 is kept for the
-/// proposed host vblank feature.
+/// Set whenever Venus and the cursor plane both are. Bit 17 is the NVIDIA PCI
+/// personality's.
 pub const NVGPU_CFG_VENUS_CURSOR: u32 = 1 << 18;
 
 /// Device config `features` bit, only together with [`NVGPU_CFG_VENUS_CURSOR`]:
@@ -489,7 +527,7 @@ pub const NVGPU_CFG_VENUS_CURSOR: u32 = 1 << 18;
 /// traffic: the backend serves the cursor queue first, between any two control
 /// requests. A guest also needs the VMM to expose the queue (`num_vqs=3`).
 /// Bit 19 is the presentation-feedback virtio feature's (config bit 19 stays
-/// unused), bit 17 the host vblank proposal's.
+/// unused), bit 17 the NVIDIA PCI personality's.
 pub const NVGPU_CFG_CURSOR_QUEUE: u32 = 1 << 20;
 
 /// A **virtio device feature** the guest acks (like [`NVGPU_CFG_TAKES_INPUT`],
@@ -604,7 +642,7 @@ pub fn encode_scanout_released(r: &ScanoutReleased, out: &mut [u8]) -> Option<us
 /// A **virtio device feature** the guest acks (like [`NVGPU_F_SCANOUT_RELEASE`]; config
 /// `features` bit 19 stays unused): the guest wants `ScanoutPresented` events. The
 /// backend offers it whenever it has a display; a guest that does not ack it never
-/// gets one. Bit 17 is kept for the proposed host vblank feature.
+/// gets one. Bit 17 is the NVIDIA PCI personality's.
 pub const NVGPU_F_SCANOUT_PRESENTED: u32 = 1 << 19;
 
 /// [`ScanoutPresented::flags`]: the frame was shown through Venus
@@ -732,6 +770,98 @@ pub struct RmResourceImport {
     pub flags: u32,
     /// 0.
     pub reserved: u32,
+}
+
+/// [`UmdVersion::kind`]: NVIDIA's Windows user-mode drivers, numbered the way
+/// their own package is (`610.88` for file version `32.0.16.1088`).
+pub const UMD_KIND_NVIDIA_WINDOWS: u32 = 1;
+
+/// Request payload for `MsgType::UmdVersion`, following a `MsgHeader` (whose
+/// `handle` is 0). 16 bytes.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct UmdVersion {
+    /// [`UMD_KIND_NVIDIA_WINDOWS`].
+    pub kind: u32,
+    /// `610` of `610.88`.
+    pub major: u32,
+    /// `88` of `610.88`.
+    pub minor: u32,
+    /// 0.
+    pub reserved: u32,
+}
+
+/// [`UmdVersionReply::verdict`]: the UMDs are the release paired with the
+/// host RM (or the one the host pins).
+pub const UMD_VERDICT_MATCH: u32 = 0;
+/// [`UmdVersionReply::verdict`]: they are not. The backend refuses every RM
+/// call from this guest until the next report matches.
+pub const UMD_VERDICT_MISMATCH: u32 = 1;
+/// [`UmdVersionReply::verdict`]: the host cannot tell (no host release known,
+/// or the check is switched off on the host).
+pub const UMD_VERDICT_UNCHECKED: u32 = 2;
+/// [`UmdVersionReply::verdict`]: no pair is known for the host release, and
+/// the UMDs are at least from its branch (`610` for `610.57.04`).
+pub const UMD_VERDICT_BRANCH: u32 = 3;
+
+/// Response payload for `MsgType::UmdVersion`, following a `MsgHeader` with
+/// status 0. 16 bytes.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct UmdVersionReply {
+    /// `UMD_VERDICT_*`.
+    pub verdict: u32,
+    /// The host RM release, `610.57.04` as 610, 57, 4; zeros when unknown.
+    pub host_major: u32,
+    pub host_minor: u32,
+    pub host_patch: u32,
+}
+
+impl UmdVersion {
+    /// Decode from the bytes after the header. `None` if too short.
+    pub fn from_bytes(b: &[u8]) -> Option<Self> {
+        let w = |at: usize| Some(u32::from_le_bytes(b.get(at..at + 4)?.try_into().ok()?));
+        Some(Self {
+            kind: w(0)?,
+            major: w(4)?,
+            minor: w(8)?,
+            reserved: w(12)?,
+        })
+    }
+
+    pub fn to_bytes(&self) -> [u8; 16] {
+        words16([self.kind, self.major, self.minor, self.reserved])
+    }
+}
+
+impl UmdVersionReply {
+    /// Decode from the bytes after the header. `None` if too short.
+    pub fn from_bytes(b: &[u8]) -> Option<Self> {
+        let w = |at: usize| Some(u32::from_le_bytes(b.get(at..at + 4)?.try_into().ok()?));
+        Some(Self {
+            verdict: w(0)?,
+            host_major: w(4)?,
+            host_minor: w(8)?,
+            host_patch: w(12)?,
+        })
+    }
+
+    pub fn to_bytes(&self) -> [u8; 16] {
+        words16([
+            self.verdict,
+            self.host_major,
+            self.host_minor,
+            self.host_patch,
+        ])
+    }
+}
+
+fn words16(w: [u32; 4]) -> [u8; 16] {
+    let mut o = [0u8; 16];
+    for (i, v) in w.into_iter().enumerate() {
+        o[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    o
 }
 
 /// [`RmResourceImportReply::flags`]: `modifier` is known.
@@ -959,6 +1089,89 @@ pub const NVGPU_F_EVENT_PACKED: u32 = 1 << 22;
 /// ([`NVGPU_F_EVENT_PACKED`]), whatever the buffer's size: a guest can size
 /// what it copies out of a buffer by this.
 pub const EVENT_READY_PER_BUFFER_MAX: usize = 32;
+
+/// Device config `features` bit: the backend serves [`MsgType::RmBatch`].
+/// Read from the config, never acked; a guest that does not see it sends one
+/// `Ioctl` per round trip, as before.
+pub const NVGPU_CFG_RM_BATCH: u32 = 1 << 23;
+
+/// The most entries one [`MsgType::RmBatch`] may carry.
+pub const RM_BATCH_MAX_ENTRIES: u32 = 64;
+/// The most reply bytes one batch entry may ask room for.
+pub const RM_BATCH_MAX_RESP: u32 = 4096;
+/// [`RmBatchEntry::status_at`]: the entry has no RM status word to judge.
+pub const RM_BATCH_NO_STATUS: u32 = u32::MAX;
+/// [`RmBatchEntry::flags`]: when this entry fails, the later entries of the
+/// same group (`flags >> 16`) are skipped, not served.
+pub const RM_BATCH_SKIP_GROUP_ON_FAIL: u32 = 1 << 0;
+/// [`RmBatchEntry::flags`]: when this entry fails, every later entry is skipped.
+pub const RM_BATCH_ABORT_ON_FAIL: u32 = 1 << 1;
+/// [`RmBatchReply::flags`]: the entry was served.
+pub const RM_BATCH_REPLY_SERVED: u32 = 1 << 0;
+/// [`RmBatchReply::flags`]: the entry failed (host status nonzero, or RM's
+/// status word nonzero or out of reach of the reply).
+pub const RM_BATCH_REPLY_FAILED: u32 = 1 << 1;
+
+/// Request payload for `MsgType::RmBatch`, following a `MsgHeader` (whose
+/// `handle` is 0). 8 bytes, then `count` entries.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RmBatchReq {
+    /// Entries that follow, 1..=[`RM_BATCH_MAX_ENTRIES`].
+    pub count: u32,
+    /// 0.
+    pub flags: u32,
+}
+
+/// One entry of an `RmBatch` request: this, then `req_len` bytes of a whole
+/// `Ioctl` request (`MsgHeader | IoctlReq | data | nested | deep`), then zero
+/// padding to a multiple of 8. 16 bytes.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RmBatchEntry {
+    pub req_len: u32,
+    /// Reply bytes the guest makes room for, at most [`RM_BATCH_MAX_RESP`].
+    pub resp_cap: u32,
+    /// Where RM's own status word sits in the reply's data block (after
+    /// `MsgHeader | IoctlResp`), or [`RM_BATCH_NO_STATUS`].
+    pub status_at: u32,
+    /// `RM_BATCH_SKIP_GROUP_ON_FAIL | RM_BATCH_ABORT_ON_FAIL`, and the
+    /// entry's group in the high 16 bits.
+    pub flags: u32,
+}
+
+/// Response payload for `MsgType::RmBatch`, following a `MsgHeader` (status
+/// 0 when the batch was well formed): this, then one [`RmBatchReply`] and its
+/// bytes per request entry, in order. 8 bytes.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RmBatchResp {
+    /// Entries answered (always the request's `count`).
+    pub count: u32,
+    /// Entries served (the others were skipped).
+    pub served: u32,
+}
+
+/// One entry's answer: this, then `len` bytes of its reply (exactly what a
+/// single `Ioctl` would have answered), then zero padding to a multiple of 8,
+/// the slot always `resp_cap` bytes long. 16 bytes.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RmBatchReply {
+    /// Reply bytes written; 0 for a skipped entry.
+    pub len: u32,
+    /// RM's status word as read at `status_at`, `u32::MAX` when not read.
+    pub rm_status: u32,
+    /// `RM_BATCH_REPLY_SERVED | RM_BATCH_REPLY_FAILED`.
+    pub flags: u32,
+    /// 0.
+    pub reserved: u32,
+}
+
+/// `n` rounded up to a multiple of 8 (every `RmBatch` slot is).
+pub const fn rm_batch_pad8(n: usize) -> usize {
+    (n + 7) & !7
+}
 
 /// Event-queue payload for `MsgType::DisplayModeList`, following a
 /// `MsgHeader` (handle 0, status 0), then `count` entries. 16 bytes.
@@ -1382,6 +1595,9 @@ const _: () = {
     assert!(size_of::<IoctlReq>() == 24);
     assert!(size_of::<IoctlResp>() == 12);
     assert!(size_of::<MmapReq>() == 24);
+    assert!(size_of::<MmapAtReq>() == 32);
+    assert!(size_of::<UmdVersion>() == 16);
+    assert!(size_of::<UmdVersionReply>() == 16);
     assert!(size_of::<MmapResp>() == 24);
     assert!(size_of::<MunmapReq>() == 8);
     assert!(size_of::<FileEntry>() == 8);
@@ -1482,11 +1698,10 @@ mod tests {
         assert_eq!(MsgType::from_u32(32), None);
         assert_eq!(MsgType::ScanoutPresented as u32, 33);
         assert_eq!(MsgType::from_u32(33), Some(MsgType::ScanoutPresented));
-        // A device feature like SCANOUT_RELEASE, above every config bit in use
-        // (17 is kept for the host vblank proposal).
+        // A device feature like SCANOUT_RELEASE, above every config bit in use.
         assert_eq!(NVGPU_F_SCANOUT_PRESENTED, 1 << 19);
         assert_eq!(NVGPU_CFG_RM_RESOURCE_IMPORT, 1 << 14);
-        // Bit 17 is the proposed host vblank feature's.
+        assert_eq!(NVGPU_CFG_NVIDIA_UMD, 1 << 17);
         assert_eq!(NVGPU_CFG_VENUS_CURSOR, 1 << 18);
         assert_eq!(NVGPU_CFG_CURSOR_QUEUE, 1 << 20);
         let r = RmResourceImport {
@@ -1512,6 +1727,66 @@ mod tests {
         assert_eq!(crate::venus::BLOB_MEM_RM_EXPORT, 0x8000_0001);
         assert_eq!(crate::venus::rm_export_ids(0x0000_0007_0000_004d), (7, 77));
         assert_eq!(crate::venus::errno_padding(-34), [34, 0, 0]);
+    }
+
+    #[test]
+    fn nvidia_umd_feature_bit_does_not_collide() {
+        for other in [
+            NVGPU_CFG_DISPLAY,
+            NVGPU_CFG_CURSOR,
+            NVGPU_CFG_VENUS,
+            NVGPU_CFG_DRM_FENCES,
+            NVGPU_CFG_TAKES_INPUT,
+            NVGPU_CFG_RM_IMPORT,
+            NVGPU_CFG_RM_RESOURCE_IMPORT,
+            NVGPU_F_SCANOUT_RELEASE,
+            NVGPU_CFG_GUEST_BLOB,
+            NVGPU_CFG_VENUS_CURSOR,
+            NVGPU_F_SCANOUT_PRESENTED,
+            NVGPU_CFG_CURSOR_QUEUE,
+            NVGPU_F_MODE_LIST,
+            NVGPU_F_EVENT_PACKED,
+        ] {
+            assert_eq!(NVGPU_CFG_NVIDIA_UMD & other, 0, "{other:#x}");
+        }
+        assert_eq!(NVGPU_CFG_NVIDIA_UMD, 1 << 17);
+    }
+
+    /// The batch bit is its own, and the batch structs are the sizes the KMD
+    /// (`kmd_logic::rm_batch`) lays out.
+    #[test]
+    fn rm_batch_layout() {
+        let all = [
+            NVGPU_CFG_DISPLAY,
+            NVGPU_CFG_CURSOR,
+            NVGPU_CFG_VENUS,
+            NVGPU_CFG_DRM_FENCES,
+            NVGPU_CFG_TAKES_INPUT,
+            NVGPU_CFG_RM_IMPORT,
+            NVGPU_CFG_RM_RESOURCE_IMPORT,
+            NVGPU_F_SCANOUT_RELEASE,
+            NVGPU_CFG_GUEST_BLOB,
+            NVGPU_CFG_NVIDIA_UMD,
+            NVGPU_CFG_VENUS_CURSOR,
+            NVGPU_F_SCANOUT_PRESENTED,
+            NVGPU_CFG_CURSOR_QUEUE,
+            NVGPU_F_MODE_LIST,
+            NVGPU_F_EVENT_PACKED,
+        ];
+        for other in all {
+            assert_eq!(NVGPU_CFG_RM_BATCH & other, 0, "{other:#x}");
+        }
+        assert_eq!(NVGPU_CFG_RM_BATCH, 1 << 23);
+        assert_eq!(size_of::<RmBatchReq>(), 8);
+        assert_eq!(size_of::<RmBatchEntry>(), 16);
+        assert_eq!(size_of::<RmBatchResp>(), 8);
+        assert_eq!(size_of::<RmBatchReply>(), 16);
+        assert_eq!(RM_BATCH_MAX_ENTRIES, 64);
+        assert_eq!(RM_BATCH_MAX_RESP, 4096);
+        assert_eq!(rm_batch_pad8(0), 0);
+        assert_eq!(rm_batch_pad8(1), 8);
+        assert_eq!(rm_batch_pad8(16), 16);
+        assert_eq!(rm_batch_pad8(17), 24);
     }
 
     /// Header, then {scanout, flags, owner_handle, host_handle, seq, 0}.
@@ -1587,6 +1862,13 @@ mod tests {
         assert_eq!(NVGPU_F_EVENT_PACKED, 1 << 22);
         assert_eq!(MsgType::DisplayModeList as u32, 34);
         assert_eq!(MsgType::from_u32(34), Some(MsgType::DisplayModeList));
+        assert_eq!(MsgType::MmapAt as u32, 35);
+        assert_eq!(MsgType::from_u32(35), Some(MsgType::MmapAt));
+        assert_eq!(MsgType::UmdVersion as u32, 36);
+        assert_eq!(MsgType::from_u32(36), Some(MsgType::UmdVersion));
+        assert_eq!(MsgType::RmBatch as u32, 37);
+        assert_eq!(MsgType::from_u32(37), Some(MsgType::RmBatch));
+        assert_eq!(MsgType::from_u32(38), None);
         let modes = [(5120, 1440), (1920, 1080)];
         let mut buf = [0u8; 64];
         assert_eq!(

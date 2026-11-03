@@ -7,6 +7,7 @@
 //! ignore the `DeviceFunction` argument and always access our own device.
 
 use core::ffi::c_void;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use virtio_drivers::transport::pci::bus::{ConfigurationAccess, DeviceFunction};
 
@@ -34,18 +35,34 @@ impl DxgkConfigAccess {
 
 /// virtio-drivers 0.13 knows device types up to 25 and `PciTransport::new`
 /// refuses any other PCI device id, so Conduit's device (virtio id 45, PCI
-/// `0x106D`; id 41, `0x1069`, under some QEMU setups) never got a transport and
-/// `StartDevice` silently left the device off. The transport only reads the
-/// vendor/device word at offset 0 and keeps the type for nothing we use, so
-/// report the virtio-gpu id (`0x1050`) for those two and leave every other read,
-/// including the KMD's own capability scans, untouched.
+/// `0x106D`; id 41, `0x1069`, under some QEMU setups; or the RTX 5090
+/// personality's `0x2B85`) never got a transport and `StartDevice` silently
+/// left the device off. The transport only reads the vendor/device word at
+/// offset 0 and keeps the type for nothing we use, so report the virtio-gpu id
+/// (`0x1050`) for those IDs and leave every other read, including the KMD's own
+/// capability scans, untouched.
+///
+/// The transport also refuses any vendor but `0x1AF4`, so the RTX 5090
+/// personality (`10DE:2B85`) reports the virtio vendor too.
+/// Whether the device is the RTX 5090 personality (`10DE:2B85`), as the transport's read of
+/// the vendor/device word saw it (set before the transport exists, never cleared: the PCI
+/// identity of a device does not change while the driver is loaded).
+static NVIDIA_PERSONALITY: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn nvidia_personality() -> bool {
+    NVIDIA_PERSONALITY.load(Ordering::Relaxed)
+}
+
 fn known_device_id(vendor_device: u32) -> u32 {
-    const CONDUIT_IDS: [u32; 2] = [0x106D, 0x1069];
+    const VIRTIO_VENDOR: u32 = 0x1AF4;
+    const NVIDIA_VENDOR: u32 = 0x10DE;
     const VIRTIO_GPU_ID: u32 = 0x1050;
-    if CONDUIT_IDS.contains(&(vendor_device >> 16)) {
-        (VIRTIO_GPU_ID << 16) | (vendor_device & 0xFFFF)
-    } else {
-        vendor_device
+    let vendor = vendor_device & 0xFFFF;
+    match (vendor, vendor_device >> 16) {
+        (VIRTIO_VENDOR, 0x106D | 0x1069) | (NVIDIA_VENDOR, 0x2B85) => {
+            (VIRTIO_GPU_ID << 16) | VIRTIO_VENDOR
+        }
+        _ => vendor_device,
     }
 }
 
@@ -68,6 +85,9 @@ impl ConfigurationAccess for DxgkConfigAccess {
             }
         }
         if register_offset == 0 {
+            if val == 0x2B85_10DE {
+                NVIDIA_PERSONALITY.store(true, Ordering::Relaxed);
+            }
             val = known_device_id(val);
         }
         val

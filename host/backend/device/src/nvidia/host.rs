@@ -19,13 +19,17 @@ pub struct RealHost;
 
 impl HostDriver for RealHost {
     fn ioctl(&self, fd: RawFd, request: u64, arg: &mut [u8]) -> std::result::Result<(), i32> {
+        let started = std::time::Instant::now();
         // SAFETY: `arg` is a live, writable buffer for the whole call, sized by
         // the caller to what `request` declares or longer.
         let rc = unsafe { libc::ioctl(fd, request as libc::Ioctl, arg.as_mut_ptr()) };
-        if rc < 0 {
+        let result = if rc < 0 {
             Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(0))
         } else {
             Ok(())
-        }
+        };
+        // A call that took long is logged with what it was (`slow_log`).
+        super::slow_log::note(fd, request, arg, started.elapsed(), result);
+        result
     }
 }

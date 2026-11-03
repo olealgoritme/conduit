@@ -14,8 +14,11 @@ use wdk_sys::ntddk::KeQueryInterruptTimePrecise;
 use crate::adapter::AdapterContext;
 use crate::device::DeviceHandleRef;
 use crate::dxgk::*;
+use crate::virtio::native_channel::{NativeContext, NativeError, NativeQueue, NativeRingBacking};
+use helios_kmd_logic::native_channel as native_format;
 
 const HW_TAG_CONTEXT: u32 = 0x4843_5458; // "HCTX"
+const HW_TAG_QUEUE: u32 = 0x4848_5751; // "HHWQ"
 
 /// The one opaque object this driver hands dxgkrnl for hardware scheduling.
 ///
@@ -33,6 +36,71 @@ const HW_TAG_CONTEXT: u32 = 0x4843_5458; // "HCTX"
 struct HwHandle {
     tag: u32,
     adapter: *mut AdapterContext,
+    /// Present only for a native 610.88 CUDA context. The legacy handle keeps
+    /// its old successful context-creation behaviour and still refuses queues.
+    native: Option<Box<NativeContext>>,
+}
+
+#[repr(C)]
+struct HwQueue {
+    handle: HwHandle,
+    native: NativeQueue,
+}
+
+/// `NativeError` discriminant + 1, for the `VkF` codes.
+pub(crate) fn native_code(error: NativeError) -> u32 {
+    match error {
+        NativeError::Invalid => 1,
+        NativeError::Busy => 2,
+        NativeError::NoMemory => 3,
+        NativeError::Unsupported => 4,
+        NativeError::Transport => 5,
+        NativeError::Rm => 6,
+        NativeError::UnbackedRing => 7,
+        NativeError::Dead => 8,
+    }
+}
+
+/// `nc::PrivateError` discriminant + 1, for the `VkF` codes.
+pub(crate) fn private_code(error: native_format::PrivateError) -> u32 {
+    use native_format::PrivateError as E;
+    match error {
+        E::Size => 1,
+        E::Magic => 2,
+        E::Version => 3,
+        E::Node => 4,
+        E::EngineAffinity => 5,
+        E::Flags => 6,
+        E::ClientHint => 7,
+        E::GpfifoVa => 8,
+        E::RingBytes => 9,
+        E::Allocation => 10,
+        E::QueueFlags => 11,
+        E::GpPut => 12,
+        E::ProgressFence => 13,
+    }
+}
+
+/// A refused CreateHwQueue into `VkF`: `reason` (`vk_fail::queue_reason`) with the
+/// detail code in its low byte; answers `status`.
+fn queue_refused(reason: u32, detail: u32, status: NTSTATUS, hint: u32) -> NTSTATUS {
+    crate::ddi::vk_fail::note(
+        helios_kmd_logic::vk_fail::kind::CREATE_HW_QUEUE,
+        reason | (detail & 0xff),
+        status,
+        hint,
+    );
+    status
+}
+
+fn native_status(error: NativeError) -> NTSTATUS {
+    match error {
+        NativeError::Invalid | NativeError::UnbackedRing => STATUS_INVALID_PARAMETER,
+        NativeError::Busy => STATUS_DEVICE_BUSY,
+        NativeError::NoMemory => STATUS_NO_MEMORY,
+        NativeError::Unsupported => STATUS_NOT_SUPPORTED,
+        NativeError::Transport | NativeError::Rm | NativeError::Dead => STATUS_IO_DEVICE_ERROR,
+    }
 }
 
 static PRESENT_HWQ_COUNT: AtomicU32 = AtomicU32::new(0);
@@ -52,6 +120,21 @@ unsafe fn hw_handle(h: IN_CONST_HANDLE) -> Option<&'static HwHandle> {
     // first, so the read is in-bounds for any handle we minted.
     let handle = unsafe { &*(h as *const HwHandle) };
     (handle.tag == HW_TAG_CONTEXT && !handle.adapter.is_null()).then_some(handle)
+}
+
+/// Validate a native queue without ever interpreting a context as a queue.
+unsafe fn hw_queue_handle(h: IN_CONST_HANDLE) -> Option<&'static HwQueue> {
+    if h.is_null() {
+        return None;
+    }
+    // SAFETY: the common prefix is read once; only its queue tag permits the
+    // subsequent cast to the larger HwQueue object.
+    let prefix = unsafe { &*(h as *const HwHandle) };
+    if prefix.tag != HW_TAG_QUEUE || prefix.adapter.is_null() {
+        return None;
+    }
+    // SAFETY: this tag is written only when the whole HwQueue is boxed.
+    Some(unsafe { &*(h as *const HwQueue) })
 }
 
 pub unsafe extern "C" fn dxgkddi_query_dependent_engine_group(
@@ -121,6 +204,9 @@ pub unsafe extern "C" fn dxgkddi_reset_engine(
         },
         Some(reset_node),
     );
+    // Native NVIDIA channels on the node that were reported faulted or hung are
+    // recovered too (none outside the NVIDIA personality).
+    let _ = crate::ddi::hws::recover_native(adapter, crate::ddi::hws::Recover::Flagged(reset_node));
     // Present streams are node 0's (DWM, D3D11 presents); a reset of the D3D12
     // node (`D3d12Node`) leaves them.
     if reset_node == 0 {
@@ -141,79 +227,328 @@ pub unsafe extern "C" fn dxgkddi_create_hw_context(
     }
 
     let args = unsafe { &mut *args };
-    if args.NodeOrdinal != 0 || args.EngineAffinity != 0 {
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    // SAFETY: h_device is the DeviceContext pointer returned from
-    // DxgkDdiCreateDevice for this adapter. The checked traversal is the only
-    // route to the adapter now that the back-pointer is private.
     let Some(device) = (unsafe { DeviceHandleRef::from_raw(h_device) }) else {
         return STATUS_INVALID_PARAMETER;
     };
-    if device.adapter().is_none() {
-        return STATUS_INVALID_PARAMETER;
-    }
+    let private = if args.PrivateDriverDataSize == 0 {
+        &[][..]
+    } else {
+        if args.pPrivateDriverData.is_null() {
+            return STATUS_INVALID_PARAMETER;
+        }
+        // SAFETY: dxgkrnl supplies exactly PrivateDriverDataSize readable bytes
+        // for the duration of this PASSIVE DDI.
+        unsafe {
+            core::slice::from_raw_parts(
+                args.pPrivateDriverData as *const u8,
+                args.PrivateDriverDataSize as usize,
+            )
+        }
+    };
+    let native_requested = native_format::is_context_private(private);
+    // SAFETY: Value is the plain UINT arm of D3DDDI_CREATEHWCONTEXTFLAGS.
+    let flags = unsafe { args.Flags.__bindgen_anon_1.Value };
+    let native = if native_requested {
+        if let Err(error) = native_format::parse_context_private(
+            private,
+            args.NodeOrdinal,
+            args.EngineAffinity,
+            flags,
+        ) {
+            return native_status(error.into());
+        }
+        // SAFETY: CreateHwContext is PASSIVE_LEVEL; `h_device` is live.
+        match unsafe { create_native_context(h_device, &device) } {
+            Ok(context) => Some(context),
+            Err(status) => return status,
+        }
+    } else {
+        // Existing default: non-native D3D contexts on node 0 engine 0 keep
+        // the old opaque object and do not create any RM state.
+        if args.NodeOrdinal != 0 || args.EngineAffinity != 0 {
+            return STATUS_INVALID_PARAMETER;
+        }
+        None
+    };
 
     let ctx = Box::new(HwHandle {
         tag: HW_TAG_CONTEXT,
-        // Stored, not borrowed: `HwHandle` outlives this call.
         adapter: device.adapter_ptr(),
+        native,
     });
     args.hHwContext = Box::into_raw(ctx) as HANDLE;
     STATUS_SUCCESS
 }
 
+/// Build the native Blackwell TSG + context share for a validated NVDA-private
+/// context. Shared by `CreateHwContext` (default table) and the NVIDIA
+/// personality's `CreateContext` (`ddi::hws`).
+///
+/// # Safety
+/// PASSIVE_LEVEL; `h_device` is the live hDevice `device` was built from.
+pub(crate) unsafe fn create_native_context(
+    h_device: IN_CONST_HANDLE,
+    device: &DeviceHandleRef<'_>,
+) -> Result<Box<NativeContext>, NTSTATUS> {
+    let Some(adapter) = device.adapter() else {
+        return Err(STATUS_INVALID_PARAMETER);
+    };
+    let Some(owner) = crate::virtio::gpu::DeviceOwner::new(h_device as usize) else {
+        return Err(STATUS_INVALID_PARAMETER);
+    };
+    let process = device.native_process_ptr();
+    let Some(process) = (unsafe { process.as_mut() }) else {
+        return Err(STATUS_INVALID_PARAMETER);
+    };
+    let passive = unsafe { crate::irql::PassiveLevel::assume() };
+    match NativeContext::create(passive, adapter, process, owner) {
+        Ok(context) => Ok(Box::new(context)),
+        Err(error) => Err(native_status(error)),
+    }
+}
+
+/// Tear down a native TSG (DestroyHwContext / NVIDIA-mode DestroyContext).
+pub(crate) fn destroy_native_context(
+    passive: crate::irql::PassiveLevel,
+    native: &mut NativeContext,
+) -> Result<(), NTSTATUS> {
+    native.destroy(passive).map_err(native_status)
+}
+
 pub unsafe extern "C" fn dxgkddi_destroy_hw_context(h_hw_context: IN_CONST_HANDLE) -> NTSTATUS {
     crate::diag::record(0x0700_0002);
     if !h_hw_context.is_null() {
-        drop(unsafe { Box::from_raw(h_hw_context as *mut HwHandle) });
+        let mut context = unsafe { Box::from_raw(h_hw_context as *mut HwHandle) };
+        if let Some(native) = context.native.as_mut() {
+            let passive = unsafe { crate::irql::PassiveLevel::assume() };
+            // What RM would not free is filed for DestroyProcess
+            // (`native_channel`); an error here means the context was never
+            // torn down, and the handle stays.
+            if let Err(error) = native.destroy(passive) {
+                let status = native_status(error);
+                let _ = Box::into_raw(context);
+                return status;
+            }
+        }
+        drop(context);
     }
     STATUS_SUCCESS
 }
 
-/// REFUSE AT THE FIRST STEP. This driver advertises no hardware-scheduling
-/// capability anywhere -- a repo-wide search for `HwSched` / `HardwareSchedul` /
-/// `HwQueueSupported` finds nothing, and `query_adapter_info.rs` sets only
-/// `MultiEngineAware | PreemptionAware`.
-///
-/// It used to hand back a magic-tagged `Box`ed queue and succeed, while
-/// `SubmitCommandToHwQueue` returned `STATUS_NOT_SUPPORTED` -- the worst
-/// possible pairing, because the scheduler has already committed to the queue
-/// by the time the submission fails, and this file's own comment documents that
-/// shape as VidSch bugcheck `0x119`/Arg1=2. Failing here means no queue handle
-/// exists, so a submission against one is unrepresentable.
-///
-/// Evidence gate (ROADMAP 7g(b)): `PHQcall` is ABSENT from the service key
-/// entirely -- `PresentToHwQueue` has never been called in the key's lifetime.
+/// Create a real native queue only for a validated CUDA HW context. Legacy
+/// contexts retain the old loud refusal; no HWS capability is advertised here.
 pub unsafe extern "C" fn dxgkddi_create_hw_queue(
-    _h_hw_context: IN_CONST_HANDLE,
-    _args: INOUT_PDXGKARG_CREATEHWQUEUE,
+    h_hw_context: IN_CONST_HANDLE,
+    args: INOUT_PDXGKARG_CREATEHWQUEUE,
 ) -> NTSTATUS {
     crate::diag::record(0x0700_0003);
-    crate::diag::record_named_bytes(b"HwQRef", 1);
-    STATUS_NOT_SUPPORTED
+    if h_hw_context.is_null() || args.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let Some(context) = (unsafe { hw_handle(h_hw_context) }) else {
+        return STATUS_INVALID_PARAMETER;
+    };
+    let Some(native_context) = context.native.as_ref() else {
+        crate::diag::record_named_bytes(b"HwQRef", 1);
+        return STATUS_NOT_SUPPORTED;
+    };
+    // SAFETY: dxgkrnl's live args; the context outlives its queues.
+    unsafe { create_native_queue(context.adapter, native_context, &mut *args) }
 }
 
-pub unsafe extern "C" fn dxgkddi_destroy_hw_queue(_h_hw_queue: IN_CONST_HANDLE) -> NTSTATUS {
+/// Build a native queue on `native_context` and hand its boxed handle back in
+/// `args.hHwQueue`. Shared by both DDI tables.
+///
+/// # Safety
+/// PASSIVE_LEVEL; `adapter` is the live adapter the context belongs to, and
+/// `native_context` outlives the queue (WDDM destroys queues first).
+pub(crate) unsafe fn create_native_queue(
+    adapter_ptr: *mut AdapterContext,
+    native_context: &NativeContext,
+    args: &mut DXGKARG_CREATEHWQUEUE,
+) -> NTSTATUS {
+    if args.pPrivateDriverData.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    // SAFETY: dxgkrnl supplies this in/out buffer for the DDI's duration.
+    let private = unsafe {
+        core::slice::from_raw_parts_mut(
+            args.pPrivateDriverData as *mut u8,
+            args.PrivateDriverDataSize as usize,
+        )
+    };
+    use helios_kmd_logic::vk_fail::{queue_hint, queue_reason as qr};
+    // SAFETY: Value is the plain UINT arm of D3DDDI_CREATEHWQUEUEFLAGS.
+    let queue_flags = unsafe { args.Flags.__bindgen_anon_1.Value };
+    let parsed = match native_format::parse_queue_private(private) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            return queue_refused(
+                qr::PRIVATE,
+                private_code(error),
+                native_status(error.into()),
+                private.len() as u32,
+            )
+        }
+    };
+    let hint = queue_hint(parsed.kind(), parsed.ring_bytes, queue_flags);
+    if args.hHwQueueProgressFence == 0 {
+        return queue_refused(qr::NO_FENCE, 0, STATUS_NOT_SUPPORTED, hint);
+    }
+    let Some(adapter) = (unsafe { adapter_ptr.as_ref() }) else {
+        return STATUS_INVALID_PARAMETER;
+    };
+    let owner = native_context.owner();
+    let backing: NativeRingBacking = match unsafe {
+        crate::ddi::create_allocation::native_ring_backing(
+            adapter,
+            owner,
+            native_context.process_key(),
+            parsed.allocation,
+            parsed.gpfifo_va,
+            u64::from(parsed.ring_bytes),
+        )
+    } {
+        Some(backing) => backing,
+        None => return queue_refused(qr::RING_BACKING, 0, STATUS_INVALID_PARAMETER, hint),
+    };
+    let passive = unsafe { crate::irql::PassiveLevel::assume() };
+    let native = match NativeQueue::create(
+        passive,
+        adapter,
+        native_context,
+        backing,
+        &parsed,
+        queue_flags,
+        args.HwQueueProgressFenceCPUVirtualAddress as u64,
+        args.HwQueueProgressFenceGPUVirtualAddress,
+    ) {
+        Ok(queue) => queue,
+        Err(error) => {
+            return queue_refused(qr::NATIVE, native_code(error), native_status(error), hint)
+        }
+    };
+    let token = native.token();
+    if let Err(error) =
+        native_format::write_queue_created(private, token.0, token.runlist(), token.channel())
+    {
+        let mut native = native;
+        let _ = native.destroy(passive);
+        return queue_refused(qr::WRITEBACK, private_code(error), native_status(error.into()), hint);
+    }
+    let queue = Box::new(HwQueue {
+        handle: HwHandle {
+            tag: HW_TAG_QUEUE,
+            adapter: adapter_ptr,
+            native: None,
+        },
+        native,
+    });
+    args.hHwQueue = Box::into_raw(queue) as HANDLE;
+    STATUS_SUCCESS
+}
+
+/// The native queue behind a queue handle this driver minted, or `None`.
+///
+/// # Safety
+/// `h` is null or a handle this driver returned from a CreateHwQueue that has
+/// not been destroyed.
+pub(crate) unsafe fn native_queue_of(h: IN_CONST_HANDLE) -> Option<&'static NativeQueue> {
+    // SAFETY: per the contract.
+    unsafe { hw_queue_handle(h) }.map(|queue| &queue.native)
+}
+
+pub unsafe extern "C" fn dxgkddi_destroy_hw_queue(h_hw_queue: IN_CONST_HANDLE) -> NTSTATUS {
     crate::diag::record(0x0700_0004);
-    // Nothing to free: `CreateHwQueue` never hands out an object. The slot stays
-    // REGISTERED because this driver has been bitten twice by absent/null DDI
-    // slots (`DxgkDdiUpdateMonitorLinkInfo` Code 43, `DdiRenderGdi` null-pointer
-    // bugcheck), so unregistering is a separate behaviour change.
+    if h_hw_queue.is_null() {
+        return STATUS_SUCCESS;
+    }
+    if unsafe { hw_queue_handle(h_hw_queue) }.is_none() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let mut queue = unsafe { Box::from_raw(h_hw_queue as *mut HwQueue) };
+    let passive = unsafe { crate::irql::PassiveLevel::assume() };
+    // What RM would not free is filed for DestroyProcess (`native_channel`); an
+    // error here means the queue was never torn down, and the handle stays.
+    if let Err(error) = queue.native.destroy(passive) {
+        let status = native_status(error);
+        let _ = Box::into_raw(queue);
+        return status;
+    }
+    drop(queue);
     STATUS_SUCCESS
 }
 
 pub unsafe extern "C" fn dxgkddi_submit_command_to_hw_queue(
-    _h_adapter: IN_CONST_HANDLE,
+    h_adapter: IN_CONST_HANDLE,
     args: IN_CONST_PDXGKARG_SUBMITCOMMANDTOHWQUEUE,
 ) -> NTSTATUS {
-    crate::diag::record(0x0700_0005);
-    if args.is_null() {
+    if h_adapter.is_null() || args.is_null() {
         return STATUS_INVALID_PARAMETER;
     }
-
-    STATUS_NOT_SUPPORTED
+    let args = unsafe { &*args };
+    let refused = |reason: u32| {
+        crate::ddi::vk_fail::note(
+            helios_kmd_logic::vk_fail::kind::SUBMIT_HW_QUEUE,
+            reason,
+            STATUS_INVALID_PARAMETER,
+            args.DmaBufferPrivateDataSize,
+        );
+        STATUS_INVALID_PARAMETER
+    };
+    let Some(queue) = (unsafe { hw_queue_handle(args.hHwQueue) }) else {
+        return refused(helios_kmd_logic::vk_fail::submit_reason::BAD_HANDLE);
+    };
+    if queue.handle.adapter != h_adapter as *mut AdapterContext {
+        return refused(helios_kmd_logic::vk_fail::submit_reason::BAD_HANDLE);
+    }
+    if args.pDmaBufferPrivateData.is_null() {
+        return refused(helios_kmd_logic::vk_fail::submit_reason::NO_PRIVATE);
+    }
+    // SAFETY: dxgkrnl supplies exactly DmaBufferPrivateDataSize readable bytes.
+    // NativeQueue::submit performs only its leaf spinlock and volatile stores;
+    // in particular there is no registry/host call or allocation at this IRQL.
+    let private = unsafe {
+        core::slice::from_raw_parts(
+            args.pDmaBufferPrivateData as *const u8,
+            args.DmaBufferPrivateDataSize as usize,
+        )
+    };
+    if queue.native.wants_copy_binding() {
+        let irql = unsafe { wdk_sys::ntddk::KeGetCurrentIrql() };
+        crate::virtio::native_channel::CE_BIND_IRQL.store(u32::from(irql), Ordering::Relaxed);
+        if irql <= wdk_sys::DISPATCH_LEVEL as u8 {
+            // SAFETY: the token only when the IRQL really is PASSIVE.
+            let passive = (irql == wdk_sys::PASSIVE_LEVEL as u8)
+                .then(|| unsafe { crate::irql::PassiveLevel::assume() });
+            queue.native.bind_copy_subchannel(passive, args.DmaBufferVirtualAddress);
+        }
+    }
+    use helios_kmd_logic::vk_fail::{kind, submit_hint, submit_reason};
+    let hint = || {
+        submit_hint(
+            helios_kmd_logic::rm_client::get32(private, 0x78).unwrap_or(0),
+            private.len() as u32,
+        )
+    };
+    match queue.native.submit(private, args.HwQueueProgressFenceId) {
+        Ok(()) => STATUS_SUCCESS,
+        // A recovered queue: its context is (being) invalidated and the channel
+        // runs nothing more, so the submission is completed as it arrives and
+        // nobody waits on it.
+        Err(NativeError::Dead) => {
+            queue.native.complete_progress(args.HwQueueProgressFenceId);
+            crate::ddi::vk_fail::note(kind::SUBMIT_HW_QUEUE, submit_reason::DEAD, 0, hint());
+            STATUS_SUCCESS
+        }
+        Err(error) => {
+            // `Invalid` with a well-sized record: its GP_PUT is out of range or did
+            // not move (`gp_put_advance`).
+            let status = native_status(error);
+            crate::ddi::vk_fail::note(kind::SUBMIT_HW_QUEUE, native_code(error), status, hint());
+            status
+        }
+    }
 }
 
 pub unsafe extern "C" fn dxgkddi_switch_to_hw_context_list(

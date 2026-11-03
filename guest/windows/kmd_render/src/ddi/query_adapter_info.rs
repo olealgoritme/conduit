@@ -17,13 +17,13 @@ use crate::dxgk::_DXGK_QUERYADAPTERINFOTYPE::{
     DXGKQAITYPE_HARDWARERESERVEDRANGES2, DXGKQAITYPE_HISTORYBUFFERPRECISION,
     DXGKQAITYPE_IOMMU_CAPS, DXGKQAITYPE_PAGETABLELEVELDESC, DXGKQAITYPE_PHYSICAL_MEMORY_CAPS,
     DXGKQAITYPE_QUERYSEGMENT, DXGKQAITYPE_QUERYSEGMENT3, DXGKQAITYPE_QUERYSEGMENT4,
-    DXGKQAITYPE_WDDMDEVICECAPS,
+    DXGKQAITYPE_UMDRIVERPRIVATE, DXGKQAITYPE_WDDMDEVICECAPS,
 };
 use crate::dxgk::*;
 
 use crate::adapter::{AdapterContext, AdapterKnobs};
 use crate::ddi::gpummu;
-use crate::ddi::wddm_surface::SURFACE;
+use crate::ddi::wddm_surface::surface;
 
 pub unsafe extern "C" fn dxgkddi_query_adapter_info(
     miniport_device_context: *mut c_void,
@@ -62,7 +62,8 @@ pub unsafe extern "C" fn dxgkddi_query_adapter_info(
         DXGKQAITYPE_HARDWARERESERVEDRANGES2 => unsafe {
             query_zeroed::<DXGK_HARDWARERESERVEDRANGES>(args)
         },
-        DXGKQAITYPE_GPUVERSION => unsafe { query_gpu_version(args) },
+        DXGKQAITYPE_GPUVERSION => unsafe { query_gpu_version(adapter, args) },
+        DXGKQAITYPE_UMDRIVERPRIVATE => unsafe { query_umdriver_private(args) },
         DXGKQAITYPE_ADAPTERPERFDATA_CAPS => unsafe {
             query_zeroed::<DXGK_ADAPTER_PERFDATACAPS>(args)
         },
@@ -71,6 +72,29 @@ pub unsafe extern "C" fn dxgkddi_query_adapter_info(
         },
         DXGKQAITYPE_HISTORYBUFFERPRECISION => unsafe { query_history_buffer_precision(args) },
         DXGKQAITYPE_64BITONLYCAPS => unsafe { query_zeroed::<DXGK_64_BIT_ONLY_CAPS>(args) },
+        // NVIDIA personality only: NVIDIA's KMD answers the Task Manager perf polls with
+        // success, and its UMDs read them. No telemetry exists here, so zeros. The default
+        // personality keeps NOT_SUPPORTED (the arm below).
+        _DXGK_QUERYADAPTERINFOTYPE::DXGKQAITYPE_NODEPERFDATA
+            if crate::ddi::wddm_surface::nvidia_selected() =>
+        unsafe { query_zeroed::<DXGK_NODE_PERFDATA>(args) },
+        _DXGK_QUERYADAPTERINFOTYPE::DXGKQAITYPE_ADAPTERPERFDATA
+            if crate::ddi::wddm_surface::nvidia_selected() =>
+        unsafe { query_zeroed::<DXGK_ADAPTER_PERFDATA>(args) },
+        // NVIDIA personality only. With hardware scheduling on, AddAdapter fails
+        // STATUS_NOT_SUPPORTED (DxgKrnl-Admin 549, StartAdapter_AddAdapterFailed)
+        // without it. NVIDIA's KMD answers: all nodes, its paging node, dxgkrnl's
+        // DeviceHandle, GpuMmuSupported|MovePagingSupported. The paging node here
+        // stays the one DRIVERCAPS reports (0) until paging moves to a copy node.
+        _DXGK_QUERYADAPTERINFOTYPE::DXGKQAITYPE_PHYSICALADAPTERCAPS
+            if crate::ddi::wddm_surface::nvidia_selected() =>
+        unsafe { query_physical_adapter_caps(adapter, args) },
+        // NVIDIA personality only (WDDM 3.2 surface): AddAdapter asks for it and
+        // fails STATUS_NOT_SUPPORTED without an answer (DxgKrnl-Admin 549). No
+        // HDR / virtual-mode / secure-display capability here: all bits clear.
+        _DXGK_QUERYADAPTERINFOTYPE::DXGKQAITYPE_DISPLAY_DRIVERCAPS_EXTENSION
+            if crate::ddi::wddm_surface::nvidia_selected() =>
+        unsafe { query_zeroed::<DXGK_DISPLAY_DRIVERCAPS_EXTENSION>(args) },
         // Everything else stays unsupported until backed by real implementation
         // (checklist rule: "unknown must stay unadvertised"). Notably dxgkrnl
         // steady-state-polls NODEPERFDATA (0x18) and ADAPTERPERFDATA (0x19) to
@@ -220,7 +244,7 @@ unsafe fn query_driver_caps(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTE
         caps_offset!(MaxAllocationListSlotId),
         max_allocation_list_slot_id,
     );
-    let aperture_segment_commit_limit: SIZE_T = APERTURE_COMMIT_LIMIT as SIZE_T;
+    let aperture_segment_commit_limit: SIZE_T = aperture_commit_limit() as SIZE_T;
     out.set(
         caps_offset!(ApertureSegmentCommitLimit),
         aperture_segment_commit_limit,
@@ -249,7 +273,7 @@ unsafe fn query_driver_caps(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTE
     // One value drives this, DXGKQAITYPE_WDDMDEVICECAPS and DriverEntry's
     // DRIVER_INITIALIZATION_DATA.Version. Dxgkrnl rejects internally
     // inconsistent version/capability surfaces during AddAdapter.
-    let wddm_version = SURFACE.driver_caps_version();
+    let wddm_version = surface().driver_caps_version();
     out.set(caps_offset!(WDDMVersion), wddm_version);
     out.set(
         caps_offset!(
@@ -346,7 +370,7 @@ unsafe fn query_driver_caps(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTE
     if knobs.cross_adapter {
         mem_caps |= MEMORYMANAGEMENTCAPS_CROSS_ADAPTER_RESOURCE;
     }
-    if SURFACE.gpu_mmu() {
+    if surface().gpu_mmu() {
         mem_caps |= MEMORYMANAGEMENTCAPS_VIRTUAL_ADDRESSING_SUPPORTED
             | MEMORYMANAGEMENTCAPS_GPU_MMU_SUPPORTED;
     }
@@ -462,6 +486,30 @@ unsafe fn query_driver_caps(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTE
     )
     .clamp(1, FLIP_QUEUE_DEPTH_MAX);
     out.set(caps_offset!(MaxQueuedFlipOnVSync), max_queued_flip_on_vsync);
+    // The NVIDIA personality flips through MPO3 (`ddi::mpo3`): one plane, immediate
+    // flips allowed, the same queue depth.
+    {
+        use crate::ddi::mpo3::{part, PART_CAPS, PART_IMMEDIATE, PART_QUEUE};
+        if part(PART_CAPS) {
+            // dxgkrnl's adapter start refuses SupportMultiPlaneOverlay without at
+            // least one overlay plane ("doesn't report any overlay planes or panel
+            // fitter", 1..=8) and without SupportDirectFlip (set below).
+            out.set(caps_offset!(SupportMultiPlaneOverlay), 1 as BOOLEAN);
+            out.set(caps_offset!(MaxOverlayPlanes), 1 as UINT);
+        }
+        if part(PART_IMMEDIATE) {
+            out.set(caps_offset!(SupportMultiPlaneOverlayImmediateFlip), 1 as BOOLEAN);
+        }
+        if part(PART_QUEUE) {
+            out.set(caps_offset!(MaxQueuedMultiPlaneOverlayFlipVSync), max_queued_flip_on_vsync);
+        }
+        // `MaxHwQueuedFlips` (`ddi::hwfq`): only when dxgkrnl enabled DXGK_FEATURE_HWFLIPQUEUE.
+        let hw_queued = crate::ddi::hwfq::max_hw_queued_flips();
+        if hw_queued > 1 {
+            out.set(caps_offset!(MaxHwQueuedFlips), hw_queued as UINT);
+        }
+        crate::diag::record_named_bytes(b"HfqCap", hw_queued);
+    }
     // Same reason as `FlipCapV`: what was ADVERTISED, so a knob that read as its
     // default cannot be mistaken for a knob that had no effect.
     crate::diag::record_named_bytes(b"FlipQueV", max_queued_flip_on_vsync);
@@ -479,12 +527,27 @@ unsafe fn query_driver_caps(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTE
     // `CheckDirectFlipSupport` (knob `DirectFlipSupport`) is the third door. The value
     // lands in the 0x01D7 diag record bit 2. (The old denial here dated from when the
     // display was an IddCx capture and the KMD scanned out nothing; that premise is gone.)
-    let support_direct_flip: BOOLEAN = if knobs.direct_flip { 1 } else { 0 };
+    // MPO (`ddi::mpo3` caps) requires it: dxgkrnl fails the adapter start otherwise.
+    let support_direct_flip: BOOLEAN = if knobs.direct_flip
+        || crate::ddi::mpo3::part(crate::ddi::mpo3::PART_CAPS)
+    {
+        1
+    } else {
+        0
+    };
     out.set(caps_offset!(SupportDirectFlip), support_direct_flip);
     // `D3d12Node`: a second 3D node (ordinal 1) for the D3D12 UMD's contexts,
     // completed independently of node 0 (`virtio::gpu`, "WDDM nodes"). The count
     // dxgkrnl gets here is the one every per-node path validates against.
-    let nb_asymetric_processing_nodes: UINT = if knobs.d3d12_node { 2 } else { 1 };
+    // The NVIDIA personality reports NVIDIA's 16 nodes (`kmd_logic::hws::NVIDIA_NODES`),
+    // which its UMDs enumerate; the default personality is unchanged.
+    let nb_asymetric_processing_nodes: UINT = if crate::ddi::wddm_surface::nvidia_selected() {
+        helios_kmd_logic::hws::NVIDIA_NODES.len() as UINT
+    } else if knobs.d3d12_node {
+        2
+    } else {
+        1
+    };
     crate::virtio::gpu::WDDM_NODE_COUNT.store(nb_asymetric_processing_nodes, Ordering::Relaxed);
     out.set(
         caps_offset!(
@@ -509,7 +572,7 @@ unsafe fn query_driver_caps(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTE
     // `ApertureSegmentCommitLimit` was truncated to its low 16 bits, and 64 MiB
     // has none — so 0x01D6 read 0x01D6_0000 on every boot regardless of the
     // value, which made it useless for exactly the thing it exists to report.
-    crate::diag::record(0x01D6_0000 | ((APERTURE_COMMIT_LIMIT >> 20) as u32 & 0xFFFF));
+    crate::diag::record(0x01D6_0000 | ((aperture_commit_limit() >> 20) as u32 & 0xFFFF));
     crate::diag::record(
         0x01D7_0000
             | (((support_non_vga as u32) & 1) << 0)
@@ -536,6 +599,28 @@ unsafe fn query_zeroed<T>(args: &DXGKARG_QUERYADAPTERINFO) -> NTSTATUS {
     STATUS_SUCCESS
 }
 
+unsafe fn query_physical_adapter_caps(
+    adapter: &AdapterContext,
+    args: &DXGKARG_QUERYADAPTERINFO,
+) -> NTSTATUS {
+    if (args.OutputDataSize as usize) < size_of::<DXGK_PHYSICALADAPTERCAPS>() {
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+    let Ok(dxg) = adapter.dxgkrnl() else {
+        return STATUS_DEVICE_NOT_READY;
+    };
+    // SAFETY: pOutputData points to a writable DXGK_PHYSICALADAPTERCAPS.
+    unsafe { core::ptr::write_bytes(args.pOutputData as *mut u8, 0, args.OutputDataSize as usize) };
+    let caps = unsafe { &mut *(args.pOutputData as *mut DXGK_PHYSICALADAPTERCAPS) };
+    caps.NumExecutionNodes = helios_kmd_logic::hws::NVIDIA_NODES.len() as u16;
+    caps.PagingNodeIndex = 0;
+    caps.DxgkPhysicalAdapterHandle = dxg.DeviceHandle;
+    // SAFETY: plain bitfield setters on the flags union's struct arm.
+    unsafe { caps.Flags.__bindgen_anon_1.__bindgen_anon_1.set_GpuMmuSupported(1) };
+    crate::diag::record_named_bytes(b"NvPhysCaps", u32::from(caps.NumExecutionNodes));
+    STATUS_SUCCESS
+}
+
 unsafe fn query_wddm_device_caps(args: &DXGKARG_QUERYADAPTERINFO) -> NTSTATUS {
     if (args.OutputDataSize as usize) < size_of::<DXGK_WDDMDEVICECAPS>() {
         return STATUS_BUFFER_TOO_SMALL;
@@ -544,7 +629,7 @@ unsafe fn query_wddm_device_caps(args: &DXGKARG_QUERYADAPTERINFO) -> NTSTATUS {
     // SAFETY: pOutputData points to a DXGK_WDDMDEVICECAPS of sufficient size.
     let caps = unsafe { &mut *(args.pOutputData as *mut DXGK_WDDMDEVICECAPS) };
     unsafe { core::ptr::write_bytes(args.pOutputData as *mut u8, 0, args.OutputDataSize as usize) };
-    caps.WDDMVersion = SURFACE.driver_caps_version();
+    caps.WDDMVersion = surface().driver_caps_version();
     STATUS_SUCCESS
 }
 
@@ -560,10 +645,73 @@ unsafe fn query_physical_memory_caps(args: &DXGKARG_QUERYADAPTERINFO) -> NTSTATU
     STATUS_SUCCESS
 }
 
-unsafe fn query_gpu_version(args: &DXGKARG_QUERYADAPTERINFO) -> NTSTATUS {
+fn nvidia_umd_enabled() -> bool {
+    crate::virtio::nvda::enabled()
+}
+
+/// Captured NVIDIA 610.88 ABI, pinned to the Blackwell personality and the RTX
+/// 5090 IDs in this template.
+const NVIDIA_UMD_PRIVATE: &[u8; 50_600] = include_bytes!("nvidia_umd_private.bin");
+
+/// Where the template carries the adapter LUID (LowPart, then HighPart): the
+/// capture machine's 0x7a45. nvwgf2umx opens the adapter by this LUID
+/// (D3DKMTOpenAdapterFromLuid), so it must be this adapter's.
+const UMD_PRIVATE_LUID_AT: usize = 0xc45c;
+
+/// This adapter's LUID from `DxgkDdiStartDevice` (LowPart | HighPart << 32).
+static ADAPTER_LUID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Record the LUID dxgkrnl assigned at StartDevice.
+pub(crate) fn note_adapter_luid(low: u32, high: i32) {
+    ADAPTER_LUID.store(
+        u64::from(low) | (u64::from(high as u32) << 32),
+        core::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+unsafe fn query_umdriver_private(args: &DXGKARG_QUERYADAPTERINFO) -> NTSTATUS {
+    if !nvidia_umd_enabled() {
+        return STATUS_NOT_SUPPORTED;
+    }
+    if (args.OutputDataSize as usize) < NVIDIA_UMD_PRIVATE.len() {
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+
+    // SAFETY: the size gate proves the output can hold exactly this template;
+    // bytes beyond it remain untouched when dxgkrnl supplies a larger buffer.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            NVIDIA_UMD_PRIVATE.as_ptr(),
+            args.pOutputData as *mut u8,
+            NVIDIA_UMD_PRIVATE.len(),
+        );
+    }
+    let luid = ADAPTER_LUID.load(core::sync::atomic::Ordering::Relaxed);
+    if luid != 0 {
+        // SAFETY: inside the template-sized prefix checked above.
+        unsafe {
+            core::ptr::write_unaligned(
+                (args.pOutputData as *mut u8).add(UMD_PRIVATE_LUID_AT) as *mut u64,
+                luid,
+            );
+        }
+    }
+    STATUS_SUCCESS
+}
+
+unsafe fn query_gpu_version(
+    _adapter: &AdapterContext,
+    args: &DXGKARG_QUERYADAPTERINFO,
+) -> NTSTATUS {
     if (args.OutputDataSize as usize) < size_of::<DXGK_GPUVERSION>() {
         return STATUS_BUFFER_TOO_SMALL;
     }
+
+    let gpu_architecture: &[u8] = if nvidia_umd_enabled() {
+        b"Blackwell"
+    } else {
+        b"virtio-gpu"
+    };
 
     // SAFETY: pOutputData points to a DXGK_GPUVERSION of sufficient size.
     let version = args.pOutputData as *mut DXGK_GPUVERSION;
@@ -577,7 +725,7 @@ unsafe fn query_gpu_version(args: &DXGKARG_QUERYADAPTERINFO) -> NTSTATUS {
         write_wchar_z_unaligned(
             core::ptr::addr_of_mut!((*version).GpuArchitecture) as *mut WCHAR,
             32,
-            b"virtio-gpu",
+            gpu_architecture,
         );
     }
     STATUS_SUCCESS
@@ -632,8 +780,23 @@ const APERTURE_COMMIT_LIMIT: u64 = 64 * 1024 * 1024;
 /// Aperture window length. viogpu3d uses 1 GiB (`256 * 1024 * 4096`).
 const APERTURE_SEGMENT_SIZE: SIZE_T = 256 * 1024 * 4096;
 
-/// A commit limit above the segment it caps would be nonsense.
-const _: () = assert!(APERTURE_COMMIT_LIMIT <= APERTURE_SEGMENT_SIZE as u64);
+/// The commit limit in force: `NvApCommitMb` (MiB) in the NVIDIA personality, default 8 GiB.
+///
+/// `ApertureSegmentCommitLimit` caps the system memory VidMm lets GPU allocations commit
+/// (it reduces the OS-computed `SharedSystemMemory`). 64 MiB made VidMm block
+/// `CreateAllocation` under trim/eviction pressure while NVIDIA's UMD loads (Steel Nomad
+/// D3D12: the render thread sat in `DxgkCreateAllocation` while the GPU waited on a value that
+/// thread writes next — a deadlock that ended in CTX SWITCH TIMEOUT). The Helios personality
+/// keeps 64 MiB. `NvApCommitMb=64` restores the old value.
+fn aperture_commit_limit() -> u64 {
+    if !crate::ddi::wddm_surface::nvidia_selected() {
+        return APERTURE_COMMIT_LIMIT;
+    }
+    let mb = crate::diag::read_config_dword(crate::diag::KnobName::new(b"NvApCommitMb"), 8192);
+    let mb = u64::from(mb.clamp(64, 65536));
+    crate::diag::record_named_bytes(b"NvApCommitMbEff", mb as u32);
+    mb << 20
+}
 
 // WHY THE APERTURE IS ALWAYS SEGMENT 0 — from the live-KD decode of dxgmms2's
 // paging DMA-pool init (INITDMAPOOLS_HANDOVER.md, 2026-06-21).
@@ -979,7 +1142,25 @@ impl SegmentDescriptorSpec {
 /// Write the viogpu3d-style linear aperture descriptor (paging-buffer host).
 /// SAFETY: `seg` points to a writable `DXGK_SEGMENTDESCRIPTOR4`.
 unsafe fn write_aperture_descriptor(seg: *mut DXGK_SEGMENTDESCRIPTOR4, knobs: &AdapterKnobs) {
-    unsafe { SegmentDescriptorSpec::aperture(knobs.direct_flip).write_into_v4(seg) };
+    let mut spec = SegmentDescriptorSpec::aperture(knobs.direct_flip);
+    spec.application_target = aperture_application_target();
+    unsafe { spec.write_into_v4(seg) };
+}
+
+/// Test knob `NvApBudget` (default 0, NVIDIA personality only): 1 marks the
+/// aperture segment `ApplicationTarget`, so dxgkrnl budgets non-local memory for
+/// applications. Without it `D3DKMTQueryVideoMemoryInfo(NON_LOCAL).Budget` is 0
+/// and the Vulkan ICD reports heap 1 (8 GiB of system memory) with a 0-byte
+/// VK_EXT_memory_budget budget (`vk_memory_probe`, 405.300). Read at each
+/// QUERYSEGMENT (AddAdapter); `NvApBudgetOn` mirrors it. A rejected flag would
+/// fail AddAdapter (Code 43): remove the value offline to recover.
+fn aperture_application_target() -> bool {
+    if !crate::ddi::wddm_surface::nvidia_selected() {
+        return false;
+    }
+    let on = crate::diag::read_config_dword(crate::diag::KnobName::new(b"NvApBudget"), 0) != 0;
+    crate::diag::record_named_bytes(b"NvApBudgetOn", u32::from(on));
+    on
 }
 
 /// The same aperture, for WDDM 1.2/1.3 `DXGK_QUERYSEGMENTOUT3`.
@@ -1307,12 +1488,30 @@ pub unsafe extern "C" fn dxgkddi_get_node_metadata(
     unsafe {
         core::ptr::write_bytes(node as *mut _ as *mut u8, 0, size_of::<DXGK_NODEMETADATA>());
     }
+    if crate::ddi::wddm_surface::nvidia_selected() {
+        // NVIDIA personality: NVIDIA's captured 16-node topology. `wddm_node_valid`
+        // above already admits all 16 (WDDM_NODE_COUNT was set from the same table).
+        let Some(desc) = helios_kmd_logic::hws::nvidia_node(node_ordinal) else {
+            return STATUS_INVALID_PARAMETER;
+        };
+        node.EngineType = desc.engine_type as DXGK_ENGINE_TYPE::Type;
+        // DXGK_NODEMETADATA is packed: write the name through an unaligned raw pointer.
+        let name = core::ptr::addr_of_mut!(node.FriendlyName) as *mut WCHAR;
+        for (i, ch) in desc.name.bytes().take(31).enumerate() {
+            // SAFETY: i < 31 < 32 elements of the zeroed FriendlyName array.
+            unsafe { name.add(i).write_unaligned(WCHAR::from(ch)) };
+        }
+        node.Flags.__bindgen_anon_1.Value = desc.flags;
+        node.GpuMmuSupported = 1;
+        node.IoMmuSupported = 0;
+        return STATUS_SUCCESS;
+    }
     node.EngineType = DXGK_ENGINE_TYPE::DXGK_ENGINE_TYPE_3D;
     // The node memory model must match the DRIVERCAPS surface, so it reads the same
     // value: a GpuMmu level advertises the GPU-virtual-addressing model, WDDM 1.3
     // stays at the viogpu3d-style surface with no explicit memory model. GpuMmu and
     // IoMmu are mutually exclusive.
-    node.GpuMmuSupported = BOOLEAN::from(SURFACE.gpu_mmu());
+    node.GpuMmuSupported = BOOLEAN::from(surface().gpu_mmu());
     node.IoMmuSupported = 0;
     // WDK requires an empty FriendlyName for standard engines such as 3D;
     // custom names are for DXGK_ENGINE_TYPE_OTHER. Flags stay zeroed.

@@ -106,6 +106,39 @@ None of this can be switched off from the command line.
   modules or a branch older than 580 it is on. `conduit doctor` says which
   and why.
 
+- **NVIDIA's own Windows drivers (`CONDUIT_NVIDIA_UMD=1`).** A Windows guest
+  that runs NVIDIA's user-mode drivers reaches RM only through its KMD, and
+  what that path sends is known. On top of RM's own rules the backend then
+  serves only the RM controls, classes and escapes on that list
+  (`host/backend/device/src/nvidia/rmpolicy.rs`, built from captures of
+  NVIDIA's UMDs on real hardware and from what the guest KMD sends itself);
+  every request must name an RM client this guest made; a CPU mapping must
+  name memory this guest allocated (never the device, subdevice or client,
+  which would map GPU registers); memory by address is only an OS descriptor
+  over the guest's own pages; `NV_ESC_RM_IDLE_CHANNELS` may not carry a
+  channel list; and parameter blocks have ceilings. A refusal is
+  `NV_ERR_INSUFFICIENT_PERMISSIONS` and a host log line naming the call (the
+  1st, 10th, 100th... time), plus a total when the VM exits.
+  `CONDUIT_RM_POLICY` in the backend's environment selects the mode: `log`
+  (the default in this personality: everything is served and what `enforce`
+  would refuse is logged, so missing entries can be collected), `enforce`, or
+  `off`. For a VM started by `conduit`, add
+  `Environment=CONDUIT_RM_POLICY=enforce` next to `CONDUIT_NVIDIA_UMD=1` in
+  the `conduit-backend@NAME.service` drop-in and restart the VM.
+- **NVIDIA UMD release (`CONDUIT_NVIDIA_UMD=1`).** NVIDIA's UMDs speak the RM
+  ABI of their own release. The guest's REG_SZ `NvUmdVersion` (written by the
+  Helios INF under the service key's `Parameters`, `610.88`; a value in the
+  service key itself overrides it) names that release: the installer stages
+  only an NVIDIA package of it, and the guest KMD reports it at every adapter
+  start. The backend accepts only the release paired with the host driver
+  (`host/backend/device/src/nvidia/umd_version.rs`;
+  `CONDUIT_NVIDIA_UMD_VERSION=610.88` pins one, `any` turns the check off).
+  On a mismatch the host logs one error naming both releases, the guest's
+  adapter fails to start (Code 43, `NvUmdChk` = 1 in the KMD's diagnostics)
+  and every RM call from that guest is refused. A guest without the value,
+  or with one that is not a release, reports nothing and the backend has
+  nothing to compare (`NvUmdChk` = 0xff or 0xfe).
+
 The backend counts refusals and logs the totals when the VM exits
 (`conduit logs NAME`).
 

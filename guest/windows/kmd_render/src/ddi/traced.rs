@@ -130,6 +130,14 @@ traced!(
     (h_device: *mut c_void, create_context: *mut DXGKARG_CREATECONTEXT),
     handle_hint(h_device)
 );
+// The NVIDIA personality's CreateContext (`ddi::hws`): same DDI id, same ring.
+traced!(
+    hws_create_context,
+    ddi::CREATE_CONTEXT,
+    crate::ddi::hws::dxgkddi_create_context,
+    (h_device: *mut c_void, create_context: *mut DXGKARG_CREATECONTEXT),
+    handle_hint(h_device)
+);
 traced!(
     destroy_context,
     ddi::DESTROY_CONTEXT,

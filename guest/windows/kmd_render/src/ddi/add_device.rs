@@ -26,6 +26,14 @@ pub unsafe extern "C" fn dxgkddi_add_device(
     // leave a deterministic NULL out-pointer on every failure path after this.
     unsafe { *miniport_device_context = core::ptr::null_mut() };
 
+    // The separate WDM control device is a no-op unless the NVIDIA personality
+    // is enabled. Its lifetime spans StopDevice/StartDevice and ends at final
+    // RemoveDevice, not with an individual transport generation.
+    let admin_status = unsafe { crate::admin::add_device() };
+    if admin_status < 0 {
+        return admin_status;
+    }
+
     // One call: allocate at the final heap address AND initialize the embedded
     // kernel dispatcher objects there. `create` never hands back an
     // `AdapterContext` by value, so a caller cannot skip the in-place init and

@@ -164,10 +164,14 @@ static MAP_LOG_PG: [AtomicU32; MAP_LOG] = [const { AtomicU32::new(0) }; MAP_LOG]
 
 /// Mirror the map log (PASSIVE; the `Nv*` mirror pass).
 pub(crate) fn publish_map_log() {
-    const R: [&[u8]; MAP_LOG] =
-        [b"BarApR0", b"BarApR1", b"BarApR2", b"BarApR3", b"BarApR4", b"BarApR5", b"BarApR6", b"BarApR7"];
-    const P: [&[u8]; MAP_LOG] =
-        [b"BarApP0", b"BarApP1", b"BarApP2", b"BarApP3", b"BarApP4", b"BarApP5", b"BarApP6", b"BarApP7"];
+    const R: [&[u8]; MAP_LOG] = [
+        b"BarApR0", b"BarApR1", b"BarApR2", b"BarApR3", b"BarApR4", b"BarApR5", b"BarApR6",
+        b"BarApR7",
+    ];
+    const P: [&[u8]; MAP_LOG] = [
+        b"BarApP0", b"BarApP1", b"BarApP2", b"BarApP3", b"BarApP4", b"BarApP5", b"BarApP6",
+        b"BarApP7",
+    ];
     for i in 0..MAP_LOG {
         let r = MAP_LOG_RES[i].load(Ordering::Relaxed);
         if r != 0 {
@@ -328,6 +332,55 @@ pub unsafe extern "C" fn dxgkddi_map_cpu_host_aperture(
 
     // SAFETY: dxgkrnl hands back our AdapterContext as the miniport context.
     let adapter = unsafe { &*(h_adapter as *const AdapterContext) };
+    if let Some(allocation) = unsafe { paging_alloc_info(adapter, args.hAllocation) }
+        .filter(|allocation| allocation.native_id != 0)
+    {
+        if allocation.system_backing_policy
+            == crate::ddi::create_allocation::SystemBackingPolicy::None
+            && allocation.native_segment == 0
+        {
+            // ExistingSysMem: Lock2 already names the exact pSystemMem VA; no
+            // second CPU mapping (and no different cache alias) is needed.
+            return STATUS_SUCCESS;
+        }
+        let Some(bar) = adapter
+            .bar_segment()
+            .filter(|b| b.seg_id == args.SegmentId as u32)
+        else {
+            return STATUS_NO_MEMORY;
+        };
+        if unsafe { KeGetCurrentIrql() } != PASSIVE_LEVEL_IRQL {
+            BAR_AP_ERR_IRQL.fetch_add(1, Ordering::Relaxed);
+            return STATUS_NO_MEMORY;
+        }
+        let range = match unsafe { validate_aperture_request(args, &allocation, bar) } {
+            Ok(range) => range,
+            Err(refusal) => {
+                refusal.count(None);
+                return STATUS_NO_MEMORY;
+            }
+        };
+        let Some(expected_gpa) = bar.gpa.checked_add(range.offset) else {
+            return STATUS_NO_MEMORY;
+        };
+        let passive = unsafe { crate::irql::PassiveLevel::assume() };
+        return match crate::virtio::native_memory::map_aperture(
+            passive,
+            adapter,
+            allocation.native_id,
+            range.offset,
+            expected_gpa,
+        ) {
+            Ok(_) => {
+                BAR_AP_MAPS.fetch_add(1, Ordering::Relaxed);
+                STATUS_SUCCESS
+            }
+            Err(_) => {
+                BAR_AP_ERR_MAP.fetch_add(1, Ordering::Relaxed);
+                STATUS_NO_MEMORY
+            }
+        };
+    }
     let bar_active = adapter
         .bar_segment()
         .filter(|b| b.seg_id == args.SegmentId as u32);
@@ -492,6 +545,16 @@ pub unsafe extern "C" fn dxgkddi_unmap_cpu_host_aperture(
     // the documented annotation. The non-PASSIVE arm leaves the mapping in place
     // (self-healed by the next `map_blob_at`) and holds no token.
     let passive = unsafe { crate::irql::PassiveLevel::assume() };
+    match crate::virtio::native_memory::unmap_aperture(passive, adapter, offset) {
+        Ok(()) => {
+            BAR_AP_UNMAPS.fetch_add(1, Ordering::Relaxed);
+            return STATUS_SUCCESS;
+        }
+        Err(crate::virtio::native_memory::Error::Invalid) => {
+            // Not a native aperture mapping: resolve the default Venus blob.
+        }
+        Err(_) => return STATUS_NO_MEMORY,
+    }
     let resid = adapter
         .with_virtio(|v| v.blob_resid_at_offset(offset))
         .unwrap_or(None);

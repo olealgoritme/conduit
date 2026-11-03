@@ -1,0 +1,2446 @@
+//! Hang snapshots of the native NVIDIA channels (`NvSnapMs`, `NvSnapNow`, `NvSnapVa`): the
+//! pure half. The I/O half (registry knobs, the queue registry, CPU reads of GPFIFO rings,
+//! pushbuffers and semaphores, the VA lookups) is `kmd_render/src/ddi/native_snap.rs`; the
+//! host decoder is `pr198-tools/agent-snap/snapdec.py`.
+//!
+//! A snapshot answers "where is each queue stuck": per native HW queue its channel (the
+//! work-submit token's channel id is the `channel 0x..` of a host Xid), GP_PUT, the progress
+//! fence (submitted / completed), USERD (GB20x does not write GP_GET back to it, so GP_GET
+//! there reads 0), the queue's last [`HISTORY`] submissions (fence id and GPFIFO range), and
+//! from those the first incomplete submission: the GPFIFO entries around it, read through
+//! the ring's GPU VA, and for its segments (and [`SEGMENTS_BEFORE`] before) their first and
+//! last dwords, every semaphore
+//! operation in them ([`SemOp`]: host `SEM_EXECUTE`, 3D / compute `REPORT_SEMAPHORE_EXECUTE` and
+//! `SET_REPORT_SEMAPHORE_D`, copy `LAUNCH_DMA` releases) and every GPU VA they point the front
+//! end or the MME at ([`AddrRef`]: MME DMA reads / writes, inline-to-memory, QMDs, constant
+//! buffers, index buffers, texture pools, ...). Each such VA is looked up in the KMD's
+//! native-memory mapping table ([`va_entry`]) and the page-table operation ring, and the
+//! current value at every semaphore address is read back.
+//!
+//! The decoder ([`Scanner`]) runs over the segments in GPFIFO order with one state, so a
+//! method pair split across segments (an address set in one, used in the next) still resolves.
+//!
+//! # Blob layout (all little-endian; `NvSnapBlob`, `NvSnapB0`..`NvSnapB3`, `NvSnapVaR`)
+//!
+//! ```text
+//! header (HDR_BYTES = 64):
+//!   0 magic "NSNP" | 4 version | 8 header bytes | 12 total bytes | 16 seq | 20 reason
+//!  24 trigger token | 28 queue records | 32 now (100 ns, u64) | 40 duration us
+//!  44 NvSnapMs in force | 48 NvHangMs in force | 52 flags (FLAG_*)
+//!  56 HwsSubmit | 60 HwsPollTick
+//! then the queue records (QREC_*), then one VA table record (VREC_*)
+//! queue record:
+//!   0 bytes | 4 kind (REC_QUEUE) | 8 slot | 12 node | 16 pid | 20 flags (Q_*) | 24 veid
+//!  28 token | 32 TSG handle | 36 context-share handle | 40 channel handle | 44 TSG hw id
+//!  48 process key u64 | 56 context key u64 | 64 GPFIFO VA u64 | 72 ring entries
+//!  76 KMD GP_PUT | 80 USERD GP_GET | 84 USERD GP_PUT | 88 submitted u64 | 96 signalled u64
+//! 104 fence now u64 | 112 fence GPU VA u64 | 120 ms without progress | 124 notifier info32
+//! 128 notifier word | 132 ring read status | 136 USERD dwords [USERD_DWORDS]
+//! 392 window first index | 396 window entries | 400 segments | 404 0
+//! 408 window entries [WINDOW] x (lo, hi) | 536 focus start | 540 focus end (the GPFIFO range
+//! of the first incomplete submission; u32::MAX none) | 544 entry at GP_PUT-1 lo | 548 hi
+//! 552 its read status | 556 history entries | 560 history [HISTORY] x (fence u64, before,
+//! after) | 816 segment records
+//! segment record:
+//!   0 bytes | 4 GP index | 8 VA u64 | 16 length (dwords) | 20 read status | 24 scanned dwords
+//!  28 scan status (SCAN_*) | 32 lost at | 36 semaphore ops seen | 40 semaphore ops recorded
+//!  44 tail start | 48 tail aligned (first header >= tail start, u32::MAX none) | 52 head dwords
+//!  56 tail dwords | 60 MME calls | 64 address refs seen | 68 address refs recorded
+//!  72 VA-table index of the segment's own VA | 76 flags (S_*)
+//!  80 head [n] | tail [n] | semaphore ops [n] x SEM_BYTES | address refs [n] x REF_BYTES
+//! semaphore op (SEM_BYTES = 40):
+//!   0 kind | 1 subchannel | 2 operation | 3 flags (SEM_ACQUIRE, SEM_PAYLOAD64)
+//!   4 execute word | 8 at (dword offset) | 12 class | 16 address u64 | 24 payload u64
+//!  32 VA-table index | 36 0
+//! address ref (REF_BYTES = 32):
+//!   0 tag (TAG_*) | 2 subchannel | 3 flags (REF_HI_SEEN) | 4 method | 8 at | 12 length
+//!  16 VA u64 | 24 VA-table index | 28 class
+//! VA table record:
+//!   0 bytes | 4 kind (REC_VA) | 8 entries | 12 pt-ring on | 16 entries [n] x VA_BYTES
+//! VA entry (VA_BYTES = 112):
+//!   0 VA u64 | 8 process key u64 | 16 hit (HIT_*) | 20 allocation id | 24 RM memory handle
+//!  28 flags (V_*) | 32 piece VA u64 | 40 piece length u64 | 48 memory offset u64
+//!  56 allocation size u64 | 64 resident PA u64 | 72 value u64 (8 bytes at VA when read)
+//!  80 value status (RD_*) | 84 last ring kind | 88 last ring time (100 ns) u64
+//!  96 last ring VA u64 | 104 last ring length u32 | 108 touch-table kind
+//! ```
+
+/// `NvSnapMs` when the service key has no value; 0 turns the automatic snapshot off.
+pub const DEFAULT_SNAP_MS: u32 = 3_000;
+pub const MIN_SNAP_MS: u32 = 500;
+pub const MAX_SNAP_MS: u32 = 600_000;
+/// Two automatic snapshots at least this far apart (100 ns).
+pub const AUTO_MIN_GAP_100NS: u64 = 20_000_000;
+/// Automatic snapshots per boot at most (a manual one is always taken).
+pub const AUTO_MAX: u32 = 32;
+/// The snapshot's memory reads stop after this long (100 ns); later reads report RD_BUDGET.
+pub const READ_BUDGET_100NS: u64 = 40_000_000;
+/// The longest blob (bytes).
+pub const BLOB_CAP: usize = 256 * 1024;
+
+/// The stall timeout for an `NvSnapMs` value: `None` (0) = automatic snapshots off.
+pub const fn snap_timeout_100ns(knob_ms: u32) -> Option<u64> {
+    if knob_ms == 0 || knob_ms == u32::MAX {
+        return None;
+    }
+    let ms = if knob_ms < MIN_SNAP_MS {
+        MIN_SNAP_MS
+    } else if knob_ms > MAX_SNAP_MS {
+        MAX_SNAP_MS
+    } else {
+        knob_ms
+    };
+    Some(ms as u64 * 10_000)
+}
+
+/// Why a snapshot was taken.
+pub mod reason {
+    /// A queue with work outstanding made no progress for `NvSnapMs`.
+    pub const AUTO: u32 = 1;
+    /// `NvSnapNow` was set.
+    pub const MANUAL: u32 = 2;
+    /// A queue's error notifier was set (RM put the channel in error).
+    pub const ERROR: u32 = 3;
+    /// `NvSnapVa`: a VA lookup only (no queue records).
+    pub const VA_QUERY: u32 = 4;
+}
+
+/// The host channel id of a Blackwell work-submit token (`NV_VIRTUAL_FUNCTION_DOORBELL_VECTOR`).
+pub const fn token_chid(token: u32) -> u32 {
+    token & 0xfff
+}
+
+/// The runlist of a work-submit token (`NV_VIRTUAL_FUNCTION_DOORBELL_RUNLIST_ID`).
+pub const fn token_runlist(token: u32) -> u32 {
+    (token >> 16) & 0x7f
+}
+
+// ── GPFIFO entries ───────────────────────────────────────────────────────────────────────────
+
+/// One decoded GPFIFO entry (`NVCA6F_GP_ENTRY0/1`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GpEntry {
+    pub va: u64,
+    /// Segment length in dwords; 0 = a control entry (`opcode`).
+    pub dwords: u32,
+    pub subroutine: bool,
+    pub sync_wait: bool,
+    pub conditional: bool,
+    pub opcode: u8,
+}
+
+pub const fn gp_entry(lo: u32, hi: u32) -> GpEntry {
+    GpEntry {
+        va: (lo & !3) as u64 | ((hi & 0xff) as u64) << 32,
+        dwords: (hi >> 10) & 0x1f_ffff,
+        subroutine: (hi >> 9) & 1 != 0,
+        sync_wait: hi >> 31 != 0,
+        conditional: lo & 1 != 0,
+        opcode: hi as u8,
+    }
+}
+
+/// GPFIFO entries recorded around the focus (the stuck submission).
+pub const WINDOW: usize = 16;
+/// The window starts this many entries before the focus.
+pub const WINDOW_BEFORE: u32 = 4;
+/// Segments decoded per queue at most.
+pub const MAX_SEGMENTS: usize = 8;
+/// Segments decoded before the focus (the end of the last completed submission).
+pub const SEGMENTS_BEFORE: u32 = 2;
+/// Submissions remembered per queue (`NativeQueue`'s history).
+pub const HISTORY: usize = 16;
+
+/// The first ring index of the window around `focus` in a ring of `entries`.
+pub const fn window_first(focus: u32, entries: u32) -> u32 {
+    if entries == 0 {
+        return 0;
+    }
+    let back = if WINDOW_BEFORE < entries { WINDOW_BEFORE } else { entries - 1 };
+    (focus % entries + entries - back) % entries
+}
+
+/// One submission of a queue: its progress fence id and the GPFIFO range it wrote
+/// (`[before, after)`, ring indices).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Submission {
+    pub fence: u64,
+    pub before: u32,
+    pub after: u32,
+}
+
+/// The first submission the progress fence does not show complete: the one the channel is
+/// in (or waiting before). `None` when the history holds none (all complete, or too old).
+pub fn stuck_submission(history: &[Submission], fence_now: u64) -> Option<Submission> {
+    history
+        .iter()
+        .filter(|h| h.fence != 0 && h.fence > fence_now)
+        .min_by_key(|h| h.fence)
+        .copied()
+}
+
+/// The GPFIFO range to decode: the stuck submission's own entries, or (none known) the
+/// entries just before GP_PUT. `(start, end)` ring indices, `end` exclusive.
+pub fn focus_range(history: &[Submission], fence_now: u64, gp_put: u32, entries: u32) -> (u32, u32) {
+    match stuck_submission(history, fence_now) {
+        Some(h) => (h.before, h.after),
+        None if entries != 0 => ((gp_put % entries + entries - 1) % entries, gp_put % entries),
+        None => (0, 0),
+    }
+}
+
+/// A NOP GPFIFO entry: length 0, control opcode 0 (the sync bit aside). The NVIDIA UMDs leave
+/// runs of them (all-zero entries) inside their submissions; the real work follows.
+pub const fn is_nop(entry: GpEntry) -> bool {
+    entry.dwords == 0 && entry.opcode == 0
+}
+
+/// Entries of the focus range scanned for its first real one at most ([`skip_nops`]).
+pub const NOP_SCAN: u32 = 512;
+
+/// The focus start moved past a leading run of NOP entries: `first_real` is the offset of the
+/// first non-NOP entry from `focus_start` (`None`: all NOPs, or none read), so the window and
+/// its decoded segments show the submission's real entries instead of its NOP gap. Stays
+/// inside `[focus_start, focus_end)`; the window then begins [`WINDOW_BEFORE`] entries before
+/// the returned index.
+pub const fn skip_nops(focus_start: u32, focus_end: u32, entries: u32, first_real: Option<u32>) -> u32 {
+    if entries == 0 {
+        return focus_start;
+    }
+    let span = (focus_end % entries + entries - focus_start % entries) % entries;
+    match first_real {
+        Some(k) if k < span => (focus_start % entries + k) % entries,
+        _ => focus_start,
+    }
+}
+
+/// The segments to decode, in GPFIFO order: window positions (0-based offsets into `window`,
+/// whose first entry has ring index `first`) of up to [`SEGMENTS_BEFORE`] real segments before
+/// `focus_start` and then the focus range's own segments, [`MAX_SEGMENTS`] at most; control
+/// entries are skipped. Returns `(positions, count)`.
+pub fn pick_segments(
+    window: &[GpEntry],
+    first: u32,
+    entries: u32,
+    focus_start: u32,
+    focus_end: u32,
+) -> ([u8; MAX_SEGMENTS], usize) {
+    let mut out = [0u8; MAX_SEGMENTS];
+    if entries == 0 || window.is_empty() {
+        return (out, 0);
+    }
+    let pos = |index: u32| ((index % entries + entries - first % entries) % entries) as usize;
+    let start = pos(focus_start);
+    let span = ((focus_end % entries + entries - focus_start % entries) % entries) as usize;
+    let mut picked = [false; WINDOW];
+    // Before the focus.
+    let mut before = 0u32;
+    let mut p = start;
+    while p > 0 && before < SEGMENTS_BEFORE {
+        p -= 1;
+        if p < window.len() && window[p].dwords != 0 {
+            picked[p] = true;
+            before += 1;
+        }
+    }
+    let mut n = before as usize;
+    let mut q = start;
+    while q < window.len() && q < start + span.max(1) && n < MAX_SEGMENTS {
+        if window[q].dwords != 0 {
+            picked[q] = true;
+            n += 1;
+        }
+        q += 1;
+    }
+    let mut k = 0usize;
+    for (i, on) in picked.iter().enumerate() {
+        if *on && k < MAX_SEGMENTS {
+            out[k] = i as u8;
+            k += 1;
+        }
+    }
+    (out, k)
+}
+
+// ── pushbuffer decoding ──────────────────────────────────────────────────────────────────────
+
+/// Semaphore operation kinds.
+pub mod sem_kind {
+    /// Host `SEM_ADDR_LO/HI`, `SEM_PAYLOAD_LO/HI`, `SEM_EXECUTE` (`NVC86F`/`NVCA6F`).
+    pub const HOST: u8 = 1;
+    /// Host `SEMAPHOREA..D` (the pre-Hopper form).
+    pub const HOST_LEGACY: u8 = 2;
+    /// 3D / compute `SET_REPORT_SEMAPHORE_PAYLOAD/ADDRESS_*` + `REPORT_SEMAPHORE_EXECUTE`.
+    pub const GR_EXEC: u8 = 3;
+    /// 3D / compute `SET_REPORT_SEMAPHORE_A..D`.
+    pub const GR_LEGACY: u8 = 4;
+    /// Copy `SET_SEMAPHORE_*` + `LAUNCH_DMA` semaphore (a release).
+    pub const COPY: u8 = 5;
+}
+
+pub const SEM_ACQUIRE: u8 = 1;
+pub const SEM_PAYLOAD64: u8 = 2;
+
+/// One semaphore operation in a segment.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SemOp {
+    pub kind: u8,
+    pub subch: u8,
+    pub op: u8,
+    pub flags: u8,
+    pub word: u32,
+    pub at: u32,
+    pub class: u32,
+    pub addr: u64,
+    pub payload: u64,
+}
+
+impl SemOp {
+    pub const fn acquire(&self) -> bool {
+        self.flags & SEM_ACQUIRE != 0
+    }
+}
+
+/// What a front-end / MME address points at.
+pub mod tag {
+    pub const MME_READ: u16 = 1;
+    pub const MME_READ_FIFOED: u16 = 2;
+    pub const MME_WRITE: u16 = 3;
+    pub const MME_REDUCTION: u16 = 4;
+    /// Inline-to-memory destination (`OFFSET_OUT` + `LAUNCH_DMA`).
+    pub const I2M: u16 = 5;
+    /// Compute `SEND_PCAS_A` (QMD address >> 8).
+    pub const QMD: u16 = 6;
+    pub const CONSTANT_BUFFER: u16 = 7;
+    pub const INDEX_BUFFER: u16 = 8;
+    pub const TEX_HEADER_POOL: u16 = 9;
+    pub const TEX_SAMPLER_POOL: u16 = 10;
+    pub const SHADER_LOCAL_MEMORY: u16 = 11;
+    pub const PROGRAM: u16 = 12;
+    pub const VERTEX_STREAM: u16 = 13;
+    /// `SET_MME_MEM_ADDRESS_B` written (the address an MME macro's DMA may use).
+    pub const MME_ADDRESS: u16 = 14;
+
+    /// Kept even when the record array is full (they replace lower-priority refs).
+    pub const fn priority(tag: u16) -> bool {
+        matches!(tag, MME_READ | MME_READ_FIFOED | MME_WRITE | MME_REDUCTION | I2M | QMD | MME_ADDRESS)
+    }
+}
+
+/// The upper half of the address was set (in this or an earlier segment of the scan).
+pub const REF_HI_SEEN: u8 = 1;
+
+/// One address the segment points the front end / MME at.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AddrRef {
+    pub tag: u16,
+    pub subch: u8,
+    pub flags: u8,
+    pub method: u32,
+    pub at: u32,
+    pub len: u32,
+    pub va: u64,
+    pub class: u32,
+}
+
+/// Scan outcome.
+pub mod scan_status {
+    /// The whole segment was decoded.
+    pub const COMPLETE: u32 = 0;
+    /// Stopped at the scan cap.
+    pub const CAPPED: u32 = 1;
+    /// An unknown header: decoding stopped at `lost_at`.
+    pub const LOST: u32 = 2;
+    /// A read failed (see the segment's read status).
+    pub const READ_FAILED: u32 = 3;
+    /// `END_PB_SEGMENT`.
+    pub const ENDED: u32 = 4;
+    /// Not scanned (budget, control entry).
+    pub const SKIPPED: u32 = 5;
+}
+
+pub const SEM_CAP: usize = 16;
+pub const REF_CAP: usize = 48;
+/// Watched semaphore addresses a scanner matches releases against ([`Scanner::set_watch`]).
+pub const WATCH_CAP: usize = 8;
+/// Matching releases kept per segment ([`Scanner::hits`]), apart from the `SEM_CAP` record.
+pub const HIT_CAP: usize = 8;
+
+/// Whether the release `op` writes the 4 bytes at `target`: its address, or the upper half
+/// of a 64-bit payload.
+pub const fn release_covers(op: &SemOp, target: u64) -> bool {
+    !op.acquire()
+        && (op.addr == target || (op.flags & SEM_PAYLOAD64 != 0 && op.addr.wrapping_add(4) == target))
+}
+
+/// Whether the acquire `op` waits on the 4 bytes at `target` (its address, or the upper half
+/// of a 64-bit compare).
+pub const fn acquire_covers(op: &SemOp, target: u64) -> bool {
+    op.acquire() && (op.addr == target || (op.flags & SEM_PAYLOAD64 != 0 && op.addr.wrapping_add(4) == target))
+}
+
+/// The subchannel bindings the D3D UMDs assume on a native graphics channel
+/// (`native_channel::BINDINGS` and the deferred-API object on 5).
+pub const DEFAULT_CLASSES: [u32; 8] = [0xce97, 0xcec0, 0xcd40, 0x902d, 0xcab5, 0x5080, 0, 0];
+
+const fn is_gr(class: u32) -> bool {
+    matches!(class & 0xff, 0x97 | 0xc0)
+}
+
+const fn is_3d(class: u32) -> bool {
+    class & 0xff == 0x97
+}
+
+const fn is_compute(class: u32) -> bool {
+    class & 0xff == 0xc0
+}
+
+const fn is_copy(class: u32) -> bool {
+    class & 0xff == 0xb5
+}
+
+const fn is_i2m(class: u32) -> bool {
+    class & 0xff == 0x40
+}
+
+#[derive(Clone, Copy, Default)]
+struct SubState {
+    /// REPORT_SEMAPHORE payload lo, hi, address lo, hi.
+    rep: [u32; 4],
+    /// SET_REPORT_SEMAPHORE_A, B, C.
+    rep_legacy: [u32; 3],
+    /// Copy SET_SEMAPHORE_A (upper), B (lower), payload, payload upper.
+    copy: [u32; 4],
+    mme_hi: u32,
+    mme_lo: u32,
+    mme_hi_seen: bool,
+    i2m_hi: u32,
+    i2m_lo: u32,
+    i2m_hi_seen: bool,
+    cb_size: u32,
+    /// Generic hi halves by tag (indexed by tag), for the simple pairs.
+    hi: [u32; 16],
+    hi_seen: u16,
+}
+
+/// The pushbuffer decoder: fed dword by dword over one or more segments in GPFIFO order.
+pub struct Scanner {
+    pos: u32,
+    remaining: u32,
+    method: u32,
+    subch: u32,
+    mode: u32,
+    first: bool,
+    pub classes: [u32; 8],
+    host: [u32; 4],
+    host_legacy: [u32; 3],
+    subs: [SubState; 8],
+    // Per segment:
+    pub sems: [SemOp; SEM_CAP],
+    pub n_sems: u32,
+    pub sems_seen: u32,
+    pub refs: [AddrRef; REF_CAP],
+    pub n_refs: u32,
+    pub refs_seen: u32,
+    pub lost_at: Option<u32>,
+    pub ended: bool,
+    tail_start: u32,
+    pub tail_aligned: u32,
+    pub mme_calls: u32,
+    pub headers: u32,
+    /// Watched addresses ([`Scanner::set_watch`], kept across segments) and the releases to
+    /// them in this segment, however many other semaphore operations it has.
+    pub watch: [u64; WATCH_CAP],
+    pub n_watch: u32,
+    pub hits: [SemOp; HIT_CAP],
+    pub n_hits: u32,
+    pub hits_seen: u32,
+    /// Also match acquires of the watched addresses ([`Scanner::set_watch_all`]).
+    pub watch_acquires: bool,
+}
+
+impl Scanner {
+    pub const fn new(classes: [u32; 8]) -> Self {
+        const S: SubState = SubState {
+            rep: [0; 4],
+            rep_legacy: [0; 3],
+            copy: [0; 4],
+            mme_hi: 0,
+            mme_lo: 0,
+            mme_hi_seen: false,
+            i2m_hi: 0,
+            i2m_lo: 0,
+            i2m_hi_seen: false,
+            cb_size: 0,
+            hi: [0; 16],
+            hi_seen: 0,
+        };
+        const Z: SemOp = SemOp {
+            kind: 0,
+            subch: 0,
+            op: 0,
+            flags: 0,
+            word: 0,
+            at: 0,
+            class: 0,
+            addr: 0,
+            payload: 0,
+        };
+        const R: AddrRef = AddrRef {
+            tag: 0,
+            subch: 0,
+            flags: 0,
+            method: 0,
+            at: 0,
+            len: 0,
+            va: 0,
+            class: 0,
+        };
+        Self {
+            pos: 0,
+            remaining: 0,
+            method: 0,
+            subch: 0,
+            mode: 0,
+            first: false,
+            classes,
+            host: [0; 4],
+            host_legacy: [0; 3],
+            subs: [S; 8],
+            sems: [Z; SEM_CAP],
+            n_sems: 0,
+            sems_seen: 0,
+            refs: [R; REF_CAP],
+            n_refs: 0,
+            refs_seen: 0,
+            lost_at: None,
+            ended: false,
+            tail_start: u32::MAX,
+            tail_aligned: u32::MAX,
+            mme_calls: 0,
+            headers: 0,
+            watch: [0; WATCH_CAP],
+            n_watch: 0,
+            hits: [Z; HIT_CAP],
+            n_hits: 0,
+            hits_seen: 0,
+            watch_acquires: false,
+        }
+    }
+
+    /// Match releases against `targets` (the first [`WATCH_CAP`]) from now on.
+    pub fn set_watch(&mut self, targets: &[u64]) {
+        let n = targets.len().min(WATCH_CAP);
+        self.watch[..n].copy_from_slice(&targets[..n]);
+        self.n_watch = n as u32;
+        self.watch_acquires = false;
+    }
+
+    /// Match releases and acquires of `targets` from now on (`NvSemWatch`: who writes the
+    /// value and who waits for it).
+    pub fn set_watch_all(&mut self, targets: &[u64]) {
+        self.set_watch(targets);
+        self.watch_acquires = true;
+    }
+
+    /// This segment's releases to a watched address.
+    pub fn hits(&self) -> &[SemOp] {
+        &self.hits[..(self.n_hits as usize).min(HIT_CAP)]
+    }
+
+    /// Start a new segment: the per-segment outputs are cleared, the method state
+    /// (bindings, address halves, semaphore registers) carries over. `tail_start` is the
+    /// dword offset from which [`Scanner::tail_aligned`] looks for the first header.
+    pub fn begin_segment(&mut self, tail_start: u32) {
+        self.pos = 0;
+        // A method's data never spans two GPFIFO segments.
+        self.remaining = 0;
+        self.n_sems = 0;
+        self.sems_seen = 0;
+        self.n_refs = 0;
+        self.refs_seen = 0;
+        self.lost_at = None;
+        self.ended = false;
+        self.tail_start = tail_start;
+        self.tail_aligned = u32::MAX;
+        self.mme_calls = 0;
+        self.headers = 0;
+        self.n_hits = 0;
+        self.hits_seen = 0;
+    }
+
+    pub const fn position(&self) -> u32 {
+        self.pos
+    }
+
+    pub fn sems(&self) -> &[SemOp] {
+        &self.sems[..(self.n_sems as usize).min(SEM_CAP)]
+    }
+
+    pub fn refs(&self) -> &[AddrRef] {
+        &self.refs[..(self.n_refs as usize).min(REF_CAP)]
+    }
+
+    /// Feed one dword. `false`: decoding of this segment stopped (lost sync or
+    /// `END_PB_SEGMENT`); the rest of it is not decoded.
+    pub fn feed(&mut self, w: u32) -> bool {
+        if self.lost_at.is_some() || self.ended {
+            return false;
+        }
+        let at = self.pos;
+        self.pos = self.pos.wrapping_add(1);
+        if self.remaining > 0 {
+            let (sc, m) = (self.subch, self.method);
+            self.write(sc, m, w, at);
+            match self.mode {
+                1 => self.method = self.method.wrapping_add(4),
+                5 if self.first => {
+                    self.method = self.method.wrapping_add(4);
+                    self.first = false;
+                }
+                _ => {}
+            }
+            self.remaining -= 1;
+            return true;
+        }
+        self.headers += 1;
+        if at >= self.tail_start && self.tail_aligned == u32::MAX {
+            self.tail_aligned = at;
+        }
+        let count = (w >> 16) & 0x1fff;
+        let sc = (w >> 13) & 7;
+        let m = (w & 0xfff) << 2;
+        match w >> 29 {
+            0 => {
+                // NOP (0), or a subdevice-mask operation (one dword, no data).
+                if w != 0 && (w >> 16) & 3 == 0 {
+                    self.lost_at = Some(at);
+                    return false;
+                }
+            }
+            1 | 3 | 5 => {
+                self.mode = w >> 29;
+                self.method = m;
+                self.subch = sc;
+                self.remaining = count;
+                self.first = true;
+            }
+            4 => self.write(sc, m, count, at),
+            7 => {
+                self.ended = true;
+                return false;
+            }
+            _ => {
+                self.lost_at = Some(at);
+                return false;
+            }
+        }
+        true
+    }
+
+    fn push_sem(&mut self, op: SemOp) {
+        self.sems_seen += 1;
+        let watched = &self.watch[..(self.n_watch as usize).min(WATCH_CAP)];
+        let acquires = self.watch_acquires;
+        if watched.iter().any(|t| release_covers(&op, *t) || (acquires && acquire_covers(&op, *t))) {
+            self.hits_seen += 1;
+            let k = self.n_hits as usize;
+            if k < HIT_CAP {
+                self.hits[k] = op;
+                self.n_hits += 1;
+            } else {
+                // Full: the latest replaces the last (the newest payload matters most).
+                self.hits[HIT_CAP - 1] = op;
+            }
+        }
+        let n = self.n_sems as usize;
+        if n < SEM_CAP {
+            self.sems[n] = op;
+            self.n_sems += 1;
+        } else if op.acquire() {
+            // Full: an acquire replaces the latest release.
+            if let Some(i) = self.sems.iter().rposition(|s| !s.acquire()) {
+                self.sems[i] = op;
+            }
+        }
+    }
+
+    fn push_ref(&mut self, r: AddrRef) {
+        self.refs_seen += 1;
+        let n = self.n_refs as usize;
+        if n < REF_CAP {
+            self.refs[n] = r;
+            self.n_refs += 1;
+        } else if tag::priority(r.tag) {
+            if let Some(i) = self.refs.iter().position(|x| !tag::priority(x.tag)) {
+                self.refs[i] = r;
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn addr_ref(&mut self, tag: u16, sc: u32, method: u32, at: u32, len: u32, va: u64, hi_seen: bool) {
+        let class = self.classes[sc as usize & 7];
+        self.push_ref(AddrRef {
+            tag,
+            subch: sc as u8,
+            flags: if hi_seen { REF_HI_SEEN } else { 0 },
+            method,
+            at,
+            len,
+            va,
+            class,
+        });
+    }
+
+    /// A simple (hi method, lo method) pair: the lo write emits the ref.
+    fn pair(&mut self, sc: u32, t: u16, hi_mask: u32, is_hi: bool, data: u32, method: u32, at: u32, len: u32) {
+        let s = &mut self.subs[sc as usize & 7];
+        let i = (t as usize) & 15;
+        if is_hi {
+            s.hi[i] = data & hi_mask;
+            s.hi_seen |= 1 << i;
+        } else {
+            let va = (s.hi[i] as u64) << 32 | data as u64;
+            let seen = s.hi_seen & (1 << i) != 0;
+            self.addr_ref(t, sc, method, at, len, va, seen);
+        }
+    }
+
+    fn write(&mut self, sc: u32, m: u32, data: u32, at: u32) {
+        let sc = sc & 7;
+        if m < 0x100 {
+            self.host_method(sc, m, data, at);
+            return;
+        }
+        let class = self.classes[sc as usize];
+        if is_gr(class) || is_i2m(class) {
+            match m {
+                0x188 => {
+                    let s = &mut self.subs[sc as usize];
+                    s.i2m_hi = data & 0x1ff_ffff;
+                    s.i2m_hi_seen = true;
+                    return;
+                }
+                0x18c => {
+                    self.subs[sc as usize].i2m_lo = data;
+                    return;
+                }
+                0x1b0 => {
+                    let s = self.subs[sc as usize];
+                    let va = (s.i2m_hi as u64) << 32 | s.i2m_lo as u64;
+                    self.addr_ref(tag::I2M, sc, m, at, 0, va, s.i2m_hi_seen);
+                    return;
+                }
+                _ => {}
+            }
+        }
+        if is_gr(class) {
+            match m {
+                0x158..=0x164 => {
+                    self.subs[sc as usize].rep[((m - 0x158) / 4) as usize] = data;
+                }
+                0x168 => {
+                    let r = self.subs[sc as usize].rep;
+                    let op = (data & 3) as u8;
+                    let p64 = (data >> 27) & 1 != 0;
+                    // RELEASE 0, ACQUIRE 1 (REPORT_ONLY 2 and TRAP 3 are not syncs).
+                    if op <= 1 {
+                        self.push_sem(SemOp {
+                            kind: sem_kind::GR_EXEC,
+                            subch: sc as u8,
+                            op,
+                            flags: if op == 1 { SEM_ACQUIRE } else { 0 }
+                                | if p64 { SEM_PAYLOAD64 } else { 0 },
+                            word: data,
+                            at,
+                            class,
+                            addr: ((r[3] & 0x1ff_ffff) as u64) << 32 | r[2] as u64,
+                            payload: if p64 { (r[1] as u64) << 32 | r[0] as u64 } else { r[0] as u64 },
+                        });
+                    }
+                }
+                0x1b00..=0x1b08 => {
+                    self.subs[sc as usize].rep_legacy[((m - 0x1b00) / 4) as usize] = data;
+                }
+                0x1b0c => {
+                    let r = self.subs[sc as usize].rep_legacy;
+                    let op = (data & 3) as u8;
+                    if op <= 1 {
+                        self.push_sem(SemOp {
+                            kind: sem_kind::GR_LEGACY,
+                            subch: sc as u8,
+                            op,
+                            flags: if op == 1 { SEM_ACQUIRE } else { 0 },
+                            word: data,
+                            at,
+                            class,
+                            addr: ((r[0] & 0x1ff_ffff) as u64) << 32 | r[1] as u64,
+                            payload: r[2] as u64,
+                        });
+                    }
+                }
+                0x550 => {
+                    let s = &mut self.subs[sc as usize];
+                    s.mme_hi = data & 0x1ff_ffff;
+                    s.mme_hi_seen = true;
+                }
+                0x554 => {
+                    let s = &mut self.subs[sc as usize];
+                    s.mme_lo = data;
+                    let (va, seen) = ((s.mme_hi as u64) << 32 | data as u64, s.mme_hi_seen);
+                    self.addr_ref(tag::MME_ADDRESS, sc, m, at, 0, va, seen);
+                }
+                0x55c | 0x560 | 0x564 | 0x568 => {
+                    let s = self.subs[sc as usize];
+                    let t = match m {
+                        0x55c => tag::MME_READ,
+                        0x560 => tag::MME_READ_FIFOED,
+                        0x564 => tag::MME_WRITE,
+                        _ => tag::MME_REDUCTION,
+                    };
+                    let len = if m == 0x568 { 0 } else { data };
+                    let va = (s.mme_hi as u64) << 32 | s.mme_lo as u64;
+                    self.addr_ref(t, sc, m, at, len, va, s.mme_hi_seen);
+                }
+                0x790 => self.pair(sc, tag::SHADER_LOCAL_MEMORY, 0xff, true, data, m, at, 0),
+                0x794 => self.pair(sc, tag::SHADER_LOCAL_MEMORY, 0xff, false, data, m, at, 0),
+                0x155c => self.pair(sc, tag::TEX_SAMPLER_POOL, 0x1ff_ffff, true, data, m, at, 0),
+                0x1560 => self.pair(sc, tag::TEX_SAMPLER_POOL, 0x1ff_ffff, false, data, m, at, 0),
+                0x1574 => self.pair(sc, tag::TEX_HEADER_POOL, 0x1ff_ffff, true, data, m, at, 0),
+                0x1578 => self.pair(sc, tag::TEX_HEADER_POOL, 0x1ff_ffff, false, data, m, at, 0),
+                _ => {}
+            }
+        }
+        if is_3d(class) {
+            match m {
+                // CALL_MME_MACRO(j): 0x3800 + 8j.
+                0x3800..=0x3ffc if m & 7 == 0 => self.mme_calls += 1,
+                0x17c8 => self.pair(sc, tag::INDEX_BUFFER, 0xff, true, data, m, at, 0),
+                0x17cc => self.pair(sc, tag::INDEX_BUFFER, 0xff, false, data, m, at, 0),
+                0x2380 => self.subs[sc as usize].cb_size = data & 0x1_ffff,
+                0x2384 => self.pair(sc, tag::CONSTANT_BUFFER, 0xff, true, data, m, at, 0),
+                0x2388 => {
+                    let size = self.subs[sc as usize].cb_size;
+                    self.pair(sc, tag::CONSTANT_BUFFER, 0xff, false, data, m, at, size)
+                }
+                // SET_PIPELINE_PROGRAM_ADDRESS_A/B(j): 0x2014 / 0x2018 + 64j, j < 6.
+                0x2014..=0x2158 if (m - 0x2014) % 64 == 0 => {
+                    self.pair(sc, tag::PROGRAM, 0x1ff_ffff, true, data, m, at, 0)
+                }
+                0x2018..=0x215c if (m - 0x2018) % 64 == 0 => {
+                    self.pair(sc, tag::PROGRAM, 0x1ff_ffff, false, data, m, at, 0)
+                }
+                // SET_VERTEX_STREAM_A_LOCATION_A/B(j): 0x1c04 / 0x1c08 + 16j.
+                0x1c04..=0x1cf4 if (m - 0x1c04) % 16 == 0 => {
+                    self.pair(sc, tag::VERTEX_STREAM, 0xff, true, data, m, at, 0)
+                }
+                0x1c08..=0x1cf8 if (m - 0x1c08) % 16 == 0 => {
+                    self.pair(sc, tag::VERTEX_STREAM, 0xff, false, data, m, at, 0)
+                }
+                _ => {}
+            }
+        }
+        if is_compute(class) && m == 0x2b4 {
+            // SEND_PCAS_A: QMD_ADDRESS_SHIFTED8.
+            self.addr_ref(tag::QMD, sc, m, at, 0, (data as u64) << 8, true);
+        }
+        if is_copy(class) {
+            match m {
+                0x240..=0x24c => self.subs[sc as usize].copy[((m - 0x240) / 4) as usize] = data,
+                0x300 if (data >> 3) & 3 != 0 => {
+                    let c = self.subs[sc as usize].copy;
+                    let p64 = (data >> 27) & 1 != 0;
+                    self.push_sem(SemOp {
+                        kind: sem_kind::COPY,
+                        subch: sc as u8,
+                        op: ((data >> 3) & 3) as u8,
+                        flags: if p64 { SEM_PAYLOAD64 } else { 0 },
+                        word: data,
+                        at,
+                        class,
+                        addr: ((c[0] & 0x1ff_ffff) as u64) << 32 | c[1] as u64,
+                        payload: if p64 { (c[3] as u64) << 32 | c[2] as u64 } else { c[2] as u64 },
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn host_method(&mut self, sc: u32, m: u32, data: u32, at: u32) {
+        match m {
+            0x00 => self.classes[sc as usize] = data & 0xffff,
+            0x10 | 0x14 | 0x18 => self.host_legacy[((m - 0x10) / 4) as usize] = data,
+            0x1c => {
+                let h = self.host_legacy;
+                let op = (data & 0x1f) as u8;
+                // ACQUIRE 1, RELEASE 2, ACQ_GEQ 4, ACQ_AND 8, REDUCTION 0x10.
+                let acquire = op & (1 | 4 | 8) != 0;
+                self.push_sem(SemOp {
+                    kind: sem_kind::HOST_LEGACY,
+                    subch: sc as u8,
+                    op,
+                    flags: if acquire { SEM_ACQUIRE } else { 0 },
+                    word: data,
+                    at,
+                    class: 0,
+                    addr: ((h[0] & 0xff) as u64) << 32 | (h[1] & !3) as u64,
+                    payload: h[2] as u64,
+                });
+            }
+            0x5c | 0x60 | 0x64 | 0x68 => self.host[((m - 0x5c) / 4) as usize] = data,
+            0x6c => {
+                let h = self.host;
+                let op = (data & 7) as u8;
+                let p64 = (data >> 24) & 1 != 0;
+                // ACQUIRE 0, RELEASE 1, ACQ_STRICT_GEQ 2, ACQ_CIRC_GEQ 3, ACQ_AND 4,
+                // ACQ_NOR 5, REDUCTION 6.
+                let acquire = matches!(op, 0 | 2 | 3 | 4 | 5);
+                self.push_sem(SemOp {
+                    kind: sem_kind::HOST,
+                    subch: sc as u8,
+                    op,
+                    flags: if acquire { SEM_ACQUIRE } else { 0 } | if p64 { SEM_PAYLOAD64 } else { 0 },
+                    word: data,
+                    at,
+                    class: 0,
+                    addr: ((h[1] & 0x1ff_ffff) as u64) << 32 | (h[0] & !3) as u64,
+                    payload: if p64 { (h[3] as u64) << 32 | h[2] as u64 } else { h[2] as u64 },
+                });
+            }
+            _ => {}
+        }
+    }
+}
+
+// ── the automatic trigger ────────────────────────────────────────────────────────────────────
+
+/// What a [`StallWatch::tick`] asks for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Trigger {
+    None,
+    /// Busy without progress for the timeout (once per stall).
+    Stall,
+    /// The error notifier was seen set (once per queue).
+    Error,
+}
+
+/// One look at a queue by the mirror thread.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StallSample {
+    pub now: u64,
+    /// Work the progress fence does not show complete.
+    pub busy: bool,
+    pub progress: u64,
+    pub gp_get: u32,
+    pub error: bool,
+}
+
+/// While a stall lasts, it fires again this often (100 ns): the snapshot closest to a later
+/// fault is the one worth keeping.
+pub const REPEAT_100NS: u64 = 50_000_000;
+
+/// The snapshot's own stall detection (independent of `native_hang`'s recovery watch).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StallWatch {
+    progress: u64,
+    since: Option<u64>,
+    fired: Option<u64>,
+    error_seen: bool,
+}
+
+impl StallWatch {
+    pub const fn new() -> Self {
+        Self {
+            progress: 0,
+            since: None,
+            fired: None,
+            error_seen: false,
+        }
+    }
+
+    /// `busy` is work the progress fence does not show complete. GP_GET is not used: GB20x
+    /// does not write it back to USERD.
+    pub fn tick(&mut self, s: StallSample, timeout: Option<u64>) -> Trigger {
+        if s.error && !self.error_seen {
+            self.error_seen = true;
+            return Trigger::Error;
+        }
+        if !s.busy || self.since.is_none() || s.progress != self.progress {
+            self.progress = s.progress;
+            self.since = s.busy.then_some(s.now);
+            self.fired = None;
+            return Trigger::None;
+        }
+        match (timeout, self.since) {
+            (Some(t), Some(since)) if s.now.saturating_sub(since) >= t => match self.fired {
+                Some(at) if s.now.saturating_sub(at) < REPEAT_100NS => Trigger::None,
+                _ => {
+                    self.fired = Some(s.now);
+                    Trigger::Stall
+                }
+            },
+            _ => Trigger::None,
+        }
+    }
+
+    /// How long the queue has been busy without progress (ms; 0 = not stalled).
+    pub fn stalled_ms(&self, now: u64) -> u32 {
+        self.since
+            .map_or(0, |since| (now.saturating_sub(since) / 10_000).min(u32::MAX as u64) as u32)
+    }
+}
+
+// ── the blob ─────────────────────────────────────────────────────────────────────────────────
+
+pub const MAGIC: u32 = u32::from_le_bytes(*b"NSNP");
+pub const VERSION: u32 = 2;
+pub const HDR_BYTES: usize = 64;
+pub const REC_QUEUE: u32 = 1;
+pub const REC_VA: u32 = 2;
+pub const USERD_DWORDS: usize = 64;
+pub const QREC_FIXED: usize = 432 + WINDOW * 8 + HISTORY * 16;
+pub const SEG_FIXED: usize = 80;
+pub const SEM_BYTES: usize = 40;
+pub const REF_BYTES: usize = 32;
+pub const VA_BYTES: usize = 112;
+pub const VA_FIXED: usize = 16;
+/// Head / tail dwords recorded per segment at most.
+pub const HEAD_DWORDS: usize = 64;
+pub const TAIL_DWORDS: usize = 64;
+/// Dwords decoded per segment at most.
+pub const SCAN_MAX_DWORDS: u32 = 16 * 1024;
+/// VA table entries at most.
+pub const VA_TABLE_CAP: usize = 512;
+
+/// Header flags.
+pub const FLAG_TRUNCATED: u32 = 1;
+pub const FLAG_BUDGET: u32 = 2;
+pub const FLAG_PIN_FAILED: u32 = 4;
+pub const FLAG_VA_TABLE_FULL: u32 = 8;
+
+/// Queue flags.
+pub const Q_GRAPHICS: u32 = 1;
+pub const Q_DEAD: u32 = 2;
+pub const Q_OUTSTANDING: u32 = 4;
+pub const Q_FLAGGED: u32 = 8;
+pub const Q_IN_GRACE: u32 = 0x10;
+pub const Q_WATCH_DEAD: u32 = 0x20;
+pub const Q_DETAIL: u32 = 0x40;
+pub const Q_ERROR: u32 = 0x80;
+pub const Q_TRIGGER: u32 = 0x100;
+pub const Q_COPY_BOUND: u32 = 0x200;
+/// The focus is the first incomplete submission of the history (else the entry before GP_PUT).
+pub const Q_FOCUS_FROM_HISTORY: u32 = 0x400;
+
+/// Segment flags: part of the first incomplete submission (`S_FOCUS`), its first entry
+/// (`S_FOCUS_FIRST`), or of the work before it (`S_BEFORE`).
+pub const S_FOCUS: u32 = 1;
+pub const S_FOCUS_FIRST: u32 = 2;
+pub const S_BEFORE: u32 = 4;
+
+/// VA lookup hits.
+pub const HIT_NONE: u32 = 0;
+/// A native allocation's RM memory mapped there.
+pub const HIT_NATIVE_RM: u32 = 1;
+/// VidMm's system pages of a native allocation (an OS-descriptor mapping).
+pub const HIT_NATIVE_SYSTEM: u32 = 2;
+/// A non-native allocation's system pages (dxgkrnl's monitored fences and the like).
+pub const HIT_FOREIGN: u32 = 3;
+/// The lookup could not run (state busy).
+pub const HIT_UNKNOWN: u32 = 0xff;
+
+/// VA entry flags.
+pub const V_RESIDENT_KNOWN: u32 = 1;
+pub const V_POISONED: u32 = 2;
+pub const V_SYSTEM_MEMORY: u32 = 4;
+pub const V_HUGE: u32 = 8;
+pub const V_TOUCH_TABLE: u32 = 0x10;
+
+/// Read statuses.
+pub const RD_OK: u32 = 0;
+pub const RD_NOT_MAPPED: u32 = 1;
+pub const RD_ERROR: u32 = 2;
+pub const RD_BUDGET: u32 = 3;
+pub const RD_NOT_READ: u32 = 4;
+
+/// An append-only little-endian writer over a fixed buffer; writes past the end are dropped
+/// and remembered ([`Writer::overflowed`]).
+pub struct Writer<'a> {
+    buf: &'a mut [u8],
+    len: usize,
+    overflow: bool,
+}
+
+impl<'a> Writer<'a> {
+    pub fn new(buf: &'a mut [u8]) -> Self {
+        Self {
+            buf,
+            len: 0,
+            overflow: false,
+        }
+    }
+
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub const fn overflowed(&self) -> bool {
+        self.overflow
+    }
+
+    /// Bytes still free.
+    pub const fn room(&self) -> usize {
+        self.buf.len() - self.len
+    }
+
+    pub fn u8(&mut self, v: u8) {
+        if self.len < self.buf.len() {
+            self.buf[self.len] = v;
+            self.len += 1;
+        } else {
+            self.overflow = true;
+        }
+    }
+
+    pub fn u16(&mut self, v: u16) {
+        for b in v.to_le_bytes() {
+            self.u8(b);
+        }
+    }
+
+    pub fn u32(&mut self, v: u32) {
+        for b in v.to_le_bytes() {
+            self.u8(b);
+        }
+    }
+
+    pub fn u64(&mut self, v: u64) {
+        for b in v.to_le_bytes() {
+            self.u8(b);
+        }
+    }
+
+    pub fn zeros(&mut self, n: usize) {
+        for _ in 0..n {
+            self.u8(0);
+        }
+    }
+
+    /// Overwrite a u32 already written at `at`.
+    pub fn patch_u32(&mut self, at: usize, v: u32) {
+        if at + 4 <= self.len {
+            self.buf[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        }
+    }
+
+    /// Cut back to `len` (a record that did not fit).
+    pub fn truncate(&mut self, len: usize) {
+        if len < self.len {
+            self.len = len;
+        }
+    }
+}
+
+/// The header (its sizes, duration and flags are patched at the end with [`finish_header`]).
+#[allow(clippy::too_many_arguments)]
+pub fn write_header(
+    w: &mut Writer<'_>,
+    seq: u32,
+    reason: u32,
+    token: u32,
+    now: u64,
+    snap_ms: u32,
+    hang_ms: u32,
+    submits: u32,
+    poll_ticks: u32,
+) {
+    w.u32(MAGIC);
+    w.u32(VERSION);
+    w.u32(HDR_BYTES as u32);
+    w.u32(0);
+    w.u32(seq);
+    w.u32(reason);
+    w.u32(token);
+    w.u32(0);
+    w.u64(now);
+    w.u32(0);
+    w.u32(snap_ms);
+    w.u32(hang_ms);
+    w.u32(0);
+    w.u32(submits);
+    w.u32(poll_ticks);
+}
+
+pub fn finish_header(w: &mut Writer<'_>, records: u32, duration_us: u32, flags: u32) {
+    let total = w.len() as u32;
+    w.patch_u32(12, total);
+    w.patch_u32(28, records);
+    w.patch_u32(40, duration_us);
+    w.patch_u32(52, flags);
+}
+
+/// A queue record's fixed part.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct QueueFields {
+    pub slot: u32,
+    pub node: u32,
+    pub pid: u32,
+    pub flags: u32,
+    pub veid: u32,
+    pub token: u32,
+    pub tsg: u32,
+    pub ctxshare: u32,
+    pub channel: u32,
+    pub hw_tsg: u32,
+    pub process: u64,
+    pub context: u64,
+    pub gpfifo_va: u64,
+    pub ring_entries: u32,
+    pub kmd_gp_put: u32,
+    pub gp_get: u32,
+    pub userd_gp_put: u32,
+    pub submitted: u64,
+    pub signalled: u64,
+    pub fence_now: u64,
+    pub fence_gpu: u64,
+    pub stall_ms: u32,
+    pub notifier_info32: u32,
+    pub notifier_word: u32,
+    pub ring_status: u32,
+    pub window_first: u32,
+    pub window_n: u32,
+    /// The GPFIFO range of the first incomplete submission (`focus_range`), u32::MAX none.
+    pub focus_start: u32,
+    pub focus_end: u32,
+    /// The ring entry at GP_PUT - 1 read back through the GPU VA (a check that the ring
+    /// reads the memory the GPU fetches: nonzero once anything was submitted).
+    pub last_lo: u32,
+    pub last_hi: u32,
+    pub last_status: u32,
+    pub history_n: u32,
+}
+
+/// Where a record started and where its count to patch sits.
+#[derive(Clone, Copy, Debug)]
+pub struct Mark {
+    start: usize,
+    count_at: usize,
+}
+
+/// Write a queue record's fixed part (USERD and the GPFIFO window included); its segment
+/// records follow, then [`end_queue`].
+pub fn begin_queue(
+    w: &mut Writer<'_>,
+    q: &QueueFields,
+    userd: &[u32; USERD_DWORDS],
+    window: &[(u32, u32); WINDOW],
+    history: &[Submission; HISTORY],
+) -> Mark {
+    let start = w.len();
+    w.u32(0);
+    w.u32(REC_QUEUE);
+    for v in [q.slot, q.node, q.pid, q.flags, q.veid, q.token, q.tsg, q.ctxshare, q.channel, q.hw_tsg] {
+        w.u32(v);
+    }
+    w.u64(q.process);
+    w.u64(q.context);
+    w.u64(q.gpfifo_va);
+    for v in [q.ring_entries, q.kmd_gp_put, q.gp_get, q.userd_gp_put] {
+        w.u32(v);
+    }
+    w.u64(q.submitted);
+    w.u64(q.signalled);
+    w.u64(q.fence_now);
+    w.u64(q.fence_gpu);
+    for v in [q.stall_ms, q.notifier_info32, q.notifier_word, q.ring_status] {
+        w.u32(v);
+    }
+    for v in userd.iter() {
+        w.u32(*v);
+    }
+    w.u32(q.window_first);
+    w.u32(q.window_n);
+    let count_at = w.len();
+    w.u32(0);
+    w.u32(0);
+    for (lo, hi) in window.iter() {
+        w.u32(*lo);
+        w.u32(*hi);
+    }
+    for v in [q.focus_start, q.focus_end, q.last_lo, q.last_hi, q.last_status, q.history_n] {
+        w.u32(v);
+    }
+    for h in history.iter() {
+        w.u64(h.fence);
+        w.u32(h.before);
+        w.u32(h.after);
+    }
+    Mark { start, count_at }
+}
+
+/// Close a queue record: its segment count and size.
+pub fn end_queue(w: &mut Writer<'_>, mark: Mark, segments: u32) {
+    w.patch_u32(mark.count_at, segments);
+    let bytes = (w.len() - mark.start) as u32;
+    w.patch_u32(mark.start, bytes);
+}
+
+/// A segment record's fixed part.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SegFields {
+    pub index: u32,
+    pub va: u64,
+    pub len: u32,
+    pub read_status: u32,
+    pub scanned: u32,
+    pub scan_status: u32,
+    pub lost_at: u32,
+    pub sems_seen: u32,
+    pub n_sems: u32,
+    pub tail_start: u32,
+    pub tail_aligned: u32,
+    pub n_head: u32,
+    pub n_tail: u32,
+    pub mme_calls: u32,
+    pub refs_seen: u32,
+    pub n_refs: u32,
+    pub va_index: u32,
+    pub flags: u32,
+}
+
+/// Write a segment record's fixed part; the head and tail dwords, `n_sems` [`write_sem`]s
+/// and `n_refs` [`write_ref`]s follow, then [`end_segment`].
+pub fn begin_segment(w: &mut Writer<'_>, s: &SegFields) -> Mark {
+    let start = w.len();
+    w.u32(0);
+    w.u32(s.index);
+    w.u64(s.va);
+    for v in [
+        s.len,
+        s.read_status,
+        s.scanned,
+        s.scan_status,
+        s.lost_at,
+        s.sems_seen,
+        s.n_sems,
+        s.tail_start,
+        s.tail_aligned,
+        s.n_head,
+        s.n_tail,
+        s.mme_calls,
+        s.refs_seen,
+        s.n_refs,
+        s.va_index,
+        s.flags,
+    ] {
+        w.u32(v);
+    }
+    Mark { start, count_at: start }
+}
+
+pub fn end_segment(w: &mut Writer<'_>, mark: Mark) {
+    let bytes = (w.len() - mark.start) as u32;
+    w.patch_u32(mark.start, bytes);
+}
+
+/// One VA-table entry, as the KMD fills it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VaEntry {
+    pub va: u64,
+    pub process: u64,
+    pub hit: u32,
+    pub id: u32,
+    pub memory: u32,
+    pub flags: u32,
+    pub piece_va: u64,
+    pub piece_len: u64,
+    pub memory_offset: u64,
+    pub size: u64,
+    pub resident_pa: u64,
+    pub value: u64,
+    pub value_status: u32,
+    pub ring_kind: u32,
+    pub ring_t: u64,
+    pub ring_va: u64,
+    pub ring_len: u32,
+    pub touch_kind: u32,
+}
+
+/// The VA table: lookups deduplicated by (process, VA), over caller storage (the KMD's is
+/// on the heap: [`VA_TABLE_CAP`] entries do not belong on a kernel stack).
+pub struct VaTable<'a> {
+    pub entries: &'a mut [VaEntry],
+    pub n: usize,
+    pub full: bool,
+}
+
+impl<'a> VaTable<'a> {
+    pub fn new(entries: &'a mut [VaEntry]) -> Self {
+        Self {
+            entries,
+            n: 0,
+            full: false,
+        }
+    }
+
+    pub fn used(&self) -> &[VaEntry] {
+        &self.entries[..self.n]
+    }
+
+    /// The index of (process, va), adding a fresh entry (`hit` = HIT_UNKNOWN until filled)
+    /// when new. `(index, new)`; `None` when full.
+    pub fn intern(&mut self, process: u64, va: u64) -> Option<(u32, bool)> {
+        if let Some(i) = self.entries[..self.n].iter().position(|e| e.va == va && e.process == process) {
+            return Some((i as u32, false));
+        }
+        if self.n >= self.entries.len() {
+            self.full = true;
+            return None;
+        }
+        self.entries[self.n] = VaEntry {
+            va,
+            process,
+            hit: HIT_UNKNOWN,
+            value_status: RD_NOT_READ,
+            ..VaEntry::default()
+        };
+        self.n += 1;
+        Some(((self.n - 1) as u32, true))
+    }
+}
+
+pub fn write_va_entry(w: &mut Writer<'_>, e: &VaEntry) {
+    w.u64(e.va);
+    w.u64(e.process);
+    w.u32(e.hit);
+    w.u32(e.id);
+    w.u32(e.memory);
+    w.u32(e.flags);
+    w.u64(e.piece_va);
+    w.u64(e.piece_len);
+    w.u64(e.memory_offset);
+    w.u64(e.size);
+    w.u64(e.resident_pa);
+    w.u64(e.value);
+    w.u32(e.value_status);
+    w.u32(e.ring_kind);
+    w.u64(e.ring_t);
+    w.u64(e.ring_va);
+    w.u32(e.ring_len);
+    w.u32(e.touch_kind);
+}
+
+pub fn write_va_table(w: &mut Writer<'_>, entries: &[VaEntry], ring_on: bool) {
+    let start = w.len();
+    w.u32(0);
+    w.u32(REC_VA);
+    w.u32(entries.len() as u32);
+    w.u32(u32::from(ring_on));
+    for e in entries {
+        write_va_entry(w, e);
+    }
+    let bytes = (w.len() - start) as u32;
+    w.patch_u32(start, bytes);
+}
+
+pub fn write_sem(w: &mut Writer<'_>, s: &SemOp, va_index: u32) {
+    w.u8(s.kind);
+    w.u8(s.subch);
+    w.u8(s.op);
+    w.u8(s.flags);
+    w.u32(s.word);
+    w.u32(s.at);
+    w.u32(s.class);
+    w.u64(s.addr);
+    w.u64(s.payload);
+    w.u32(va_index);
+    w.u32(0);
+}
+
+pub fn write_ref(w: &mut Writer<'_>, r: &AddrRef, va_index: u32) {
+    w.u16(r.tag);
+    w.u8(r.subch);
+    w.u8(r.flags);
+    w.u32(r.method);
+    w.u32(r.at);
+    w.u32(r.len);
+    w.u64(r.va);
+    w.u32(va_index);
+    w.u32(r.class);
+}
+
+// ── the ring-history release scan (`REC_RELEASES`) ─────────────────────────────────────────
+
+/// A record of who releases the stuck submissions' acquire targets: every native queue's ring
+/// (the last [`REL_RING_ENTRIES`] GPFIFO entries before its GP_PUT) and every copy channel's
+/// ring of the same process, scanned for releases to those addresses.
+pub const REC_RELEASES: u32 = 3;
+pub const REL_TARGET_CAP: usize = WATCH_CAP;
+pub const REL_CAP: usize = 64;
+pub const REL_FIXED: usize = 40;
+pub const REL_TARGET_BYTES: usize = 16;
+pub const REL_BYTES: usize = 56;
+pub const REL_MAX_BYTES: usize = REL_FIXED + REL_TARGET_CAP * REL_TARGET_BYTES + REL_CAP * REL_BYTES;
+/// GPFIFO entries of one ring scanned back from GP_PUT.
+pub const REL_RING_ENTRIES: u32 = 2048;
+/// Dwords of one segment scanned.
+pub const REL_SEG_DWORDS: u32 = 4096;
+
+/// Where a release was found.
+pub mod rel_source {
+    /// A native HW queue's GPFIFO ring.
+    pub const NATIVE_RING: u8 = 1;
+    /// A copy-context channel's ring (`nv_copy`).
+    pub const COPY_RING: u8 = 2;
+    /// A copy-context submission still waiting in the KMD's backlog (not on the ring yet:
+    /// its releases cannot have happened).
+    pub const COPY_BACKLOG: u8 = 3;
+}
+
+/// The scan stopped at the read budget.
+pub const REL_FLAG_BUDGET: u32 = 1;
+/// More releases than [`REL_CAP`]: the latest ones replaced the last slot.
+pub const REL_FLAG_FULL: u32 = 2;
+/// A segment read failed (memory reused, unmapped).
+pub const REL_FLAG_READ_FAILED: u32 = 4;
+
+/// One release to a target found in a ring.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Release {
+    pub process: u64,
+    pub target: u64,
+    pub op: SemOp,
+    pub seg_va: u64,
+    pub token: u32,
+    pub gp_index: u32,
+    pub source: u8,
+}
+
+/// The targets and what the scan found.
+pub struct ReleaseScan {
+    pub targets: [(u64, u64); REL_TARGET_CAP],
+    pub n_targets: usize,
+    pub hits: [Release; REL_CAP],
+    pub n_hits: usize,
+    pub hits_seen: u32,
+    pub queues: u32,
+    pub segments: u32,
+    pub entries: u32,
+    pub flags: u32,
+}
+
+impl Default for ReleaseScan {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ReleaseScan {
+    pub const fn new() -> Self {
+        const R: Release = Release {
+            process: 0,
+            target: 0,
+            op: SemOp { kind: 0, subch: 0, op: 0, flags: 0, word: 0, at: 0, class: 0, addr: 0, payload: 0 },
+            seg_va: 0,
+            token: 0,
+            gp_index: 0,
+            source: 0,
+        };
+        Self {
+            targets: [(0, 0); REL_TARGET_CAP],
+            n_targets: 0,
+            hits: [R; REL_CAP],
+            n_hits: 0,
+            hits_seen: 0,
+            queues: 0,
+            segments: 0,
+            entries: 0,
+            flags: 0,
+        }
+    }
+
+    /// Add (process, va) unless known or full; `false` when full.
+    pub fn add_target(&mut self, process: u64, va: u64) -> bool {
+        if self.targets[..self.n_targets].contains(&(process, va)) {
+            return true;
+        }
+        if self.n_targets >= REL_TARGET_CAP {
+            return false;
+        }
+        self.targets[self.n_targets] = (process, va);
+        self.n_targets += 1;
+        true
+    }
+
+    /// The target addresses of `process` (for [`Scanner::set_watch`]).
+    pub fn targets_of(&self, process: u64) -> ([u64; REL_TARGET_CAP], usize) {
+        let mut out = [0u64; REL_TARGET_CAP];
+        let mut n = 0;
+        for (p, va) in self.targets[..self.n_targets].iter() {
+            if *p == process && !out[..n].contains(va) {
+                out[n] = *va;
+                n += 1;
+            }
+        }
+        (out, n)
+    }
+
+    /// Record the scanner's hits of one segment.
+    pub fn note(&mut self, process: u64, hits: &[SemOp], seen: u32, seg_va: u64, token: u32, gp_index: u32, source: u8) {
+        self.hits_seen += seen;
+        if seen as usize > hits.len() {
+            self.flags |= REL_FLAG_FULL;
+        }
+        for op in hits {
+            let target = self.targets[..self.n_targets]
+                .iter()
+                .find(|(p, va)| *p == process && release_covers(op, *va))
+                .map_or(op.addr, |(_, va)| *va);
+            let r = Release { process, target, op: *op, seg_va, token, gp_index, source };
+            if self.n_hits < REL_CAP {
+                self.hits[self.n_hits] = r;
+                self.n_hits += 1;
+            } else {
+                self.flags |= REL_FLAG_FULL;
+                self.hits[REL_CAP - 1] = r;
+            }
+        }
+    }
+}
+
+/// The release record (written only when there were targets).
+pub fn write_releases(w: &mut Writer<'_>, r: &ReleaseScan) {
+    let start = w.len();
+    w.u32(0);
+    w.u32(REC_RELEASES);
+    w.u32(r.n_targets as u32);
+    w.u32(r.n_hits as u32);
+    w.u32(r.hits_seen);
+    w.u32(r.flags);
+    w.u32(r.queues);
+    w.u32(r.segments);
+    w.u32(r.entries);
+    w.u32(0);
+    for (p, va) in r.targets[..r.n_targets].iter() {
+        w.u64(*p);
+        w.u64(*va);
+    }
+    for h in r.hits[..r.n_hits].iter() {
+        w.u64(h.process);
+        w.u64(h.target);
+        w.u64(h.op.addr);
+        w.u64(h.op.payload);
+        w.u64(h.seg_va);
+        w.u32(h.token);
+        w.u32(h.gp_index);
+        w.u32(h.op.at);
+        w.u8(h.op.kind);
+        w.u8(h.op.op);
+        w.u8(h.op.flags);
+        w.u8(h.source);
+    }
+    let bytes = (w.len() - start) as u32;
+    w.patch_u32(start, bytes);
+}
+
+// ── the KMD's copy-context channels (`REC_COPY`) ───────────────────────────────────────────
+
+/// One record per copy-context channel (`nv_copy`): where its ring is, what waits in the
+/// backlog, and the semaphore operations of the work not done yet (the ring's pending
+/// entries and the backlog's first submissions), so a hang's "waits on" / "released by"
+/// chain crosses into the copy context.
+///
+/// ```text
+/// copy record:
+///   0 bytes | 4 kind (REC_COPY) | 8 slot | 12 flags (C_*) | 16 process key u64 | 24 token
+///  28 engine type (NV2080_ENGINE_TYPE; 1 graphics) | 32 KMD GP_PUT | 36 consumed index
+///  40 progress u64 | 48 submitted u64 | 56 seen u64 | 64 forced u64
+///  72 backlog submissions | 76 ring entries pending | 80 first backlog seq u64
+///  88 stuck seq u64 (the first not complete; 0 none) | 96 segments | 100 ms without progress
+/// 104 0 | 108 0 | 112 segments [n]
+/// copy segment:
+///   0 VA u64 | 8 dwords | 12 seq (low 32) | 16 source (COPY_SEG_*) | 20 read status
+///  24 scan status | 28 semaphore ops seen | 32 recorded | 36 0 | 40 semaphore ops [n] x SEM_BYTES
+/// ```
+pub const REC_COPY: u32 = 4;
+pub const COPY_FIXED: usize = 112;
+pub const COPY_SEG_FIXED: usize = 40;
+/// Segments recorded per copy channel at most.
+pub const COPY_SEG_CAP: usize = 24;
+/// Semaphore operations recorded per copy segment at most.
+pub const COPY_SEM_CAP: usize = 8;
+/// The most bytes one copy record takes.
+pub const COPY_MAX_BYTES: usize = COPY_FIXED + COPY_SEG_CAP * (COPY_SEG_FIXED + COPY_SEM_CAP * SEM_BYTES);
+
+/// Copy record flags.
+pub const C_DEAD: u32 = 1;
+pub const C_ASYNC: u32 = 2;
+pub const C_IN_GRACE: u32 = 4;
+/// More segments than [`COPY_SEG_CAP`] were not done.
+pub const C_SEGS_TRUNCATED: u32 = 8;
+
+/// Where a copy segment comes from.
+pub const COPY_SEG_PENDING: u32 = 1;
+pub const COPY_SEG_BACKLOG: u32 = 2;
+
+/// A copy record's fixed part.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CopyFields {
+    pub slot: u32,
+    pub flags: u32,
+    pub process: u64,
+    pub token: u32,
+    pub engine: u32,
+    pub put: u32,
+    pub consumed: u32,
+    pub progress: u64,
+    pub submitted: u64,
+    pub seen: u64,
+    pub forced: u64,
+    pub backlog: u32,
+    pub pending: u32,
+    pub backlog_first: u64,
+    pub stuck: u64,
+    pub stall_ms: u32,
+}
+
+/// Write a copy record's fixed part; [`write_copy_segment`]s follow, then [`end_copy`].
+pub fn begin_copy(w: &mut Writer<'_>, c: &CopyFields) -> Mark {
+    let start = w.len();
+    w.u32(0);
+    w.u32(REC_COPY);
+    w.u32(c.slot);
+    w.u32(c.flags);
+    w.u64(c.process);
+    w.u32(c.token);
+    w.u32(c.engine);
+    w.u32(c.put);
+    w.u32(c.consumed);
+    w.u64(c.progress);
+    w.u64(c.submitted);
+    w.u64(c.seen);
+    w.u64(c.forced);
+    w.u32(c.backlog);
+    w.u32(c.pending);
+    w.u64(c.backlog_first);
+    w.u64(c.stuck);
+    let count_at = w.len();
+    w.u32(0);
+    w.u32(c.stall_ms);
+    w.u32(0);
+    w.u32(0);
+    Mark { start, count_at }
+}
+
+/// One not-yet-done segment of a copy channel and its semaphore operations (at most
+/// [`COPY_SEM_CAP`]; acquires are kept first when there are more).
+#[allow(clippy::too_many_arguments)]
+pub fn write_copy_segment(
+    w: &mut Writer<'_>,
+    va: u64,
+    dwords: u32,
+    seq: u64,
+    source: u32,
+    read_status: u32,
+    scan_status: u32,
+    sems_seen: u32,
+    sems: &[SemOp],
+) {
+    let mut keep = [SemOp::default(); COPY_SEM_CAP];
+    let mut n = 0;
+    for pass_acquires in [true, false] {
+        for op in sems.iter().filter(|op| op.acquire() == pass_acquires) {
+            if n < COPY_SEM_CAP {
+                keep[n] = *op;
+                n += 1;
+            }
+        }
+    }
+    // Back in stream order.
+    keep[..n].sort_unstable_by_key(|op| op.at);
+    w.u64(va);
+    w.u32(dwords);
+    w.u32(seq as u32);
+    w.u32(source);
+    w.u32(read_status);
+    w.u32(scan_status);
+    w.u32(sems_seen);
+    w.u32(n as u32);
+    w.u32(0);
+    for op in keep[..n].iter() {
+        write_sem(w, op, u32::MAX);
+    }
+}
+
+/// Close a copy record: its segment count, its flags (truncation is known only now) and size.
+pub fn end_copy(w: &mut Writer<'_>, mark: Mark, segments: u32, flags: u32) {
+    w.patch_u32(mark.count_at, segments);
+    w.patch_u32(mark.start + 12, flags);
+    let bytes = (w.len() - mark.start) as u32;
+    w.patch_u32(mark.start, bytes);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn copy_records_carry_ring_backlog_and_pending_acquires() {
+        let mut buf = [0u8; 4096];
+        let mut w = Writer::new(&mut buf);
+        let c = CopyFields {
+            slot: 2,
+            flags: C_ASYNC,
+            process: 0xffff_8000_1234_0000,
+            token: 0x0005_0041,
+            engine: 0x0b,
+            put: 300,
+            consumed: 250,
+            progress: 17,
+            submitted: 21,
+            seen: 17,
+            forced: 0,
+            backlog: 2,
+            pending: 50,
+            backlog_first: 20,
+            stuck: 18,
+            stall_ms: 4100,
+        };
+        let mark = begin_copy(&mut w, &c);
+        assert_eq!(w.len(), COPY_FIXED);
+        // A host acquire on the graphics queue's value and ten releases: the acquire is kept.
+        let mut sems = [SemOp::default(); 11];
+        sems[0] = SemOp { kind: sem_kind::HOST, op: 0, flags: SEM_ACQUIRE, at: 3, addr: 0x852d008, payload: 0x3d, ..SemOp::default() };
+        for (i, s) in sems[1..].iter_mut().enumerate() {
+            *s = SemOp { kind: sem_kind::COPY, op: 1, at: 10 + i as u32, addr: 0x852d070, payload: 5, ..SemOp::default() };
+        }
+        write_copy_segment(&mut w, 0x406_1200, 360, 18, COPY_SEG_PENDING, RD_OK, scan_status::COMPLETE, 11, &sems);
+        write_copy_segment(&mut w, 0x406_1880, 4, 20, COPY_SEG_BACKLOG, RD_NOT_MAPPED, scan_status::READ_FAILED, 0, &[]);
+        end_copy(&mut w, mark, 2, C_ASYNC | C_SEGS_TRUNCATED);
+        let len = w.len();
+        assert!(!w.overflowed());
+        assert_eq!(len, COPY_FIXED + 2 * COPY_SEG_FIXED + COPY_SEM_CAP * SEM_BYTES);
+        let u32_at = |at: usize| u32::from_le_bytes([buf[at], buf[at + 1], buf[at + 2], buf[at + 3]]);
+        let u64_at = |at: usize| u32_at(at) as u64 | (u32_at(at + 4) as u64) << 32;
+        assert_eq!(u32_at(0) as usize, len);
+        assert_eq!(u32_at(4), REC_COPY);
+        assert_eq!(u32_at(8), 2);
+        assert_eq!(u32_at(12), C_ASYNC | C_SEGS_TRUNCATED);
+        assert_eq!(u64_at(16), 0xffff_8000_1234_0000);
+        assert_eq!((u32_at(32), u32_at(36)), (300, 250));
+        assert_eq!(u64_at(40), 17);
+        assert_eq!(u64_at(48), 21);
+        assert_eq!(u32_at(72), 2);
+        assert_eq!(u32_at(76), 50);
+        assert_eq!(u64_at(80), 20);
+        assert_eq!(u64_at(88), 18);
+        assert_eq!(u32_at(96), 2);
+        assert_eq!(u32_at(100), 4100);
+        let seg = COPY_FIXED;
+        assert_eq!(u64_at(seg), 0x406_1200);
+        assert_eq!(u32_at(seg + 12), 18);
+        assert_eq!(u32_at(seg + 28), 11);
+        assert_eq!(u32_at(seg + 32), COPY_SEM_CAP as u32);
+        // The acquire survived the cap and comes first (stream order).
+        let first = seg + COPY_SEG_FIXED;
+        assert_eq!(buf[first + 3] & SEM_ACQUIRE, SEM_ACQUIRE);
+        assert_eq!(u64_at(first + 16), 0x852d008);
+        assert_eq!(u32_at(first + 32), u32::MAX);
+        let second = seg + COPY_SEG_FIXED + COPY_SEM_CAP * SEM_BYTES;
+        assert_eq!(u32_at(second + 16), COPY_SEG_BACKLOG);
+        assert_eq!(u32_at(second + 20), RD_NOT_MAPPED);
+        assert!(COPY_MAX_BYTES < BLOB_CAP / 8);
+    }
+
+    #[test]
+    fn the_watch_can_match_acquires_too() {
+        // host SEM_ADDR_LO/HI, PAYLOAD_LO/HI, SEM_EXECUTE: ACQUIRE(eq) 5 at 0x852d070, then a
+        // copy release of 5 to it on subchannel 4.
+        let words = [
+            0x2005_e017u32, 0x0852_d070, 0, 5, 0, 0,
+            0x2004_8090, 0, 0x0852_d070, 5, 0, 0x2001_80c0, 0x0000_000c,
+        ];
+        let mut s = Scanner::new(DEFAULT_CLASSES);
+        s.set_watch(&[0x852d070]);
+        s.begin_segment(u32::MAX);
+        for w in words {
+            s.feed(w);
+        }
+        assert_eq!(s.hits().len(), 1);
+        assert!(!s.hits()[0].acquire());
+        let mut s = Scanner::new(DEFAULT_CLASSES);
+        s.set_watch_all(&[0x852d070]);
+        s.begin_segment(u32::MAX);
+        for w in words {
+            s.feed(w);
+        }
+        assert_eq!(s.hits().len(), 2);
+        assert!(s.hits()[0].acquire());
+        assert_eq!(s.hits()[0].payload, 5);
+        assert_eq!(s.hits()[1].payload, 5);
+        // set_watch again turns acquires off.
+        s.set_watch(&[0x852d070]);
+        assert!(!s.watch_acquires);
+    }
+
+    #[test]
+    fn nop_entries_and_skipping_them() {
+        assert!(is_nop(gp_entry(0, 0)));
+        // A control entry with the sync bit is still a NOP.
+        assert!(is_nop(gp_entry(0, 0x8000_0200)));
+        assert!(!is_nop(gp_entry(0x082c_d200, 0x0001_1a00)));
+        // PB_EXTENDED_BASE (opcode 4) is not.
+        assert!(!is_nop(gp_entry(0x100, 4)));
+        // Steel Nomad 293: [133..154) with its real entry at 153.
+        assert_eq!(skip_nops(133, 154, 8192, Some(20)), 153);
+        assert_eq!(skip_nops(133, 154, 8192, Some(0)), 133);
+        assert_eq!(skip_nops(133, 154, 8192, None), 133);
+        // Past the range: unchanged.
+        assert_eq!(skip_nops(133, 154, 8192, Some(21)), 133);
+        // Wrapping range.
+        assert_eq!(skip_nops(8190, 4, 8192, Some(3)), 1);
+        assert_eq!(skip_nops(5, 9, 0, Some(1)), 5);
+    }
+
+    fn inc(sc: u32, method: u32, count: u32) -> u32 {
+        (1 << 29) | (count << 16) | (sc << 13) | (method >> 2)
+    }
+
+    fn feed_all(s: &mut Scanner, words: &[u32]) {
+        for w in words {
+            if !s.feed(*w) {
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn watched_releases_beyond_the_sem_cap() {
+        let mut s = Scanner::new(DEFAULT_CLASSES);
+        s.set_watch(&[0x852d070, 0x5000_0004]);
+        s.begin_segment(u32::MAX);
+        // 20 unrelated releases fill the SEM_CAP record, then one to the target.
+        for i in 0..20u32 {
+            feed_all(&mut s, &[inc(0, 0x5c, 5), 0x1000 + 8 * i, 0, i, 0, 1]);
+        }
+        feed_all(&mut s, &[inc(0, 0x5c, 5), 0x852d070, 0, 5, 0, 1]);
+        // An acquire of the target is not a hit.
+        feed_all(&mut s, &[inc(0, 0x5c, 5), 0x852d070, 0, 6, 0, 0]);
+        // A 64-bit release whose upper half is the second target.
+        feed_all(&mut s, &[inc(0, 0x5c, 5), 0x5000_0000, 0, 7, 0, (1 << 24) | 1]);
+        assert_eq!(s.sems().len(), SEM_CAP);
+        assert_eq!(s.hits_seen, 2);
+        let hits = s.hits();
+        assert_eq!(hits.len(), 2);
+        assert_eq!((hits[0].addr, hits[0].payload), (0x852d070, 5));
+        assert_eq!(hits[1].addr, 0x5000_0000);
+        // The next segment starts with no hits, the watch stays.
+        s.begin_segment(u32::MAX);
+        assert!(s.hits().is_empty());
+        assert_eq!(s.n_watch, 2);
+    }
+
+    #[test]
+    fn release_record_layout() {
+        let mut r = ReleaseScan::new();
+        assert!(r.add_target(0xaa, 0x852d070));
+        assert!(r.add_target(0xaa, 0x852d070));
+        assert!(r.add_target(0xbb, 0x1000));
+        assert_eq!(r.n_targets, 2);
+        let (t, n) = r.targets_of(0xaa);
+        assert_eq!(&t[..n], &[0x852d070]);
+        let op = SemOp { kind: sem_kind::HOST, op: 1, addr: 0x852d070, payload: 4, at: 11, ..SemOp::default() };
+        r.note(0xaa, &[op], 1, 0x82cd200, 0x4000_0031, 99, rel_source::NATIVE_RING);
+        let mut buf = [0u8; 1024];
+        let mut w = Writer::new(&mut buf);
+        write_releases(&mut w, &r);
+        let len = w.len();
+        assert_eq!(len, REL_FIXED + 2 * REL_TARGET_BYTES + REL_BYTES);
+        let u32_at = |at: usize| u32::from_le_bytes(buf[at..at + 4].try_into().unwrap());
+        let u64_at = |at: usize| u64::from_le_bytes(buf[at..at + 8].try_into().unwrap());
+        assert_eq!(u32_at(0) as usize, len);
+        assert_eq!(u32_at(4), REC_RELEASES);
+        assert_eq!((u32_at(8), u32_at(12), u32_at(16)), (2, 1, 1));
+        let h = REL_FIXED + 2 * REL_TARGET_BYTES;
+        assert_eq!(u64_at(h), 0xaa);
+        assert_eq!(u64_at(h + 8), 0x852d070);
+        assert_eq!(u64_at(h + 24), 4);
+        assert_eq!(u64_at(h + 32), 0x82cd200);
+        assert_eq!((u32_at(h + 40), u32_at(h + 44), u32_at(h + 48)), (0x4000_0031, 99, 11));
+        assert_eq!(&buf[h + 52..h + 56], &[sem_kind::HOST, 1, 0, rel_source::NATIVE_RING]);
+        assert!(REL_MAX_BYTES >= len);
+    }
+
+    #[test]
+    fn knob() {
+        assert_eq!(snap_timeout_100ns(0), None);
+        assert_eq!(snap_timeout_100ns(u32::MAX), None);
+        assert_eq!(snap_timeout_100ns(100), Some(500 * 10_000));
+        assert_eq!(snap_timeout_100ns(3000), Some(3000 * 10_000));
+        assert_eq!(snap_timeout_100ns(10_000_000), Some(600_000 * 10_000));
+    }
+
+    #[test]
+    fn token_fields() {
+        // GB202: VECTOR 11:0, RUNLIST_ID 22:16, RUNLIST_DOORBELL 30.
+        let token = (1 << 30) | (0xd << 16) | 0x37;
+        assert_eq!(token_chid(token), 0x37);
+        assert_eq!(token_runlist(token), 0xd);
+    }
+
+    #[test]
+    fn gp_entry_fields() {
+        let e = gp_entry(0x1234_5678 | 1, (0x40 << 10) | 0x12 | (1 << 9) | (1 << 31));
+        assert_eq!(e.va, 0x12_1234_5678);
+        assert_eq!(e.dwords, 0x40);
+        assert!(e.subroutine && e.sync_wait && e.conditional);
+        // nv_copy's encoding round-trips.
+        let (lo, hi) = crate::nv_copy::GpEntry { va: 0x7f_dead_b000, dwords: 7 }.encode();
+        let d = gp_entry(lo, hi);
+        assert_eq!((d.va, d.dwords), (0x7f_dead_b000, 7));
+    }
+
+    #[test]
+    fn window_and_segments() {
+        assert_eq!(window_first(10, 1024), 6);
+        assert_eq!(window_first(2, 1024), 1022);
+        assert_eq!(window_first(0, 4), 1);
+        let h = |fence: u64, before: u32, after: u32| Submission { fence, before, after };
+        let history = [h(56, 140, 142), h(57, 142, 145), h(58, 145, 148), h(59, 148, 150), Submission::default()];
+        assert_eq!(stuck_submission(&history, 57), Some(h(58, 145, 148)));
+        assert_eq!(stuck_submission(&history, 59), None);
+        assert_eq!(focus_range(&history, 57, 154, 8192), (145, 148));
+        assert_eq!(focus_range(&history, 59, 154, 8192), (153, 154));
+        assert_eq!(focus_range(&history, 59, 0, 8192), (8191, 0));
+        let seg = |va: u64| GpEntry { va, dwords: 16, ..GpEntry::default() };
+        let mut w = [GpEntry::default(); WINDOW];
+        for (i, e) in w.iter_mut().enumerate() {
+            *e = seg(0x1000 * (i as u64 + 1));
+        }
+        // Focus 145..148 with the window from 141: positions 4..7, and 2 before.
+        let first = window_first(145, 8192);
+        assert_eq!(first, 141);
+        let (p, n) = pick_segments(&w, first, 8192, 145, 148);
+        assert_eq!(&p[..n], &[2, 3, 4, 5, 6]);
+        // A control entry before the focus is skipped.
+        w[3].dwords = 0;
+        let (p, n) = pick_segments(&w, first, 8192, 145, 148);
+        assert_eq!(&p[..n], &[1, 2, 4, 5, 6]);
+        // A long focus is cut at MAX_SEGMENTS.
+        let (p, n) = pick_segments(&w, first, 8192, 145, 157);
+        assert_eq!(n, MAX_SEGMENTS);
+        assert_eq!(&p[..n], &[1, 2, 4, 5, 6, 7, 8, 9]);
+        // Ring wrap: focus 8191..1.
+        let first = window_first(8191, 8192);
+        let (p, n) = pick_segments(&w, first, 8192, 8191, 1);
+        assert_eq!(&p[..n], &[1, 2, 4, 5]);
+    }
+
+    #[test]
+    fn host_acquire_and_release() {
+        let mut s = Scanner::new(DEFAULT_CLASSES);
+        s.begin_segment(u32::MAX);
+        feed_all(
+            &mut s,
+            &[
+                0,
+                inc(0, 0x5c, 5),
+                0x89ab_cdec,
+                0x12,
+                7,
+                0,
+                (1 << 24) | 3, // ACQ_CIRC_GEQ, 64-bit
+                inc(0, 0x5c, 5),
+                0x1000,
+                0x1,
+                9,
+                0,
+                1, // RELEASE
+            ],
+        );
+        let sems = s.sems();
+        assert_eq!(sems.len(), 2);
+        assert_eq!(sems[0].kind, sem_kind::HOST);
+        assert!(sems[0].acquire());
+        assert_eq!(sems[0].addr, 0x12_89ab_cdec);
+        assert_eq!(sems[0].payload, 7);
+        assert_eq!(sems[0].at, 6);
+        assert!(!sems[1].acquire());
+        assert_eq!(sems[1].addr, 0x1_0000_1000);
+    }
+
+    #[test]
+    fn gr_semaphores_and_immediate() {
+        let mut s = Scanner::new(DEFAULT_CLASSES);
+        s.begin_segment(u32::MAX);
+        feed_all(
+            &mut s,
+            &[
+                inc(0, 0x158, 5),
+                5,
+                0,
+                0x2000,
+                0x3,
+                (1 << 27) | 1, // ACQUIRE, 64-bit payload
+                inc(1, 0x1b00, 4),
+                0x4,
+                0x3000,
+                11,
+                0, // RELEASE
+                inc(0, 0x158, 5),
+                1,
+                0,
+                0,
+                0,
+                2, // REPORT_ONLY: not recorded
+            ],
+        );
+        let sems = s.sems();
+        assert_eq!(sems.len(), 2);
+        assert_eq!((sems[0].kind, sems[0].addr, sems[0].payload), (sem_kind::GR_EXEC, 0x3_0000_2000, 5));
+        assert!(sems[0].acquire());
+        assert_eq!((sems[1].kind, sems[1].addr, sems[1].payload), (sem_kind::GR_LEGACY, 0x4_0000_3000, 11));
+        assert_eq!(sems[1].class, 0xcec0);
+        assert_eq!(s.sems_seen, 2);
+    }
+
+    #[test]
+    fn mme_dma_and_pairs() {
+        let mut s = Scanner::new(DEFAULT_CLASSES);
+        s.begin_segment(u32::MAX);
+        feed_all(&mut s, &[inc(0, 0x550, 2), 0x7f, 0xdead_0000]);
+        // The address carries over into the next segment.
+        s.begin_segment(u32::MAX);
+        let immd_read = (4 << 29) | (6 << 16) | (0x55c >> 2); // MME_DMA_READ, immediate: 6 dwords
+        feed_all(
+            &mut s,
+            &[
+                immd_read,
+                inc(0, 0x560, 1),
+                12,
+                inc(0, 0x2380, 3),
+                0x100,
+                0x5,
+                0xbeef_0000,
+                inc(0, 0x3800, 2),
+                1,
+                2,
+                inc(1, 0x2b4, 1),
+                0x1234_5600,
+            ],
+        );
+        let refs = s.refs();
+        assert_eq!(refs.len(), 4);
+        assert_eq!((refs[0].tag, refs[0].va, refs[0].len), (tag::MME_READ, 0x7f_dead_0000, 6));
+        assert_eq!(refs[0].flags, REF_HI_SEEN);
+        assert_eq!((refs[1].tag, refs[1].len), (tag::MME_READ_FIFOED, 12));
+        assert_eq!((refs[2].tag, refs[2].va, refs[2].len), (tag::CONSTANT_BUFFER, 0x5_beef_0000, 0x100));
+        assert_eq!((refs[3].tag, refs[3].va), (tag::QMD, 0x12_3456_0000));
+        assert_eq!(s.mme_calls, 1);
+    }
+
+    #[test]
+    fn set_object_and_copy_release() {
+        let mut s = Scanner::new([0; 8]);
+        s.begin_segment(u32::MAX);
+        feed_all(
+            &mut s,
+            &[
+                inc(4, 0, 1),
+                0xcab5,
+                inc(4, 0x240, 4),
+                0x1,
+                0x40,
+                3,
+                0,
+                inc(4, 0x300, 1),
+                1 << 3,
+            ],
+        );
+        assert_eq!(s.classes[4], 0xcab5);
+        let sems = s.sems();
+        assert_eq!(sems.len(), 1);
+        assert_eq!((sems[0].kind, sems[0].addr, sems[0].payload), (sem_kind::COPY, 0x1_0000_0040, 3));
+    }
+
+    #[test]
+    fn noninc_oneinc_and_tail_alignment() {
+        let mut s = Scanner::new(DEFAULT_CLASSES);
+        s.begin_segment(4);
+        // NONINC 3 to 0x5c: all three land on SEM_ADDR_LO; ONE_INC to 0x64: 7 -> PAYLOAD_LO,
+        // the rest -> PAYLOAD_HI.
+        let noninc = (3 << 29) | (3 << 16) | (0x5c >> 2);
+        let oneinc = (5 << 29) | (3 << 16) | (0x64 >> 2);
+        feed_all(&mut s, &[noninc, 1, 2, 0x100, oneinc, 7, 8, 9, inc(0, 0x6c, 1), 0]);
+        assert_eq!(s.tail_aligned, 4);
+        let sem = s.sems()[0];
+        assert_eq!(sem.addr, 0x100);
+        assert_eq!(sem.payload, 7);
+        assert_eq!(s.host, [0x100, 0, 7, 9]);
+    }
+
+    #[test]
+    fn lost_and_end() {
+        let mut s = Scanner::new(DEFAULT_CLASSES);
+        s.begin_segment(u32::MAX);
+        assert!(!s.feed(6 << 29));
+        assert_eq!(s.lost_at, Some(0));
+        s.begin_segment(u32::MAX);
+        assert!(s.feed(0));
+        assert!(!s.feed(7 << 29));
+        assert!(s.ended);
+        assert!(!s.feed(0));
+    }
+
+    #[test]
+    fn sem_cap_keeps_acquires() {
+        let mut s = Scanner::new(DEFAULT_CLASSES);
+        s.begin_segment(u32::MAX);
+        for _ in 0..SEM_CAP {
+            feed_all(&mut s, &[inc(0, 0x6c, 1), 1]);
+        }
+        feed_all(&mut s, &[inc(0, 0x6c, 1), 0]);
+        assert_eq!(s.sems_seen, SEM_CAP as u32 + 1);
+        assert!(s.sems().iter().any(|x| x.acquire()));
+    }
+
+    #[test]
+    fn stall_watch() {
+        let t = Some(3_000 * 10_000u64);
+        let ms = |n: u64| n * 10_000;
+        let mut w = StallWatch::new();
+        let s = |now: u64, busy: bool, progress: u64| StallSample {
+            now,
+            busy,
+            progress,
+            gp_get: 0,
+            error: false,
+        };
+        assert_eq!(w.tick(s(ms(0), true, 5), t), Trigger::None);
+        assert_eq!(w.tick(s(ms(2_000), true, 5), t), Trigger::None);
+        assert_eq!(w.stalled_ms(ms(2_000)), 2_000);
+        assert_eq!(w.tick(s(ms(3_000), true, 5), t), Trigger::Stall);
+        assert_eq!(w.tick(s(ms(7_000), true, 5), t), Trigger::None);
+        // The stall goes on: again after REPEAT.
+        assert_eq!(w.tick(s(ms(8_000), true, 5), t), Trigger::Stall);
+        assert_eq!(w.tick(s(ms(9_000), true, 5), t), Trigger::None);
+        // Progress re-arms.
+        assert_eq!(w.tick(s(ms(9_500), true, 6), t), Trigger::None);
+        assert_eq!(w.tick(s(ms(12_500), true, 6), t), Trigger::Stall);
+        // Idle (nothing outstanding) clears.
+        assert_eq!(w.tick(s(ms(13_000), false, 6), t), Trigger::None);
+        assert_eq!(w.stalled_ms(ms(20_000)), 0);
+        assert_eq!(w.tick(s(ms(30_000), false, 6), t), Trigger::None);
+        // Off.
+        assert_eq!(w.tick(s(ms(31_000), true, 6), None), Trigger::None);
+        assert_eq!(w.tick(s(ms(99_000), true, 6), None), Trigger::None);
+        // An error once.
+        let mut e = s(ms(100_000), true, 6);
+        e.error = true;
+        assert_eq!(w.tick(e, t), Trigger::Error);
+        assert_eq!(w.tick(e, None), Trigger::None);
+    }
+
+    /// A whole snapshot through the same writers the KMD uses: the record sizes match the
+    /// documented layout, and with `NSNP_FIXTURE=<path>` the blob is written there for
+    /// `snapdec.py` to decode.
+    #[test]
+    fn fixture_blob() {
+        extern crate std;
+        let mut buf = [0u8; 16 * 1024];
+        let mut store = [VaEntry::default(); 16];
+        let mut table = VaTable::new(&mut store);
+        let mut w = Writer::new(&mut buf);
+        let token = (1 << 30) | (2 << 16) | 0x37;
+        write_header(&mut w, 1, reason::AUTO, token, 50_000_000, 3000, 10_000, 1234, 99);
+        let mut userd = [0u32; USERD_DWORDS];
+        userd[0x88 / 4] = 11;
+        userd[0x8c / 4] = 12;
+        userd[0x44 / 4] = 0x0010_0040;
+        userd[0x60 / 4] = 0x1;
+        let mut window = [(0u32, 0u32); WINDOW];
+        for (i, e) in window.iter_mut().enumerate() {
+            let va = 0x1_0010_0000u64 + 0x1000 * i as u64;
+            *e = crate::nv_copy::GpEntry { va, dwords: 32 }.encode();
+        }
+        let mut history = [Submission::default(); HISTORY];
+        history[0] = Submission { fence: 76, before: 8, after: 10 };
+        history[1] = Submission { fence: 77, before: 10, after: 12 };
+        let (focus_start, focus_end) = focus_range(&history, 76, 12, 1024);
+        assert_eq!((focus_start, focus_end), (10, 12));
+        let q = QueueFields {
+            slot: 3,
+            node: 0,
+            pid: 4242,
+            flags: Q_GRAPHICS | Q_OUTSTANDING | Q_DETAIL | Q_TRIGGER | Q_FOCUS_FROM_HISTORY,
+            token,
+            hw_tsg: 0x1c,
+            process: 0xffff_8000_1234_0000,
+            gpfifo_va: 0x1_0000_0000,
+            ring_entries: 1024,
+            kmd_gp_put: 12,
+            gp_get: 11,
+            userd_gp_put: 12,
+            submitted: 77,
+            signalled: 76,
+            fence_now: 76,
+            fence_gpu: 0x2_0000_0000,
+            stall_ms: 3100,
+            window_first: window_first(focus_start, 1024),
+            window_n: WINDOW as u32,
+            focus_start,
+            focus_end,
+            last_lo: window[7].0,
+            last_hi: window[7].1,
+            history_n: 2,
+            ..QueueFields::default()
+        };
+        let mark = begin_queue(&mut w, &q, &userd, &window, &history);
+        let qrec = w.len() - mark.start;
+        assert_eq!(qrec, QREC_FIXED);
+        // One segment: an MME DMA read of an address, a host acquire, a release.
+        let inc = |sc: u32, m: u32, n: u32| (1 << 29) | (n << 16) | (sc << 13) | (m >> 2);
+        let words = [
+            inc(0, 0x550, 2),
+            0x3,
+            0x4560_0000,
+            inc(0, 0x560, 1),
+            16,
+            inc(0, 0x3800, 1),
+            0,
+            inc(0, 0x5c, 5),
+            0x0,
+            0x2,
+            5,
+            0,
+            3,
+            inc(0, 0x168, 1),
+            0,
+        ];
+        let mut sc = Scanner::new(DEFAULT_CLASSES);
+        sc.begin_segment(0);
+        for d in words {
+            sc.feed(d);
+        }
+        let seg_va = 0x1_0010_0000u64 + 0x1000 * 4;
+        let (picks, n) = pick_segments(
+            &window.map(|(lo, hi)| gp_entry(lo, hi)),
+            q.window_first,
+            1024,
+            focus_start,
+            focus_end,
+        );
+        assert_eq!(&picks[..n], &[2, 3, 4, 5]);
+        let seg_index = table.intern(q.process, seg_va).unwrap().0;
+        let f = SegFields {
+            index: 10,
+            va: seg_va,
+            len: words.len() as u32,
+            scanned: words.len() as u32,
+            lost_at: u32::MAX,
+            sems_seen: sc.sems_seen,
+            n_sems: sc.sems().len() as u32,
+            tail_aligned: sc.tail_aligned,
+            n_head: words.len() as u32,
+            n_tail: words.len() as u32,
+            mme_calls: sc.mme_calls,
+            refs_seen: sc.refs_seen,
+            n_refs: sc.refs().len() as u32,
+            va_index: seg_index,
+            flags: S_FOCUS | S_FOCUS_FIRST,
+            ..SegFields::default()
+        };
+        let sm = begin_segment(&mut w, &f);
+        assert_eq!(w.len() - sm.start, SEG_FIXED);
+        for d in words.iter().chain(words.iter()) {
+            w.u32(*d);
+        }
+        for s in sc.sems() {
+            let i = table.intern(q.process, s.addr).unwrap().0;
+            write_sem(&mut w, s, i);
+        }
+        for r in sc.refs() {
+            let i = table.intern(q.process, r.va).unwrap().0;
+            write_ref(&mut w, r, i);
+        }
+        end_segment(&mut w, sm);
+        end_queue(&mut w, mark, 1);
+        // Resolve: the acquire's semaphore holds 4 (wait for 5), the MME address is unmapped.
+        for e in table.entries[..table.n].iter_mut() {
+            if e.va == 0x2_0000_0000 {
+                e.hit = HIT_FOREIGN;
+                e.piece_va = e.va;
+                e.piece_len = 0x1000;
+                e.value = 4;
+                e.value_status = RD_OK;
+            } else if e.va == seg_va {
+                e.hit = HIT_NATIVE_SYSTEM;
+                e.id = 9;
+                e.flags = V_RESIDENT_KNOWN;
+                e.resident_pa = 0x1234_5000;
+                e.value_status = RD_OK;
+            } else {
+                e.hit = HIT_NONE;
+                e.value_status = RD_NOT_MAPPED;
+                e.ring_kind = K_UNMAP_FOR_TEST;
+                e.ring_t = 40_000_000;
+                e.ring_va = 0x3_4560_0000;
+                e.ring_len = 0x10000;
+            }
+        }
+        write_va_table(&mut w, table.used(), true);
+        finish_header(&mut w, 1, 321, 0);
+        assert!(!w.overflowed());
+        let len = w.len();
+        if let Some(path) = std::env::var_os("NSNP_FIXTURE") {
+            std::fs::write(path, &buf[..len]).unwrap();
+        }
+    }
+
+    const K_UNMAP_FOR_TEST: u32 = crate::pt_ring::K_UNMAP as u32;
+
+    #[test]
+    fn writer_and_layout() {
+        let mut buf = [0u8; 4096];
+        let mut w = Writer::new(&mut buf);
+        write_header(&mut w, 3, reason::MANUAL, 0x37, 0x1122, 3000, 10_000, 5, 6);
+        assert_eq!(w.len(), HDR_BYTES);
+        let mut store = [VaEntry::default(); 4];
+        let mut t = VaTable::new(&mut store);
+        let (i, new) = t.intern(1, 0x1000).unwrap();
+        assert!(new && i == 0);
+        assert_eq!(t.intern(1, 0x1000), Some((0, false)));
+        assert_eq!(t.intern(2, 0x1000), Some((1, true)));
+        let at = w.len();
+        write_va_table(&mut w, t.used(), true);
+        assert_eq!(w.len() - at, VA_FIXED + 2 * VA_BYTES);
+        let at = w.len();
+        write_sem(&mut w, &SemOp::default(), 0);
+        assert_eq!(w.len() - at, SEM_BYTES);
+        let at = w.len();
+        write_ref(&mut w, &AddrRef::default(), 0);
+        assert_eq!(w.len() - at, REF_BYTES);
+        finish_header(&mut w, 0, 7, FLAG_BUDGET);
+        let total = w.len() as u32;
+        assert_eq!(&buf[0..4], b"NSNP");
+        assert_eq!(u32::from_le_bytes(buf[12..16].try_into().unwrap()), total);
+        assert_eq!(u32::from_le_bytes(buf[52..56].try_into().unwrap()), FLAG_BUDGET);
+        // Overflow is remembered.
+        let mut small = [0u8; 3];
+        let mut w = Writer::new(&mut small);
+        w.u32(1);
+        assert!(w.overflowed());
+        // The table refuses past its size.
+        let mut store = [VaEntry::default(); 1];
+        let mut t = VaTable::new(&mut store);
+        assert!(t.intern(0, 1).is_some());
+        assert!(t.intern(0, 2).is_none());
+        assert!(t.full);
+    }
+}

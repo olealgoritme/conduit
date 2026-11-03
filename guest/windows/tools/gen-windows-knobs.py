@@ -19,7 +19,8 @@ What is extracted:
   * KMD service key: the `knobs` module of kmd_render/src/diag.rs and every
     read_config_dword(knobs::X, default) (direct or through a one-level
     wrapper function), defaults resolved through `const` items in kmd_render
-    and kmd_logic.
+    and kmd_logic; a knob read with read_config_sz/read_parameters_sz is a
+    REG_SZ.
   * HKLM\\SOFTWARE\\Helios: BoolKnob/DwordKnob definitions, the ad hoc
     reg_dword/reg_sz reads of the Rust UMDs, the C/C++ bridge and policy
     header reads, and the install scripts' reads.
@@ -293,7 +294,11 @@ def extract_kmd(inv: Inventory) -> dict[str, str]:
             name = const_to_name[const]
             default = kmd_default_at(code, um.start(), f, wrappers, consts)
             src = f"{rel(f)}:{line_of(code, um.start())}"
-            inv.get(KMD_SECTION, name, "REG_DWORD").add(default, src)
+            knob = inv.get(KMD_SECTION, name, "REG_DWORD")
+            knob.add(default, src)
+            call = enclosing_call(code, um.start())
+            if call and call[0] in SZ_READERS:
+                knob.type = "REG_SZ"
     return const_to_name
 
 
@@ -337,11 +342,17 @@ def use_aliases(code: str) -> dict[str, str]:
     return out
 
 
+# The KMD's REG_SZ readers (diag.rs): `(knobs::X, absent, decode)`.
+SZ_READERS = ("read_config_sz", "read_parameters_sz")
+
+
 def kmd_default_at(code, pos, f, wrappers, consts) -> str | None:
     call = enclosing_call(code, pos)
     if call is None:
         return None
     ident, open_pos, argidx = call
+    if ident in SZ_READERS:
+        return "absent"
     if ident == "read_config_dword":
         args, _ = balanced_args(code, open_pos)
         if len(args) == 2:
@@ -806,7 +817,8 @@ def default_cell(k: Knob, d: dict) -> str:
 SECTION_TITLES = {
     KMD_SECTION: (
         "KMD: service key",
-        "`HKLM\\SYSTEM\\CurrentControlSet\\Services\\helios_kmd_render`, REG_DWORD. Read by the kernel driver "
+        "`HKLM\\SYSTEM\\CurrentControlSet\\Services\\helios_kmd_render`, REG_DWORD unless the Type column "
+        "says otherwise. Read by the kernel driver "
         "(`helios_kmd_render.sys`); most are read again at every StartDevice, so `pnputil /restart-device` "
         "applies them, the rest need a reboot (the Read column says which).",
     ),

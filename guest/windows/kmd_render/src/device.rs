@@ -39,7 +39,11 @@ pub struct DeviceContext {
 pub enum StashedMarker {
     /// A registered Venus stream point `(ctx, value, cookie)`; the Present resolves
     /// it against the stream table.
-    Stream { ctx_id: u32, value: u32, cookie: u64 },
+    Stream {
+        ctx_id: u32,
+        value: u32,
+        cookie: u64,
+    },
     /// An RM fence already attached at Render (`docs/rm-fence-marker.md`): the
     /// boundary it named. Attaching takes the fence over, so it happens exactly once,
     /// at Render, and Present only carries the result.
@@ -137,6 +141,29 @@ pub struct ContextContext {
     /// a pending record.
     flush_pending: crate::sync::SpinLock<Option<helios_kmd_logic::flush_trace::PendingFlush>>,
     flush_pending_flag: AtomicU32,
+    /// `DXGKARG_CREATECONTEXT.NodeOrdinal`, kept for the NVIDIA personality's
+    /// HW queues (their progress interrupts name the node). Unread otherwise.
+    node_ordinal: u32,
+    /// NVIDIA personality only (`ddi::hws`): the native Blackwell TSG behind a
+    /// context created with NVDA private data. `None` for every other context,
+    /// and always `None` in the default personality.
+    native: Option<alloc::boxed::Box<crate::virtio::native_channel::NativeContext>>,
+    /// NVIDIA personality only: what the WDDM 2.7 scheduling DDIs stored for
+    /// this context (`ddi::hws`). Plain atomics; untouched otherwise.
+    hws: crate::ddi::hws::ContextSched,
+    /// `DXGKARG_CREATECONTEXT.Flags.Value`. Read by the NVIDIA personality's
+    /// software HW queues (`ddi::hws`) to tell dxgkrnl's own contexts apart.
+    create_flags: u32,
+    /// NVIDIA personality only: the context was created with NVDA private data
+    /// (native TSG or not). Always `false` in the default personality.
+    nvda: bool,
+    /// NVIDIA personality only: live software HW queues on this context
+    /// (`ddi::hws::SoftQueue`). 0 in the default personality.
+    soft_queues: AtomicU32,
+    /// NVIDIA personality only: a `SignalMonitoredFence` held for the next
+    /// software-queue submission on this context (`ddi::hws`). Never set in the
+    /// default personality.
+    smf_stash: crate::sync::SpinLock<Option<helios_kmd_logic::hws::FenceWrite>>,
 }
 
 /// Typed borrowed view of a scheduler context handle.
@@ -180,6 +207,49 @@ impl<'a> ContextHandleRef<'a> {
             self.context.execution_stream.load(Ordering::Acquire),
         )
         .unwrap_or(0)
+    }
+
+    /// NVIDIA personality: the native TSG of an NVDA-private context.
+    pub(crate) fn native(&self) -> Option<&'a crate::virtio::native_channel::NativeContext> {
+        self.context.native.as_deref()
+    }
+
+    /// `DXGKARG_CREATECONTEXT.NodeOrdinal` of this context.
+    pub fn node_ordinal(&self) -> u32 {
+        self.context.node_ordinal
+    }
+
+    /// The raw adapter back-pointer, for a HW queue that stores it.
+    pub fn adapter_ptr(&self) -> *mut AdapterContext {
+        unsafe { self.context.device.as_ref() }
+            .map_or(core::ptr::null_mut(), |device| device.adapter)
+    }
+
+    /// NVIDIA personality: the scheduling state `ddi::hws` stores.
+    pub(crate) fn hws(&self) -> &'a crate::ddi::hws::ContextSched {
+        &self.context.hws
+    }
+
+    /// `DXGKARG_CREATECONTEXT.Flags.Value` of this context.
+    pub fn create_flags(&self) -> u32 {
+        self.context.create_flags
+    }
+
+    /// NVIDIA personality: created with NVDA private data.
+    pub(crate) fn nvda(&self) -> bool {
+        self.context.nvda
+    }
+
+    /// NVIDIA personality: the live software HW queue count (`ddi::hws`).
+    pub(crate) fn soft_queues(&self) -> &'a AtomicU32 {
+        &self.context.soft_queues
+    }
+
+    /// NVIDIA personality: the held `SignalMonitoredFence` (`ddi::hws`).
+    pub(crate) fn smf_stash(
+        &self,
+    ) -> &'a crate::sync::SpinLock<Option<helios_kmd_logic::hws::FenceWrite>> {
+        &self.context.smf_stash
     }
 
     pub fn belongs_to_device(&self, device: HANDLE) -> bool {
@@ -322,7 +392,8 @@ impl<'a> ContextHandleRef<'a> {
         let mut slot = ctx.window_tag.lock();
         let orphan = slot.is_some();
         *slot = tag;
-        ctx.window_flag.store(u32::from(tag.is_some()), Ordering::Relaxed);
+        ctx.window_flag
+            .store(u32::from(tag.is_some()), Ordering::Relaxed);
         orphan
     }
 
@@ -471,23 +542,108 @@ impl<'a> DeviceHandleRef<'a> {
     pub fn creator_process(&self) -> usize {
         self.device.creator_process
     }
+
+    /// The process object which owns native-channel VA/RM state, when dxgkrnl
+    /// supplied one at CreateDevice.
+    pub fn native_process_ptr(&self) -> *mut ProcessContext {
+        self.device.creator_process as *mut ProcessContext
+    }
 }
 
-/// State for one GPU process object (WDDM 2.0 GPU-VA requirement). We keep no
-/// per-process GPU virtual address space (host-owned VA), but dxgkrnl requires a
-/// non-NULL driver handle it can round-trip through every per-process DDI and
-/// hand back at DestroyProcess, so we allocate a real object to back the handle.
-///
-/// DELIBERATELY EMPTY. It used to carry an `adapter` back-pointer that was
-/// written at CreateProcess and never read, which implied an ownership edge that
-/// does not exist. The allocation stays — dxgkrnl needs the non-NULL handle — but
-/// the object is an opaque token and nothing more.
+/// State for one GPU process object (WDDM 2.0 GPU-VA requirement). The legacy
+/// render path keeps its host-owned VA model. Native CUDA contexts lazily add
+/// an association with the native-memory RM client and VA space, shared by
+/// reference across that process's HW contexts.
 pub struct ProcessContext {
-    /// Zero-sized structs still get a unique non-null address from `Box`, but a
-    /// field makes the allocation's purpose (a handle dxgkrnl can round-trip)
-    /// legible and keeps `Box::into_raw` returning a real pointer under any
-    /// future allocator.
+    /// Kept nonzero-sized so `Box::into_raw` is a distinct opaque handle even
+    /// before native channel state is requested.
     _opaque: u32,
+    /// dxgkrnl's system process (VidMm paging, kernel contexts): it never owns
+    /// native (NVIDIA UMD) RM VA spaces.
+    system: bool,
+    /// Empty until the first native CreateHwContext. Host calls are made only
+    /// after taking the value out of this lock.
+    native: crate::sync::SpinLock<crate::virtio::native_channel::NativeProcessState>,
+    /// The process's EPROCESS, taken (and referenced until DestroyProcess) at its first
+    /// native CreateContext, which runs in the calling process (0 = none yet): the exit
+    /// gate asks it whether the process exits. DXGKARG_CREATEPROCESS names no EPROCESS.
+    eprocess: core::sync::atomic::AtomicUsize,
+    /// The exit gate saw this process exiting (`NvTdExitP` counted once).
+    exit_seen: core::sync::atomic::AtomicBool,
+}
+
+extern "system" {
+    /// `PsGetProcessExitStatus`: `STATUS_PENDING` until the process begins to exit. Any IRQL
+    /// (a field read of a referenced EPROCESS).
+    fn PsGetProcessExitStatus(process: *mut c_void) -> NTSTATUS;
+    /// The calling thread's process (`PsGetCurrentProcess`). Any IRQL.
+    fn IoGetCurrentProcess() -> *mut c_void;
+}
+
+impl ProcessContext {
+    /// Whether `hKmdProcess` is dxgkrnl's system process. Null counts as system.
+    ///
+    /// # Safety
+    /// `h` is null or a handle `dxgkddi_create_process` returned and dxgkrnl
+    /// has not destroyed.
+    pub(crate) unsafe fn is_system_handle(h: usize) -> bool {
+        if h == 0 {
+            return true;
+        }
+        // SAFETY: per the contract.
+        unsafe { (*(h as *const ProcessContext)).system }
+    }
+    pub(crate) fn native_state(
+        &self,
+    ) -> &crate::sync::SpinLock<crate::virtio::native_channel::NativeProcessState> {
+        &self.native
+    }
+
+    /// Whether the process has begun to exit (`helios_kmd_logic::native_teardown::exit_begun`);
+    /// false when dxgkrnl gave no EPROCESS. Any IRQL.
+    pub(crate) fn exiting(&self) -> bool {
+        let eprocess = self.eprocess.load(core::sync::atomic::Ordering::Acquire);
+        if eprocess == 0 {
+            return false;
+        }
+        // SAFETY: referenced by `bind_eprocess`, dereferenced in DestroyProcess only.
+        let status = unsafe { PsGetProcessExitStatus(eprocess as *mut c_void) };
+        helios_kmd_logic::native_teardown::exit_begun(status)
+    }
+
+    /// Take the calling process's EPROCESS for the exit gate, once (the first native
+    /// CreateContext, in the process's own context). Not for the system process.
+    pub(crate) fn bind_eprocess(&self) {
+        use core::sync::atomic::Ordering;
+        if self.system || self.eprocess.load(Ordering::Acquire) != 0 {
+            return;
+        }
+        // `NvTdGate` 0: no gate, so no EPROCESS reference either.
+        if !crate::ddi::hws::exit_gate_on() {
+            return;
+        }
+        // SAFETY: no preconditions; the current process is live while it calls.
+        let current = unsafe { IoGetCurrentProcess() } as usize;
+        if current == 0 {
+            return;
+        }
+        // SAFETY: a live EPROCESS; the reference is dropped in DestroyProcess or below.
+        unsafe { wdk_sys::ntddk::ObfReferenceObject(current as wdk_sys::PVOID) };
+        if self
+            .eprocess
+            .compare_exchange(0, current, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            // Another thread bound it first.
+            // SAFETY: the reference just taken.
+            unsafe { wdk_sys::ntddk::ObfDereferenceObject(current as wdk_sys::PVOID) };
+        }
+    }
+
+    /// The first time the exit gate saw this process exiting (true once).
+    pub(crate) fn note_exit_seen(&self) -> bool {
+        !self.exit_seen.swap(true, core::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 /// `DxgkDdiCreateDevice` — allocate per-device state.
@@ -502,7 +658,9 @@ pub unsafe extern "C" fn dxgkddi_create_device(
     let args = unsafe { &mut *create_device };
     // `GdiAccel` census: GDI devices (`DXGK_CREATEDEVICEFLAGS.GdiDevice`). An atomic add.
     // SAFETY: `Flags` is the input arm of the union (`pInfo` is the obsolete output arm).
-    crate::ddi::gdi_accel::note_create_device(unsafe { args.__bindgen_anon_1.Flags.__bindgen_anon_1.Value });
+    crate::ddi::gdi_accel::note_create_device(unsafe {
+        args.__bindgen_anon_1.Flags.__bindgen_anon_1.Value
+    });
     let ctx = Box::new(DeviceContext {
         adapter: miniport_device_context as *mut AdapterContext,
         creator_process: args.hKmdProcess as usize,
@@ -664,6 +822,23 @@ pub unsafe extern "C" fn dxgkddi_create_context(
     h_device: *mut c_void,
     create_context: *mut DXGKARG_CREATECONTEXT,
 ) -> NTSTATUS {
+    // SAFETY: forwarded unchanged; `create_context_with` null-checks both.
+    unsafe { create_context_with(h_device, create_context, None, false) }
+}
+
+/// The body of [`dxgkddi_create_context`], with the NVIDIA personality's native
+/// TSG (`ddi::hws`) attached when it built one. `native` is always `None` and
+/// `nvda` always `false` on the default path, which this keeps byte-for-byte as
+/// it was.
+///
+/// # Safety
+/// As `DxgkDdiCreateContext`.
+pub(crate) unsafe fn create_context_with(
+    h_device: *mut c_void,
+    create_context: *mut DXGKARG_CREATECONTEXT,
+    native: Option<Box<crate::virtio::native_channel::NativeContext>>,
+    nvda: bool,
+) -> NTSTATUS {
     crate::diag::record(0x0800_0001);
     if h_device.is_null() || create_context.is_null() {
         return STATUS_INVALID_PARAMETER;
@@ -693,6 +868,13 @@ pub unsafe extern "C" fn dxgkddi_create_context(
         execution_stream: AtomicU64::new(0),
         flush_pending: crate::sync::SpinLock::new(None),
         flush_pending_flag: AtomicU32::new(0),
+        node_ordinal: args.NodeOrdinal,
+        native,
+        hws: crate::ddi::hws::ContextSched::new(),
+        create_flags,
+        nvda,
+        soft_queues: AtomicU32::new(0),
+        smf_stash: crate::sync::SpinLock::new(None),
     });
     args.hContext = Box::into_raw(ctx) as HANDLE;
     // `GdiAccel`: GDI contexts are counted and remembered (their submissions name their job by
@@ -723,6 +905,23 @@ pub unsafe extern "C" fn dxgkddi_create_context(
 pub unsafe extern "C" fn dxgkddi_destroy_context(h_context: *mut c_void) -> NTSTATUS {
     crate::diag::record(0x0800_0002);
     if !h_context.is_null() {
+        // NVIDIA personality: the Vulkan ICD's copy context's own channel
+        // (`ddi::nv_copy`); nothing when the context has none.
+        crate::ddi::nv_copy::destroy_context(h_context as usize);
+        // NVIDIA personality: a native TSG goes first (a TSG RM would not free
+        // is filed for DestroyProcess, `native_channel`). Every queue on it is
+        // gone by WDDM contract. Default path: `native` is always `None` and
+        // nothing here runs.
+        // SAFETY: dxgkrnl passes the live hContext CreateContext returned.
+        let context = unsafe { &mut *(h_context as *mut ContextContext) };
+        if let Some(native) = context.native.as_mut() {
+            // SAFETY: `DxgkDdiDestroyContext` is PASSIVE_LEVEL.
+            let passive = unsafe { crate::irql::PassiveLevel::assume() };
+            if let Err(status) = crate::ddi::hws::destroy_native_context(passive, native) {
+                return status;
+            }
+            context.native = None;
+        }
         // The context's RM gate (`virtio/gpu/rm_gates.rs`) goes with it, as a process's
         // gates go at DestroyProcess. One load when no gate is open anywhere.
         if crate::virtio::gpu::rm_gates_open() {
@@ -774,12 +973,69 @@ pub unsafe extern "C" fn dxgkddi_create_process(
     }
     // SAFETY: Dxgkrnl passes our adapter context and a valid args struct.
     let args = unsafe { &mut *args };
-    // The handle is an opaque token: dxgkrnl only round-trips it. The old
-    // `adapter` back-pointer here was written and never read.
-    let ctx = Box::new(ProcessContext { _opaque: 0 });
+    // The handle is an opaque token to dxgkrnl; native channel state is lazy.
+    // SAFETY: plain bitfield read of the flags union's struct arm.
+    let system = unsafe { args.Flags.__bindgen_anon_1.__bindgen_anon_1.SystemProcess() } != 0;
+    let ctx = Box::new(ProcessContext {
+        _opaque: 0,
+        system,
+        native: crate::sync::SpinLock::new(
+            crate::virtio::native_channel::NativeProcessState::Empty,
+        ),
+        eprocess: core::sync::atomic::AtomicUsize::new(0),
+        exit_seen: core::sync::atomic::AtomicBool::new(false),
+    });
     // Hand the process handle back to Dxgkrnl; reclaimed in destroy_process.
     args.hKmdProcess = Box::into_raw(ctx) as HANDLE;
+    if crate::ddi::wddm_surface::nvidia_selected() {
+        // SAFETY: dxgkrnl passes back the adapter context it was given.
+        if let Some(adapter) = unsafe { (miniport_device_context as *const AdapterContext).as_ref() } {
+            reserve_nvidia_va(adapter, args.hDxgkProcess, system);
+        }
+        // `NvTdGate` read here (PASSIVE), not first in a paging DDI.
+        let _ = crate::ddi::hws::exit_gate_on();
+    }
     STATUS_SUCCESS
+}
+
+/// The GPU VA NVIDIA's 610.88 KMD reserves from VidMm in every process
+/// (`DxgkCbReserveGpuVirtualAddressRange` at CreateProcess, from the L3
+/// capture): VidMm never hands these out, so RM's own mappings (which land
+/// above 4.5 GiB once `native_memory`'s low window fills [64 KiB, 4 GiB))
+/// cannot collide with a VidMm-assigned allocation VA. Without them RM's context buffers took VAs
+/// VidMm later gave the D3D11 UMD's GPFIFO (NV_ERR_INSUFFICIENT_RESOURCES).
+/// `NvVaRsvSt` records a refused reservation's status.
+fn reserve_nvidia_va(adapter: &AdapterContext, process: HANDLE, system: bool) {
+    const ALIGN: u32 = 0x2000_0000;
+    // (base, size, AllowUserModeMapping)
+    let ranges: &[(u64, u64, u32)] = if system {
+        &[(0x2000_0000, 0x2000_0000, 0)]
+    } else {
+        &[(0x2000_0000, 0xe000_0000, 1), (0x1_0000_0000, 0x1_0000_0000, 0)]
+    };
+    let Some(dxgkrnl) = adapter.dxgkrnl_opt() else {
+        crate::diag::record_named_bytes(b"NvVaRsvSt", 0xffff_fffe);
+        return;
+    };
+    let Some(reserve) = dxgkrnl.DxgkCbReserveGpuVirtualAddressRange else {
+        crate::diag::record_named_bytes(b"NvVaRsvSt", 0xffff_ffff);
+        return;
+    };
+    for &(base, size, user) in ranges {
+        // SAFETY: all-zero is a valid DXGKARGCB_RESERVEGPUVIRTUALADDRESSRANGE.
+        let mut range: crate::dxgk::DXGKARGCB_RESERVEGPUVIRTUALADDRESSRANGE =
+            unsafe { core::mem::zeroed() };
+        range.hDxgkProcess = process;
+        range.SizeInBytes = size;
+        range.Alignment = ALIGN;
+        range.BaseAddress = base;
+        range.__bindgen_anon_1.Flags = user;
+        // SAFETY: the live adapter's callback table, PASSIVE (CreateProcess).
+        let status = unsafe { reserve(dxgkrnl.DeviceHandle, &mut range) };
+        if status < 0 {
+            crate::diag::record_named_bytes(b"NvVaRsvSt", status as u32);
+        }
+    }
 }
 
 /// `DxgkDdiDestroyProcess` — free the per-process state from CreateProcess.
@@ -788,6 +1044,32 @@ pub unsafe extern "C" fn dxgkddi_destroy_process(
     h_process: *mut c_void,
 ) -> NTSTATUS {
     if !h_process.is_null() {
+        // A native process closes its RM client after every queue and context
+        // has been destroyed, before the opaque process object is reclaimed.
+        if let Some(adapter) =
+            unsafe { (miniport_device_context as *const AdapterContext).as_ref() }
+        {
+            let passive = unsafe { crate::irql::PassiveLevel::assume() };
+            let native = crate::virtio::native_channel::destroy_process(passive, adapter, unsafe {
+                &mut *(h_process as *mut ProcessContext)
+            });
+            if matches!(
+                native,
+                Err(crate::virtio::native_channel::NativeError::Busy)
+            ) {
+                // A queue/context teardown is still in flight. Retain the process
+                // object those raw pointers name instead of freeing it early.
+                core::mem::forget(h_process);
+                return STATUS_DEVICE_BUSY;
+            }
+            // Its RM virtual objects and VA space go too (NvPrRelKept counts
+            // mappings RM would not release).
+            let kept =
+                crate::virtio::native_memory::release_process(passive, adapter, h_process as usize);
+            if kept != 0 {
+                crate::diag::record_named_bytes(b"NvPrRelKept", kept);
+            }
+        }
         // The process's RM gate (`docs/rm-fence-marker.md`) goes with it: waits that
         // named it are discharged and the fences it still held are closed. The token
         // is only compared, never dereferenced.
@@ -824,7 +1106,13 @@ pub unsafe extern "C" fn dxgkddi_destroy_process(
         }
         // SAFETY: h_process was produced by Box::into_raw in create_process and
         // is destroyed exactly once.
-        drop(unsafe { Box::from_raw(h_process as *mut ProcessContext) });
+        let ctx = unsafe { Box::from_raw(h_process as *mut ProcessContext) };
+        let eprocess = ctx.eprocess.load(core::sync::atomic::Ordering::Acquire);
+        if eprocess != 0 {
+            // SAFETY: the reference `bind_eprocess` took.
+            unsafe { wdk_sys::ntddk::ObfDereferenceObject(eprocess as wdk_sys::PVOID) };
+        }
+        drop(ctx);
     }
     STATUS_SUCCESS
 }

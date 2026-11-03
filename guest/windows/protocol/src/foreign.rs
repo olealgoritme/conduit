@@ -625,7 +625,7 @@ const _: () = {
     // `RmResourceImport` (host MsgType 31) is sent by the KMD after its own checks
     // (`helios_kmd_logic::rm_resource_import`); it must never become forwardable,
     // or any process could name any resource.
-    assert!(crate::HELIOS_NVRM_FORWARD_MSG_TYPES & (1u32 << 31) == 0);
+    assert!(crate::HELIOS_NVRM_FORWARD_MSG_TYPES & (1u64 << 31) == 0);
 
     // Distinct from every other verb in the protocol crate.
     assert!(HELIOS_ESCAPE_FOREIGN_RESOURCE != crate::HELIOS_ESCAPE_NVRM);

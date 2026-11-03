@@ -735,6 +735,12 @@ pub struct AdapterContext {
     /// boot-stack budget; see `VirtioGpu::init`.
     /// Guarded by `virtio_lock`; `None` until StartDevice (and after StopDevice).
     virtio: UnsafeCell<Option<Box<VirtioGpu>>>,
+    /// `VirtioGpu::nvrm_epoch` of the transport in `virtio` (0 = none), stored by
+    /// [`Self::set_virtio`] under `virtio_lock`. The epoch is a pure function of the
+    /// transport's immutable `wire_fence_base`, so this is exactly what
+    /// `with_virtio(|v| v.nvrm_epoch()).unwrap_or(0)` answers, without the transport
+    /// spinlock: for the per-submission checks (`NativeQueue::submit`).
+    nvrm_epoch_cache: AtomicU64,
     /// Capacity retry hint only, never GPU or wire completion authority. Kept at
     /// the adapter's stable address across transport replacement. Initialized in
     /// place before publication; DDI/adapter rundown protects waiting callers.
@@ -818,6 +824,10 @@ pub struct AdapterContext {
     /// failed: the worker's plain timed waits only) whose callback sets `hpd_hr_fired` and
     /// signals `hpd_event`. Deleted with `vsync_ex_timer` at RemoveDevice.
     pub hpd_hr_timer: AtomicUsize,
+    /// NVIDIA personality only (`ddi::hws`): the high-resolution `PEX_TIMER` of the
+    /// interim HW-queue progress poll (0 = default personality, or allocation
+    /// failed). Deleted with `vsync_ex_timer` at RemoveDevice.
+    pub hws_poll_timer: AtomicUsize,
     pub hpd_hr_fired: AtomicU32,
     pub vsync_wd_on: AtomicU32,
     /// Interrupt-time deadline (100 ns units) of the one-shot tick currently
@@ -1383,6 +1393,7 @@ impl AdapterContext {
             msi_state: AtomicU32::new(0),
             virtio_lock: UnsafeCell::new(0),
             virtio: UnsafeCell::new(None),
+            nvrm_epoch_cache: AtomicU64::new(0),
             // SAFETY: inert placeholder, initialized in place before publication.
             control_space_event: UnsafeCell::new(unsafe { core::mem::zeroed() }),
             control_space_waiters: AtomicU32::new(0),
@@ -1406,6 +1417,7 @@ impl AdapterContext {
             vsync_ex_timer: AtomicUsize::new(0),
             vsync_wd_timer: AtomicUsize::new(0),
             hpd_hr_timer: AtomicUsize::new(0),
+            hws_poll_timer: AtomicUsize::new(0),
             hpd_hr_fired: AtomicU32::new(0),
             vsync_wd_on: AtomicU32::new(0),
             vsync_deadline_100ns: AtomicU64::new(0),
@@ -1797,6 +1809,7 @@ impl AdapterContext {
         }
         self.last_primary_address
             .store(primary.address, Ordering::Release);
+        crate::ddi::mpo3::note_published();
         // `FlipPub` / `FlipPubT` (`ddi::stall_diag`): every publication, bound or kept, any
         // class. Atomics only, as this is reached from DIRQL and DISPATCH too.
         crate::ddi::stall_diag::note_published(primary.address);
@@ -2019,7 +2032,9 @@ impl AdapterContext {
         // SAFETY: `virtio_lock` is a valid KSPIN_LOCK; the critical section only
         // swaps the Option in/out of the cell (no allocation, no device I/O).
         let irql = unsafe { KeAcquireSpinLockRaiseToDpc(self.virtio_lock.get()) };
+        let epoch = new.as_ref().map_or(0, |v| v.nvrm_epoch());
         let old = core::mem::replace(unsafe { &mut *self.virtio.get() }, new);
+        self.nvrm_epoch_cache.store(epoch, Ordering::Release);
         // Retry against the new/absent transport; the event belongs to the adapter.
         self.signal_control_space();
         unsafe { KeReleaseSpinLock(self.virtio_lock.get(), irql) };
@@ -2029,6 +2044,14 @@ impl AdapterContext {
         // reads in `Drop`; signal the readers now rather than at the next
         // transport-lock exit.
         self.read_ledger.flush_broadcast();
+    }
+
+    /// The live transport's NVRM epoch (0 = no transport), lock-free: the value
+    /// `with_virtio(|v| v.nvrm_epoch()).unwrap_or(0)` gives, as of the last
+    /// [`Self::set_virtio`]. Any IRQL.
+    #[inline]
+    pub(crate) fn nvrm_epoch_fast(&self) -> u64 {
+        self.nvrm_epoch_cache.load(Ordering::Acquire)
     }
 
     /// The real-RAM paging/page-table segment backing, if it was allocated.
