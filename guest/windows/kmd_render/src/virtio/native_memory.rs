@@ -25,6 +25,7 @@ use helios_kmd_logic::rm_batch as rb;
 use helios_kmd_logic::native_memory as nm;
 use helios_kmd_logic::native_perf as np;
 use helios_kmd_logic::native_teardown as nt;
+use helios_kmd_logic::pg_phase::{self as pg, Acc, Kind, Phase};
 use helios_kmd_logic::nvda as nd;
 use helios_kmd_logic::pt_ring as ptr;
 use helios_kmd_logic::rm_ce_channel as cc;
@@ -234,7 +235,7 @@ pub(crate) fn publish_hot() {
     rec(b"PgDescFree", r(&DESC_FREED));
     rec(b"PgDescEvict", r(&DESC_EVICTED));
     let (live, idle, procs, broken) = {
-        let state = STATE.lock();
+        let state = st();
         let (n, idle) = state.descs.counts();
         (n - idle, idle, state.by_process.len(), state.index_broken)
     };
@@ -251,6 +252,18 @@ pub(crate) fn publish_hot() {
         rec(cost.names[1], r(&cost.trips));
         rec(cost.names[2], r(&cost.micros));
         rec(cost.names[3], r(&cost.max_micros));
+    }
+    publish_phases();
+    let copied = r(&COPY_KIB);
+    if copied != 0 || r(&COPY_US) != 0 {
+        rec(b"PgCopyKiB", copied);
+        rec(b"PgCopyUs", r(&COPY_US));
+        rec(b"PgCopyFree", r(&COPIES_UNLOCKED));
+        rec(b"PgCopyLeak", r(&COPY_LEAKED));
+    }
+    if r(&VIEW_KIB) != 0 || r(&VIEW_US) != 0 {
+        rec(b"PgViewKiB", r(&VIEW_KIB));
+        rec(b"PgViewUs", r(&VIEW_US));
     }
     let evicted = EVICTED.load(Ordering::Relaxed);
     if evicted != 0 {
@@ -338,8 +351,295 @@ fn bump(counter: &AtomicU32, name: &[u8]) {
 }
 /// Replacements whose RM idle-channels quiesce was refused (`update_leaf`).
 static QUIESCE_REFUSED: AtomicU32 = AtomicU32::new(0);
+/// `with_cpu_range` temporary-view copies (`PgCopy*`, published by the mirror
+/// pass): `PgCopyKiB` KiB copied, `PgCopyUs` time in the copies,
+/// `PgCopyFree` copies run without the mutex (`NvPaging` 0x8), `PgCopyLeak` views
+/// whose host half could not be released after one (the mutex timed out).
+static COPY_KIB: AtomicU32 = AtomicU32::new(0);
+static COPY_US: AtomicU32 = AtomicU32::new(0);
+static COPIES_UNLOCKED: AtomicU32 = AtomicU32::new(0);
+static COPY_LEAKED: AtomicU32 = AtomicU32::new(0);
+/// `PgViewKiB` / `PgViewUs`: `with_cpu_range` copies through a view the allocation
+/// already has (its aperture view, its pinned system pages), always under the mutex.
+static VIEW_KIB: AtomicU32 = AtomicU32::new(0);
+static VIEW_US: AtomicU32 = AtomicU32::new(0);
+
+fn view_copy(length: u64, f: impl FnOnce() -> bool) -> bool {
+    let start = now();
+    let out = f();
+    VIEW_KIB.fetch_add(u32::try_from(length >> 10).unwrap_or(u32::MAX), Ordering::Relaxed);
+    VIEW_US.fetch_add(np::ticks_to_us(now().saturating_sub(start)), Ordering::Relaxed);
+    out
+}
 static IO_MUTEX: SpinLock<Option<&'static PassiveMutex>> = SpinLock::new(None);
 static STATE: SpinLock<State> = SpinLock::new(State::new());
+
+// ── where leaf updates spend their time (`helios_kmd_logic::pg_phase`) ─────────────────────
+//
+// Published by the mirror pass (`publish_phases`), never written here:
+// * `PgPh<phase>` / `PgPh<phase>Mx` / `PgPh<phase>W`: system-page leaf updates
+//   (`update_leaf_system`), the phase's total and longest segment (us), and its
+//   part of the longest update; `PgPhN` updates timed, `PgPhSlow` those of 10 ms
+//   and more, `PgPhWorstUs` the longest, `PgPhWorstPh` its dominant phase
+//   (`pg_phase::Phase` number), `PgPhUntimed` updates no slot was free for.
+//   `PgPv*`: the same for video-memory leaf updates (`update_leaf`).
+// * `PgHoN<k>` / `PgHoUs<k>` / `PgHoMx<k>`: holds of the native-memory mutex by
+//   kind `k` (`pg_phase::Kind`, hex): count, total, longest (us). `PgNmWaitN` /
+//   `PgNmWaitUs` / `PgNmWaitMx`: waits for it, `PgNmWaitBy` the kind that held it
+//   when the longest wait began.
+// * `PgStWaitUs` / `PgStWaitMx` / `PgStWaitLn`: waits for the STATE spinlock
+//   (total, longest, the source line of `native_memory.rs` that waited);
+//   `PgStHoldUs` / `PgStHoldMx` / `PgStHoldLn`: the same for holding it.
+// `NvPgPhase` (REG_DWORD, default 1): 0 turns the clock reads off (the counters
+// then stay 0).
+
+
+extern "system" {
+    /// `PsGetCurrentThread()` (exported; `KeGetCurrentThread` is an inline): any IRQL.
+    fn PsGetCurrentThread() -> usize;
+}
+
+fn me() -> usize {
+    // SAFETY: a scalar read of the current thread; any IRQL.
+    unsafe { PsGetCurrentThread() }
+}
+
+fn now() -> u64 {
+    crate::adapter::foreign_scanout::now_100ns()
+}
+
+/// `NvPgPhase`, read once (PASSIVE). Before it is read (a DISPATCH caller first),
+/// timing is on.
+fn phase_on() -> bool {
+    static VALUE: AtomicU32 = AtomicU32::new(u32::MAX);
+    let value = VALUE.load(Ordering::Relaxed);
+    if value != u32::MAX {
+        return value != 0;
+    }
+    if crate::irql::PassiveLevel::try_assume().is_none() {
+        return true;
+    }
+    let mut value = crate::diag::read_config_dword(crate::diag::KnobName::new(b"NvPgPhase"), 1);
+    if value == u32::MAX {
+        value = 1;
+    }
+    VALUE.store(value, Ordering::Relaxed);
+    value != 0
+}
+
+static PH_SLOTS: pg::Slots<8> = pg::Slots::new();
+static PH_SYSTEM: pg::PhaseStats = pg::PhaseStats::new();
+static PH_LEAF: pg::PhaseStats = pg::PhaseStats::new();
+static HOLDS: pg::KindStats = pg::KindStats::new();
+static ST_WAIT: pg::LineMax = pg::LineMax::new();
+static ST_HOLD: pg::LineMax = pg::LineMax::new();
+
+/// Add `ticks` of `acc` to the calling thread's timed update, if it has one.
+fn ph_add(acc: Acc, ticks: u64) {
+    if PH_SLOTS.any() {
+        PH_SLOTS.add(me(), acc, ticks);
+    }
+}
+
+/// Run `f` as a timed scope of `acc` (the descriptor lookup, the page-run table).
+fn ph_scope<R>(acc: Acc, f: impl FnOnce() -> R) -> R {
+    if !PH_SLOTS.any() {
+        return f();
+    }
+    let begun = PH_SLOTS.scope_begin(me());
+    if begun.is_none() {
+        return f();
+    }
+    let start = now();
+    let out = f();
+    PH_SLOTS.scope_end(begun, acc, now().saturating_sub(start));
+    out
+}
+
+/// One timed leaf update: its slot and stopwatch. Dropped without [`Watch::done`]
+/// (a skipped update) it only gives the slot back.
+struct Watch {
+    slot: usize,
+    clock: pg::Stopwatch,
+    stats: &'static pg::PhaseStats,
+}
+
+impl Watch {
+    fn start(stats: &'static pg::PhaseStats, phase: Phase) -> Option<Self> {
+        if !phase_on() {
+            return None;
+        }
+        let Some(slot) = PH_SLOTS.claim(me()) else {
+            stats.note_untimed();
+            return None;
+        };
+        Some(Self {
+            slot,
+            clock: pg::Stopwatch::start(phase, now(), PH_SLOTS.read(slot)),
+            stats,
+        })
+    }
+
+    fn to(&mut self, phase: Phase) {
+        self.clock.switch(phase, now(), PH_SLOTS.read(self.slot));
+    }
+
+    fn done(self) {
+        let b = self.clock.finish(now(), PH_SLOTS.read(self.slot));
+        self.stats.note(&b);
+    }
+}
+
+impl Drop for Watch {
+    fn drop(&mut self) {
+        PH_SLOTS.release(self.slot);
+    }
+}
+
+/// Continue `w` (if timed) in `phase`.
+fn ph(w: &mut Option<Watch>, phase: Phase) {
+    if let Some(w) = w.as_mut() {
+        w.to(phase);
+    }
+}
+
+/// The STATE spinlock, timed: the wait goes to the caller's update (`Spin`) and,
+/// with the hold, to `PgSt*` under the caller's line.
+struct StGuard {
+    guard: crate::sync::SpinLockGuard<'static, State>,
+    since: u64,
+    line: u32,
+}
+
+#[track_caller]
+fn st() -> StGuard {
+    let line = core::panic::Location::caller().line();
+    if !phase_on() {
+        return StGuard { guard: STATE.lock(), since: 0, line };
+    }
+    let start = now();
+    let guard = STATE.lock();
+    let since = now();
+    let waited = since.saturating_sub(start);
+    ST_WAIT.note(waited, line);
+    ph_add(Acc::Spin, waited);
+    StGuard { guard, since, line }
+}
+
+impl core::ops::Deref for StGuard {
+    type Target = State;
+    fn deref(&self) -> &State {
+        &self.guard
+    }
+}
+
+impl core::ops::DerefMut for StGuard {
+    fn deref_mut(&mut self) -> &mut State {
+        &mut self.guard
+    }
+}
+
+impl Drop for StGuard {
+    fn drop(&mut self) {
+        if self.since != 0 {
+            ST_HOLD.note(now().saturating_sub(self.since), self.line);
+        }
+    }
+}
+
+/// The native-memory mutex's holder, for hold times per kind (`PgHo*`) and the
+/// holder a waiter waited for (`PgNmWaitBy`). Written by the owning thread only
+/// (the KMUTEX is recursive: the outermost acquisition counts).
+static HOLD_THREAD: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static HOLD_DEPTH: AtomicU32 = AtomicU32::new(0);
+static HOLD_KIND: AtomicU32 = AtomicU32::new(0);
+static HOLD_SINCE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// A held native-memory mutex. The bookkeeping runs before the mutex is released
+/// (fields drop after `Drop::drop`).
+pub(crate) struct IoGuard {
+    _mutex: PassiveMutexGuard<'static>,
+}
+
+impl IoGuard {
+    fn acquired(mutex: PassiveMutexGuard<'static>, kind: Kind, start: u64, holder: u32) -> Self {
+        let thread = me();
+        if HOLD_THREAD.load(Ordering::Relaxed) == thread {
+            HOLD_DEPTH.fetch_add(1, Ordering::Relaxed);
+        } else {
+            let since = if phase_on() { now() } else { 0 };
+            if since != 0 {
+                let waited = since.saturating_sub(start);
+                HOLDS.waited(holder, waited);
+                ph_add(Acc::Mutex, waited);
+            }
+            HOLD_DEPTH.store(1, Ordering::Relaxed);
+            HOLD_KIND.store(kind as u32, Ordering::Relaxed);
+            HOLD_SINCE.store(since, Ordering::Relaxed);
+            HOLD_THREAD.store(thread, Ordering::Release);
+        }
+        Self { _mutex: mutex }
+    }
+}
+
+impl Drop for IoGuard {
+    fn drop(&mut self) {
+        if HOLD_DEPTH.fetch_sub(1, Ordering::Relaxed) == 1 {
+            let since = HOLD_SINCE.load(Ordering::Relaxed);
+            if since != 0 {
+                HOLDS.held(HOLD_KIND.load(Ordering::Relaxed), now().saturating_sub(since));
+            }
+            HOLD_KIND.store(Kind::None as u32, Ordering::Relaxed);
+            HOLD_THREAD.store(0, Ordering::Release);
+        }
+    }
+}
+
+/// The `PgPh*`, `PgPv*`, `PgHo*`, `PgNmWait*` and `PgSt*` values (mirror pass, PASSIVE).
+fn publish_phases() {
+    let rec = |name: ([u8; 14], usize), value: u32| crate::diag::record_named_bytes(&name.0[..name.1], value);
+    for (prefix, stats) in [(&b"PgPh"[..], &PH_SYSTEM), (&b"PgPv"[..], &PH_LEAF)] {
+        if stats.updates() == 0 && stats.untimed() == 0 {
+            continue;
+        }
+        rec(pg::name(prefix, b"N", b""), stats.updates());
+        rec(pg::name(prefix, b"Slow", b""), stats.slow());
+        rec(pg::name(prefix, b"Untimed", b""), stats.untimed());
+        rec(pg::name(prefix, b"WorstUs", b""), stats.worst_us());
+        rec(pg::name(prefix, b"WorstPh", b""), stats.worst_phase() as u32);
+        for p in Phase::ALL {
+            rec(pg::name(prefix, p.name(), b""), stats.total_us(p));
+            rec(pg::name(prefix, p.name(), b"Mx"), stats.max_us(p));
+            rec(pg::name(prefix, p.name(), b"W"), stats.at_worst_us(p));
+        }
+    }
+    for k in 1..pg::KINDS {
+        let (n, total, max) = HOLDS.held_of(k);
+        if n == 0 {
+            continue;
+        }
+        let d = [pg::hex(k)];
+        rec(pg::name(b"PgHoN", &d, b""), n);
+        rec(pg::name(b"PgHoUs", &d, b""), total);
+        rec(pg::name(b"PgHoMx", &d, b""), max);
+    }
+    let (n, total, max, by) = HOLDS.waits();
+    if n != 0 {
+        rec(pg::name(b"PgNmWaitN", b"", b""), n);
+        rec(pg::name(b"PgNmWaitUs", b"", b""), total);
+        rec(pg::name(b"PgNmWaitMx", b"", b""), max);
+        rec(pg::name(b"PgNmWaitBy", b"", b""), by);
+    }
+    for (prefix, lm) in [(&b"PgStWait"[..], &ST_WAIT), (&b"PgStHold"[..], &ST_HOLD)] {
+        let (total, max, line) = lm.get();
+        if max == 0 {
+            continue;
+        }
+        rec(pg::name(prefix, b"Us", b""), total);
+        rec(pg::name(prefix, b"Mx", b""), max);
+        rec(pg::name(prefix, b"Ln", b""), line);
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
@@ -633,10 +933,13 @@ const LOCK_MAX_MS: u64 = 20_000;
 /// Waits for the mutex that gave up after [`LOCK_MAX_MS`] (`NvMemLockTo`).
 static LOCK_TIMEOUTS: AtomicU32 = AtomicU32::new(0);
 
-fn lock(passive: PassiveLevel) -> Result<PassiveMutexGuard<'static>, Error> {
+/// The native-memory mutex for an operation of `kind` (`PgHo*`); the wait goes to
+/// the caller's timed update (`Mutex`) and to `PgNmWait*`.
+fn lock(passive: PassiveLevel, kind: Kind) -> Result<IoGuard, Error> {
     let start = crate::adapter::foreign_scanout::now_100ns();
+    let holder = HOLD_KIND.load(Ordering::Relaxed);
     match mutex(passive)?.lock_within(passive, LOCK_MAX_MS) {
-        Some(guard) => Ok(guard),
+        Some(guard) => Ok(IoGuard::acquired(guard, kind, start, holder)),
         None => {
             // An escape abort returns early; only a wait that ran out is a timeout.
             let waited = crate::adapter::foreign_scanout::now_100ns().saturating_sub(start);
@@ -659,7 +962,8 @@ impl Io<'_> {
     pub(super) fn send(&self, req: &[u8], resp: &mut [u8]) -> Result<usize, Error> {
         ROUND_TRIPS.fetch_add(1, Ordering::Relaxed);
         let mut seen = None;
-        let n = nvrm::forward(
+        let start = if PH_SLOTS.any() { now() } else { 0 };
+        let sent = nvrm::forward(
             self.passive,
             self.adapter,
             KMD,
@@ -670,8 +974,11 @@ impl Io<'_> {
             0,
             0,
             &mut seen,
-        )
-        .map_err(|_| Error::Host)?;
+        );
+        if start != 0 {
+            ph_add(Acc::Rt, now().saturating_sub(start));
+        }
+        let n = sent.map_err(|_| Error::Host)?;
         if seen.is_some_and(|epoch| epoch != self.client.epoch) {
             return Err(Error::NotReady);
         }
@@ -789,9 +1096,9 @@ pub fn install_client(
     adapter: &AdapterContext,
     client: NativeClient,
 ) -> Result<(), Error> {
-    let _guard = lock(passive)?;
+    let _guard = lock(passive, Kind::Client)?;
     {
-        let state = STATE.lock();
+        let state = st();
         if state.client.is_some() || !state.allocations.is_empty() {
             return Err(Error::Busy);
         }
@@ -808,7 +1115,7 @@ pub fn install_client(
         &cc::vaspace_params(),
     )?;
     {
-        let mut state = STATE.lock();
+        let mut state = st();
         state.spaces.clear();
         state.windows.clear();
         state.foreign.clear();
@@ -820,8 +1127,8 @@ pub fn install_client(
             .try_reserve_exact(1)
             .map_err(|_| Error::NoMemory)?;
     }
-    STATE.lock().client = Some(client);
-    STATE.lock().spaces.push((0, H_VASPACE));
+    st().client = Some(client);
+    st().spaces.push((0, H_VASPACE));
     Ok(())
 }
 
@@ -835,11 +1142,11 @@ pub fn channel_client(
     // Under the I/O mutex (a recursive KMUTEX: `create` already holds it), like
     // every other `ensure_space` caller, so two threads cannot both find no space
     // for one process and each allocate one.
-    let _guard = lock(passive)?;
+    let _guard = lock(passive, Kind::Client)?;
     // Copy the client out first: a guard in an `if let` scrutinee lives through
     // the body (edition 2021), and `ensure_space` takes STATE again on this
     // non-reentrant spinlock (CreateContext spun forever in ensure_space).
-    let existing = STATE.lock().client.as_ref().copied();
+    let existing = st().client.as_ref().copied();
     if let Some(client) = existing {
         let io = Io {
             passive,
@@ -867,20 +1174,18 @@ pub fn channel_client(
 /// address ranges remain process-scoped; no second process can alias them by
 /// sharing a root VA space.
 fn ensure_space(io: &Io<'_>, process: usize) -> Result<u32, Error> {
-    if let Some((_, space)) = STATE
-        .lock()
+    if let Some((_, space)) = st()
         .spaces
         .iter()
         .find(|(owner, _)| *owner == process)
     {
         return Ok(*space);
     }
-    STATE
-        .lock()
+    st()
         .spaces
         .try_reserve_exact(1)
         .map_err(|_| Error::NoMemory)?;
-    let space = STATE.lock().mint()?;
+    let space = st().mint()?;
     // NvVaDevice=1 (experiment): the device's own VA space (index GPU_DEVICE,
     // shared by every process, no window) as NVK on RM uses, to tell whether
     // the new per-process spaces are what the graphics copy engine fails on.
@@ -893,7 +1198,7 @@ fn ensure_space(io: &Io<'_>, process: usize) -> Result<u32, Error> {
         &if device_space { cc::vaspace_params() } else { cc::vaspace_params_vidmm() },
     )?;
     if device_space {
-        STATE.lock().spaces.push((process, space));
+        st().spaces.push((process, space));
         return Ok(space);
     }
     // Diagnosis: the space RM made (vaSize at +8, vaBase at +40 of the
@@ -911,7 +1216,7 @@ fn ensure_space(io: &Io<'_>, process: usize) -> Result<u32, Error> {
     // buffers) then land above 4.5 GiB, in the [4 GiB, 8 GiB) range the KMD
     // reserves from VidMm, and every VidMm VA below 4 GiB is mapped inside
     // this window at its exact address.
-    let window = match STATE.lock().mint() {
+    let window = match st().mint() {
         Ok(window) => window,
         Err(error) => {
             let _ = io.rm_free(nd::H_DEVICE, space);
@@ -933,7 +1238,7 @@ fn ensure_space(io: &Io<'_>, process: usize) -> Result<u32, Error> {
         return Err(error);
     }
     {
-        let mut state = STATE.lock();
+        let mut state = st();
         state.spaces.push((process, space));
         let _ = state.windows.try_reserve(2);
         state.windows.push((space, window, LOW_WINDOW_BASE, LOW_WINDOW_END));
@@ -943,8 +1248,8 @@ fn ensure_space(io: &Io<'_>, process: usize) -> Result<u32, Error> {
     // hands out (they reached 0x2_3200_0000, and every later fixed mapping there was
     // refused with NO_MEMORY). Optional: without it, mappings fall back to fixed
     // virtual objects.
-    // The guard of `STATE.lock()` must end before the block, which locks STATE again.
-    let minted = STATE.lock().mint();
+    // The guard of `st()` must end before the block, which locks STATE again.
+    let minted = st().mint();
     if let Ok(high) = minted {
         let mut params = cc::virtual_params(
             io.client.root,
@@ -955,7 +1260,7 @@ fn ensure_space(io: &Io<'_>, process: usize) -> Result<u32, Error> {
         sparse_window(&mut params, ptr::window_flags(sparse, true));
         match io.rm_alloc(nd::H_DEVICE, high, cc::NV50_MEMORY_VIRTUAL, &params) {
             Ok(_) => {
-                let mut state = STATE.lock();
+                let mut state = st();
                 let _ = state.windows.try_reserve(1);
                 state.windows.push((space, high, HIGH_WINDOW_BASE, HIGH_WINDOW_END));
             }
@@ -966,7 +1271,7 @@ fn ensure_space(io: &Io<'_>, process: usize) -> Result<u32, Error> {
     crate::diag::record_named_bytes(b"NvSpaceH", space);
     // Diagnosis: where RM puts a non-fixed 2-MiB virtual object now (in 64-KiB
     // units; 0xffffffff = refused), i.e. where its own mappings would go.
-    let minted = STATE.lock().mint();
+    let minted = st().mint();
     if let Ok(probe) = minted {
         let params = cc::virtual_params(io.client.root, space, None, 0x20_0000);
         let at = match io.rm_alloc(nd::H_DEVICE, probe, cc::NV50_MEMORY_VIRTUAL, &params) {
@@ -1006,8 +1311,7 @@ const HIGH_WINDOW_END: u64 = 0x10_0000_0000;
 
 /// The window of `space` that holds [va, end), if any.
 fn window_for(space: u32, va: u64, end: u64) -> Option<u32> {
-    STATE
-        .lock()
+    st()
         .windows
         .iter()
         .find(|(owner, _, base, limit)| *owner == space && va >= *base && end <= *limit)
@@ -1015,8 +1319,7 @@ fn window_for(space: u32, va: u64, end: u64) -> Option<u32> {
 }
 
 fn windows_of(space: u32) -> Vec<u32> {
-    STATE
-        .lock()
+    st()
         .windows
         .iter()
         .filter(|(owner, _, _, _)| *owner == space)
@@ -1025,7 +1328,7 @@ fn windows_of(space: u32) -> Vec<u32> {
 }
 
 fn is_window(virt: u32) -> bool {
-    STATE.lock().windows.iter().any(|(_, window, _, _)| *window == virt)
+    st().windows.iter().any(|(_, window, _, _)| *window == virt)
 }
 
 
@@ -1037,7 +1340,7 @@ pub fn ring_backing(
     gpfifo_va: u64,
     ring_bytes: u64,
 ) -> Result<super::native_channel::NativeRingBacking, Error> {
-    let state = STATE.lock();
+    let state = st();
     let allocation = state.allocation(id)?;
     let end = gpfifo_va.checked_add(ring_bytes).ok_or(Error::Invalid)?;
     if ring_bytes == 0 || ring_bytes > allocation.size {
@@ -1113,7 +1416,7 @@ fn unlock_pins(pins: &mut Vec<Pin>) {
 }
 
 fn preserve_ambiguous_pins(pins: &mut Vec<Pin>) {
-    STATE.lock().orphan_pins.append(pins);
+    st().orphan_pins.append(pins);
 }
 
 /// A create that will not finish gives back its RM memory; the pins unlock only
@@ -1179,7 +1482,8 @@ fn pin_system_memory(system_memory: u64, size: u64) -> Result<(Vec<Pin>, Vec<u64
 }
 
 fn alloc_system_descriptor(io: &Io<'_>, memory: u32, pfns: &[u64], size: u64) -> Result<(), Error> {
-    let (kind, deep, big) = nvrm::page_run_table(io.passive, pfns).map_err(|_| Error::NoMemory)?;
+    let (kind, deep, big) = ph_scope(Acc::Table, || nvrm::page_run_table(io.passive, pfns))
+        .map_err(|_| Error::NoMemory)?;
     let block = cr::nvos02_osdesc(
         io.client.root,
         nd::H_DEVICE,
@@ -1201,6 +1505,7 @@ fn alloc_system_descriptor(io: &Io<'_>, memory: u32, pfns: &[u64], size: u64) ->
     .ok_or(Error::Invalid)?;
     let mut response = [0u8; REPLY_MAX];
     ROUND_TRIPS.fetch_add(1, Ordering::Relaxed);
+    let start = if PH_SLOTS.any() { now() } else { 0 };
     let sent = nvrm::forward_kmd_registration(
         io.passive,
         io.adapter,
@@ -1210,6 +1515,9 @@ fn alloc_system_descriptor(io: &Io<'_>, memory: u32, pfns: &[u64], size: u64) ->
         &mut response,
         TIMEOUT_MS,
     );
+    if start != 0 {
+        ph_add(Acc::Rt, now().saturating_sub(start));
+    }
     let reply = match sent {
         Ok(len) => {
             drop(big);
@@ -1289,10 +1597,10 @@ pub fn create(
     // queued behind a host that does not answer), and the record is published
     // under it again, only if the client generation is still the one used.
     let (client, epoch, space, memory) = {
-        let _guard = lock(passive)?;
+        let _guard = lock(passive, Kind::Create)?;
         step(2);
         // As in `channel_client`: release STATE before `channel_client` re-takes it.
-        let existing = STATE.lock().client.as_ref().copied();
+        let existing = st().client.as_ref().copied();
         let client = match existing {
             Some(client) => client,
             None => channel_client(passive, adapter, 0)?.0,
@@ -1309,7 +1617,7 @@ pub fn create(
         };
         let space = ensure_space(&io, 0)?;
         step(4);
-        let memory = STATE.lock().mint()?;
+        let memory = st().mint()?;
         (client, epoch, space, memory)
     };
     let io = Io {
@@ -1464,9 +1772,9 @@ pub fn create(
     // closed this client with the object in it: the record is dropped and its pins
     // kept, as for any object whose host state is unknown.
     let mut unpublished = Some(allocation);
-    let refused = match lock(passive) {
+    let refused = match lock(passive, Kind::Create) {
         Ok(_guard) => {
-            let mut state = STATE.lock();
+            let mut state = st();
             if state.client.as_ref().map(|c| c.epoch) != Some(epoch) {
                 Some((Error::NotReady, false))
             } else if state.allocations.try_reserve_exact(1).is_err() {
@@ -1525,8 +1833,7 @@ fn map_fixed(
 /// Whether the RM memory `memory` of a native allocation has 2-MiB pages. Takes
 /// STATE: never call it with a STATE guard alive.
 fn memory_is_huge(memory: u32) -> bool {
-    STATE
-        .lock()
+    st()
         .allocations
         .iter()
         .any(|a| a.memory == memory && a.huge)
@@ -1874,7 +2181,9 @@ fn send_batch(io: &Io<'_>, batch: &rb::Batch, resp: &mut Vec<u8>) -> Result<(), 
     ROUND_TRIPS.fetch_add(1, Ordering::Relaxed);
     let start = crate::adapter::foreign_scanout::now_100ns();
     let sent = nvrm::forward_kmd_batch(io.passive, io.adapter, batch.request(), resp, TIMEOUT_MS);
-    let us = np::ticks_to_us(crate::adapter::foreign_scanout::now_100ns().saturating_sub(start));
+    let ticks = crate::adapter::foreign_scanout::now_100ns().saturating_sub(start);
+    ph_add(Acc::Rt, ticks);
+    let us = np::ticks_to_us(ticks);
     BATCH_US.fetch_add(us, Ordering::Relaxed);
     BATCH_MAX_US.fetch_max(us, Ordering::Relaxed);
     let n = match sent {
@@ -1939,7 +2248,11 @@ type DescMade = Result<(u32, u32), (u32, Error)>;
 /// An OS descriptor over exactly `pfns`: one already made (`PgDescHit`) or a new
 /// handle to register (`.1` true).
 fn take_desc(pfns: &[u64], owner: u32) -> Result<(u32, bool), Error> {
-    let mut state = STATE.lock();
+    ph_scope(Acc::Lookup, || take_desc_inner(pfns, owner))
+}
+
+fn take_desc_inner(pfns: &[u64], owner: u32) -> Result<(u32, bool), Error> {
+    let mut state = st();
     if let Some((desc, was_idle)) = state.descs.acquire(pfns, owner) {
         DESC_HIT.fetch_add(1, Ordering::Relaxed);
         if was_idle {
@@ -1965,8 +2278,7 @@ fn give_back_desc(io: &Io<'_>, desc: u32, new: bool) {
 /// kept idle (`NvPaging` 0x2), and free the idle ones the bound pushes out.
 fn release_desc(io: &Io<'_>, desc: u32) -> Result<(), Error> {
     let mut evicted = Vec::new();
-    let released = STATE
-        .lock()
+    let released = st()
         .descs
         .release(desc, desc_cache_on(), desc_cache_max(), &mut evicted);
     free_descs(io, &evicted, &DESC_EVICTED);
@@ -2031,7 +2343,7 @@ fn free_descs(io: &Io<'_>, descs: &[u32], counter: &AtomicU32) {
 /// known to be its own: it moved to video memory, or it is destroyed).
 fn drop_idle_descs_of(io: &Io<'_>, id: u32) {
     let mut gone = Vec::new();
-    STATE.lock().descs.drop_idle_of(id, &mut gone);
+    st().descs.drop_idle_of(id, &mut gone);
     free_descs(io, &gone, &DESC_EVICTED);
 }
 
@@ -2063,7 +2375,7 @@ fn map_desc_single(io: &Io<'_>, owner: u32, space: u32, job: &DescJob<'_>) -> De
     }
     // Minted first: a STATE guard in a `match` scrutinee would live through the
     // arms, and `give_back_desc` takes STATE again.
-    let minted = STATE.lock().mint();
+    let minted = st().mint();
     let virt = match minted {
         Ok(virt) => virt,
         Err(error) => {
@@ -2080,7 +2392,7 @@ fn map_desc_single(io: &Io<'_>, owner: u32, space: u32, job: &DescJob<'_>) -> De
         Ok(used) => {
             if new {
                 // Unrecorded (no memory): it is freed at its unmap, as before.
-                let _ = STATE.lock().descs.insert(desc, job.pfns, owner);
+                let _ = st().descs.insert(desc, job.pfns, owner);
             }
             Ok((used, desc))
         }
@@ -2207,7 +2519,7 @@ fn plan_desc_job(
     let flags = rb::SKIP_GROUP_ON_FAIL;
     let mut big = None;
     let at_desc = if new_desc {
-        let (kind, deep, table) = match nvrm::page_run_table(io.passive, job.pfns) {
+        let (kind, deep, table) = match ph_scope(Acc::Table, || nvrm::page_run_table(io.passive, job.pfns)) {
             Ok(t) => t,
             Err(_) => return Err(undo(batch, Some(Error::NoMemory))),
         };
@@ -2237,7 +2549,7 @@ fn plan_desc_job(
     };
     let mut virt = 0;
     let at_virt = if window == 0 {
-        let minted = STATE.lock().mint();
+        let minted = st().mint();
         virt = match minted {
             Ok(virt) => virt,
             Err(error) => return Err(undo(batch, Some(error))),
@@ -2332,7 +2644,7 @@ fn finish_desc_job(
             bump(&DEFERRED, b"NvPmDefer");
         }
         if plan.new_desc {
-            let _ = STATE.lock().descs.insert(plan.desc, job.pfns, owner);
+            let _ = st().descs.insert(plan.desc, job.pfns, owner);
         }
         return Ok((if plan.window != 0 { plan.window } else { plan.virt }, plan.desc));
     }
@@ -2466,7 +2778,7 @@ fn unmap_many_batched(io: &Io<'_>, items: &[(u32, HostMapping, bool)], abort: bo
                     .map_err(|_| ())
             };
             let at_virt = if is_window(m.virt) { Ok(None) } else { free(&mut batch, m.virt) };
-            let at_desc = if m.desc != 0 && STATE.lock().descs.would_free(m.desc, cache, max_idle) {
+            let at_desc = if m.desc != 0 && st().descs.would_free(m.desc, cache, max_idle) {
                 free(&mut batch, m.desc)
             } else {
                 Ok(None)
@@ -2504,7 +2816,7 @@ fn unmap_many_batched(io: &Io<'_>, items: &[(u32, HostMapping, bool)], abort: bo
             if m.desc != 0 {
                 match plan.at_desc {
                     Some(i) if entry_ok(&resp, caps, i) => {
-                        STATE.lock().descs.forget(m.desc);
+                        st().descs.forget(m.desc);
                         DESC_FREED.fetch_add(1, Ordering::Relaxed);
                     }
                     // Not freed in the batch (kept, or its free was skipped).
@@ -2537,7 +2849,7 @@ pub struct ScanoutSource {
 }
 
 pub fn scanout_source(id: u32) -> Result<ScanoutSource, Error> {
-    let state = STATE.lock();
+    let state = st();
     let a = state.allocation(id)?;
     let surface = a.surface.ok_or(Error::Unsupported)?;
     Ok(ScanoutSource {
@@ -2554,7 +2866,7 @@ pub fn scanout_source(id: u32) -> Result<ScanoutSource, Error> {
 /// STATE spinlock only, no I/O mutex: `native_scanout`'s flip fast path
 /// (`NvHotPath` 0x1).
 pub fn scanout_imported(id: u32) -> Option<(u32, u64)> {
-    let state = STATE.lock();
+    let state = st();
     let client = state.client.as_ref()?;
     let a = state.allocation(id).ok()?;
     if a.scanout_gem == 0 || a.poisoned || a.epoch != client.epoch || a.surface.is_none() {
@@ -2565,13 +2877,13 @@ pub fn scanout_imported(id: u32) -> Option<(u32, u64)> {
 
 /// The width and height of an allocation's 2D picture (DescribeAllocation).
 pub fn surface_extent(id: u32) -> Option<(u32, u32)> {
-    let state = STATE.lock();
+    let state = st();
     let s = state.allocation(id).ok()?.surface?;
     Some((s.width, s.height))
 }
 
 pub fn set_scanout_gem(id: u32, gem: u32) -> Result<(), Error> {
-    STATE.lock().allocation_mut(id)?.scanout_gem = gem;
+    st().allocation_mut(id)?.scanout_gem = gem;
     Ok(())
 }
 
@@ -2581,8 +2893,8 @@ pub(crate) fn with_io<R>(
     adapter: &AdapterContext,
     f: impl FnOnce(&Io<'_>) -> Result<R, Error>,
 ) -> Result<R, Error> {
-    let _guard = lock(passive)?;
-    let client = STATE.lock().client()?;
+    let _guard = lock(passive, Kind::WithIo)?;
+    let client = st().client()?;
     let io = Io {
         passive,
         adapter,
@@ -2592,7 +2904,7 @@ pub(crate) fn with_io<R>(
 }
 
 pub fn writeback_open(id: u32, bytes: &mut [u8]) -> Result<(), Error> {
-    let writeback = STATE.lock().allocation(id)?.writeback.ok_or(Error::Invalid)?;
+    let writeback = st().allocation(id)?.writeback.ok_or(Error::Invalid)?;
     writeback.apply(bytes).map_err(|_| Error::Invalid)
 }
 
@@ -2638,7 +2950,7 @@ fn evict_range(
     }
     let mut candidates = Vec::new();
     let (foreign, victims) = {
-        let mut state = STATE.lock();
+        let mut state = st();
         // Only this process's allocations can map here (`by_process`).
         state.candidates(process, &mut candidates)?;
         let mut foreign = Vec::new();
@@ -2707,7 +3019,7 @@ fn evict_range(
         let m = victim.mapping;
         crate::ddi::pt_ring::record(ptr::K_EVICT, 0, 0, victim.id, m.piece.va, m.piece.len, process);
         if unmapped.is_err() {
-            if let Ok(allocation) = STATE.lock().allocation_mut(victim.id) {
+            if let Ok(allocation) = st().allocation_mut(victim.id) {
                 allocation.poisoned = true;
             }
             failed();
@@ -2732,7 +3044,7 @@ fn evict_range(
             };
             let shown = (|| -> Result<HostMapping, Error> {
                 if m.desc == 0 {
-                    let virt = STATE.lock().mint()?;
+                    let virt = st().mint()?;
                     let used = map_fixed(io, victim.memory, victim.size, victim.system_backed, space, virt, piece)?;
                     return Ok(HostMapping { process, piece, virt: used, desc: 0 });
                 }
@@ -2750,7 +3062,7 @@ fn evict_range(
                 continue;
             };
             let recorded = {
-                let mut state = STATE.lock();
+                let mut state = st();
                 let recorded = match state.allocation_mut(victim.id) {
                     Ok(allocation) => {
                         if allocation.mappings.try_reserve(1).is_ok() {
@@ -2811,6 +3123,8 @@ pub fn update_leaf_system(
     };
     let start = crate::adapter::foreign_scanout::now_100ns();
     let trips = round_trips();
+    // The phases (`PgPh*`): the clock starts with NvPmSys's.
+    let mut watch = Watch::start(&PH_SYSTEM, Phase::Skip);
     let chunk_pages = system_chunk_pages();
     let perf = perf();
     // NvPerfMem 0x40: VidMm rewrites a range with the pages that are mapped there
@@ -2821,6 +3135,7 @@ pub fn update_leaf_system(
         bump(&SKIPPED_UNCHANGED, b"NvPmSkip");
         return Ok(());
     }
+    ph(&mut watch, Phase::Other);
     let result = update_leaf_system_inner(
         passive,
         adapter,
@@ -2833,8 +3148,12 @@ pub fn update_leaf_system(
         chunk_pages,
         perf.tlb_defer(),
         &why,
+        &mut watch,
     );
     SYSTEM_COST.note(start, trips);
+    if let Some(watch) = watch {
+        watch.done();
+    }
     result
 }
 
@@ -2848,7 +3167,7 @@ fn system_mapping_unchanged(
     pfns: &[u64],
     chunk_pages: usize,
 ) -> bool {
-    let state = STATE.lock();
+    let state = st();
     let Ok(allocation) = state.allocation(id) else {
         return false;
     };
@@ -2887,18 +3206,32 @@ fn update_leaf_system_inner(
     chunk_pages: usize,
     defer_on: bool,
     why: &dyn Fn(u32, Error) -> Error,
+    watch: &mut Option<Watch>,
 ) -> Result<(), Error> {
-    update_leaf_staged(passive, adapter, id, process, first_va, allocation_offset, none)
+    // `NvPaging` 0x4: one hold of the mutex for both halves (the KMUTEX is
+    // recursive: the halves' own acquisitions return at once). Without it the
+    // mutex is let go between them, and whatever queued for it meanwhile runs
+    // before the map half.
+    let _whole = if paging().one_lock() {
+        Some(lock(passive, Kind::System).map_err(|error| why(1, error))?)
+    } else {
+        None
+    };
+    ph(watch, Phase::Other);
+    update_leaf_staged(passive, adapter, id, process, first_va, allocation_offset, none, Kind::System, watch)
         .map_err(|error| why(1, error))?;
 
-    let _guard = lock(passive)?;
-    let client = STATE.lock().client()?;
+    ph(watch, Phase::Other);
+    let _guard = lock(passive, Kind::System)?;
+    let client = st().client()?;
     let io = Io {
         passive,
         adapter,
         client,
     };
+    ph(watch, Phase::Space);
     let space = ensure_space(&io, process)?;
+    ph(watch, Phase::Other);
     // One OS descriptor per chunk (`NvSysChunk`, default 128 pages): RM refused
     // large ones (512 and 335 pages) with NV_ERR_INVALID_ADDRESS after pinning
     // them (bpftrace: every pin succeeded), and the range stayed unmapped (ring
@@ -2919,43 +3252,57 @@ fn update_leaf_system_inner(
         });
     }
     let mut made = Vec::new();
+    ph(watch, Phase::Build);
     map_descs(&io, id, space, &jobs, &mut made)?;
+    ph(watch, Phase::Book);
+    // Every made mapping is recorded under ONE STATE hold and the list sorted
+    // once (it was a hold, a push and a sort of the allocation's whole list per
+    // chunk). One that cannot be recorded (no memory, the allocation gone) is
+    // taken down again, as before.
+    let as_mapping = |chunk: &np::SystemChunk, virt: u32, desc: u32| HostMapping {
+        process,
+        piece: nm::MappingPiece {
+            va: chunk.va,
+            memory_offset: chunk.memory_offset,
+            len: chunk.bytes(),
+        },
+        virt,
+        desc,
+    };
+    let ok_count = made.iter().filter(|r| r.is_ok()).count();
+    let recorded_all = ok_count != 0 && {
+        let mut state = st();
+        let pushed = match state.allocation_mut(id) {
+            Ok(allocation) => {
+                let room = allocation.mappings.try_reserve(ok_count).is_ok();
+                if room {
+                    for (chunk, result) in chunks.iter().zip(&made) {
+                        if let Ok((virt, desc)) = result {
+                            allocation.mappings.push(as_mapping(chunk, *virt, *desc));
+                        }
+                    }
+                    allocation
+                        .mappings
+                        .sort_unstable_by_key(|mapping| (mapping.process, mapping.piece.va));
+                }
+                room
+            }
+            Err(_) => false,
+        };
+        if pushed {
+            state.note_mapped(process, id);
+        }
+        pushed
+    };
     let mut first_error = None;
     let mut deferred = false;
     let mut last_ok = false;
     for ((chunk, job), result) in chunks.iter().zip(&jobs).zip(made) {
         let recorded = result.map_err(|(stage, error)| why(stage, error)).and_then(|(virt, desc)| {
-            let mapping = HostMapping {
-                process,
-                piece: nm::MappingPiece {
-                    va: chunk.va,
-                    memory_offset: chunk.memory_offset,
-                    len: chunk.bytes(),
-                },
-                virt,
-                desc,
-            };
-            let mut state = STATE.lock();
-            let pushed = match state.allocation_mut(id) {
-                Ok(allocation) => {
-                    if allocation.mappings.try_reserve(1).is_ok() {
-                        allocation.mappings.push(mapping);
-                        allocation
-                            .mappings
-                            .sort_unstable_by_key(|mapping| (mapping.process, mapping.piece.va));
-                        true
-                    } else {
-                        false
-                    }
-                }
-                Err(_) => false,
-            };
-            if pushed {
-                state.note_mapped(process, id);
+            if recorded_all {
                 return Ok(());
             }
-            drop(state);
-            let _ = unmap_fixed(&io, 0, mapping);
+            let _ = unmap_fixed(&io, 0, as_mapping(chunk, virt, desc));
             Err(Error::NoMemory)
         });
         last_ok = recorded.is_ok();
@@ -2998,12 +3345,12 @@ pub fn update_foreign_leaf(
     // the KMD's RM client up: bring it up here, or those pages were never
     // mirrored (NvFgnFail with NotReady) and the GPU's fence writes faulted
     // (Xid 31, CE FAULT_PTE writes at the fence VAs).
-    let up = STATE.lock().client.is_some();
+    let up = st().client.is_some();
     if !up && !pfns.is_empty() {
         super::nvda::memory_client(passive, adapter, process)?;
     }
-    let _guard = lock(passive)?;
-    let client = STATE.lock().client()?;
+    let _guard = lock(passive, Kind::Foreign)?;
+    let client = st().client()?;
     let io = Io {
         passive,
         adapter,
@@ -3025,7 +3372,7 @@ pub fn update_foreign_leaf(
         let hit = |m: &HostMapping| {
             m.process == process && nm::ranges_overlap(m.piece.va, m.piece.len, first_va, len)
         };
-        let mut state = STATE.lock();
+        let mut state = st();
         let mut stale = Vec::new();
         // Only the overlapping ones are copied out; the list is not rebuilt.
         let n = state.foreign.iter().filter(|m| hit(m)).count();
@@ -3082,7 +3429,7 @@ pub fn update_foreign_leaf(
         virt: used,
         desc,
     };
-    let mut state = STATE.lock();
+    let mut state = st();
     if state.foreign.try_reserve(1).is_err() {
         drop(state);
         let _ = unmap_fixed(&io, 0, mapping);
@@ -3096,7 +3443,7 @@ pub fn update_foreign_leaf(
 /// one mapping of exactly that range whose descriptor holds exactly `pfns`
 /// (`helios_kmd_logic::hot_path::foreign_update_unchanged`).
 fn foreign_mapping_unchanged(process: usize, first_va: u64, len: u64, pfns: &[u64]) -> bool {
-    let state = STATE.lock();
+    let state = st();
     let mut overlapping: [(nm::MappingPiece, Option<&[u64]>); 2] = [(
         nm::MappingPiece {
             va: 0,
@@ -3142,7 +3489,7 @@ pub fn patch_gpu_bytes(
         Rm(u32, u64),
     }
     let found = {
-        let state = STATE.lock();
+        let state = st();
         let look = |allocation: &Allocation| -> Option<Where> {
             let m = allocation.mappings.iter().find(|m| {
                 m.process == process
@@ -3251,12 +3598,29 @@ pub fn update_leaf(
 ) -> Result<(), Error> {
     let start = crate::adapter::foreign_scanout::now_100ns();
     let trips = round_trips();
-    let result = update_leaf_staged(passive, adapter, id, process, first_va, allocation_offset, pieces);
+    // The phases (`PgPv*`).
+    let mut watch = Watch::start(&PH_LEAF, Phase::Other);
+    let result = update_leaf_staged(
+        passive,
+        adapter,
+        id,
+        process,
+        first_va,
+        allocation_offset,
+        pieces,
+        Kind::Leaf,
+        &mut watch,
+    );
     LEAF_COST.note(start, trips);
+    if let Some(watch) = watch {
+        watch.done();
+    }
     result
 }
 
-/// [`update_leaf`] without the cost counters (`update_leaf_system` counts its own).
+/// [`update_leaf`] without the cost counters (`update_leaf_system` counts its own);
+/// the mutex is taken as `kind`, the phases go to `watch`.
+#[allow(clippy::too_many_arguments)]
 fn update_leaf_staged(
     passive: PassiveLevel,
     adapter: &AdapterContext,
@@ -3265,9 +3629,12 @@ fn update_leaf_staged(
     first_va: u64,
     allocation_offset: u64,
     pieces: &[Option<nm::MappingPiece>],
+    kind: Kind,
+    watch: &mut Option<Watch>,
 ) -> Result<(), Error> {
     leaf_stage(1);
-    let result = update_leaf_inner(passive, adapter, id, process, first_va, allocation_offset, pieces);
+    let result =
+        update_leaf_inner(passive, adapter, id, process, first_va, allocation_offset, pieces, kind, watch);
     let stage = LEAF_STAGE.load(Ordering::Relaxed);
     let len = pieces.len() as u64 * nm::PAGE_BYTES;
     match result {
@@ -3296,14 +3663,17 @@ fn update_leaf_inner(
     first_va: u64,
     allocation_offset: u64,
     pieces: &[Option<nm::MappingPiece>],
+    kind: Kind,
+    watch: &mut Option<Watch>,
 ) -> Result<(), Error> {
-    let _guard = lock(passive)?;
-    let client = STATE.lock().client()?;
+    let _guard = lock(passive, kind)?;
+    let client = st().client()?;
     let io = Io {
         passive,
         adapter,
         client,
     };
+    ph(watch, Phase::Other);
     leaf_stage(2);
     let count = pieces.len() as u64;
     let len = count.checked_mul(nm::PAGE_BYTES).ok_or(Error::Invalid)?;
@@ -3312,7 +3682,7 @@ fn update_leaf_inner(
     // changed below); the allocation's whole list is not cloned.
     let mut old_process: Vec<HostMapping> = Vec::new();
     let (memory, size, system_backed) = {
-        let state = STATE.lock();
+        let state = st();
         let allocation = state.allocation(id)?;
         if allocation.poisoned || allocation.epoch != client.epoch {
             return Err(Error::Poisoned);
@@ -3328,10 +3698,13 @@ fn update_leaf_inner(
     if pieces.iter().any(|p| p.is_some()) {
         // Placed in video memory: VidMm's system pages for it are its to free, so
         // its idle OS descriptors go (`helios_kmd_logic::desc_cache`).
+        ph(watch, Phase::Unmap);
         drop_idle_descs_of(&io, id);
     }
     leaf_stage(3);
+    ph(watch, Phase::Space);
     let space = ensure_space(&io, process)?;
+    ph(watch, Phase::Other);
     leaf_stage(4);
     if count == 0 || first_va & (nm::PAGE_BYTES - 1) != 0 {
         return Err(Error::Invalid);
@@ -3393,7 +3766,9 @@ fn update_leaf_inner(
     // goes from RM's too (RM refused the new fixed mapping over the stale one:
     // NV_ERR_INVALID_ARGUMENT, and the GPU faulted on the unmapped range).
     leaf_stage(8);
+    ph(watch, Phase::Evict);
     evict_range(&io, space, process, first_va, len, Some(id))?;
+    ph(watch, Phase::Other);
     leaf_stage(9);
 
     let affected_old: Vec<HostMapping> = old_process
@@ -3437,6 +3812,7 @@ fn update_leaf_inner(
     // `NvHotPath` 0x4 skips it (`HpQuiSkip`); otherwise it is timed (`HpQuiN`, `HpQuiUs`,
     // `HpQuiMaxUs`): one host round trip that waits for the client's channels.
     if !affected_old.is_empty() {
+        ph(watch, Phase::Quiesce);
         if crate::ddi::hot_path::knob(passive).no_quiesce() {
             crate::ddi::hot_path::count(&crate::ddi::hot_path::QUIESCE_SKIPPED);
             crate::ddi::pt_ring::record(ptr::K_QUIESCE, 0, 2, id, first_va, len, process);
@@ -3454,6 +3830,7 @@ fn update_leaf_inner(
         }
     }
 
+    ph(watch, Phase::Other);
     // Mint handles before tearing down anything.  A local handle-space
     // exhaustion therefore cannot strand the old mapping.
     let mut planned = Vec::new();
@@ -3461,7 +3838,7 @@ fn update_leaf_inner(
         .try_reserve_exact(affected_new.len())
         .map_err(|_| Error::NoMemory)?;
     for piece in affected_new.iter().copied() {
-        planned.push((piece, STATE.lock().mint()?));
+        planned.push((piece, st().mint()?));
     }
     leaf_stage(11);
     // NvPerfMem 0x20: every unmap and map of this update but the last defers its
@@ -3480,13 +3857,15 @@ fn update_leaf_inner(
         items.push((memory, mapping, np::defer_tlb(defer_on, index, operations)));
     }
     let mut unmapped = Vec::new();
+    ph(watch, Phase::Unmap);
     unmap_many(&io, &items, true, &mut unmapped)?;
+    ph(watch, Phase::Build);
     for (item, result) in items.iter().zip(&unmapped) {
         if result.is_err() {
             if deferred {
                 invalidate_tlb(&io, space);
             }
-            STATE.lock().allocation_mut(id)?.poisoned = true;
+            st().allocation_mut(id)?.poisoned = true;
             return Err(Error::Poisoned);
         }
         deferred |= item.2;
@@ -3512,7 +3891,7 @@ fn update_leaf_inner(
             // Who collided: the process key, the allocation, its space and how
             // many allocations / tracked mappings of this process exist.
             {
-                let state = STATE.lock();
+                let state = st();
                 let tracked = state
                     .allocations
                     .iter()
@@ -3538,7 +3917,7 @@ fn update_leaf_inner(
                     rollback_ok = false;
                     break;
                 }
-                let virt = match STATE.lock().mint() {
+                let virt = match st().mint() {
                     Ok(v) => v,
                     Err(_) => {
                         rollback_ok = false;
@@ -3566,10 +3945,10 @@ fn update_leaf_inner(
                 if deferred {
                     invalidate_tlb(&io, space);
                 }
-                STATE.lock().allocation_mut(id)?.poisoned = true;
+                st().allocation_mut(id)?.poisoned = true;
                 return Err(Error::Poisoned);
             }
-            let mut state = STATE.lock();
+            let mut state = st();
             let allocation = state.allocation_mut(id)?;
             allocation.mappings.retain(|mapping| {
                 !(mapping.process == process
@@ -3595,7 +3974,8 @@ fn update_leaf_inner(
         });
     }
 
-    let mut state = STATE.lock();
+    ph(watch, Phase::Book);
+    let mut state = st();
     let allocation = state.allocation_mut(id)?;
     allocation.mappings.retain(|mapping| {
         !(mapping.process == process
@@ -3616,7 +3996,7 @@ fn update_leaf_inner(
 /// Mark whether an address space has been quiesced for a live replacement.
 /// The scheduler/root-page-table integration calls this; absence means busy.
 pub fn set_address_space_idle(process: usize, idle: bool) {
-    let mut state = STATE.lock();
+    let mut state = st();
     if idle {
         if !state.idle_spaces.contains(&process) {
             let _ = state.idle_spaces.try_reserve_exact(1);
@@ -3630,7 +4010,7 @@ pub fn set_address_space_idle(process: usize, idle: bool) {
 }
 
 pub fn notify_residency(id: u32, physical_address: u64, resident: bool) -> Result<(), Error> {
-    let mut state = STATE.lock();
+    let mut state = st();
     let allocation = state.allocation_mut(id)?;
     allocation.resident = resident.then_some((physical_address, true));
     Ok(())
@@ -3783,6 +4163,19 @@ fn cpu_map(
     aperture_offset: Option<u64>,
     expected_gpa: Option<u64>,
 ) -> Result<CpuMapping, Error> {
+    cpu_map_as(io, allocation, offset, len, aperture_offset, expected_gpa, _MEMORY_CACHING_TYPE::MmNonCached)
+}
+
+/// [`cpu_map`] whose guest view of RM memory has caching `cache`.
+fn cpu_map_as(
+    io: &Io<'_>,
+    allocation: &Allocation,
+    offset: u64,
+    len: u64,
+    aperture_offset: Option<u64>,
+    expected_gpa: Option<u64>,
+    cache: _MEMORY_CACHING_TYPE::Type,
+) -> Result<CpuMapping, Error> {
     let end = offset.checked_add(len).ok_or(Error::Invalid)?;
     if len == 0
         || end > allocation.size
@@ -3846,7 +4239,7 @@ fn cpu_map(
     pa.QuadPart = physical as i64;
     // A fixed aperture has contiguous placements by construction, so one
     // aggregate guest view is valid. Dynamic mappings are limited to one chunk.
-    let kernel_va = unsafe { MmMapIoSpace(pa, len, _MEMORY_CACHING_TYPE::MmNonCached) } as u64;
+    let kernel_va = unsafe { MmMapIoSpace(pa, len, cache) } as u64;
     let mut mapping = CpuMapping {
         view: CpuView {
             address: kernel_va,
@@ -3895,15 +4288,15 @@ pub unsafe fn with_cpu_range(
     length: u64,
     mut f: impl FnMut(u64, *mut u8, u64) -> bool,
 ) -> Result<bool, Error> {
-    let _guard = lock(passive)?;
-    let client = STATE.lock().client()?;
+    let mut guard = Some(lock(passive, Kind::CpuRange)?);
+    let client = st().client()?;
     let io = Io {
         passive,
         adapter,
         client,
     };
     let (snapshot, existing, pending) = {
-        let state = STATE.lock();
+        let state = st();
         let a = state.allocation(id)?;
         let pending = a
             .cpu
@@ -3945,22 +4338,21 @@ pub unsafe fn with_cpu_range(
     if pending {
         // A previous temporary teardown failed after its guest view was removed.
         // Retry the retained host state before making another mapping.
-        let mut mapping = STATE
-            .lock()
+        let mut mapping = st()
             .allocation_mut(id)?
             .cpu
             .take()
             .ok_or(Error::Invalid)?;
         if let Err(error) = cpu_unmap_for(&io, snapshot.memory, &mut mapping) {
-            STATE.lock().allocation_mut(id)?.cpu = Some(mapping);
+            st().allocation_mut(id)?.cpu = Some(mapping);
             return Err(error);
         }
-    } else if STATE.lock().allocation(id)?.cpu.is_some() && existing.is_none() {
+    } else if st().allocation(id)?.cpu.is_some() && existing.is_none() {
         return Err(Error::Busy);
     }
     if let Some(view) = existing {
         let address = view.address.checked_add(offset).ok_or(Error::Invalid)?;
-        return Ok(f(0, address as *mut u8, length));
+        return Ok(view_copy(length, || f(0, address as *mut u8, length)));
     }
     if snapshot.system_memory != 0 {
         if snapshot.system_kernel_va == 0 {
@@ -3970,9 +4362,18 @@ pub unsafe fn with_cpu_range(
             .system_kernel_va
             .checked_add(offset)
             .ok_or(Error::Invalid)?;
-        return Ok(f(0, address as *mut u8, length));
+        return Ok(view_copy(length, || f(0, address as *mut u8, length)));
     }
 
+    // `NvPaging` 0x8: the copy runs without the mutex (the temporary view is this
+    // call's alone; only its RM map and unmap need the mutex). 0x10: the view is
+    // write-combined, and a full fence drains the combining buffers after the copy.
+    let knob = paging();
+    let cache = if knob.copy_wc() {
+        _MEMORY_CACHING_TYPE::MmWriteCombined
+    } else {
+        _MEMORY_CACHING_TYPE::MmNonCached
+    };
     let mut completed = 0u64;
     while completed < length {
         let request_offset = offset + completed;
@@ -3985,14 +4386,58 @@ pub unsafe fn with_cpu_range(
             .map(|end| end & !(nm::PAGE_BYTES - 1))
             .unwrap_or(snapshot.size)
             .min(snapshot.size);
-        let mut mapping = cpu_map(&io, &snapshot, map_offset, map_end - map_offset, None, None)?;
+        if guard.is_none() {
+            guard = Some(lock(passive, Kind::CpuRange)?);
+        }
+        let mut mapping =
+            cpu_map_as(&io, &snapshot, map_offset, map_end - map_offset, None, None, cache)?;
+        if knob.copy_unlocked() {
+            guard = None;
+            COPIES_UNLOCKED.fetch_add(1, Ordering::Relaxed);
+        }
         // SAFETY: page_offset is within the page-rounded mapping made above.
         let address = (mapping.view.address as *mut u8).add(page_offset as usize);
+        let copy_start = now();
         let accepted = f(completed, address, chunk_len);
+        if knob.copy_wc() {
+            core::sync::atomic::fence(Ordering::SeqCst);
+        }
+        COPY_KIB.fetch_add(u32::try_from(chunk_len >> 10).unwrap_or(u32::MAX), Ordering::Relaxed);
+        COPY_US.fetch_add(np::ticks_to_us(now().saturating_sub(copy_start)), Ordering::Relaxed);
+        if guard.is_none() {
+            match lock(passive, Kind::CpuRange) {
+                Ok(g) => guard = Some(g),
+                Err(error) => {
+                    // Without the mutex the host half cannot be released; the guest
+                    // view goes, the host state is kept for a later retry (the
+                    // `pending` path) when the record can hold it.
+                    if mapping.kernel_va != 0 {
+                        MmUnmapIoSpace(mapping.kernel_va as *mut c_void, mapping.view.len);
+                        mapping.kernel_va = 0;
+                    }
+                    let unstored = {
+                        let mut state = st();
+                        match state.allocation_mut(id) {
+                            Ok(allocation) if allocation.cpu.is_none() => {
+                                allocation.cpu = Some(mapping);
+                                None
+                            }
+                            _ => Some(mapping),
+                        }
+                    };
+                    if let Some(mapping) = unstored {
+                        // The host may still name it: never released, never reused.
+                        core::mem::forget(mapping);
+                        COPY_LEAKED.fetch_add(1, Ordering::Relaxed);
+                    }
+                    return Err(error);
+                }
+            }
+        }
         if let Err(error) = cpu_unmap_for(&io, snapshot.memory, &mut mapping) {
             // Keep partially released host state reachable for a later retry or
             // transport teardown; never silently drop a live mapping.
-            STATE.lock().allocation_mut(id)?.cpu = Some(mapping);
+            st().allocation_mut(id)?.cpu = Some(mapping);
             return Err(error);
         }
         if !accepted {
@@ -4013,15 +4458,15 @@ pub fn map_aperture(
     aperture_offset: u64,
     expected_gpa: u64,
 ) -> Result<CpuView, Error> {
-    let _guard = lock(passive)?;
-    let client = STATE.lock().client()?;
+    let _guard = lock(passive, Kind::ApertureMap)?;
+    let client = st().client()?;
     let io = Io {
         passive,
         adapter,
         client,
     };
     let snapshot = {
-        let state = STATE.lock();
+        let state = st();
         let a = state.allocation(id)?;
         Allocation {
             id: a.id,
@@ -4050,7 +4495,7 @@ pub fn map_aperture(
         Some(expected_gpa),
     )?;
     let view = mapping.view;
-    let mut state = STATE.lock();
+    let mut state = st();
     let allocation = state.allocation_mut(id)?;
     if allocation.cpu.is_some() {
         drop(state);
@@ -4067,15 +4512,15 @@ pub fn unmap_aperture(
     adapter: &AdapterContext,
     aperture_offset: u64,
 ) -> Result<(), Error> {
-    let _guard = lock(passive)?;
-    let client = STATE.lock().client()?;
+    let _guard = lock(passive, Kind::ApertureUnmap)?;
+    let client = st().client()?;
     let io = Io {
         passive,
         adapter,
         client,
     };
     let (id, memory) = {
-        let state = STATE.lock();
+        let state = st();
         let allocation = state
             .allocations
             .iter()
@@ -4087,8 +4532,7 @@ pub fn unmap_aperture(
             .ok_or(Error::Invalid)?;
         (allocation.id, allocation.memory)
     };
-    let mut mapping = STATE
-        .lock()
+    let mut mapping = st()
         .allocation_mut(id)?
         .cpu
         .take()
@@ -4098,7 +4542,7 @@ pub fn unmap_aperture(
         Err(error) => {
             // Preserve whatever remains live for a later retry or transport
             // teardown; a failed host unmap is not permission to forget it.
-            STATE.lock().allocation_mut(id)?.cpu = Some(mapping);
+            st().allocation_mut(id)?.cpu = Some(mapping);
             Err(error)
         }
     }
@@ -4108,15 +4552,15 @@ pub fn unmap_aperture(
 /// leaves the record and its MDLs alive; the caller must not report reclamation
 /// or unlock pSystemMem early.
 pub fn destroy(passive: PassiveLevel, adapter: &AdapterContext, id: u32) -> Result<(), Error> {
-    let _guard = lock(passive)?;
-    let client = STATE.lock().client()?;
+    let guard = lock(passive, Kind::Destroy)?;
+    let client = st().client()?;
     let io = Io {
         passive,
         adapter,
         client,
     };
     let (memory, mappings, gem) = {
-        let state = STATE.lock();
+        let state = st();
         let allocation = state.allocation(id)?;
         (
             allocation.memory,
@@ -4127,16 +4571,16 @@ pub fn destroy(passive: PassiveLevel, adapter: &AdapterContext, id: u32) -> Resu
     // A CPU view dxgkrnl did not unmap first (an UnmapApertureSegment that came
     // above PASSIVE leaves it, `cpu_host_aperture`) goes here: nothing maps the
     // allocation through the aperture once it is destroyed.
-    let cpu = STATE.lock().allocation_mut(id)?.cpu.take();
+    let cpu = st().allocation_mut(id)?.cpu.take();
     if let Some(mut mapping) = cpu {
         if let Err(error) = cpu_unmap_for(&io, memory, &mut mapping) {
-            STATE.lock().allocation_mut(id)?.cpu = Some(mapping);
+            st().allocation_mut(id)?.cpu = Some(mapping);
             return Err(error);
         }
     }
     if gem != 0 {
         super::native_scanout::release_gem(&io, gem);
-        STATE.lock().allocation_mut(id)?.scanout_gem = 0;
+        st().allocation_mut(id)?.scanout_gem = 0;
     }
     // Every mapping is tried (in as few round trips as `NvPaging` 0x1 allows); one
     // RM refuses stays recorded (and the allocation with it), the others are gone
@@ -4146,17 +4590,30 @@ pub fn destroy(passive: PassiveLevel, adapter: &AdapterContext, id: u32) -> Resu
     items.extend(mappings.iter().map(|m| (memory, *m, false)));
     let mut results = Vec::new();
     unmap_many(&io, &items, false, &mut results)?;
+    // The record's mappings are the copy taken above (only holders of the mutex
+    // change them): drop the unmapped ones in one pass (it was a STATE hold and a
+    // scan of the whole list per mapping).
     let mut unmapped = Ok(());
-    for (mapping, result) in mappings.iter().zip(results) {
-        match result {
-            Ok(()) => {
-                STATE
-                    .lock()
-                    .allocation_mut(id)?
-                    .mappings
-                    .retain(|live| !(live.virt == mapping.virt && live.piece.va == mapping.piece.va));
-            }
-            Err(error) => unmapped = Err(error),
+    let mut kept = Vec::new();
+    kept.try_reserve_exact(results.iter().filter(|r| r.is_err()).count())
+        .map_err(|_| Error::NoMemory)?;
+    for (mapping, result) in mappings.iter().zip(&results) {
+        if let Err(error) = result {
+            unmapped = Err(*error);
+            kept.push((mapping.virt, mapping.piece.va));
+        }
+    }
+    {
+        let mut state = st();
+        let allocation = state.allocation_mut(id)?;
+        if unmapped.is_ok() {
+            allocation.mappings.clear();
+        } else {
+            let tried = &mappings;
+            allocation.mappings.retain(|live| {
+                kept.contains(&(live.virt, live.piece.va))
+                    || !tried.iter().any(|m| m.virt == live.virt && m.piece.va == live.piece.va)
+            });
         }
     }
     unmapped?;
@@ -4165,10 +4622,13 @@ pub fn destroy(passive: PassiveLevel, adapter: &AdapterContext, id: u32) -> Resu
     io.rm_free(nd::H_DEVICE, memory)?;
     super::nvda::forget_memory(memory);
     let mut allocation = {
-        let mut state = STATE.lock();
+        let mut state = st();
         let index = state.index_of(id).ok_or(Error::Invalid)?;
         state.allocations.remove(index)
     };
+    // The record is gone and RM freed the memory: nothing names the pages, so
+    // they unlock outside the mutex (MmUnlockPages of a large allocation is long).
+    drop(guard);
     unlock_pins(&mut allocation.pins);
     Ok(())
 }
@@ -4183,12 +4643,12 @@ pub fn release_process(passive: PassiveLevel, adapter: &AdapterContext, process:
     if process == 0 {
         return 0;
     }
-    let Ok(_guard) = lock(passive) else {
+    let Ok(_guard) = lock(passive, Kind::Process) else {
         return 1;
     };
-    let Ok(client) = STATE.lock().client() else {
+    let Ok(client) = st().client() else {
         // No native client: nothing was ever mapped for anyone.
-        let mut state = STATE.lock();
+        let mut state = st();
         state.spaces.retain(|(owner, _)| *owner != process);
         state.idle_spaces.retain(|p| *p != process);
         return 0;
@@ -4199,7 +4659,7 @@ pub fn release_process(passive: PassiveLevel, adapter: &AdapterContext, process:
         client,
     };
     let owned: Vec<(u32, u32, HostMapping)> = {
-        let state = STATE.lock();
+        let state = st();
         let mut owned = Vec::new();
         let mut candidates = Vec::new();
         if state.candidates(process, &mut candidates).is_err() {
@@ -4219,7 +4679,7 @@ pub fn release_process(passive: PassiveLevel, adapter: &AdapterContext, process:
     };
     let mut kept = 0;
     let foreign: Vec<HostMapping> = {
-        let mut state = STATE.lock();
+        let mut state = st();
         let mut mine = Vec::new();
         if mine.try_reserve(state.foreign.len()).is_err() {
             return 1;
@@ -4250,7 +4710,7 @@ pub fn release_process(passive: PassiveLevel, adapter: &AdapterContext, process:
         if result.is_err() {
             kept += 1;
             // Still mapped: recorded under the dead key (see below).
-            let mut state = STATE.lock();
+            let mut state = st();
             if state.foreign.try_reserve(1).is_ok() {
                 state.foreign.push(HostMapping {
                     process: nt::DEAD_PROCESS,
@@ -4259,20 +4719,42 @@ pub fn release_process(passive: PassiveLevel, adapter: &AdapterContext, process:
             }
         }
     }
-    for ((id, _, mapping), result) in owned.into_iter().zip(owned_results) {
-        if result.is_ok() {
-            if let Ok(allocation) = STATE.lock().allocation_mut(id) {
-                allocation
-                    .mappings
-                    .retain(|live| !(live.virt == mapping.virt && live.piece.va == mapping.piece.va));
-            }
-        } else {
+    // Drop the released mappings in one pass per allocation (it was a STATE hold
+    // and a scan of the allocation's list per mapping). Only holders of the mutex
+    // add mappings, so the process's mappings are still the ones collected above.
+    let mut failed = Vec::new();
+    if failed
+        .try_reserve_exact(owned_results.iter().filter(|r| r.is_err()).count())
+        .is_err()
+    {
+        // No memory: nothing is dropped from the records, and the process's
+        // space stays (as for a mapping RM would not release).
+        return 1;
+    }
+    for ((id, _, mapping), result) in owned.iter().zip(owned_results) {
+        if result.is_err() {
             kept += 1;
+            failed.push((*id, mapping.virt, mapping.piece.va));
+        }
+    }
+    {
+        let mut state = st();
+        let mut last = None;
+        for (id, _, _) in owned.iter() {
+            if last == Some(*id) {
+                continue;
+            }
+            last = Some(*id);
+            if let Ok(allocation) = state.allocation_mut(*id) {
+                allocation.mappings.retain(|live| {
+                    live.process != process
+                        || failed.contains(&(*id, live.virt, live.piece.va))
+                });
+            }
         }
     }
     if kept == 0 {
-        let space = STATE
-            .lock()
+        let space = st()
             .spaces
             .iter()
             .find(|(owner, _)| *owner == process)
@@ -4280,23 +4762,23 @@ pub fn release_process(passive: PassiveLevel, adapter: &AdapterContext, process:
         if let Some(space) = space {
             for window in windows_of(space) {
                 if io.rm_free(nd::H_DEVICE, window).is_ok() {
-                    STATE.lock().windows.retain(|(_, live, _, _)| *live != window);
+                    st().windows.retain(|(_, live, _, _)| *live != window);
                 }
             }
             if io.rm_free(nd::H_DEVICE, space).is_ok() {
-                STATE.lock().spaces.retain(|(owner, _)| *owner != process);
+                st().spaces.retain(|(owner, _)| *owner != process);
             } else {
                 kept += 1;
             }
         }
-        STATE.lock().idle_spaces.retain(|p| *p != process);
+        st().idle_spaces.retain(|p| *p != process);
     }
     if kept != 0 {
         // What RM would not release stays recorded, but no longer under this key:
         // the key is the freed ProcessContext's address, and a new process at the
         // same address must get a fresh space, not the dead one's. Allocation
         // teardown and the transport's sweep still find it.
-        let mut state = STATE.lock();
+        let mut state = st();
         for allocation in state.allocations.iter_mut() {
             for mapping in allocation.mappings.iter_mut() {
                 mapping.process = nt::retire_owner(mapping.process, process);
@@ -4315,7 +4797,7 @@ pub fn release_process(passive: PassiveLevel, adapter: &AdapterContext, process:
     // A new process may get this key: its index starts empty. (What stayed is
     // recorded under the dead key, which no update names.)
     {
-        let mut state = STATE.lock();
+        let mut state = st();
         if let Some(at) = state.by_process.iter().position(|(p, _)| *p == process) {
             state.by_process.swap_remove(at);
         }
@@ -4326,7 +4808,7 @@ pub fn release_process(passive: PassiveLevel, adapter: &AdapterContext, process:
 /// Drop only guest-owned state after the transport already destroyed every RM
 /// object.  No host request is sent and no pSystemMem page is unlocked early.
 pub fn discard(id: u32) -> Result<(), Error> {
-    let mut state = STATE.lock();
+    let mut state = st();
     let index = state.index_of(id).ok_or(Error::Invalid)?;
     let mut allocation = state.allocations.remove(index);
     // The transport destroyed every RM object: its idle descriptors are gone too.
@@ -4354,7 +4836,7 @@ pub fn forget(passive: PassiveLevel) {
     let Ok(_guard) = mutex(passive).and_then(|m| m.lock(passive).ok_or(Error::Busy)) else {
         return;
     };
-    let mut state = STATE.lock();
+    let mut state = st();
     let mut allocations = core::mem::take(&mut state.allocations);
     state.client = None;
     state.spaces.clear();

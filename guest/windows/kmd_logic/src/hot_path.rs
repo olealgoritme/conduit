@@ -70,18 +70,42 @@ impl HotPath {
 ///   kept (up to `NvDescCacheMax`, default 256) and reused for the same pages
 ///   (`crate::desc_cache`). Sharing a mapped descriptor for the same pages is
 ///   always on: it is the same RM object either way.
+/// * [`Paging::ONE_LOCK`] (0x4): a system-page leaf update takes the
+///   native-memory mutex once for its unmap and its map half (it took it twice:
+///   anything queued meanwhile ran between the two halves, and the update
+///   waited for it again).
+/// * [`Paging::COPY_UNLOCKED`] (0x8): `with_cpu_range` (VidMm's native
+///   fills and transfers, through an uncached BAR view) lets go of the
+///   native-memory mutex while it copies; only the RM map / unmap of the
+///   temporary view run under it. A copy of many megabytes through an uncached
+///   view takes up to seconds, and every leaf update on another thread waited.
+/// * [`Paging::COPY_WC`] (0x10): that temporary view is write-combined instead
+///   of uncached (writes, i.e. fills and uploads, are combined into bursts),
+///   with a store fence after the copy.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Paging(pub u32);
 
 impl Paging {
     pub const BATCH: u32 = 0x1;
     pub const DESC_CACHE: u32 = 0x2;
+    pub const ONE_LOCK: u32 = 0x4;
+    pub const COPY_UNLOCKED: u32 = 0x8;
+    pub const COPY_WC: u32 = 0x10;
 
     pub const fn batch(self) -> bool {
         self.0 & Self::BATCH != 0
     }
     pub const fn desc_cache(self) -> bool {
         self.0 & Self::DESC_CACHE != 0
+    }
+    pub const fn one_lock(self) -> bool {
+        self.0 & Self::ONE_LOCK != 0
+    }
+    pub const fn copy_unlocked(self) -> bool {
+        self.0 & Self::COPY_UNLOCKED != 0
+    }
+    pub const fn copy_wc(self) -> bool {
+        self.0 & Self::COPY_WC != 0
     }
 }
 
@@ -279,6 +303,12 @@ mod tests {
         assert!(Paging(1).batch() && !Paging(1).desc_cache());
         assert!(!Paging(2).batch() && Paging(2).desc_cache());
         assert!(Paging(3).batch() && Paging(3).desc_cache());
+        assert!(!Paging(3).one_lock() && !Paging(3).copy_unlocked() && !Paging(3).copy_wc());
+        assert!(Paging(4).one_lock() && !Paging(4).batch());
+        assert!(Paging(8).copy_unlocked() && !Paging(8).one_lock());
+        assert!(Paging(0x10).copy_wc() && !Paging(0x10).copy_unlocked());
+        let all = Paging(0x1f);
+        assert!(all.batch() && all.desc_cache() && all.one_lock() && all.copy_unlocked() && all.copy_wc());
     }
 
     #[test]
