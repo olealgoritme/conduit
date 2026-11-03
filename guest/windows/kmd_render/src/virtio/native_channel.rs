@@ -13,6 +13,8 @@
 //! already real and exact; channel creation never substitutes another VA or
 //! duplicates it into a second client.
 
+pub(crate) mod pg_channel;
+
 use super::gpu::DeviceOwner;
 use super::native_memory::NativeClient;
 use super::nvrm::{self, MapRefusal, Refusal};

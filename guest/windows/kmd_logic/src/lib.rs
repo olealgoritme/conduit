@@ -72,6 +72,7 @@ pub mod rm_client;
 pub mod rm_batch;
 pub mod desc_cache;
 pub mod pg_phase;
+pub mod pg_gpu;
 pub mod rm_present;
 pub mod rm_refresh;
 pub mod rm_blt;
