@@ -23,7 +23,7 @@ use crate::irql::PassiveLevel;
 use crate::sync::SpinLock;
 use alloc::vec::Vec;
 use core::ffi::c_void;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use helios_kmd_logic::ce_present::{self as cp, Token};
 use helios_kmd_logic::native_channel as nc;
 use helios_kmd_logic::native_teardown as nt;
@@ -506,6 +506,10 @@ pub(crate) struct NativeContext {
     /// dxgkrnl's own handle for this context (`DXGKARG_CREATECONTEXT.hContext` on
     /// input), which `DxgkCbInvalidateHwContext` names; 0 = unknown.
     dxg_context: usize,
+    /// Live graphics-kind queues (channels on VEID 0).
+    graphics_queues: AtomicU32,
+    /// VEIDs taken by compute-only channels of this TSG (bit n = VEID n).
+    veids: AtomicU64,
 }
 
 impl NativeContext {
@@ -616,6 +620,8 @@ impl NativeContext {
             ctxshare,
             scheduled: AtomicU32::new(0),
             dxg_context: 0,
+            graphics_queues: AtomicU32::new(0),
+            veids: AtomicU64::new(0),
         })
     }
 
@@ -684,6 +690,10 @@ struct QueueParts {
     ctl: CpuView,
     usermode_allocated: bool,
     usermode: CpuView,
+    /// The queue's own context share (`handles.at(12)`, a non-zero VEID), and
+    /// whether RM kept it at teardown (its VEID stays taken).
+    ctxshare_allocated: bool,
+    ctxshare_left: bool,
     channel_allocated: bool,
     token: u32,
     /// What the last `destroy` could not free, for the caller to file.
@@ -722,6 +732,17 @@ impl QueueParts {
                 result = Err(error);
             }
             self.channel_allocated = false;
+        }
+        if self.ctxshare_allocated {
+            self.ctxshare_allocated = false;
+            let freed = channel_gone && io.free(client, tsg, handles.at(12)).is_ok();
+            if !freed {
+                self.ctxshare_left = true;
+                self.left.add(tsg, handles.at(12));
+                if result.is_ok() {
+                    result = Err(NativeError::Rm);
+                }
+            }
         }
         for view in [&mut self.usermode, &mut self.ctl] {
             // `cpu_unmap` drops the kernel view first, whatever fails after it.
@@ -781,6 +802,10 @@ pub(crate) struct NativeQueue {
     _progress_fence_gpu: u64,
     /// Recovered (`mark_dead`): submissions no longer reach the channel.
     dead: core::sync::atomic::AtomicBool,
+    /// The compute-only channel's VEID (0: the channel is on the context's
+    /// share), and whether the queue counts as the context's graphics queue.
+    veid: u32,
+    graphics: bool,
 }
 
 impl NativeQueue {
@@ -816,22 +841,79 @@ impl NativeQueue {
             adapter,
             epoch: native.epoch,
         };
-        let mut parts = QueueParts {
-            handles: Some(handles),
-            ..QueueParts::default()
-        };
-        let result = create_queue_objects(
-            io,
-            &native.client,
-            context.tsg,
-            context.ctxshare,
-            &context.scheduled,
-            queue,
-            &mut parts,
-        );
-        // A half-made queue's objects RM would not free go to DestroyProcess.
-        file_leftovers(context.process_key(), native.epoch, &mut parts.left);
+        // A compute queue next to a graphics queue gets NVIDIA's layout: a
+        // compute-only channel on a VEID of its own. On VEID 0 its compute
+        // methods interleaved with the graphics channel's 3D stream (Steel
+        // Nomad DX12: Xid 13 MME MISSING_MACRO_DATA). NvQVeidOff=1 keeps every
+        // queue on VEID 0. NvQVeid* record the outcome.
+        let mut veid = 0u32;
+        let mut parts = QueueParts::default();
+        let mut result = Err(NativeError::Invalid);
+        let graphics_queues = context.graphics_queues.load(Ordering::Acquire);
+        let veid_off =
+            crate::diag::read_config_dword(crate::diag::KnobName::new(b"NvQVeidOff"), 0) != 0;
+        if nc::wants_own_veid(queue.kind(), graphics_queues) && !veid_off {
+            if let Some(pick) = take_veid(&context.veids) {
+                parts = QueueParts {
+                    handles: Some(handles),
+                    ..QueueParts::default()
+                };
+                result = create_queue_objects_on(
+                    io,
+                    &native.client,
+                    context.tsg,
+                    context.ctxshare,
+                    &context.scheduled,
+                    queue,
+                    &mut parts,
+                    Some(OwnVeid {
+                        veid: pick,
+                        vaspace: native.vaspace,
+                    }),
+                );
+                file_leftovers(context.process_key(), native.epoch, &mut parts.left);
+                if result.is_ok() {
+                    veid = pick;
+                    let made = VEID_MADE.fetch_add(1, Ordering::Relaxed) + 1;
+                    crate::diag::record_named_bytes(b"NvQVeidMade", made);
+                    crate::diag::record_named_bytes(b"NvQVeidLast", pick);
+                } else {
+                    // Its subcontext stays taken if RM kept the share.
+                    if !parts.ctxshare_left {
+                        context.veids.fetch_and(!(1u64 << pick), Ordering::AcqRel);
+                    }
+                    let failed = VEID_FAILED.fetch_add(1, Ordering::Relaxed) + 1;
+                    crate::diag::record_named_bytes(b"NvQVeidFail", failed);
+                }
+            }
+        }
+        if veid == 0 {
+            let handles = if result.is_err() && parts.handles.is_some() {
+                ObjectHandles::mint()?
+            } else {
+                handles
+            };
+            parts = QueueParts {
+                handles: Some(handles),
+                ..QueueParts::default()
+            };
+            result = create_queue_objects(
+                io,
+                &native.client,
+                context.tsg,
+                context.ctxshare,
+                &context.scheduled,
+                queue,
+                &mut parts,
+            );
+            // A half-made queue's objects RM would not free go to DestroyProcess.
+            file_leftovers(context.process_key(), native.epoch, &mut parts.left);
+        }
         result?;
+        let graphics = queue.kind() == nc::QUEUE_KIND_GRAPHICS;
+        if graphics {
+            context.graphics_queues.fetch_add(1, Ordering::AcqRel);
+        }
         // NvCeBindOn: bit 0 enables the binding, bits 8..12 are subchannel 4's
         // SET_OBJECT ENGINE field (its engine on the GR runlist; 0 = GR itself).
         let knob = crate::diag::read_config_dword(crate::diag::KnobName::new(b"NvCeBindOn"), 0);
@@ -856,6 +938,8 @@ impl NativeQueue {
             copy_tries: AtomicU32::new(0),
             _progress_fence_gpu: progress_gpu,
             dead: core::sync::atomic::AtomicBool::new(false),
+            veid,
+            graphics,
         })
     }
 
@@ -1180,7 +1264,40 @@ impl NativeQueue {
         // `Drop`).
         let _ = self.parts.destroy(io, &native.client, context.tsg);
         file_leftovers(context.process_key(), native.epoch, &mut self.parts.left);
+        self.release_context_slots(context);
         Ok(())
+    }
+
+    /// Give the context back this queue's graphics count and VEID (a VEID
+    /// whose share RM kept stays taken). Once, at teardown.
+    fn release_context_slots(&mut self, context: &NativeContext) {
+        if core::mem::take(&mut self.graphics) {
+            context.graphics_queues.fetch_sub(1, Ordering::AcqRel);
+        }
+        let veid = core::mem::take(&mut self.veid);
+        if veid != 0 && !self.parts.ctxshare_left {
+            context.veids.fetch_and(!(1u64 << veid), Ordering::AcqRel);
+        }
+    }
+}
+
+static VEID_MADE: AtomicU32 = AtomicU32::new(0);
+static VEID_FAILED: AtomicU32 = AtomicU32::new(0);
+
+/// Take the lowest free non-zero VEID of a TSG's `veids` mask.
+fn take_veid(veids: &AtomicU64) -> Option<u32> {
+    let mut used = veids.load(Ordering::Acquire);
+    loop {
+        let pick = nc::pick_veid(used)?;
+        match veids.compare_exchange_weak(
+            used,
+            used | (1u64 << pick),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return Some(pick),
+            Err(now) => used = now,
+        }
     }
 }
 
@@ -1206,6 +1323,32 @@ fn create_queue_objects(
     scheduled: &AtomicU32,
     queue: &nc::QueuePrivate,
     parts: &mut QueueParts,
+) -> Result<(), NativeError> {
+    create_queue_objects_on(io, client, tsg, ctxshare, scheduled, queue, parts, None)
+}
+
+/// A compute-only channel's own subcontext: `veid` (non-zero) in the VA space
+/// `vaspace` of the TSG.
+#[derive(Clone, Copy)]
+struct OwnVeid {
+    veid: u32,
+    vaspace: u32,
+}
+
+/// `own` None: the graphics layout, a channel on the context's share (VEID 0)
+/// with every object the UMDs drive. `own` Some: NVIDIA's compute-only queue,
+/// a channel on runqueue 1 under a SPECIFIED context share of its own, with
+/// the compute and deferred-API objects only.
+#[allow(clippy::too_many_arguments)]
+fn create_queue_objects_on(
+    io: Io<'_>,
+    client: &NativeClient,
+    tsg: u32,
+    ctxshare: u32,
+    scheduled: &AtomicU32,
+    queue: &nc::QueuePrivate,
+    parts: &mut QueueParts,
+    own: Option<OwnVeid>,
 ) -> Result<(), NativeError> {
     let handles = parts.handles.ok_or(NativeError::Invalid)?;
     let result = (|| {
@@ -1254,14 +1397,30 @@ fn create_queue_objects(
             _MEMORY_CACHING_TYPE::MmNonCached,
         )?;
 
+        let (channel_share, channel_flags) = match own {
+            Some(own) => {
+                crate::diag::record_named_bytes(b"NvQStep", 0x41);
+                io.alloc(
+                    client,
+                    tsg,
+                    handles.at(12),
+                    cc::FERMI_CONTEXT_SHARE_A,
+                    &cc::ctxshare_specified_params(own.vaspace, own.veid),
+                )?;
+                parts.ctxshare_allocated = true;
+                (handles.at(12), cc::CHANNEL_FLAGS_ASYNC_COMPUTE)
+            }
+            None => (ctxshare, 0),
+        };
         crate::diag::record_named_bytes(b"NvQStep", 5);
         let channel = cc::channel_params(&cc::ChannelDesc {
             h_ctl: handles.at(3),
             gpfifo_va: queue.gpfifo_va,
             entries: queue.entries(),
-            h_ctxshare: ctxshare,
+            h_ctxshare: channel_share,
             userd_offset: cc::USERD_OFFSET,
             engine_type: cc::ENGINE_GRAPHICS,
+            flags: channel_flags,
         });
         io.alloc(
             client,
@@ -1281,55 +1440,71 @@ fn create_queue_objects(
             BLACKWELL_COMPUTE_B,
             &[0u8; 16],
         )?;
-        // The D3D UMDs drive the 3D class on subchannel 0 and the graphics copy
-        // engine on subchannel 4 (they never SET_OBJECT them; their pushbuffers
-        // assume both). RM maps a class's GR context buffers when its object is
-        // allocated (kgrctxMapCtxBuffers), so without a 3D object the 3D
-        // pipeline wrote through unset context addresses (Xid 31 at VA 0,
-        // HUBCLIENT_SCC_NB). Best effort: NvCh3dSt / NvChCeSt record RM's
-        // answer (0 = allocated).
-        let three_d = io.alloc(client, handles.at(5), handles.at(7), BLACKWELL_B, &[0u8; 16]);
-        crate::diag::record_named_bytes(b"NvCh3dSt", u32::from(three_d.is_err()));
-        // The copy object must be the graphics runlist's copy engine (GRCE):
-        // engine type 0 let RM bind an async CE, and every method the UMD sent
-        // to subchannel 4 raised PBDMA DEVICE (Xid 32, SET_RENDER_ENABLE_C).
-        let grce = grce_engine(io, client).unwrap_or(0);
-        crate::diag::record_named_bytes(b"NvChGrce", grce);
-        let copy = io.alloc(
-            client,
-            handles.at(5),
-            handles.at(8),
-            cp::Gen::Gb202.classes().copy,
-            &cc::ce_object_params(grce),
-        );
-        crate::diag::record_named_bytes(b"NvChCeSt", u32::from(copy.is_err()));
-        // The D3D UMDs' copy queues open with SET_OBJECT(subchannel 5,
-        // NV50_DEFERRED_API_CLASS). On a GR channel without that object every
-        // later subchannel-4 (copy engine) method raises PBDMA DEVICE (Xid 32,
-        // reproduced on the host RM); with the object allocated, RM accepts the
-        // binding and the copy engine keeps working. Best effort: NvChDapiSt.
-        let deferred = io.alloc(
-            client,
-            handles.at(5),
-            handles.at(9),
-            NV50_DEFERRED_API_CLASS,
-            &[0u8; 1],
-        );
-        crate::diag::record_named_bytes(b"NvChDapiSt", u32::from(deferred.is_err()));
-        // NVIDIA's KMD puts an inline-to-memory and a 2D object on every graphics
-        // channel next to the 3D one: the Vulkan ICD asks their engine ids by the
-        // pseudo handles 0xff1fe01a / 0xff1fe02c (610.88 capture) and drives them
-        // without allocating them itself. Best effort: NvChI2mSt / NvCh2dSt.
-        let i2m = io.alloc(
-            client,
-            handles.at(5),
-            handles.at(10),
-            BLACKWELL_INLINE_TO_MEMORY_A,
-            &[0u8; 16],
-        );
-        crate::diag::record_named_bytes(b"NvChI2mSt", u32::from(i2m.is_err()));
-        let two_d = io.alloc(client, handles.at(5), handles.at(11), FERMI_TWOD_A, &[0u8; 16]);
-        crate::diag::record_named_bytes(b"NvCh2dSt", u32::from(two_d.is_err()));
+        if own.is_some() {
+            // The compute queues bind NV50_DEFERRED_API_CLASS on subchannel 5
+            // like every other queue; 3D (VEID 0 only) and copy (runqueue 0
+            // only) are refused on this channel and the queue drives neither.
+            let deferred = io.alloc(
+                client,
+                handles.at(5),
+                handles.at(9),
+                NV50_DEFERRED_API_CLASS,
+                &[0u8; 1],
+            );
+            crate::diag::record_named_bytes(b"NvQVeidDapi", u32::from(deferred.is_err()));
+        } else {
+            // The D3D UMDs drive the 3D class on subchannel 0 and the graphics copy
+            // engine on subchannel 4 (they never SET_OBJECT them; their pushbuffers
+            // assume both). RM maps a class's GR context buffers when its object is
+            // allocated (kgrctxMapCtxBuffers), so without a 3D object the 3D
+            // pipeline wrote through unset context addresses (Xid 31 at VA 0,
+            // HUBCLIENT_SCC_NB). Best effort: NvCh3dSt / NvChCeSt record RM's
+            // answer (0 = allocated).
+            let three_d =
+                io.alloc(client, handles.at(5), handles.at(7), BLACKWELL_B, &[0u8; 16]);
+            crate::diag::record_named_bytes(b"NvCh3dSt", u32::from(three_d.is_err()));
+            // The copy object must be the graphics runlist's copy engine (GRCE):
+            // engine type 0 let RM bind an async CE, and every method the UMD sent
+            // to subchannel 4 raised PBDMA DEVICE (Xid 32, SET_RENDER_ENABLE_C).
+            let grce = grce_engine(io, client).unwrap_or(0);
+            crate::diag::record_named_bytes(b"NvChGrce", grce);
+            let copy = io.alloc(
+                client,
+                handles.at(5),
+                handles.at(8),
+                cp::Gen::Gb202.classes().copy,
+                &cc::ce_object_params(grce),
+            );
+            crate::diag::record_named_bytes(b"NvChCeSt", u32::from(copy.is_err()));
+            // The D3D UMDs' copy queues open with SET_OBJECT(subchannel 5,
+            // NV50_DEFERRED_API_CLASS). On a GR channel without that object every
+            // later subchannel-4 (copy engine) method raises PBDMA DEVICE (Xid 32,
+            // reproduced on the host RM); with the object allocated, RM accepts the
+            // binding and the copy engine keeps working. Best effort: NvChDapiSt.
+            let deferred = io.alloc(
+                client,
+                handles.at(5),
+                handles.at(9),
+                NV50_DEFERRED_API_CLASS,
+                &[0u8; 1],
+            );
+            crate::diag::record_named_bytes(b"NvChDapiSt", u32::from(deferred.is_err()));
+            // NVIDIA's KMD puts an inline-to-memory and a 2D object on every graphics
+            // channel next to the 3D one: the Vulkan ICD asks their engine ids by the
+            // pseudo handles 0xff1fe01a / 0xff1fe02c (610.88 capture) and drives them
+            // without allocating them itself. Best effort: NvChI2mSt / NvCh2dSt.
+            let i2m = io.alloc(
+                client,
+                handles.at(5),
+                handles.at(10),
+                BLACKWELL_INLINE_TO_MEMORY_A,
+                &[0u8; 16],
+            );
+            crate::diag::record_named_bytes(b"NvChI2mSt", u32::from(i2m.is_err()));
+            let two_d =
+                io.alloc(client, handles.at(5), handles.at(11), FERMI_TWOD_A, &[0u8; 16]);
+            crate::diag::record_named_bytes(b"NvCh2dSt", u32::from(two_d.is_err()));
+        }
         crate::diag::record_named_bytes(b"NvQStep", 8);
         let mut index = cc::token_notif_index_params();
         io.control(
@@ -1351,7 +1526,7 @@ fn create_queue_objects(
             .ok_or(NativeError::Transport)?
             .0;
         crate::diag::record_named_bytes(b"NvQStep", 10);
-        note_channel(parts.token, queue.gpfifo_va, ctxshare);
+        note_channel(parts.token, queue.gpfifo_va, channel_share);
         if scheduled
             .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
