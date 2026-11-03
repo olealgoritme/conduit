@@ -443,6 +443,16 @@ impl NvidiaBackend {
                 );
                 let status =
                     u32::from_le_bytes(outer[NVOS54_STATUS..NVOS54_STATUS + 4].try_into().unwrap());
+                // The GR preemption controls: RM's (GSP-RM's) answer and the modes asked.
+                if preempt_log::is_logged(cmd) {
+                    preempt_log::log(
+                        cmd,
+                        u32::from_le_bytes(outer[0..4].try_into().unwrap()),
+                        u32::from_le_bytes(outer[4..8].try_into().unwrap()),
+                        status,
+                        host_buf,
+                    );
+                }
                 if status == NV_OK {
                     log::debug!(
                         "RM_CONTROL cmd=0x{:08x} paramsSize={} -> NV_OK",

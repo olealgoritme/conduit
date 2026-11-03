@@ -510,6 +510,20 @@ pub(crate) struct NativeContext {
     graphics_queues: AtomicU32,
     /// VEIDs taken by compute-only channels of this TSG (bit n = VEID n).
     veids: AtomicU64,
+    /// `NvPreempt`: the TSG's preemption modes, set once, and its GfxP buffers.
+    preempt: Preempt,
+}
+
+/// A TSG's preemption state (`NvPreempt`, `helios_kmd_logic::ctxsw_preempt`): the gate
+/// (`ctxsw_preempt::gate`) and the GfxP buffers bound to its GR context, memory `i` at
+/// handle `first + i`, its virtual allocation at `first + BIND_BUFFERS + i`.
+#[derive(Default)]
+struct Preempt {
+    gate: AtomicU32,
+    /// First handle of the buffers' block; 0 = none.
+    first: AtomicU32,
+    /// Allocated objects: bit `i` memory `i`, bit `BIND_BUFFERS + i` its virtual allocation.
+    live: AtomicU32,
 }
 
 impl NativeContext {
@@ -622,6 +636,7 @@ impl NativeContext {
             dxg_context: 0,
             graphics_queues: AtomicU32::new(0),
             veids: AtomicU64::new(0),
+            preempt: Preempt::default(),
         })
     }
 
@@ -663,8 +678,13 @@ impl NativeContext {
         // the context share without any live channel beneath it. dxgkrnl never
         // repeats DestroyContext: a TSG RM would not free is filed for
         // DestroyProcess, and the context goes either way.
+        let key = self.process_key();
         if io.free(&native.client, nd::H_DEVICE, self.tsg).is_err() {
-            file_leftover(self.process_key(), native.epoch, nd::H_DEVICE, self.tsg);
+            file_leftover(key, native.epoch, nd::H_DEVICE, self.tsg);
+            // The GR context may still reference its GfxP buffers: they go with the TSG.
+            free_preempt_buffers(io, &native.client, &self.preempt, Some((key, native.epoch)), true);
+        } else {
+            free_preempt_buffers(io, &native.client, &self.preempt, Some((key, native.epoch)), false);
         }
         Ok(())
     }
@@ -861,9 +881,8 @@ impl NativeQueue {
                 result = create_queue_objects_on(
                     io,
                     &native.client,
-                    context.tsg,
-                    context.ctxshare,
-                    &context.scheduled,
+                    context,
+                    native.vaspace,
                     queue,
                     &mut parts,
                     Some(OwnVeid {
@@ -900,9 +919,8 @@ impl NativeQueue {
             result = create_queue_objects(
                 io,
                 &native.client,
-                context.tsg,
-                context.ctxshare,
-                &context.scheduled,
+                context,
+                native.vaspace,
                 queue,
                 &mut parts,
             );
@@ -1442,9 +1460,8 @@ impl CopyChannel {
         let result = create_queue_objects(
             io,
             client,
-            self.context.tsg,
-            self.context.ctxshare,
-            &self.context.scheduled,
+            &self.context,
+            native.vaspace,
             &queue,
             &mut self.parts,
         );
@@ -1620,13 +1637,12 @@ fn note_channel(token: u32, gpfifo_va: u64, space: u32) {
 fn create_queue_objects(
     io: Io<'_>,
     client: &NativeClient,
-    tsg: u32,
-    ctxshare: u32,
-    scheduled: &AtomicU32,
+    context: &NativeContext,
+    vaspace: u32,
     queue: &nc::QueuePrivate,
     parts: &mut QueueParts,
 ) -> Result<(), NativeError> {
-    create_queue_objects_on(io, client, tsg, ctxshare, scheduled, queue, parts, None)
+    create_queue_objects_on(io, client, context, vaspace, queue, parts, None)
 }
 
 /// A compute-only channel's own subcontext: `veid` (non-zero) in the VA space
@@ -1637,47 +1653,64 @@ struct OwnVeid {
     vaspace: u32,
 }
 
-/// `NvPreempt` (`helios_kmd_logic::ctxsw_preempt`): set the preemption modes of a new channel
-/// after its engine objects, as NVIDIA's drivers do, and read the modes in force back.
-/// Best effort, never fails the queue: `NvPrSetSt` = 0 set on the channel, 1 on the TSG
-/// (the channel refused), 2 both refused; `NvPrGfx` / `NvPrCmp` = `gfxp << 8 | cilp` read
-/// back on the last graphics / compute-only channel (0xffffffff = the read was refused);
-/// `NvPrN` = channels set; `NvPrTsg<k>` the TSG's hardware id with the channel's token.
+/// `NvPreempt` (`helios_kmd_logic::ctxsw_preempt`): set the context-switch preemption modes
+/// of a new channel's TSG after its engine objects, as NVIDIA's drivers do, and read the
+/// modes in force back. The modes are the TSG's (one GR context): only the TSG's first VEID 0
+/// channel sets them, both in one call, and a refusal leaves both at RM's defaults; later
+/// channels of the TSG (compute-only ones on other VEIDs included) set nothing. GFXP binds
+/// per-TSG buffers the KMD allocates (`CTXSW_PREEMPTION_BIND`), WFI / GFXP_POOL / a compute
+/// mode alone go through `SET_CTXSW_PREEMPTION_MODE`.
+///
+/// Best effort, never fails the queue. Registry values: `NvPrSetSt` = 0 set on the channel,
+/// 1 on the TSG (the channel refused), 2 both refused (SET); `NvPrBind` = 0 bound on the TSG,
+/// 1 on the channel, 2 both refused, 3 no buffers (BIND); `NvPrSt` = RM's status of the last
+/// refused set or bind; `NvPrBufErr` why the buffers were not made (1 no MAIN size, 2
+/// alignment, 3 too large, 0x1i size query i refused, 0x2i / 0x3i / 0x4i memory / virtual /
+/// map of buffer i refused, 0x5i a mapped VA not aligned); `NvPrSz<i>` RM's size of buffer i
+/// in 4-KiB units; `NvPrVa` the MAIN buffer's VA >> 16; `NvPrBufN` TSGs with buffers bound;
+/// `NvPrN` = TSGs set; `NvPrSkip` = channels that left the modes to their TSG's first
+/// channel; `NvPrWant` = `gfxp << 8 | cilp` asked, `NvPrGfx` / `NvPrCmp` the same read back on
+/// the last graphics / compute-only channel (0xffffffff = the read was refused);
+/// `NvPrTsg<k>` the TSG's hardware id with the channel's token.
+#[allow(clippy::too_many_arguments)]
 fn set_preemption(
     io: Io<'_>,
     client: &NativeClient,
-    tsg: u32,
+    context: &NativeContext,
     channel: u32,
+    vaspace: u32,
     graphics: bool,
     token: u32,
 ) {
     use helios_kmd_logic::ctxsw_preempt as pre;
     static SET: AtomicU32 = AtomicU32::new(0);
+    static SKIPPED: AtomicU32 = AtomicU32::new(0);
+    let tsg = context.tsg;
     let knob = crate::diag::read_config_dword(crate::diag::KnobName::new(b"NvPreempt"), 0);
     let plan = pre::plan(knob, graphics);
-    if let Some(params) = pre::set_params(channel, &plan) {
-        let mut on_channel = params;
-        let status = if io
-            .control(client, nd::H_SUBDEVICE, pre::CTRL_SET_PREEMPTION_MODE, &mut on_channel)
+    let gate = &context.preempt.gate;
+    if pre::claims(&plan, graphics, gate.load(Ordering::Acquire))
+        && gate
+            .compare_exchange(
+                pre::gate::UNTRIED,
+                pre::gate::BUSY,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
             .is_ok()
-        {
-            0
-        } else {
-            let mut on_tsg = params;
-            on_tsg[4..8].copy_from_slice(&tsg.to_le_bytes());
-            if io
-                .control(client, nd::H_SUBDEVICE, pre::CTRL_SET_PREEMPTION_MODE, &mut on_tsg)
-                .is_ok()
-            {
-                1
-            } else {
-                2
-            }
+    {
+        crate::diag::record_named_bytes(b"NvPrWant", pre::expected_word(&plan));
+        let accepted = match plan.route() {
+            pre::Route::Bind => bind_gfxp(io, client, context, channel, vaspace, &plan),
+            pre::Route::Set => set_modes(io, client, tsg, channel, &plan),
+            pre::Route::Nothing => false,
         };
-        crate::diag::record_named_bytes(b"NvPrSetSt", status);
-        if status != 2 {
+        gate.store(pre::gate_after(accepted), Ordering::Release);
+        if accepted {
             crate::diag::record_named_bytes(b"NvPrN", SET.fetch_add(1, Ordering::Relaxed) + 1);
         }
+    } else if pre::plan(knob, true).sets() {
+        crate::diag::record_named_bytes(b"NvPrSkip", SKIPPED.fetch_add(1, Ordering::Relaxed) + 1);
     }
     if plan.query {
         let mut get = pre::get_params(channel);
@@ -1706,6 +1739,235 @@ fn set_preemption(
     }
 }
 
+/// A control whose refusal's RM status the caller wants (`Err` = `rm_error_code`, or
+/// 0xfffffffe for a transport failure).
+fn control_status(
+    io: Io<'_>,
+    client: &NativeClient,
+    object: u32,
+    command: u32,
+    params: &mut [u8],
+) -> Result<(), u32> {
+    let block = rc::nvos54(client.root, object, command, params.len() as u32);
+    let mut resp = [0u8; 1024];
+    let n = io
+        .exchange(
+            client.ctl,
+            rc::nv_cmd(rc::ESC_RM_CONTROL, rc::NVOS54_BYTES as u32),
+            &block,
+            params,
+            &mut resp,
+        )
+        .map_err(|_| 0xffff_fffeu32)?;
+    let reply = rc::rm_reply(resp.get(..n).ok_or(0xffff_fffeu32)?, rc::NVOS54_STATUS_AT)
+        .map_err(rm_error_code)?;
+    let count = reply.nested.len().min(params.len());
+    params[..count].copy_from_slice(&reply.nested[..count]);
+    if count != params.len() {
+        return Err(0xffff_fffe);
+    }
+    Ok(())
+}
+
+/// `SET_CTXSW_PREEMPTION_MODE` with both of `plan`'s modes in one call, on the channel, else
+/// on the TSG. Whether RM took it.
+fn set_modes(
+    io: Io<'_>,
+    client: &NativeClient,
+    tsg: u32,
+    channel: u32,
+    plan: &helios_kmd_logic::ctxsw_preempt::Plan,
+) -> bool {
+    use helios_kmd_logic::ctxsw_preempt as pre;
+    let Some(params) = pre::set_params(channel, plan) else {
+        return false;
+    };
+    let set = pre::CTRL_SET_PREEMPTION_MODE;
+    let mut on_channel = params;
+    let status = match control_status(io, client, nd::H_SUBDEVICE, set, &mut on_channel) {
+        Ok(()) => 0,
+        Err(st) => {
+            crate::diag::record_named_bytes(b"NvPrSt", st);
+            let mut on_tsg = params;
+            on_tsg[4..8].copy_from_slice(&tsg.to_le_bytes());
+            match control_status(io, client, nd::H_SUBDEVICE, set, &mut on_tsg) {
+                Ok(()) => 1,
+                Err(st) => {
+                    crate::diag::record_named_bytes(b"NvPrSt", st);
+                    2
+                }
+            }
+        }
+    };
+    crate::diag::record_named_bytes(b"NvPrSetSt", status);
+    status != 2
+}
+
+/// GFXP for the TSG: RM's buffer sizes, the five buffers in video memory mapped into the
+/// TSG's VA space `vaspace`, and `CTXSW_PREEMPTION_BIND` (with the plan's compute mode in the
+/// same call) on the TSG, else on the channel. Buffers RM did not take are freed again.
+/// Whether RM took it.
+fn bind_gfxp(
+    io: Io<'_>,
+    client: &NativeClient,
+    context: &NativeContext,
+    channel: u32,
+    vaspace: u32,
+    plan: &helios_kmd_logic::ctxsw_preempt::Plan,
+) -> bool {
+    use helios_kmd_logic::ctxsw_preempt as pre;
+    static BOUND: AtomicU32 = AtomicU32::new(0);
+    let state = &context.preempt;
+    let mut bufs = [pre::Buffer::default(); pre::BIND_BUFFERS];
+    for (i, buf) in bufs.iter_mut().enumerate() {
+        let mut props = pre::props_params(i);
+        let props_cmd = pre::CTRL_ENGINE_CONTEXT_PROPERTIES;
+        if let Err(st) = control_status(io, client, nd::H_DEVICE, props_cmd, &mut props) {
+            crate::diag::record_named_bytes(b"NvPrSt", st);
+            crate::diag::record_named_bytes(b"NvPrBufErr", 0x10 | i as u32);
+            crate::diag::record_named_bytes(b"NvPrBind", 3);
+            return false;
+        }
+        *buf = pre::parse_props(&props);
+        crate::diag::record_named_bytes(
+            &[b'N', b'v', b'P', b'r', b'S', b'z', b'0' + i as u8],
+            (buf.size >> 12) as u32,
+        );
+    }
+    if let Err(error) = pre::check_layout(&bufs) {
+        crate::diag::record_named_bytes(b"NvPrBufErr", error.code());
+        crate::diag::record_named_bytes(b"NvPrBind", 3);
+        return false;
+    }
+    let Ok(handles) = ObjectHandles::mint() else {
+        crate::diag::record_named_bytes(b"NvPrBind", 3);
+        return false;
+    };
+    state.first.store(handles.at(0), Ordering::Release);
+    let mut vas = [0u64; pre::BIND_BUFFERS];
+    let made = (|| -> Result<(), u32> {
+        for (i, buf) in bufs.iter().enumerate() {
+            if buf.size == 0 {
+                continue;
+            }
+            let memory = handles.at(i as u32);
+            let virt = handles.at((pre::BIND_BUFFERS + i) as u32);
+            let params = pre::vidmem_params(client.root, buf);
+            io.alloc(client, nd::H_DEVICE, memory, rc::NV01_MEMORY_LOCAL_USER, &params)
+                .map_err(|_| 0x20 | i as u32)?;
+            state.live.fetch_or(1 << i, Ordering::AcqRel);
+            let params = pre::virtual_params(client.root, vaspace, buf);
+            io.alloc(client, nd::H_DEVICE, virt, cc::NV50_MEMORY_VIRTUAL, &params)
+                .map_err(|_| 0x30 | i as u32)?;
+            state.live.fetch_or(1 << (pre::BIND_BUFFERS + i), Ordering::AcqRel);
+            let va = map_dma(io, client, virt, memory, buf.size).map_err(|_| 0x40 | i as u32)?;
+            if !pre::va_ok(va, buf) {
+                return Err(0x50 | i as u32);
+            }
+            vas[i] = va;
+        }
+        Ok(())
+    })();
+    if let Err(code) = made {
+        crate::diag::record_named_bytes(b"NvPrBufErr", code);
+        crate::diag::record_named_bytes(b"NvPrBind", 3);
+        free_preempt_buffers(io, client, state, None, false);
+        return false;
+    }
+    crate::diag::record_named_bytes(b"NvPrVa", (vas[0] >> 16) as u32);
+    // The TSG first: the vGPU guest RM names the channel group when the channel has one
+    // (`_rpcAllocBuffersForKGrObj`).
+    let bound = [context.tsg, channel]
+        .iter()
+        .enumerate()
+        .find_map(|(k, &target)| {
+            let mut bind = pre::bind_params(client.root, target, plan, &vas)?;
+            let cmd = pre::CTRL_PREEMPTION_BIND;
+            match control_status(io, client, nd::H_SUBDEVICE, cmd, &mut bind) {
+                Ok(()) => Some(k as u32),
+                Err(st) => {
+                    crate::diag::record_named_bytes(b"NvPrSt", st);
+                    None
+                }
+            }
+        });
+    match bound {
+        Some(k) => {
+            crate::diag::record_named_bytes(b"NvPrBind", k);
+            crate::diag::record_named_bytes(b"NvPrBufN", BOUND.fetch_add(1, Ordering::Relaxed) + 1);
+            true
+        }
+        None => {
+            crate::diag::record_named_bytes(b"NvPrBind", 2);
+            free_preempt_buffers(io, client, state, None, false);
+            false
+        }
+    }
+}
+
+/// `MAP_MEMORY_DMA` of `memory` into the virtual allocation `virt`; the GPU VA.
+fn map_dma(
+    io: Io<'_>,
+    client: &NativeClient,
+    virt: u32,
+    memory: u32,
+    length: u64,
+) -> Result<u64, NativeError> {
+    let block = cc::nvos46(&cc::DmaMap {
+        root: client.root,
+        h_device: nd::H_DEVICE,
+        h_dma: virt,
+        h_memory: memory,
+        length,
+        flags: 0,
+    });
+    let mut resp = [0u8; 256];
+    let n = io.exchange(
+        client.ctl,
+        rc::nv_cmd(cc::ESC_RM_MAP_MEMORY_DMA, cc::NVOS46_BYTES as u32),
+        &block,
+        &[],
+        &mut resp,
+    )?;
+    let reply = rc::rm_reply(resp.get(..n).ok_or(NativeError::Transport)?, cc::NVOS46_STATUS_AT)
+        .map_err(|error| {
+            crate::diag::record_named_bytes(b"NvPrSt", rm_error_code(error));
+            NativeError::Rm
+        })?;
+    cc::map_dma_va(reply.data).ok_or(NativeError::Transport)
+}
+
+/// Free a TSG's GfxP buffers: each virtual allocation (which unmaps it), then its memory.
+/// `file` = (process key, epoch) to file what RM would not free for DestroyProcess; with
+/// `keep` everything is filed without being freed (its TSG could not be freed and may still
+/// reference them).
+fn free_preempt_buffers(
+    io: Io<'_>,
+    client: &NativeClient,
+    state: &Preempt,
+    file: Option<(usize, u64)>,
+    keep: bool,
+) {
+    use helios_kmd_logic::ctxsw_preempt as pre;
+    let first = state.first.swap(0, Ordering::AcqRel);
+    let live = state.live.swap(0, Ordering::AcqRel);
+    if first == 0 {
+        return;
+    }
+    let order = (0..pre::BIND_BUFFERS).flat_map(|i| [pre::BIND_BUFFERS + i, i]);
+    for bit in order {
+        if live & (1 << bit) == 0 {
+            continue;
+        }
+        let object = first + bit as u32;
+        if keep || io.free(client, nd::H_DEVICE, object).is_err() {
+            if let Some((key, epoch)) = file {
+                file_leftover(key, epoch, nd::H_DEVICE, object);
+            }
+        }
+    }
+}
+
 /// `own` None: the graphics layout, a channel on the context's share (VEID 0)
 /// with every object the UMDs drive. `own` Some: NVIDIA's compute-only queue,
 /// a channel on runqueue 1 under a SPECIFIED context share of its own, with
@@ -1714,13 +1976,15 @@ fn set_preemption(
 fn create_queue_objects_on(
     io: Io<'_>,
     client: &NativeClient,
-    tsg: u32,
-    ctxshare: u32,
-    scheduled: &AtomicU32,
+    context: &NativeContext,
+    vaspace: u32,
     queue: &nc::QueuePrivate,
     parts: &mut QueueParts,
     own: Option<OwnVeid>,
 ) -> Result<(), NativeError> {
+    let tsg = context.tsg;
+    let ctxshare = context.ctxshare;
+    let scheduled = &context.scheduled;
     let handles = parts.handles.ok_or(NativeError::Invalid)?;
     let result = (|| {
         crate::diag::record_named_bytes(b"NvQStep", 1);
@@ -1898,9 +2162,9 @@ fn create_queue_objects_on(
             .0;
         crate::diag::record_named_bytes(b"NvQStep", 10);
         note_channel(parts.token, queue.gpfifo_va, channel_share);
-        // `NvPreempt` (default 0): the channel's context-switch preemption modes, before
-        // the TSG is first scheduled.
-        set_preemption(io, client, tsg, handles.at(5), own.is_none(), parts.token);
+        // `NvPreempt` (default 0): the TSG's context-switch preemption modes, once, through
+        // its first VEID 0 channel, before the TSG is first scheduled.
+        set_preemption(io, client, context, handles.at(5), vaspace, own.is_none(), parts.token);
         if scheduled
             .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
