@@ -1637,6 +1637,75 @@ struct OwnVeid {
     vaspace: u32,
 }
 
+/// `NvPreempt` (`helios_kmd_logic::ctxsw_preempt`): set the preemption modes of a new channel
+/// after its engine objects, as NVIDIA's drivers do, and read the modes in force back.
+/// Best effort, never fails the queue: `NvPrSetSt` = 0 set on the channel, 1 on the TSG
+/// (the channel refused), 2 both refused; `NvPrGfx` / `NvPrCmp` = `gfxp << 8 | cilp` read
+/// back on the last graphics / compute-only channel (0xffffffff = the read was refused);
+/// `NvPrN` = channels set; `NvPrTsg<k>` the TSG's hardware id with the channel's token.
+fn set_preemption(
+    io: Io<'_>,
+    client: &NativeClient,
+    tsg: u32,
+    channel: u32,
+    graphics: bool,
+    token: u32,
+) {
+    use helios_kmd_logic::ctxsw_preempt as pre;
+    static SET: AtomicU32 = AtomicU32::new(0);
+    let knob = crate::diag::read_config_dword(crate::diag::KnobName::new(b"NvPreempt"), 0);
+    let plan = pre::plan(knob, graphics);
+    if let Some(params) = pre::set_params(channel, &plan) {
+        let mut on_channel = params;
+        let status = if io
+            .control(client, nd::H_SUBDEVICE, pre::CTRL_SET_PREEMPTION_MODE, &mut on_channel)
+            .is_ok()
+        {
+            0
+        } else {
+            let mut on_tsg = params;
+            on_tsg[4..8].copy_from_slice(&tsg.to_le_bytes());
+            if io
+                .control(client, nd::H_SUBDEVICE, pre::CTRL_SET_PREEMPTION_MODE, &mut on_tsg)
+                .is_ok()
+            {
+                1
+            } else {
+                2
+            }
+        };
+        crate::diag::record_named_bytes(b"NvPrSetSt", status);
+        if status != 2 {
+            crate::diag::record_named_bytes(b"NvPrN", SET.fetch_add(1, Ordering::Relaxed) + 1);
+        }
+    }
+    if plan.query {
+        let mut get = pre::get_params(channel);
+        let word = match io.control(client, nd::H_SUBDEVICE, pre::CTRL_GET_CTXSW_MODES, &mut get) {
+            Ok(()) => pre::modes_word(&get),
+            Err(_) => u32::MAX,
+        };
+        crate::diag::record_named_bytes(if graphics { b"NvPrGfx" } else { b"NvPrCmp" }, word);
+        // The hardware TSG id next to the channel's work-submit token (low 16 bits), the
+        // numbers a host `Xid 109 ... Info` (PREV/NEXT_TSGID) and `channel 0x..` name:
+        // `NvPrTsg<k>` = tsgID << 16 | token & 0xffff, a 16-entry ring (`NvPrTsgN`).
+        let mut info = [0u8; 4];
+        let id = match io.control(client, tsg, pre::CTRL_TSG_GET_INFO, &mut info) {
+            Ok(()) => u32::from_le_bytes(info),
+            Err(_) => 0xffff,
+        };
+        static TSGS: AtomicU32 = AtomicU32::new(0);
+        let n = TSGS.fetch_add(1, Ordering::Relaxed);
+        let k = (n % 16) as u8;
+        let digit = if k < 10 { b'0' + k } else { b'a' + k - 10 };
+        crate::diag::record_named_bytes(
+            &[b'N', b'v', b'P', b'r', b'T', b's', b'g', digit],
+            (id & 0xffff) << 16 | (token & 0xffff),
+        );
+        crate::diag::record_named_bytes(b"NvPrTsgN", n + 1);
+    }
+}
+
 /// `own` None: the graphics layout, a channel on the context's share (VEID 0)
 /// with every object the UMDs drive. `own` Some: NVIDIA's compute-only queue,
 /// a channel on runqueue 1 under a SPECIFIED context share of its own, with
@@ -1829,6 +1898,9 @@ fn create_queue_objects_on(
             .0;
         crate::diag::record_named_bytes(b"NvQStep", 10);
         note_channel(parts.token, queue.gpfifo_va, channel_share);
+        // `NvPreempt` (default 0): the channel's context-switch preemption modes, before
+        // the TSG is first scheduled.
+        set_preemption(io, client, tsg, handles.at(5), own.is_none(), parts.token);
         if scheduled
             .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()

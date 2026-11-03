@@ -2218,8 +2218,11 @@ unsafe fn native_paging_operation(
         crate::ddi::hot_path::count(&crate::ddi::hot_path::PT_ALL);
         // Not this driver's RM memory (dxgkrnl's fences, legacy allocations):
         // mirror its system pages into the process's RM VA space too.
-        let native = unsafe { paging_alloc_info(adapter, update.hAllocation) }
-            .is_some_and(|a| a.native_id != 0);
+        let native_id = unsafe { paging_alloc_info(adapter, update.hAllocation) }
+            .map_or(0, |a| a.native_id);
+        let native = native_id != 0;
+        // SAFETY: dxgkrnl's live operation.
+        unsafe { crate::ddi::pt_ring::upt_in(update, native_id) };
         unsafe { watch_update(update, native) };
         if !native && crate::ddi::wddm_surface::nvidia_selected() {
             unsafe { foreign_leaf(adapter, update) };
@@ -2296,6 +2299,15 @@ unsafe fn native_paging_operation(
         | PagingOperation::FlushTlb
         | PagingOperation::Other => Ok(()),
     };
+    if let PagingOperation::UpdatePageTable(update) = operation {
+        crate::ddi::pt_ring::upt_done(
+            result.is_ok(),
+            allocation.native_id,
+            update.FirstPteVirtualAddress,
+            u64::from(update.NumPageTableEntries) * 4096,
+            update.hProcess as usize,
+        );
+    }
     note.result = if result.is_ok() {
         dl::paging_result::EXECUTED
     } else {
@@ -2474,6 +2486,7 @@ unsafe fn native_update_leaf(
 
     let fail = |why: u32| {
         crate::diag::record_named_bytes(b"NvPgLeafWhy", why);
+        crate::ddi::pt_ring::note_why(why);
     };
     if update.pPageTableEntries.is_null() || update.NumPageTableEntries == 0 {
         fail(1);
