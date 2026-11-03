@@ -19,6 +19,9 @@ use core::ffi::c_void;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use helios_kmd_logic::ce_route as cr;
+use helios_kmd_logic::desc_cache::{DescTable, Released};
+use helios_kmd_logic::hot_path::Paging;
+use helios_kmd_logic::rm_batch as rb;
 use helios_kmd_logic::native_memory as nm;
 use helios_kmd_logic::native_perf as np;
 use helios_kmd_logic::native_teardown as nt;
@@ -147,9 +150,105 @@ pub(crate) fn round_trip_count() -> u32 {
     round_trips()
 }
 
+/// `NvPaging` (REG_DWORD, default 0): `helios_kmd_logic::hot_path::Paging`, read
+/// once (PASSIVE) and mirrored to `PgKnob`.
+fn paging() -> Paging {
+    static VALUE: AtomicU32 = AtomicU32::new(u32::MAX);
+    let mut value = VALUE.load(Ordering::Relaxed);
+    if value == u32::MAX {
+        value = crate::diag::read_config_dword(crate::diag::KnobName::new(b"NvPaging"), 0);
+        if value == u32::MAX {
+            value = 0;
+        }
+        VALUE.store(value, Ordering::Relaxed);
+    }
+    Paging(value)
+}
+
+/// `NvDescCacheMax` (REG_DWORD, default 256): idle OS descriptors kept for reuse
+/// under `NvPaging` 0x2; 0 keeps none.
+fn desc_cache_max() -> usize {
+    static VALUE: AtomicU32 = AtomicU32::new(u32::MAX);
+    let mut value = VALUE.load(Ordering::Relaxed);
+    if value == u32::MAX {
+        value = crate::diag::read_config_dword(
+            crate::diag::KnobName::new(b"NvDescCacheMax"),
+            helios_kmd_logic::desc_cache::DEFAULT_MAX_IDLE as u32,
+        );
+        if value == u32::MAX {
+            value = helios_kmd_logic::desc_cache::DEFAULT_MAX_IDLE as u32;
+        }
+        VALUE.store(value, Ordering::Relaxed);
+    }
+    value as usize
+}
+
+/// Whether idle OS descriptors are kept (`NvPaging` 0x2 and a bound above 0).
+fn desc_cache_on() -> bool {
+    paging().desc_cache() && desc_cache_max() != 0
+}
+
+// Paging fast-path counters (`Pg*`), published by the mirror pass (`publish_hot`):
+/// `PgBatchN` batches sent, `PgBatchCalls` RM calls they carried, `PgBatchRef`
+/// batches the host refused whole (the host then gets single calls), `PgBatchErr`
+/// batches that failed in transport, `PgBatchUs` / `PgBatchMaxUs` their round trips.
+static BATCHES: AtomicU32 = AtomicU32::new(0);
+static BATCH_CALLS: AtomicU32 = AtomicU32::new(0);
+static BATCH_REFUSED: AtomicU32 = AtomicU32::new(0);
+static BATCH_FAILED: AtomicU32 = AtomicU32::new(0);
+static BATCH_US: AtomicU32 = AtomicU32::new(0);
+static BATCH_MAX_US: AtomicU32 = AtomicU32::new(0);
+/// `PgDescNew` OS descriptors registered, `PgDescHit` reused for the same pages
+/// (`PgDescIdleHit` of them taken from the idle cache), `PgDescFree` freed,
+/// `PgDescEvict` idle ones freed by the bound or their allocation's move;
+/// `PgDescLive` / `PgDescIdle` the table now.
+static DESC_NEW: AtomicU32 = AtomicU32::new(0);
+static DESC_HIT: AtomicU32 = AtomicU32::new(0);
+static DESC_IDLE_HIT: AtomicU32 = AtomicU32::new(0);
+static DESC_FREED: AtomicU32 = AtomicU32::new(0);
+static DESC_EVICTED: AtomicU32 = AtomicU32::new(0);
+/// `PgIdxN` per-process lookups (evictions, CPU patches, process teardown),
+/// `PgIdxScan` allocations they looked at (all of them before the index).
+static IDX_LOOKUPS: AtomicU32 = AtomicU32::new(0);
+static IDX_SCANNED: AtomicU32 = AtomicU32::new(0);
+
 /// `NvEvict` and `NvQuiesceRef`, written by the registry mirror's pass
-/// (`ddi::hot_path::publish`) instead of on every eviction / refusal. PASSIVE.
+/// (`ddi::hot_path::publish`) instead of on every eviction / refusal; the `Pg*`
+/// paging counters above. PASSIVE.
 pub(crate) fn publish_hot() {
+    let r = |a: &AtomicU32| a.load(Ordering::Relaxed);
+    let rec = crate::diag::record_named_bytes;
+    rec(b"PgKnob", paging().0);
+    rec(b"PgBatchN", r(&BATCHES));
+    rec(b"PgBatchCalls", r(&BATCH_CALLS));
+    rec(b"PgBatchRef", r(&BATCH_REFUSED));
+    rec(b"PgBatchErr", r(&BATCH_FAILED));
+    rec(b"PgBatchUs", r(&BATCH_US));
+    rec(b"PgBatchMaxUs", r(&BATCH_MAX_US));
+    rec(b"PgDescNew", r(&DESC_NEW));
+    rec(b"PgDescHit", r(&DESC_HIT));
+    rec(b"PgDescIdleHit", r(&DESC_IDLE_HIT));
+    rec(b"PgDescFree", r(&DESC_FREED));
+    rec(b"PgDescEvict", r(&DESC_EVICTED));
+    let (live, idle, procs, broken) = {
+        let state = STATE.lock();
+        let (n, idle) = state.descs.counts();
+        (n - idle, idle, state.by_process.len(), state.index_broken)
+    };
+    rec(b"PgDescLive", live as u32);
+    rec(b"PgDescIdle", idle as u32);
+    rec(b"PgIdxN", r(&IDX_LOOKUPS));
+    rec(b"PgIdxScan", r(&IDX_SCANNED));
+    rec(b"PgIdxProcs", procs as u32);
+    rec(b"PgIdxBroken", u32::from(broken));
+    // The leaf-update costs, also here so they are fresh between their own
+    // (every 64th update) writes.
+    for cost in [&LEAF_COST, &SYSTEM_COST] {
+        rec(cost.names[0], r(&cost.updates));
+        rec(cost.names[1], r(&cost.trips));
+        rec(cost.names[2], r(&cost.micros));
+        rec(cost.names[3], r(&cost.max_micros));
+    }
     let evicted = EVICTED.load(Ordering::Relaxed);
     if evicted != 0 {
         crate::diag::record_named_bytes(b"NvEvict", evicted);
@@ -385,9 +484,17 @@ struct State {
     /// System pages of NON-native allocations (dxgkrnl's monitored fences and
     /// the like) mapped into a process's space (`update_foreign_leaf`).
     foreign: Vec<HostMapping>,
-    /// The system pages behind each `update_leaf_system` descriptor (for CPU
-    /// access to what the GPU sees there, `patch_gpu_bytes`).
-    desc_pfns: Vec<(u32, Vec<u64>)>,
+    /// Every OS-descriptor object of the paging path (system-page and foreign
+    /// leaf updates) with its pages: for CPU access to what the GPU sees there
+    /// (`patch_gpu_bytes`), the unchanged checks, and reuse for the same pages
+    /// (`helios_kmd_logic::desc_cache`, `NvPaging` 0x2).
+    descs: DescTable,
+    /// Per process, the allocations that have (or had: pruned lazily) a mapping
+    /// in its space, so an update looks at that process's allocations only.
+    by_process: Vec<(usize, Vec<u32>)>,
+    /// A `by_process` record could not be made (no memory): every lookup scans
+    /// all allocations, as before the index, until the next transport reset.
+    index_broken: bool,
     orphan_pins: Vec<Pin>,
     idle_spaces: Vec<usize>,
     next_handle: u32,
@@ -401,7 +508,9 @@ impl State {
             spaces: Vec::new(),
             windows: Vec::new(),
             foreign: Vec::new(),
-            desc_pfns: Vec::new(),
+            descs: DescTable::new(),
+            by_process: Vec::new(),
+            index_broken: false,
             orphan_pins: Vec::new(),
             idle_spaces: Vec::new(),
             next_handle: FIRST_DYNAMIC_HANDLE,
@@ -412,18 +521,80 @@ impl State {
         self.client.ok_or(Error::NotReady)
     }
 
+    /// `allocations` is kept sorted by id (`create` inserts in place).
+    fn index_of(&self, id: u32) -> Option<usize> {
+        self.allocations.binary_search_by_key(&id, |a| a.id).ok()
+    }
+
     fn allocation(&self, id: u32) -> Result<&Allocation, Error> {
-        self.allocations
-            .iter()
-            .find(|a| a.id == id)
-            .ok_or(Error::Invalid)
+        let i = self.index_of(id).ok_or(Error::Invalid)?;
+        Ok(&self.allocations[i])
     }
 
     fn allocation_mut(&mut self, id: u32) -> Result<&mut Allocation, Error> {
-        self.allocations
-            .iter_mut()
-            .find(|a| a.id == id)
-            .ok_or(Error::Invalid)
+        let i = self.index_of(id).ok_or(Error::Invalid)?;
+        Ok(&mut self.allocations[i])
+    }
+
+    /// Record that allocation `id` has a mapping in `process`'s space.
+    fn note_mapped(&mut self, process: usize, id: u32) {
+        if self.index_broken {
+            return;
+        }
+        let at = match self.by_process.iter().position(|(p, _)| *p == process) {
+            Some(at) => at,
+            None => {
+                if self.by_process.try_reserve(1).is_err() {
+                    self.index_broken = true;
+                    return;
+                }
+                self.by_process.push((process, Vec::new()));
+                self.by_process.len() - 1
+            }
+        };
+        let ids = &mut self.by_process[at].1;
+        if let Err(i) = ids.binary_search(&id) {
+            if ids.try_reserve(1).is_err() {
+                self.index_broken = true;
+                return;
+            }
+            ids.insert(i, id);
+        }
+    }
+
+    /// The allocations that may have a mapping in `process`'s space: the index's
+    /// (a superset), or all of them while the index is broken.
+    fn candidates(&self, process: usize, out: &mut Vec<u32>) -> Result<(), Error> {
+        out.clear();
+        if self.index_broken {
+            out.try_reserve(self.allocations.len()).map_err(|_| Error::NoMemory)?;
+            out.extend(self.allocations.iter().map(|a| a.id));
+        } else if let Some((_, ids)) = self.by_process.iter().find(|(p, _)| *p == process) {
+            out.try_reserve(ids.len()).map_err(|_| Error::NoMemory)?;
+            out.extend_from_slice(ids);
+        }
+        IDX_SCANNED.fetch_add(out.len() as u32, Ordering::Relaxed);
+        IDX_LOOKUPS.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Drop the ids of `process`'s index entry whose allocation is gone or has no
+    /// mapping there any more.
+    fn prune_index(&mut self, process: usize) {
+        let Some(at) = self.by_process.iter().position(|(p, _)| *p == process) else {
+            return;
+        };
+        let mut ids = core::mem::take(&mut self.by_process[at].1);
+        ids.retain(|id| {
+            self.index_of(*id).is_some_and(|i| {
+                self.allocations[i].mappings.iter().any(|m| m.process == process)
+            })
+        });
+        if ids.is_empty() {
+            self.by_process.swap_remove(at);
+        } else {
+            self.by_process[at].1 = ids;
+        }
     }
 
     fn mint(&mut self) -> Result<u32, Error> {
@@ -638,7 +809,9 @@ pub fn install_client(
         state.spaces.clear();
         state.windows.clear();
         state.foreign.clear();
-        state.desc_pfns.clear();
+        state.descs.clear();
+        state.by_process.clear();
+        state.index_broken = false;
         state
             .spaces
             .try_reserve_exact(1)
@@ -1280,7 +1453,10 @@ pub fn create(
                 Some((Error::NoMemory, true))
             } else {
                 if let Some(allocation) = unpublished.take() {
-                    state.allocations.push(allocation);
+                    // Sorted by id (`State::index_of`): ids are minted before the
+                    // RM object is made, so a slower create publishes a lower id.
+                    let at = state.allocations.partition_point(|a| a.id < allocation.id);
+                    state.allocations.insert(at, allocation);
                 }
                 None
             }
@@ -1605,8 +1781,8 @@ fn unmap_fixed_opts(io: &Io<'_>, memory: u32, mapping: HostMapping, defer: bool)
         io.rm_free(nd::H_DEVICE, mapping.virt)?;
     }
     if mapping.desc != 0 {
-        STATE.lock().desc_pfns.retain(|(desc, _)| *desc != mapping.desc);
-        io.rm_free(nd::H_DEVICE, mapping.desc)?;
+        // Freed unless another mapping shows it or it is kept idle (`NvPaging` 0x2).
+        release_desc(io, mapping.desc)?;
     }
     Ok(())
 }
@@ -1641,6 +1817,687 @@ fn invalidate_tlb(io: &Io<'_>, space: u32) {
     if !ok {
         bump(&TLB_RESCUE_FAILED, b"NvPmTlbErr");
     }
+}
+
+// ── paging fast paths: shared/cached OS descriptors, batched RM calls ─────────────────────
+
+/// Whether this update's RM calls go to the host as `RmBatch`es: `NvPaging` 0x1,
+/// the host's `NVGPU_CFG_RM_BATCH`, and no whole-batch refusal from it so far.
+fn batch_on(io: &Io<'_>) -> bool {
+    paging().batch()
+        && BATCH_REFUSED.load(Ordering::Relaxed) == 0
+        && io
+            .adapter
+            .with_virtio(|v| v.nvrm_device_features())
+            .unwrap_or(0)
+            & helios_protocol::NVGPU_CFG_RM_BATCH
+            != 0
+}
+
+/// Why a batch did not come back answered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BatchFailure {
+    /// Nothing ran (the host refused it whole, or it never left): use single calls.
+    NotSent,
+    /// Unknown what ran (a timeout, a reset): treat every entry as failed and
+    /// keep whatever the host may still read.
+    Indeterminate(Error),
+}
+
+/// Send `batch` and leave its checked reply in `resp`.
+fn send_batch(io: &Io<'_>, batch: &rb::Batch, resp: &mut Vec<u8>) -> Result<(), BatchFailure> {
+    resp.clear();
+    resp.try_reserve_exact(batch.reply_len())
+        .map_err(|_| BatchFailure::NotSent)?;
+    resp.resize(batch.reply_len(), 0);
+    ROUND_TRIPS.fetch_add(1, Ordering::Relaxed);
+    let start = crate::adapter::foreign_scanout::now_100ns();
+    let sent = nvrm::forward_kmd_batch(io.passive, io.adapter, batch.request(), resp, TIMEOUT_MS);
+    let us = np::ticks_to_us(crate::adapter::foreign_scanout::now_100ns().saturating_sub(start));
+    BATCH_US.fetch_add(us, Ordering::Relaxed);
+    BATCH_MAX_US.fetch_max(us, Ordering::Relaxed);
+    let n = match sent {
+        Ok((n, epoch)) => {
+            if epoch != io.client.epoch {
+                BATCH_FAILED.fetch_add(1, Ordering::Relaxed);
+                return Err(BatchFailure::Indeterminate(Error::NotReady));
+            }
+            n
+        }
+        Err(Refusal::Transport(VirtioError::Timeout)) => {
+            BATCH_FAILED.fetch_add(1, Ordering::Relaxed);
+            return Err(BatchFailure::Indeterminate(Error::Host));
+        }
+        Err(Refusal::Transport(VirtioError::DeviceError)) => {
+            // The transport is gone: what reached the host is unknown.
+            BATCH_FAILED.fetch_add(1, Ordering::Relaxed);
+            return Err(BatchFailure::Indeterminate(Error::Host));
+        }
+        Err(_) => {
+            BATCH_FAILED.fetch_add(1, Ordering::Relaxed);
+            return Err(BatchFailure::NotSent);
+        }
+    };
+    resp.truncate(n);
+    match rb::check_reply(resp, batch.caps()) {
+        Ok(_) => {
+            BATCHES.fetch_add(1, Ordering::Relaxed);
+            BATCH_CALLS.fetch_add(batch.len() as u32, Ordering::Relaxed);
+            Ok(())
+        }
+        Err(rb::ReplyError::Refused(_)) => {
+            // Nothing ran. A host that refuses one refuses them all: single calls
+            // from now on (`PgBatchRef`).
+            BATCH_REFUSED.fetch_add(1, Ordering::Relaxed);
+            Err(BatchFailure::NotSent)
+        }
+        Err(_) => {
+            BATCH_FAILED.fetch_add(1, Ordering::Relaxed);
+            Err(BatchFailure::Indeterminate(Error::Host))
+        }
+    }
+}
+
+/// Whether entry `index` of a checked batch reply was served and RM said OK.
+fn entry_ok(resp: &[u8], caps: &[u32], index: usize) -> bool {
+    rb::entry_reply(resp, caps, index).is_some_and(|e| e.served && !e.failed)
+}
+
+/// One mapping of `pfns` (one 4-KiB PTE each) at `va` through an OS descriptor.
+#[derive(Clone, Copy)]
+struct DescJob<'a> {
+    va: u64,
+    pfns: &'a [u64],
+    defer: bool,
+}
+
+/// A made descriptor mapping: (virtual object or window, descriptor); or where it
+/// failed (2 the descriptor, 3 mapping it) and why.
+type DescMade = Result<(u32, u32), (u32, Error)>;
+
+/// An OS descriptor over exactly `pfns`: one already made (`PgDescHit`) or a new
+/// handle to register (`.1` true).
+fn take_desc(pfns: &[u64], owner: u32) -> Result<(u32, bool), Error> {
+    let mut state = STATE.lock();
+    if let Some((desc, was_idle)) = state.descs.acquire(pfns, owner) {
+        DESC_HIT.fetch_add(1, Ordering::Relaxed);
+        if was_idle {
+            DESC_IDLE_HIT.fetch_add(1, Ordering::Relaxed);
+        }
+        return Ok((desc, false));
+    }
+    Ok((state.mint()?, true))
+}
+
+/// A descriptor taken by [`take_desc`] whose mapping was not made: a new one is
+/// freed, a reused one gives its reference back.
+fn give_back_desc(io: &Io<'_>, desc: u32, new: bool) {
+    if new {
+        let _ = io.rm_free(nd::H_DEVICE, desc);
+        DESC_FREED.fetch_add(1, Ordering::Relaxed);
+    } else {
+        let _ = release_desc(io, desc);
+    }
+}
+
+/// One mapping of `desc` went: free it if nothing else maps it and it is not
+/// kept idle (`NvPaging` 0x2), and free the idle ones the bound pushes out.
+fn release_desc(io: &Io<'_>, desc: u32) -> Result<(), Error> {
+    let mut evicted = Vec::new();
+    let released = STATE
+        .lock()
+        .descs
+        .release(desc, desc_cache_on(), desc_cache_max(), &mut evicted);
+    free_descs(io, &evicted, &DESC_EVICTED);
+    match released {
+        Released::Free => {
+            DESC_FREED.fetch_add(1, Ordering::Relaxed);
+            io.rm_free(nd::H_DEVICE, desc)
+        }
+        Released::Cached | Released::InUse => Ok(()),
+    }
+}
+
+/// Free OS descriptors nothing maps (best effort; batched when on).
+fn free_descs(io: &Io<'_>, descs: &[u32], counter: &AtomicU32) {
+    if descs.is_empty() {
+        return;
+    }
+    counter.fetch_add(descs.len() as u32, Ordering::Relaxed);
+    if batch_on(io) && descs.len() > 1 {
+        let mut batch = rb::Batch::new();
+        let mut resp = Vec::new();
+        let mut rest = descs;
+        while !rest.is_empty() {
+            batch.clear();
+            let mut taken = 0;
+            for desc in rest {
+                let block = rc::nvos00(io.client.root, nd::H_DEVICE, *desc);
+                let pushed = batch.push_ioctl(
+                    io.client.ctl,
+                    rc::nv_cmd(rc::ESC_RM_FREE, rc::NVOS00_BYTES as u32),
+                    &block,
+                    &[],
+                    None,
+                    Some(rc::NVOS00_STATUS_AT),
+                    0,
+                    0,
+                );
+                if pushed.is_err() {
+                    break;
+                }
+                taken += 1;
+            }
+            if taken == 0 || send_batch(io, &batch, &mut resp) == Err(BatchFailure::NotSent) {
+                break;
+            }
+            rest = &rest[taken..];
+        }
+        if rest.is_empty() {
+            return;
+        }
+        for desc in rest {
+            let _ = io.rm_free(nd::H_DEVICE, *desc);
+        }
+        return;
+    }
+    for desc in descs {
+        let _ = io.rm_free(nd::H_DEVICE, *desc);
+    }
+}
+
+/// Drop the idle descriptors of allocation `id` (its system pages are no longer
+/// known to be its own: it moved to video memory, or it is destroyed).
+fn drop_idle_descs_of(io: &Io<'_>, id: u32) {
+    let mut gone = Vec::new();
+    STATE.lock().descs.drop_idle_of(id, &mut gone);
+    free_descs(io, &gone, &DESC_EVICTED);
+}
+
+/// Make `jobs`' descriptor mappings in `space` for allocation `owner` (0: foreign
+/// pages), one result per job in `out`, in order. Batched under `NvPaging` 0x1,
+/// else one round trip per call; descriptors over the same pages are reused.
+fn map_descs(io: &Io<'_>, owner: u32, space: u32, jobs: &[DescJob<'_>], out: &mut Vec<DescMade>) -> Result<(), Error> {
+    out.clear();
+    out.try_reserve_exact(jobs.len()).map_err(|_| Error::NoMemory)?;
+    let mut done = 0;
+    if batch_on(io) {
+        done = map_descs_batched(io, owner, space, jobs, out);
+    }
+    for job in &jobs[done..] {
+        out.push(map_desc_single(io, owner, space, job));
+    }
+    Ok(())
+}
+
+/// One descriptor mapping, a round trip per call (the path before `NvPaging`).
+fn map_desc_single(io: &Io<'_>, owner: u32, space: u32, job: &DescJob<'_>) -> DescMade {
+    let len = (job.pfns.len() as u64)
+        .checked_mul(nm::PAGE_BYTES)
+        .ok_or((2, Error::Invalid))?;
+    let (desc, new) = take_desc(job.pfns, owner).map_err(|e| (2, e))?;
+    if new {
+        alloc_system_descriptor(io, desc, job.pfns, len).map_err(|e| (2, e))?;
+        DESC_NEW.fetch_add(1, Ordering::Relaxed);
+    }
+    // Minted first: a STATE guard in a `match` scrutinee would live through the
+    // arms, and `give_back_desc` takes STATE again.
+    let minted = STATE.lock().mint();
+    let virt = match minted {
+        Ok(virt) => virt,
+        Err(error) => {
+            give_back_desc(io, desc, new);
+            return Err((3, error));
+        }
+    };
+    let shown = nm::MappingPiece {
+        va: job.va,
+        memory_offset: 0,
+        len,
+    };
+    match map_fixed_opts(io, desc, len, true, space, virt, shown, job.defer) {
+        Ok(used) => {
+            if new {
+                // Unrecorded (no memory): it is freed at its unmap, as before.
+                let _ = STATE.lock().descs.insert(desc, job.pfns, owner);
+            }
+            Ok((used, desc))
+        }
+        Err(error) => {
+            give_back_desc(io, desc, new);
+            Err((3, error))
+        }
+    }
+}
+
+/// What one job of a batch planned.
+struct Planned {
+    desc: u32,
+    new_desc: bool,
+    /// The virtual object to make, 0 when the job maps into a window.
+    virt: u32,
+    window: u32,
+    len: u64,
+    at_desc: Option<usize>,
+    at_virt: Option<usize>,
+    at_map: usize,
+    /// An indirect page-run table the host reads while serving the batch.
+    big: Option<super::hal::DmaBuffer>,
+}
+
+/// [`map_descs`] in batches of up to 16 jobs: each job's registration (when its
+/// pages have no descriptor yet), virtual object (outside the windows) and map,
+/// one group that stops at its first failure. Returns how many jobs it answered
+/// (pushed into `out`); the rest go the single-call way.
+fn map_descs_batched(io: &Io<'_>, owner: u32, space: u32, jobs: &[DescJob<'_>], out: &mut Vec<DescMade>) -> usize {
+    let mut batch = rb::Batch::new();
+    let mut resp = Vec::new();
+    let mut plans: Vec<Planned> = Vec::new();
+    let mut done = 0;
+    while done < jobs.len() {
+        batch.clear();
+        plans.clear();
+        let before = done;
+        // Plan as many jobs as fit.
+        for (k, job) in jobs[done..].iter().enumerate() {
+            if plans.try_reserve(1).is_err() {
+                break;
+            }
+            match plan_desc_job(io, owner, space, job, k as u16, &mut batch) {
+                Ok(plan) => plans.push(plan),
+                Err(None) => break, // full: send what is planned
+                Err(Some(error)) => {
+                    if plans.is_empty() {
+                        // This job cannot be planned (no memory, a refused table).
+                        out.push(Err((2, error)));
+                        done += 1;
+                    }
+                    break;
+                }
+            }
+        }
+        if plans.is_empty() {
+            if done == before {
+                // Not even one job fits a batch: the rest go one call at a time.
+                return done;
+            }
+            continue;
+        }
+        match send_batch(io, &batch, &mut resp) {
+            Ok(()) => {
+                for (plan, job) in plans.drain(..).zip(&jobs[done..]) {
+                    out.push(finish_desc_job(io, owner, space, job, plan, &resp, batch.caps()));
+                    done += 1;
+                }
+            }
+            Err(BatchFailure::NotSent) => {
+                // Nothing ran: undo the plans, the rest go one call at a time.
+                for plan in plans.drain(..) {
+                    if !plan.new_desc {
+                        let _ = release_desc(io, plan.desc);
+                    }
+                }
+                return done;
+            }
+            Err(BatchFailure::Indeterminate(error)) => {
+                // The host may hold any of it and may still read the tables:
+                // keep them, leak the handles (never minted again).
+                for plan in plans.drain(..) {
+                    core::mem::forget(plan.big);
+                    out.push(Err((if plan.new_desc { 2 } else { 3 }, error)));
+                    done += 1;
+                }
+            }
+        }
+    }
+    done
+}
+
+/// Plan one job into `batch`: `Err(None)` when it does not fit (nothing taken),
+/// `Err(Some(_))` when it cannot be planned at all.
+fn plan_desc_job(
+    io: &Io<'_>,
+    owner: u32,
+    space: u32,
+    job: &DescJob<'_>,
+    group: u16,
+    batch: &mut rb::Batch,
+) -> Result<Planned, Option<Error>> {
+    let len = (job.pfns.len() as u64)
+        .checked_mul(nm::PAGE_BYTES)
+        .ok_or(Some(Error::Invalid))?;
+    let end = job.va.checked_add(len).ok_or(Some(Error::Invalid))?;
+    let window = window_for(space, job.va, end).unwrap_or(0);
+    let (desc, new_desc) = take_desc(job.pfns, owner).map_err(Some)?;
+    let mark = batch.mark();
+    // A job goes in whole or not at all: undo what was taken and added.
+    let undo = |batch: &mut rb::Batch, error: Option<Error>| {
+        batch.rollback(mark);
+        if !new_desc {
+            let _ = release_desc(io, desc);
+        }
+        error
+    };
+    let pushed = |e: rb::PushError| match e {
+        rb::PushError::Full => None,
+        rb::PushError::NoMemory => Some(Error::NoMemory),
+        rb::PushError::Invalid => Some(Error::Invalid),
+    };
+    let flags = rb::SKIP_GROUP_ON_FAIL;
+    let mut big = None;
+    let at_desc = if new_desc {
+        let (kind, deep, table) = match nvrm::page_run_table(io.passive, job.pfns) {
+            Ok(t) => t,
+            Err(_) => return Err(undo(batch, Some(Error::NoMemory))),
+        };
+        big = table;
+        let block = cr::nvos02_osdesc(
+            io.client.root,
+            nd::H_DEVICE,
+            desc,
+            job.pfns.first().copied().unwrap_or(0).wrapping_mul(nm::PAGE_BYTES),
+            len,
+        );
+        match batch.push_ioctl(
+            io.client.gpu,
+            rc::nv_cmd(cr::ESC_RM_ALLOC_MEMORY, cr::NVOS02_FD_BYTES as u32),
+            &block,
+            &[],
+            Some((kind, &deep)),
+            Some(cr::NVOS02_STATUS_AT),
+            group,
+            flags,
+        ) {
+            Ok(at) => Some(at),
+            Err(e) => return Err(undo(batch, pushed(e))),
+        }
+    } else {
+        None
+    };
+    let mut virt = 0;
+    let at_virt = if window == 0 {
+        let minted = STATE.lock().mint();
+        virt = match minted {
+            Ok(virt) => virt,
+            Err(error) => return Err(undo(batch, Some(error))),
+        };
+        let params = cc::virtual_params_4k(io.client.root, space, Some(job.va), len);
+        let block = rc::nvos64(
+            io.client.root,
+            nd::H_DEVICE,
+            virt,
+            cc::NV50_MEMORY_VIRTUAL,
+            params.len() as u32,
+        );
+        match batch.push_ioctl(
+            io.client.ctl,
+            rc::nv_cmd(rc::ESC_RM_ALLOC, rc::NVOS64_BYTES as u32),
+            &block,
+            &params,
+            None,
+            Some(rc::NVOS64_STATUS_AT),
+            group,
+            flags,
+        ) {
+            Ok(at) => Some(at),
+            Err(e) => return Err(undo(batch, pushed(e))),
+        }
+    } else {
+        None
+    };
+    let defer_flag = if job.defer { np::MAP_FLAGS_DEFER_TLB } else { 0 };
+    let mut map_flags = cc::MAP_FLAGS_SYSMEM | defer_flag;
+    let target = if window != 0 {
+        map_flags |= MAP_FLAGS_DMA_OFFSET_FIXED;
+        window
+    } else {
+        virt
+    };
+    let mut block = nm::nvos46_range(io.client.root, nd::H_DEVICE, target, desc, 0, len, map_flags);
+    if window != 0 {
+        block[cc::NVOS46_DMA_OFFSET_AT..cc::NVOS46_DMA_OFFSET_AT + 8]
+            .copy_from_slice(&job.va.to_le_bytes());
+    }
+    let at_map = match batch.push_ioctl(
+        io.client.ctl,
+        rc::nv_cmd(cc::ESC_RM_MAP_MEMORY_DMA, cc::NVOS46_BYTES as u32),
+        &block,
+        &[],
+        None,
+        Some(cc::NVOS46_STATUS_AT),
+        group,
+        flags,
+    ) {
+        Ok(at) => at,
+        Err(e) => return Err(undo(batch, pushed(e))),
+    };
+    Ok(Planned {
+        desc,
+        new_desc,
+        virt,
+        window,
+        len,
+        at_desc,
+        at_virt,
+        at_map,
+        big,
+    })
+}
+
+/// Read one job's entries of an answered batch; undo what was made of a failed one.
+fn finish_desc_job(
+    io: &Io<'_>,
+    owner: u32,
+    space: u32,
+    job: &DescJob<'_>,
+    plan: Planned,
+    resp: &[u8],
+    caps: &[u32],
+) -> DescMade {
+    let _ = space;
+    drop(plan.big);
+    let desc_ok = plan.at_desc.is_none_or(|i| entry_ok(resp, caps, i));
+    let virt_ok = plan.at_virt.is_none_or(|i| entry_ok(resp, caps, i));
+    let map_reply = rb::entry_reply(resp, caps, plan.at_map);
+    let mapped_at = map_reply
+        .filter(|e| e.served && !e.failed)
+        .and_then(|e| rc::parse_ioctl_reply(e.bytes).ok())
+        .and_then(|reply| cc::map_dma_va(reply.data));
+    if desc_ok && plan.at_desc.is_some() {
+        DESC_NEW.fetch_add(1, Ordering::Relaxed);
+    }
+    if desc_ok && virt_ok && mapped_at == Some(job.va) {
+        if job.defer {
+            bump(&DEFERRED, b"NvPmDefer");
+        }
+        if plan.new_desc {
+            let _ = STATE.lock().descs.insert(plan.desc, job.pfns, owner);
+        }
+        return Ok((if plan.window != 0 { plan.window } else { plan.virt }, plan.desc));
+    }
+    // Failed: say where, and take down what was made.
+    if !desc_ok {
+        if let Some(e) = plan.at_desc.and_then(|i| rb::entry_reply(resp, caps, i)) {
+            // NvSysHost: RM's NV_STATUS, 0x1000_0000 for a host refusal.
+            let code = e.rm_status.unwrap_or(0x1000_0000);
+            crate::diag::record_named_bytes(b"NvSysHost", code);
+            crate::diag::record_named_bytes(b"NvSysPages", job.pfns.len() as u32);
+        }
+        // The rest of the group was skipped: nothing else exists.
+        return Err((2, Error::Host));
+    }
+    let error = if let Some(got) = mapped_at {
+        // RM must not relocate a WDDM mapping: take down what it made.
+        let target = if plan.window != 0 { plan.window } else { plan.virt };
+        let unmap = nm::nvos47_unmap(io.client.root, nd::H_DEVICE, target, plan.desc, got);
+        let mut ignored = [0u8; REPLY_MAX];
+        let _ = io.exchange(
+            io.client.ctl,
+            rc::nv_cmd(cc::ESC_RM_UNMAP_MEMORY_DMA, cc::NVOS47_BYTES as u32),
+            &unmap,
+            &[],
+            &mut ignored,
+        );
+        note_wrong_address(job.va, got);
+        Error::WrongAddress
+    } else {
+        if let Some(e) = map_reply.filter(|e| e.served) {
+            crate::diag::record_named_bytes(
+                if plan.window != 0 { b"NvRmWinSt" } else { b"NvRmMapSt" },
+                e.rm_status.unwrap_or(0xffff_ffff),
+            );
+        }
+        if !virt_ok {
+            crate::diag::record_named_bytes(b"NvMapVaPg", (job.va >> 12) as u32);
+            crate::diag::record_named_bytes(b"NvMapLenPg", (plan.len >> 12) as u32);
+        }
+        Error::Host
+    };
+    if plan.virt != 0 && virt_ok {
+        let _ = io.rm_free(nd::H_DEVICE, plan.virt);
+    }
+    give_back_desc(io, plan.desc, plan.new_desc);
+    Err((3, error))
+}
+
+/// Unmap each `(memory, mapping, defer)` (the descriptor of a descriptor mapping
+/// given back, [`release_desc`]): one result per item in `out`. Batched under
+/// `NvPaging` 0x1; with `abort` the first failure stops the rest (as a loop of
+/// [`unmap_fixed_opts`] that returns at its first error does).
+fn unmap_many(io: &Io<'_>, items: &[(u32, HostMapping, bool)], abort: bool, out: &mut Vec<Result<(), Error>>) -> Result<(), Error> {
+    out.clear();
+    out.try_reserve_exact(items.len()).map_err(|_| Error::NoMemory)?;
+    let mut done = 0;
+    if batch_on(io) && !items.is_empty() {
+        done = unmap_many_batched(io, items, abort, out);
+    }
+    for (memory, mapping, defer) in &items[done..] {
+        if abort && out.iter().any(|r| r.is_err()) {
+            out.push(Err(Error::Host));
+            continue;
+        }
+        out.push(unmap_fixed_opts(io, *memory, *mapping, *defer));
+    }
+    Ok(())
+}
+
+fn unmap_many_batched(io: &Io<'_>, items: &[(u32, HostMapping, bool)], abort: bool, out: &mut Vec<Result<(), Error>>) -> usize {
+    struct Plan {
+        at_unmap: usize,
+        at_virt: Option<usize>,
+        at_desc: Option<usize>,
+    }
+    let mut batch = rb::Batch::new();
+    let mut resp = Vec::new();
+    let mut plans: Vec<Plan> = Vec::new();
+    let mut done = 0;
+    let cache = desc_cache_on();
+    let max_idle = desc_cache_max();
+    while done < items.len() {
+        if abort && out.iter().any(|r| r.is_err()) {
+            return done;
+        }
+        batch.clear();
+        plans.clear();
+        for (k, (memory, m, defer)) in items[done..].iter().enumerate() {
+            if plans.try_reserve(1).is_err() {
+                break;
+            }
+            let mark = batch.mark();
+            let group = k as u16;
+            let mut flags = rb::SKIP_GROUP_ON_FAIL;
+            if abort {
+                flags |= rb::ABORT_ON_FAIL;
+            }
+            let target = if m.desc != 0 { m.desc } else { *memory };
+            let mut block = nm::nvos47_unmap(io.client.root, nd::H_DEVICE, m.virt, target, m.piece.va);
+            if *defer {
+                block[np::NVOS47_FLAGS_AT..np::NVOS47_FLAGS_AT + 4]
+                    .copy_from_slice(&np::UNMAP_FLAGS_DEFER_TLB.to_le_bytes());
+            }
+            let Ok(at_unmap) = batch.push_ioctl(
+                io.client.ctl,
+                rc::nv_cmd(cc::ESC_RM_UNMAP_MEMORY_DMA, cc::NVOS47_BYTES as u32),
+                &block,
+                &[],
+                None,
+                Some(cc::NVOS47_STATUS_AT),
+                group,
+                flags,
+            ) else {
+                break;
+            };
+            // `Err(())`: it did not fit; the item goes whole into the next batch.
+            let free = |batch: &mut rb::Batch, object: u32| -> Result<Option<usize>, ()> {
+                let block = rc::nvos00(io.client.root, nd::H_DEVICE, object);
+                batch
+                    .push_ioctl(
+                        io.client.ctl,
+                        rc::nv_cmd(rc::ESC_RM_FREE, rc::NVOS00_BYTES as u32),
+                        &block,
+                        &[],
+                        None,
+                        Some(rc::NVOS00_STATUS_AT),
+                        group,
+                        rb::SKIP_GROUP_ON_FAIL,
+                    )
+                    .map(Some)
+                    .map_err(|_| ())
+            };
+            let at_virt = if is_window(m.virt) { Ok(None) } else { free(&mut batch, m.virt) };
+            let at_desc = if m.desc != 0 && STATE.lock().descs.would_free(m.desc, cache, max_idle) {
+                free(&mut batch, m.desc)
+            } else {
+                Ok(None)
+            };
+            let (Ok(at_virt), Ok(at_desc)) = (at_virt, at_desc) else {
+                batch.rollback(mark);
+                break;
+            };
+            plans.push(Plan { at_unmap, at_virt, at_desc });
+        }
+        if plans.is_empty() {
+            return done;
+        }
+        match send_batch(io, &batch, &mut resp) {
+            Ok(()) => {}
+            Err(BatchFailure::NotSent) => return done,
+            Err(BatchFailure::Indeterminate(error)) => {
+                for _ in plans.drain(..) {
+                    out.push(Err(error));
+                    done += 1;
+                }
+                continue;
+            }
+        }
+        let caps = batch.caps();
+        for (plan, (_, m, _)) in plans.drain(..).zip(&items[done..]) {
+            done += 1;
+            if !entry_ok(&resp, caps, plan.at_unmap) {
+                out.push(Err(Error::Host));
+                continue;
+            }
+            watch::event(m.piece.va, m.piece.len, 10, 0, m.process);
+            let virt_ok = plan.at_virt.is_none_or(|i| entry_ok(&resp, caps, i));
+            let mut result = if virt_ok { Ok(()) } else { Err(Error::Host) };
+            if m.desc != 0 {
+                match plan.at_desc {
+                    Some(i) if entry_ok(&resp, caps, i) => {
+                        STATE.lock().descs.forget(m.desc);
+                        DESC_FREED.fetch_add(1, Ordering::Relaxed);
+                    }
+                    // Not freed in the batch (kept, or its free was skipped).
+                    _ => {
+                        if let Err(error) = release_desc(io, m.desc) {
+                            result = Err(error);
+                        }
+                    }
+                }
+            }
+            out.push(result);
+        }
+    }
+    done
 }
 
 /// Write the record values CreateAllocation produced for native allocation
@@ -1758,42 +2615,49 @@ fn evict_range(
         mapping: HostMapping,
         pfns: Option<Vec<u64>>,
     }
+    let mut candidates = Vec::new();
     let (foreign, victims) = {
         let mut state = STATE.lock();
+        // Only this process's allocations can map here (`by_process`).
+        state.candidates(process, &mut candidates)?;
         let mut foreign = Vec::new();
         if state.foreign.iter().any(|m| hit(m)) {
             foreign.try_reserve(state.foreign.len()).map_err(|_| Error::NoMemory)?;
             foreign.extend(state.foreign.iter().copied().filter(|m| hit(m)));
             state.foreign.retain(|m| !hit(m));
         }
-        let mut found = Vec::new();
-        for allocation in state.allocations.iter().filter(|a| Some(a.id) != keep) {
-            for mapping in allocation.mappings.iter().copied().filter(|m| hit(m)) {
-                found.try_reserve(1).map_err(|_| Error::NoMemory)?;
-                found.push((allocation.id, allocation.memory, allocation.size, allocation.system_memory != 0, mapping));
-            }
-        }
         let mut victims = Vec::new();
-        victims.try_reserve(found.len()).map_err(|_| Error::NoMemory)?;
-        for (id, memory, size, system_backed, mapping) in found {
-            let pfns = if mapping.desc != 0 {
-                state
-                    .desc_pfns
-                    .iter()
-                    .find(|(desc, _)| *desc == mapping.desc)
-                    .and_then(|(_, pfns)| {
+        let mut emptied = false;
+        for &id in candidates.iter().filter(|id| Some(**id) != keep) {
+            let Some(index) = state.index_of(id) else {
+                emptied = true;
+                continue;
+            };
+            let allocation = &state.allocations[index];
+            let (memory, size, system_backed) =
+                (allocation.memory, allocation.size, allocation.system_memory != 0);
+            if !allocation.mappings.iter().any(|m| hit(m)) {
+                emptied |= !allocation.mappings.iter().any(|m| m.process == process);
+                continue;
+            }
+            for mapping in allocation.mappings.iter().copied().filter(|m| hit(m)) {
+                let pfns = if mapping.desc != 0 {
+                    state.descs.pfns(mapping.desc).and_then(|pfns| {
                         let mut copy = Vec::new();
                         copy.try_reserve_exact(pfns.len()).ok()?;
                         copy.extend_from_slice(pfns);
                         Some(copy)
                     })
-            } else {
-                None
-            };
-            victims.push(Victim { id, memory, size, system_backed, mapping, pfns });
+                } else {
+                    None
+                };
+                victims.try_reserve(1).map_err(|_| Error::NoMemory)?;
+                victims.push(Victim { id, memory, size, system_backed, mapping, pfns });
+            }
+            state.allocations[index].mappings.retain(|m| !hit(m));
         }
-        for allocation in state.allocations.iter_mut().filter(|a| Some(a.id) != keep) {
-            allocation.mappings.retain(|m| !hit(m));
+        if emptied {
+            state.prune_index(process);
         }
         (foreign, victims)
     };
@@ -1802,16 +2666,22 @@ fn evict_range(
     }
     // `NvEvict`: published by the mirror pass (`publish_hot`).
     EVICTED.fetch_add((foreign.len() + victims.len()) as u32, Ordering::Relaxed);
-    for mapping in foreign {
-        let _ = unmap_fixed(io, 0, mapping);
-    }
     let failed = || {
         let n = EVICT_FAILED.fetch_add(1, Ordering::Relaxed) + 1;
         crate::diag::record_named_bytes(b"NvEvictFail", n);
     };
-    for victim in victims {
+    // Every unmap in as few round trips as the batch allows (`NvPaging` 0x1).
+    let mut items = Vec::new();
+    items
+        .try_reserve_exact(foreign.len() + victims.len())
+        .map_err(|_| Error::NoMemory)?;
+    items.extend(foreign.iter().map(|m| (0u32, *m, false)));
+    items.extend(victims.iter().map(|v| (v.memory, v.mapping, false)));
+    let mut results = Vec::new();
+    unmap_many(io, &items, false, &mut results)?;
+    for (victim, unmapped) in victims.into_iter().zip(results.into_iter().skip(foreign.len())) {
         let m = victim.mapping;
-        if unmap_fixed(io, victim.memory, m).is_err() {
+        if unmapped.is_err() {
             if let Ok(allocation) = STATE.lock().allocation_mut(victim.id) {
                 allocation.poisoned = true;
             }
@@ -1836,8 +2706,8 @@ fn evict_range(
                 len: bytes,
             };
             let shown = (|| -> Result<HostMapping, Error> {
-                let virt = STATE.lock().mint()?;
                 if m.desc == 0 {
+                    let virt = STATE.lock().mint()?;
                     let used = map_fixed(io, victim.memory, victim.size, victim.system_backed, space, virt, piece)?;
                     return Ok(HostMapping { process, piece, virt: used, desc: 0 });
                 }
@@ -1845,24 +2715,8 @@ fn evict_range(
                 let first = (delta / nm::PAGE_BYTES) as usize;
                 let count = (bytes / nm::PAGE_BYTES) as usize;
                 let sub = pfns.get(first..first + count).ok_or(Error::Invalid)?;
-                let desc = STATE.lock().mint()?;
-                alloc_system_descriptor(io, desc, sub, bytes)?;
-                let inner = nm::MappingPiece { va, memory_offset: 0, len: bytes };
-                let used = match map_fixed(io, desc, bytes, true, space, virt, inner) {
-                    Ok(used) => used,
-                    Err(error) => {
-                        let _ = io.rm_free(nd::H_DEVICE, desc);
-                        return Err(error);
-                    }
-                };
-                let mut kept = Vec::new();
-                if kept.try_reserve_exact(sub.len()).is_ok() {
-                    kept.extend_from_slice(sub);
-                    let mut state = STATE.lock();
-                    if state.desc_pfns.try_reserve(1).is_ok() {
-                        state.desc_pfns.push((desc, kept));
-                    }
-                }
+                let job = DescJob { va, pfns: sub, defer: false };
+                let (used, desc) = map_desc_single(io, victim.id, space, &job).map_err(|(_, e)| e)?;
                 Ok(HostMapping { process, piece, virt: used, desc })
             })();
             let Ok(shown) = shown else {
@@ -1871,7 +2725,7 @@ fn evict_range(
             };
             let recorded = {
                 let mut state = STATE.lock();
-                match state.allocation_mut(victim.id) {
+                let recorded = match state.allocation_mut(victim.id) {
                     Ok(allocation) => {
                         if allocation.mappings.try_reserve(1).is_ok() {
                             allocation.mappings.push(shown);
@@ -1884,7 +2738,11 @@ fn evict_range(
                         }
                     }
                     Err(_) => false,
+                };
+                if recorded {
+                    state.note_mapped(process, victim.id);
                 }
+                recorded
             };
             if !recorded {
                 let _ = unmap_fixed(io, victim.memory, shown);
@@ -1977,8 +2835,8 @@ fn system_mapping_unchanged(
     }
     for m in allocation.mappings.iter().filter(|m| m.process == process) {
         let shown = if m.desc != 0 {
-            match state.desc_pfns.iter().find(|(desc, _)| *desc == m.desc) {
-                Some((_, pages)) => Some(pages.as_slice()),
+            match state.descs.pfns(m.desc) {
+                Some(pages) => Some(pages),
                 // A descriptor whose pages were not kept: cannot tell.
                 None => return false,
             }
@@ -2020,35 +2878,71 @@ fn update_leaf_system_inner(
     // them (bpftrace: every pin succeeded), and the range stayed unmapped (ring
     // fetch faults). A refused chunk still fails the update; the chunks mapped
     // before it stay. With NvPerfMem 0x20 every chunk's mapping but the last
-    // defers its TLB invalidate.
+    // defers its TLB invalidate. Pages that already have a descriptor reuse it,
+    // and with `NvPaging` 0x1 every chunk's calls go in one round trip.
     let chunks = np::system_chunks(first_va, allocation_offset, pfns.len(), chunk_pages);
+    let mut jobs = Vec::new();
+    jobs.try_reserve_exact(chunks.len()).map_err(|_| Error::NoMemory)?;
+    for (index, chunk) in chunks.iter().enumerate() {
+        jobs.push(DescJob {
+            va: chunk.va,
+            pfns: pfns
+                .get(chunk.first..chunk.first + chunk.pages)
+                .ok_or(Error::Invalid)?,
+            defer: np::defer_tlb(defer_on, index, chunks.len()),
+        });
+    }
+    let mut made = Vec::new();
+    map_descs(&io, id, space, &jobs, &mut made)?;
     let mut first_error = None;
     let mut deferred = false;
     let mut last_ok = false;
-    for (index, chunk) in chunks.iter().enumerate() {
-        let defer = np::defer_tlb(defer_on, index, chunks.len());
-        let pages = pfns
-            .get(chunk.first..chunk.first + chunk.pages)
-            .ok_or(Error::Invalid)?;
-        let mapped = map_system_chunk(
-            &io,
-            id,
-            process,
-            space,
-            chunk.va,
-            chunk.memory_offset,
-            pages,
-            defer,
-            why,
-        );
-        last_ok = mapped.is_ok();
-        if let Err(error) = mapped {
-            note_failed_map(chunk.va, 2, error);
-            watch::event(chunk.va, chunk.bytes(), 8, error as u32, process);
-            first_error.get_or_insert(error);
-        } else {
-            deferred |= defer;
-            watch::event(chunk.va, chunk.bytes(), 7, 0, process);
+    for ((chunk, job), result) in chunks.iter().zip(&jobs).zip(made) {
+        let recorded = result.map_err(|(stage, error)| why(stage, error)).and_then(|(virt, desc)| {
+            let mapping = HostMapping {
+                process,
+                piece: nm::MappingPiece {
+                    va: chunk.va,
+                    memory_offset: chunk.memory_offset,
+                    len: chunk.bytes(),
+                },
+                virt,
+                desc,
+            };
+            let mut state = STATE.lock();
+            let pushed = match state.allocation_mut(id) {
+                Ok(allocation) => {
+                    if allocation.mappings.try_reserve(1).is_ok() {
+                        allocation.mappings.push(mapping);
+                        allocation
+                            .mappings
+                            .sort_unstable_by_key(|mapping| (mapping.process, mapping.piece.va));
+                        true
+                    } else {
+                        false
+                    }
+                }
+                Err(_) => false,
+            };
+            if pushed {
+                state.note_mapped(process, id);
+                return Ok(());
+            }
+            drop(state);
+            let _ = unmap_fixed(&io, 0, mapping);
+            Err(Error::NoMemory)
+        });
+        last_ok = recorded.is_ok();
+        match recorded {
+            Err(error) => {
+                note_failed_map(chunk.va, 2, error);
+                watch::event(chunk.va, chunk.bytes(), 8, error as u32, process);
+                first_error.get_or_insert(error);
+            }
+            Ok(()) => {
+                deferred |= job.defer;
+                watch::event(chunk.va, chunk.bytes(), 7, 0, process);
+            }
         }
     }
     if deferred && !last_ok {
@@ -2056,67 +2950,6 @@ fn update_leaf_system_inner(
         invalidate_tlb(&io, space);
     }
     first_error.map_or(Ok(()), Err)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn map_system_chunk(
-    io: &Io<'_>,
-    id: u32,
-    process: usize,
-    space: u32,
-    va: u64,
-    allocation_offset: u64,
-    pfns: &[u64],
-    defer: bool,
-    why: &dyn Fn(u32, Error) -> Error,
-) -> Result<(), Error> {
-    let len = (pfns.len() as u64)
-        .checked_mul(nm::PAGE_BYTES)
-        .ok_or(Error::Invalid)?;
-    let desc = STATE.lock().mint()?;
-    alloc_system_descriptor(io, desc, pfns, len).map_err(|error| why(2, error))?;
-    let virt = STATE.lock().mint()?;
-    let shown = nm::MappingPiece {
-        va,
-        memory_offset: 0,
-        len,
-    };
-    let used = match map_fixed_opts(io, desc, len, true, space, virt, shown, defer) {
-        Ok(used) => used,
-        Err(error) => {
-            let _ = io.rm_free(nd::H_DEVICE, desc);
-            return Err(why(3, error));
-        }
-    };
-    let mapping = HostMapping {
-        process,
-        piece: nm::MappingPiece {
-            va,
-            memory_offset: allocation_offset,
-            len,
-        },
-        virt: used,
-        desc,
-    };
-    let mut kept = Vec::new();
-    if kept.try_reserve_exact(pfns.len()).is_ok() {
-        kept.extend_from_slice(pfns);
-    }
-    let mut state = STATE.lock();
-    if !kept.is_empty() && state.desc_pfns.try_reserve(1).is_ok() {
-        state.desc_pfns.push((desc, kept));
-    }
-    let allocation = state.allocation_mut(id)?;
-    if allocation.mappings.try_reserve(1).is_err() {
-        drop(state);
-        let _ = unmap_fixed(io, 0, mapping);
-        return Err(Error::NoMemory);
-    }
-    allocation.mappings.push(mapping);
-    allocation
-        .mappings
-        .sort_unstable_by_key(|mapping| (mapping.process, mapping.piece.va));
-    Ok(())
 }
 
 /// A leaf update of an allocation this driver has no RM memory for (dxgkrnl's
@@ -2163,23 +2996,26 @@ pub fn update_foreign_leaf(
         return Ok(());
     }
     let stale: Vec<HostMapping> = {
+        let hit = |m: &HostMapping| {
+            m.process == process && nm::ranges_overlap(m.piece.va, m.piece.len, first_va, len)
+        };
         let mut state = STATE.lock();
         let mut stale = Vec::new();
-        let mut kept = Vec::new();
-        for mapping in state.foreign.drain(..) {
-            if mapping.process == process
-                && nm::ranges_overlap(mapping.piece.va, mapping.piece.len, first_va, len)
-            {
-                stale.push(mapping);
-            } else {
-                kept.push(mapping);
-            }
+        // Only the overlapping ones are copied out; the list is not rebuilt.
+        let n = state.foreign.iter().filter(|m| hit(m)).count();
+        if n != 0 {
+            stale.try_reserve_exact(n).map_err(|_| Error::NoMemory)?;
+            stale.extend(state.foreign.iter().copied().filter(|m| hit(m)));
+            state.foreign.retain(|m| !hit(m));
         }
-        state.foreign = kept;
         stale
     };
-    for mapping in stale {
-        let _ = unmap_fixed(&io, 0, mapping);
+    if !stale.is_empty() {
+        let mut items = Vec::new();
+        items.try_reserve_exact(stale.len()).map_err(|_| Error::NoMemory)?;
+        items.extend(stale.iter().map(|m| (0u32, *m, false)));
+        let mut results = Vec::new();
+        unmap_many(&io, &items, false, &mut results)?;
     }
     if pfns.is_empty() {
         watch::event(first_va, len, 4, 0, process);
@@ -2189,21 +3025,27 @@ pub fn update_foreign_leaf(
     // Native allocations VidMm no longer shows here (see `update_leaf`).
     evict_range(&io, space, process, first_va, len, None)
         .inspect_err(|e| note_failed_map(first_va, 3, *e))?;
-    let desc = STATE.lock().mint()?;
-    alloc_system_descriptor(&io, desc, pfns, len)
-        .inspect_err(|e| note_failed_map(first_va, 4, *e))?;
-    let virt = STATE.lock().mint()?;
     let piece = nm::MappingPiece {
         va: first_va,
         memory_offset: 0,
         len,
     };
-    let used = match map_fixed(&io, desc, len, true, space, virt, piece) {
-        Ok(used) => used,
-        Err(error) => {
-            note_failed_map(first_va, 5, error);
-            watch::event(first_va, len, 3, error as u32, process);
-            let _ = io.rm_free(nd::H_DEVICE, desc);
+    // The descriptor (reused for the same pages), its virtual object and the map:
+    // one round trip under `NvPaging` 0x1.
+    let job = DescJob {
+        va: first_va,
+        pfns,
+        defer: false,
+    };
+    let mut made = Vec::new();
+    map_descs(&io, 0, space, core::slice::from_ref(&job), &mut made)?;
+    let (used, desc) = match made.pop().unwrap_or(Err((3, Error::Host))) {
+        Ok(made) => made,
+        Err((stage, error)) => {
+            note_failed_map(first_va, if stage == 2 { 4 } else { 5 }, error);
+            if stage != 2 {
+                watch::event(first_va, len, 3, error as u32, process);
+            }
             return Err(error);
         }
     };
@@ -2214,17 +3056,6 @@ pub fn update_foreign_leaf(
         virt: used,
         desc,
     };
-    // The descriptor's pages, for the unchanged check above (`NvHotPath` 0x2 only;
-    // dropped with the descriptor by `unmap_fixed_opts`). Best effort.
-    let kept = if crate::ddi::hot_path::knob(passive).skip_foreign_unchanged() {
-        let mut copy = Vec::new();
-        if copy.try_reserve_exact(pfns.len()).is_ok() {
-            copy.extend_from_slice(pfns);
-        }
-        copy
-    } else {
-        Vec::new()
-    };
     let mut state = STATE.lock();
     if state.foreign.try_reserve(1).is_err() {
         drop(state);
@@ -2232,9 +3063,6 @@ pub fn update_foreign_leaf(
         return Err(Error::NoMemory);
     }
     state.foreign.push(mapping);
-    if !kept.is_empty() && state.desc_pfns.try_reserve(1).is_ok() {
-        state.desc_pfns.push((desc, kept));
-    }
     Ok(())
 }
 
@@ -2260,15 +3088,7 @@ fn foreign_mapping_unchanged(process: usize, first_va: u64, len: u64, pfns: &[u6
         if n == overlapping.len() {
             return false;
         }
-        let pages = if m.desc != 0 {
-            state
-                .desc_pfns
-                .iter()
-                .find(|(desc, _)| *desc == m.desc)
-                .map(|(_, pages)| pages.as_slice())
-        } else {
-            None
-        };
+        let pages = if m.desc != 0 { state.descs.pfns(m.desc) } else { None };
         overlapping[n] = (m.piece, pages);
         n += 1;
     }
@@ -2297,30 +3117,40 @@ pub fn patch_gpu_bytes(
     }
     let found = {
         let state = STATE.lock();
-        let mut found = None;
-        'outer: for allocation in state.allocations.iter() {
-            for m in allocation.mappings.iter().filter(|m| m.process == process) {
-                let Some(end) = m.piece.end() else { continue };
-                if va < m.piece.va || va + len > end {
-                    continue;
-                }
-                let delta = va - m.piece.va;
-                if m.desc != 0 {
-                    let pfn = state
-                        .desc_pfns
-                        .iter()
-                        .find(|(desc, _)| *desc == m.desc)
-                        .and_then(|(_, pfns)| pfns.get((delta >> 12) as usize).copied());
-                    if let Some(pfn) = pfn {
-                        found = Some(Where::System((pfn << 12) | (va & 0xfff)));
-                    }
-                } else {
-                    found = Some(Where::Rm(allocation.id, m.piece.memory_offset + delta));
-                }
-                break 'outer;
+        let look = |allocation: &Allocation| -> Option<Where> {
+            let m = allocation.mappings.iter().find(|m| {
+                m.process == process
+                    && va >= m.piece.va
+                    && m.piece.end().is_some_and(|end| va + len <= end)
+            })?;
+            let delta = va - m.piece.va;
+            if m.desc != 0 {
+                let pfn = state
+                    .descs
+                    .pfns(m.desc)
+                    .and_then(|pfns| pfns.get((delta >> 12) as usize).copied())?;
+                Some(Where::System((pfn << 12) | (va & 0xfff)))
+            } else {
+                Some(Where::Rm(allocation.id, m.piece.memory_offset + delta))
             }
+        };
+        // This process's allocations only (`by_process`); no allocation here (any
+        // IRQL up to DISPATCH).
+        IDX_LOOKUPS.fetch_add(1, Ordering::Relaxed);
+        if state.index_broken {
+            IDX_SCANNED.fetch_add(state.allocations.len() as u32, Ordering::Relaxed);
+            state.allocations.iter().find_map(look)
+        } else {
+            let ids = state
+                .by_process
+                .iter()
+                .find(|(p, _)| *p == process)
+                .map_or(&[][..], |(_, ids)| ids.as_slice());
+            IDX_SCANNED.fetch_add(ids.len() as u32, Ordering::Relaxed);
+            ids.iter()
+                .filter_map(|id| state.index_of(*id).map(|i| &state.allocations[i]))
+                .find_map(look)
         }
-        found
     };
     match found {
         None => Ok(false),
@@ -2449,24 +3279,34 @@ fn update_leaf_inner(
         client,
     };
     leaf_stage(2);
-    let (memory, size, system_backed, old) = {
+    let count = pieces.len() as u64;
+    let len = count.checked_mul(nm::PAGE_BYTES).ok_or(Error::Invalid)?;
+    // Only this process's mappings of the allocation that overlap the update are
+    // copied out (pieces that do not overlap it never reach the span compared or
+    // changed below); the allocation's whole list is not cloned.
+    let mut old_process: Vec<HostMapping> = Vec::new();
+    let (memory, size, system_backed) = {
         let state = STATE.lock();
         let allocation = state.allocation(id)?;
         if allocation.poisoned || allocation.epoch != client.epoch {
             return Err(Error::Poisoned);
         }
-        (
-            allocation.memory,
-            allocation.size,
-            allocation.system_memory != 0,
-            allocation.mappings.clone(),
-        )
+        let hit = |m: &&HostMapping| {
+            m.process == process && nm::ranges_overlap(m.piece.va, m.piece.len, first_va, len)
+        };
+        let n = allocation.mappings.iter().filter(hit).count();
+        old_process.try_reserve_exact(n).map_err(|_| Error::NoMemory)?;
+        old_process.extend(allocation.mappings.iter().filter(hit).copied());
+        (allocation.memory, allocation.size, allocation.system_memory != 0)
     };
+    if pieces.iter().any(|p| p.is_some()) {
+        // Placed in video memory: VidMm's system pages for it are its to free, so
+        // its idle OS descriptors go (`helios_kmd_logic::desc_cache`).
+        drop_idle_descs_of(&io, id);
+    }
     leaf_stage(3);
     let space = ensure_space(&io, process)?;
     leaf_stage(4);
-    let count = pieces.len() as u64;
-    let len = count.checked_mul(nm::PAGE_BYTES).ok_or(Error::Invalid)?;
     if count == 0 || first_va & (nm::PAGE_BYTES - 1) != 0 {
         return Err(Error::Invalid);
     }
@@ -2499,12 +3339,11 @@ fn update_leaf_inner(
     }
     nm::coalesce(&mut new);
 
-    let old_process: Vec<HostMapping> = old
-        .iter()
-        .copied()
-        .filter(|m| m.process == process)
-        .collect();
-    let old_pieces: Vec<nm::MappingPiece> = old_process.iter().map(|m| m.piece).collect();
+    let mut old_pieces: Vec<nm::MappingPiece> = Vec::new();
+    old_pieces
+        .try_reserve_exact(old_process.len())
+        .map_err(|_| Error::NoMemory)?;
+    old_pieces.extend(old_process.iter().map(|m| m.piece));
     leaf_stage(6);
     let unmapped =
         nm::replace_range(&old_pieces, first_va, len, None, size).map_err(|_| Error::Invalid)?;
@@ -2603,16 +3442,26 @@ fn update_leaf_inner(
     let defer_on = perf().tlb_defer();
     let operations = affected_old.len() + planned.len();
     let mut deferred = false;
+    // Every unmap in as few round trips as the batch allows (`NvPaging` 0x1); the
+    // first failure stops the rest, as the one-by-one loop did.
+    let mut items = Vec::new();
+    items
+        .try_reserve_exact(affected_old.len())
+        .map_err(|_| Error::NoMemory)?;
     for (index, mapping) in affected_old.iter().copied().enumerate() {
-        let defer = np::defer_tlb(defer_on, index, operations);
-        if unmap_fixed_opts(&io, memory, mapping, defer).is_err() {
+        items.push((memory, mapping, np::defer_tlb(defer_on, index, operations)));
+    }
+    let mut unmapped = Vec::new();
+    unmap_many(&io, &items, true, &mut unmapped)?;
+    for (item, result) in items.iter().zip(&unmapped) {
+        if result.is_err() {
             if deferred {
                 invalidate_tlb(&io, space);
             }
             STATE.lock().allocation_mut(id)?.poisoned = true;
             return Err(Error::Poisoned);
         }
-        deferred |= defer;
+        deferred |= item.2;
     }
     leaf_stage(13);
 
@@ -2699,10 +3548,14 @@ fn update_leaf_inner(
                     && mapping.piece.va < span_end
                     && span_start < mapping.piece.end().unwrap_or(mapping.piece.va))
             });
+            let restored = !rollback.is_empty();
             allocation.mappings.extend(rollback);
             allocation
                 .mappings
                 .sort_unstable_by_key(|mapping| (mapping.process, mapping.piece.va));
+            if restored {
+                state.note_mapped(process, id);
+            }
             return Err(error);
         }
         made.push(HostMapping {
@@ -2720,10 +3573,14 @@ fn update_leaf_inner(
         !(mapping.process == process
             && nm::ranges_overlap(mapping.piece.va, mapping.piece.len, first_va, len))
     });
+    let any = !made.is_empty();
     allocation.mappings.extend(made);
     allocation
         .mappings
         .sort_unstable_by_key(|mapping| (mapping.process, mapping.piece.va));
+    if any {
+        state.note_mapped(process, id);
+    }
     leaf_stage(0xfe);
     Ok(())
 }
@@ -3253,11 +4110,17 @@ pub fn destroy(passive: PassiveLevel, adapter: &AdapterContext, id: u32) -> Resu
         super::native_scanout::release_gem(&io, gem);
         STATE.lock().allocation_mut(id)?.scanout_gem = 0;
     }
-    // Every mapping is tried; one RM refuses stays recorded (and the allocation
-    // with it), the others are gone and not named again.
+    // Every mapping is tried (in as few round trips as `NvPaging` 0x1 allows); one
+    // RM refuses stays recorded (and the allocation with it), the others are gone
+    // and not named again.
+    let mut items = Vec::new();
+    items.try_reserve_exact(mappings.len()).map_err(|_| Error::NoMemory)?;
+    items.extend(mappings.iter().map(|m| (memory, *m, false)));
+    let mut results = Vec::new();
+    unmap_many(&io, &items, false, &mut results)?;
     let mut unmapped = Ok(());
-    for mapping in mappings {
-        match unmap_fixed(&io, memory, mapping) {
+    for (mapping, result) in mappings.iter().zip(results) {
+        match result {
             Ok(()) => {
                 STATE
                     .lock()
@@ -3269,15 +4132,13 @@ pub fn destroy(passive: PassiveLevel, adapter: &AdapterContext, id: u32) -> Resu
         }
     }
     unmapped?;
+    // Its pages are VidMm's to free now: no idle descriptor may outlive it.
+    drop_idle_descs_of(&io, id);
     io.rm_free(nd::H_DEVICE, memory)?;
     super::nvda::forget_memory(memory);
     let mut allocation = {
         let mut state = STATE.lock();
-        let index = state
-            .allocations
-            .iter()
-            .position(|a| a.id == id)
-            .ok_or(Error::Invalid)?;
+        let index = state.index_of(id).ok_or(Error::Invalid)?;
         state.allocations.remove(index)
     };
     unlock_pins(&mut allocation.pins);
@@ -3312,7 +4173,13 @@ pub fn release_process(passive: PassiveLevel, adapter: &AdapterContext, process:
     let owned: Vec<(u32, u32, HostMapping)> = {
         let state = STATE.lock();
         let mut owned = Vec::new();
-        for allocation in state.allocations.iter() {
+        let mut candidates = Vec::new();
+        if state.candidates(process, &mut candidates).is_err() {
+            return 1;
+        }
+        for id in candidates {
+            let Some(i) = state.index_of(id) else { continue };
+            let allocation = &state.allocations[i];
             for mapping in allocation.mappings.iter().filter(|m| m.process == process) {
                 if owned.try_reserve(1).is_err() {
                     return 1;
@@ -3339,8 +4206,20 @@ pub fn release_process(passive: PassiveLevel, adapter: &AdapterContext, process:
         });
         mine
     };
-    for mapping in foreign {
-        if unmap_fixed(&io, 0, mapping).is_err() {
+    // Every unmap in as few round trips as `NvPaging` 0x1 allows.
+    let mut items = Vec::new();
+    if items.try_reserve_exact(foreign.len() + owned.len()).is_err() {
+        return 1;
+    }
+    items.extend(foreign.iter().map(|m| (0u32, *m, false)));
+    items.extend(owned.iter().map(|(_, memory, m)| (*memory, *m, false)));
+    let mut results = Vec::new();
+    if unmap_many(&io, &items, false, &mut results).is_err() {
+        return 1;
+    }
+    let (foreign_results, owned_results) = results.split_at(foreign.len());
+    for (mapping, result) in foreign.into_iter().zip(foreign_results) {
+        if result.is_err() {
             kept += 1;
             // Still mapped: recorded under the dead key (see below).
             let mut state = STATE.lock();
@@ -3352,8 +4231,8 @@ pub fn release_process(passive: PassiveLevel, adapter: &AdapterContext, process:
             }
         }
     }
-    for (id, memory, mapping) in owned {
-        if unmap_fixed(&io, memory, mapping).is_ok() {
+    for ((id, _, mapping), result) in owned.into_iter().zip(owned_results) {
+        if result.is_ok() {
             if let Ok(allocation) = STATE.lock().allocation_mut(id) {
                 allocation
                     .mappings
@@ -3395,10 +4274,23 @@ pub fn release_process(passive: PassiveLevel, adapter: &AdapterContext, process:
                 mapping.process = nt::retire_owner(mapping.process, process);
             }
         }
+        for allocation in state.allocations.iter_mut() {
+            allocation
+                .mappings
+                .sort_unstable_by_key(|mapping| (mapping.process, mapping.piece.va));
+        }
         for (owner, _) in state.spaces.iter_mut() {
             *owner = nt::retire_owner(*owner, process);
         }
         state.idle_spaces.retain(|p| *p != process);
+    }
+    // A new process may get this key: its index starts empty. (What stayed is
+    // recorded under the dead key, which no update names.)
+    {
+        let mut state = STATE.lock();
+        if let Some(at) = state.by_process.iter().position(|(p, _)| *p == process) {
+            state.by_process.swap_remove(at);
+        }
     }
     kept
 }
@@ -3407,13 +4299,13 @@ pub fn release_process(passive: PassiveLevel, adapter: &AdapterContext, process:
 /// object.  No host request is sent and no pSystemMem page is unlocked early.
 pub fn discard(id: u32) -> Result<(), Error> {
     let mut state = STATE.lock();
-    let index = state
-        .allocations
-        .iter()
-        .position(|a| a.id == id)
-        .ok_or(Error::Invalid)?;
+    let index = state.index_of(id).ok_or(Error::Invalid)?;
     let mut allocation = state.allocations.remove(index);
+    // The transport destroyed every RM object: its idle descriptors are gone too.
+    let mut dead = Vec::new();
+    state.descs.drop_idle_of(id, &mut dead);
     drop(state);
+    drop(dead);
     if let Some(cpu) = allocation.cpu.as_mut() {
         if cpu.kernel_va != 0 {
             // PASSIVE (DestroyAllocation); the host mapping is already gone.
@@ -3440,7 +4332,10 @@ pub fn forget(passive: PassiveLevel) {
     state.spaces.clear();
     state.windows.clear();
     state.foreign.clear();
-    state.desc_pfns.clear();
+    // The sweep closed every RM object: the descriptors went with them.
+    state.descs.clear();
+    state.by_process.clear();
+    state.index_broken = false;
     state.idle_spaces.clear();
     // Pins kept because the host's answer was unknown: the sweep closed every
     // object that could name them.

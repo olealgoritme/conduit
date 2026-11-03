@@ -1132,6 +1132,39 @@ pub(crate) fn forward_kmd_registration(
     ctrl::raw_roundtrip(passive, adapter, &buf, resp, timeout_ms).map_err(Refusal::Transport)
 }
 
+/// An `RmBatch` of the KMD's OWN RM client (`DeviceOwner::KMD_RM`): `req` is a whole batch
+/// (`helios_kmd_logic::rm_batch`) whose every entry is an `Ioctl` on a file that client
+/// opened (checked here, with the device generation, in one lock hold). User mode can never
+/// send one: `RmBatch` is not in `HELIOS_NVRM_FORWARD_MSG_TYPES`. Entries may carry page-run
+/// deep blocks the KMD built, as [`forward_kmd_registration`] does. Returns the reply length
+/// and the device generation the batch was sent in. PASSIVE, no lock held.
+pub(crate) fn forward_kmd_batch(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    req: &[u8],
+    resp: &mut [u8],
+    timeout_ms: u64,
+) -> Result<(usize, u64), Refusal> {
+    let handles =
+        helios_kmd_logic::rm_batch::entry_handles(req).ok_or(Refusal::BadRange)?;
+    let (all_owned, epoch) = adapter
+        .with_virtio(|v| {
+            (
+                handles
+                    .iter()
+                    .all(|h| v.nvrm_handle_owned(DeviceOwner::KMD_RM, *h)),
+                v.nvrm_epoch(),
+            )
+        })
+        .unwrap_or((false, 0));
+    if !all_owned {
+        return Err(Refusal::NotOwned);
+    }
+    NVRM_IOCTLS.fetch_add(handles.len() as u32, Ordering::Relaxed);
+    let n = ctrl::raw_roundtrip(passive, adapter, req, resp, timeout_ms).map_err(Refusal::Transport)?;
+    Ok((n, epoch))
+}
+
 // ---- mappings -----------------------------------------------------------------------
 
 /// The result of a host `Mmap`.

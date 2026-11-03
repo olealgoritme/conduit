@@ -174,6 +174,17 @@ impl DescTable {
         Released::Cached
     }
 
+    /// Whether [`Self::release`] of `desc` with these settings would answer `Free`
+    /// (nothing changes): a batch frees the object in the same round trip as its
+    /// unmap, and calls [`Self::forget`] once that worked.
+    pub fn would_free(&self, desc: u32, cache: bool, max_idle: usize) -> bool {
+        match self.find(desc) {
+            None => true,
+            Some(i) if self.entries[i].refs > 1 => false,
+            Some(_) => !cache || max_idle == 0,
+        }
+    }
+
     /// Forget `desc` whatever its count (its RM object is gone or being freed).
     pub fn forget(&mut self, desc: u32) {
         if let Some(i) = self.find(desc) {
@@ -321,6 +332,22 @@ mod tests {
         assert!(t.insert(1, &[], 1).is_err());
         t.insert(1, &[1], 1).unwrap();
         assert!(t.insert(1, &[2], 1).is_err(), "a handle once");
+    }
+
+    #[test]
+    fn would_free_is_release_without_the_change() {
+        let mut t = DescTable::new();
+        let mut gone = vec![];
+        assert!(t.would_free(5, true, 8), "unknown");
+        t.insert(5, &[5], 1).unwrap();
+        assert!(!t.would_free(5, true, 8));
+        assert!(t.would_free(5, false, 8));
+        assert!(t.would_free(5, true, 0));
+        t.acquire(&[5], 1).unwrap();
+        assert!(!t.would_free(5, false, 8), "mapped twice");
+        assert_eq!(t.counts(), (1, 0));
+        assert_eq!(t.release(5, false, 8, &mut gone), Released::InUse);
+        assert!(t.would_free(5, false, 8));
     }
 
     #[test]

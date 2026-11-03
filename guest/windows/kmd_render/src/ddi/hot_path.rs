@@ -36,6 +36,7 @@
 //! | `HpFlipFast` / `HpFlipSlow` | native flips without / with the native I/O mutex (0x1) |
 //! | `HpFn0`..`HpFn7`, `HpFnN0`..`HpFnN7`, `HpFnOvf` | NVDA function census: function, count |
 //! | `HpRc0`..`HpRc7`, `HpRcN0`..`HpRcN7`, `HpRcOvf` | forwarded RM control census: cmd, count |
+//! | `Pg*` | the page-table update fast paths (`NvPaging`): batches, OS-descriptor reuse, the per-process index; see `virtio/native_memory.rs` `publish_hot` |
 //! | `HpKnob` | `NvHotPath` in force |
 //! | `HpWinMs` | the window the rates were taken over |
 

@@ -76,6 +76,14 @@ pub const fn reply_cap(data: usize, nested: usize) -> usize {
     }
 }
 
+/// A point in a batch's building ([`Batch::mark`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Mark {
+    buf: usize,
+    entries: usize,
+    reply: usize,
+}
+
 /// Why an entry could not be added.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PushError {
@@ -196,6 +204,31 @@ impl Batch {
         let count = self.caps.len() as u32;
         put32(&mut self.buf, MSG_HDR, count);
         Ok(index)
+    }
+
+    /// Where the batch stands now, for [`Self::rollback`].
+    pub fn mark(&self) -> Mark {
+        Mark {
+            buf: self.buf.len(),
+            entries: self.caps.len(),
+            reply: self.reply,
+        }
+    }
+
+    /// Drop every entry added since `mark` (a job whose later entries did not fit
+    /// must not be sent half).
+    pub fn rollback(&mut self, mark: Mark) {
+        if mark.entries >= self.caps.len() {
+            return;
+        }
+        self.caps.truncate(mark.entries);
+        self.reply = mark.reply;
+        if mark.entries == 0 {
+            self.buf.clear();
+        } else {
+            self.buf.truncate(mark.buf);
+            put32(&mut self.buf, MSG_HDR, mark.entries as u32);
+        }
     }
 
     /// The request bytes (empty for an empty batch).
@@ -391,6 +424,28 @@ mod tests {
         b.clear();
         assert!(b.is_empty());
         assert!(b.request().is_empty());
+    }
+
+    #[test]
+    fn rollback_drops_a_half_added_job() {
+        let mut b = Batch::new();
+        let empty = b.mark();
+        b.push_ioctl(1, 2, &[1u8; 16], &[], None, None, 0, 0).unwrap();
+        let one = b.request().to_vec();
+        let reply_one = b.reply_len();
+        let m = b.mark();
+        b.push_ioctl(3, 4, &[2u8; 40], &[5u8; 8], None, Some(40), 1, SKIP_GROUP_ON_FAIL).unwrap();
+        b.push_ioctl(3, 4, &[2u8; 40], &[], None, None, 1, 0).unwrap();
+        b.rollback(m);
+        assert_eq!(b.request(), &one[..]);
+        assert_eq!(b.len(), 1);
+        assert_eq!(b.reply_len(), reply_one);
+        assert_eq!(entry_handles(b.request()), Some(alloc::vec![1]));
+        b.rollback(m);
+        assert_eq!(b.len(), 1, "nothing after the mark: unchanged");
+        b.rollback(empty);
+        assert!(b.is_empty() && b.request().is_empty());
+        assert_eq!(b.reply_len(), Batch::new().reply_len());
     }
 
     #[test]
