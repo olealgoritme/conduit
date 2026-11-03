@@ -59,9 +59,10 @@ pub mod kind {
     /// A copy-context submission that waited in the backlog (ring full) and went
     /// to the channel later: informational, status 0. code: the backlog depth.
     pub const COPY_DEFERRED: u8 = 14;
-    /// The ICD polled its wait escape (0x01000021) for the same token for more
-    /// than [`super::WAIT_REPORT_MS`] (again at every doubling): it is spinning on
-    /// GPU work that has not finished. status 0, code: the token, hint: ms so far.
+    /// The ICD polled its wait escape (0x01000021) for the same [`super::wait_key`]
+    /// for more than [`super::WAIT_REPORT_MS`] (again at every doubling): it is
+    /// spinning on GPU work that has not finished. status 0, code: the key, hint:
+    /// ms so far.
     pub const LONG_WAIT: u8 = 15;
     /// One past the largest kind; per-kind counters are this long.
     pub const MAX: usize = 16;
@@ -364,11 +365,13 @@ impl Streak {
     }
 }
 
-/// The Vulkan ICD's wait poll (NVDA 0x01000021, a 32-bit token at +0x20): it
-/// spins on it (with `GetDeviceState`) while it waits for GPU work, about 2 us
-/// per poll on NVIDIA's KMD, a few polls per wait there. A streak is one token's
+/// The Vulkan ICD's wait poll (NVDA 0x01000021): its device-lost check, which it
+/// calls (with `GetDeviceState`) on every turn of its busy-wait loops while it
+/// waits for GPU work, about 2 us per poll on NVIDIA's KMD, a few polls per wait
+/// there. The word at +0x20 is the ICD's uninitialised stack, so a streak is keyed
+/// by [`wait_key`] (the escape's context, else its device). A streak is one key's
 /// polls without a gap of [`WAIT_GAP_MS`]; its length says how long the ICD has
-/// waited for that work. [`WAIT_STREAKS`] tokens are followed at once.
+/// waited for that work. [`WAIT_STREAKS`] keys are followed at once.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WaitStreaks {
     pub polls: u32,
@@ -442,6 +445,50 @@ impl WaitStreaks {
     /// The streak polled last.
     pub fn last(&self) -> Streak {
         self.streaks[self.current]
+    }
+}
+
+/// The streak key of a wait poll: the escape's hContext (the ICD's per-context
+/// check), else its hDevice (the device-wide check), as the low 32 bits dxgkrnl's
+/// handles live in.
+pub const fn wait_key(h_device: usize, h_context: usize) -> u32 {
+    if h_context != 0 {
+        h_context as u32
+    } else {
+        h_device as u32
+    }
+}
+
+/// What the KMD does on a wait poll before it answers (`NvGlYield`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PollPause {
+    /// Answer at once, as NVIDIA's KMD does.
+    None,
+    /// Give the vCPU to another ready thread (a zero-length delay), then answer.
+    Yield,
+    /// Sleep this many microseconds (rounded up to the timer resolution), then answer.
+    DelayUs(u32),
+}
+
+/// Polls of one streak answered at once before [`poll_pause`] slows the ICD
+/// down (`NvGlYieldMin` 0): above what one wait takes on NVIDIA's hardware.
+pub const POLL_PAUSE_MIN_DEFAULT: u32 = 16;
+/// The longest delay `NvGlYield` may ask for (us).
+pub const POLL_PAUSE_MAX_US: u32 = 2000;
+
+/// The pause for a poll that is the `streak`-th of its streak. `mode`
+/// (`NvGlYield`): 0 none, 1 yield, 2.. a delay of that many microseconds (at most
+/// [`POLL_PAUSE_MAX_US`]). `min_polls` (`NvGlYieldMin`, 0 = the default): the
+/// first polls of a streak are answered at once, so short waits keep NVIDIA's
+/// latency and only a spin that has lasted pays.
+pub fn poll_pause(mode: u32, min_polls: u32, streak: u32) -> PollPause {
+    let min = if min_polls == 0 { POLL_PAUSE_MIN_DEFAULT } else { min_polls };
+    if mode == 0 || streak <= min {
+        return PollPause::None;
+    }
+    match mode {
+        1 => PollPause::Yield,
+        us => PollPause::DelayUs(us.min(POLL_PAUSE_MAX_US)),
     }
 }
 
@@ -754,6 +801,23 @@ mod tests {
         rm_batch_failures(&req, &resp, 40, |_| none += 1);
         rm_batch_failures(&req_b, &resp_b, resp_b.len(), |_| none += 1);
         assert_eq!(none, 0);
+    }
+
+    #[test]
+    fn wait_key_prefers_the_context() {
+        assert_eq!(wait_key(0x4000_1280, 0x4000_31c0), 0x4000_31c0);
+        assert_eq!(wait_key(0x4000_1280, 0), 0x4000_1280);
+    }
+
+    #[test]
+    fn poll_pause_spares_short_waits() {
+        assert_eq!(poll_pause(0, 0, 1000), PollPause::None);
+        assert_eq!(poll_pause(1, 0, POLL_PAUSE_MIN_DEFAULT), PollPause::None);
+        assert_eq!(poll_pause(1, 0, POLL_PAUSE_MIN_DEFAULT + 1), PollPause::Yield);
+        assert_eq!(poll_pause(1, 4, 5), PollPause::Yield);
+        assert_eq!(poll_pause(1, 4, 4), PollPause::None);
+        assert_eq!(poll_pause(200, 0, 100), PollPause::DelayUs(200));
+        assert_eq!(poll_pause(u32::MAX - 1, 0, 100), PollPause::DelayUs(POLL_PAUSE_MAX_US));
     }
 
     #[test]

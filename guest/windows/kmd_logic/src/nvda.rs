@@ -555,12 +555,19 @@ pub fn apply_local(
             }
         }
         0x0100_0021 | 0x0100_0088 => {
-            // Vulkan ICD requests with a 32-bit token at +0x20 (0x0088: and 5 at
-            // +0x30). 0x0021 is polled while the ICD waits for GPU work (the capture
-            // polls it 228 times over the run); refused, vkCreateDevice spun on it
-            // forever. The 610.88 capture answers both with result 1 in both result
-            // words; 0x0088's reply shrinks to 0x30 bytes, 0x0021's keeps its 0x38
-            // (capture seq 2440, 1992).
+            // 0x0021 is the ICD's device-lost check (nvoglv64 0xa8e610 per context
+            // with that hContext, 0xa8e730 device-wide with none), called once a
+            // second by a worker thread and on every turn of the ICD's busy-wait
+            // loops (GPU progress, pushbuffer space). The ICD declares the device
+            // lost when the escape fails, when +0x2c is not 1, when a per-context
+            // reply has +0x34 != 0 (device-wide: when +0x34 changes, a reset
+            // counter), or when GetDeviceState after it is not ACTIVE. +0x20 is the
+            // ICD's uninitialised stack, not a token. NVIDIA's KMD answers in about
+            // 2 us without blocking (the capture: 228 polls, median 2.4 us), so the
+            // spinning is the ICD's own. 0x0088 has 5 at +0x30. Refused, vkCreateDevice
+            // spun on 0x0021 forever. The 610.88 capture answers both with result 1
+            // in both result words; 0x0088's reply shrinks to 0x30 bytes, 0x0021's
+            // keeps its 0x38 (capture seq 2440, 1992).
             if header.function == 0x0100_0021 {
                 exact(buf, 0x38)?;
             } else {
@@ -627,6 +634,75 @@ pub fn apply_local(
             put32(buf, NVDA_SIZE_AT, NVDA_COMMON_HEADER_BYTES as u32);
             put32(buf, NVDA_RESULT_AT, 1);
             put32(buf, NVDA_RESULT2_AT, 1);
+        }
+        0x0100_002d => {
+            // Device-scoped 0x3c-byte query the D3D UMD (nvwgf2umx) sends every 32nd
+            // time through one of its per-frame paths (DWM too). The UMD reads only
+            // +0x34 & +0x38: nonzero sets a per-device flag (byte +0xeb of its state);
+            // a failure just clears it. The 610.88 captures answer a 0x30-byte reply,
+            // result 1 at both result words and nonzero words at +0x30/+0x34/+0x38
+            // (d3d11test 1/1/1, d3d12test 2/3/3, DWM 0x16a/-1/-1). +0x20 is the UMD's
+            // uninitialised stack and stays. Refused, DWM flooded the VkF ring.
+            exact(buf, 0x3c)?;
+            put32(buf, NVDA_SIZE_AT, NVDA_COMMON_HEADER_BYTES as u32);
+            put32(buf, NVDA_RESULT_AT, 1);
+            put32(buf, NVDA_RESULT2_AT, 1);
+            put32(buf, 0x30, 1);
+            put32(buf, 0x34, 1);
+            put32(buf, 0x38, 1);
+        }
+        0x0100_00bb => {
+            // 0x390-byte record the D3D UMD pushes (sub-op 3 at +0x30, then
+            // counters and doubles: frame-time statistics). NVIDIA's KMD only takes
+            // it: the L3 capture (b4, DWM and d3d12test) answers a 0x30-byte reply,
+            // result 1 at both result words, every payload byte unchanged.
+            exact(buf, 0x390)?;
+            put32(buf, NVDA_SIZE_AT, NVDA_COMMON_HEADER_BYTES as u32);
+            put32(buf, NVDA_RESULT_AT, 1);
+            put32(buf, NVDA_RESULT2_AT, 1);
+        }
+        0x0100_00ae => {
+            // 0x34-byte adapter query of the OpenGL/Vulkan ICD (nvoglv64 0xa5ea20,
+            // `**VN` tag): one 32-bit value at +0x30, stored in its context (+0xbb8).
+            // No capture holds it (the captured runs never sent it). The ICD zeroes
+            // the value before the call and keeps 0 when the escape fails, so a
+            // success with 0 at +0x30 is exactly what it ends up with either way,
+            // without the refusal (52 per Steel Nomad run).
+            exact(buf, 0x34)?;
+            put32(buf, NVDA_RESULT_AT, 1);
+            put32(buf, NVDA_RESULT2_AT, 1);
+            put32(buf, 0x30, 0);
+        }
+        0x0100_000d => {
+            // 0xfc0-byte adapter-scoped NVAPI display-timing query (Flags 8, no
+            // hDevice; the vktest capture seq 3783 from nvapi64_impl via the ICD).
+            // Answered from the capture's reply with the size kept; the KMD fills in
+            // the mode this adapter scans out (`set_display_timing`).
+            exact(buf, DISPLAY_TIMING_BYTES)?;
+            put32(buf, NVDA_RESULT_AT, 1);
+            put32(buf, NVDA_RESULT2_AT, 1);
+            for at in (0x30..DISPLAY_TIMING_BYTES).step_by(4) {
+                put32(buf, at, 0);
+            }
+            for &(at, value) in DISPLAY_TIMING_FIXED.iter() {
+                put32(buf, at, value);
+            }
+            set_display_timing(buf, 1024, 768, 60_004);
+        }
+        function
+            if is_rm_control_function(function)
+                && parse_rm_control(buf).is_ok_and(|c| c.cmd == NV2080_CTRL_CMD_GPU_QUERY_ECC_STATUS) =>
+        {
+            // NV2080 GPU_QUERY_ECC_STATUS (the Vulkan ICD asks it 7 times while it
+            // creates a device). A GeForce has no ECC: NVIDIA's KMD answers RM
+            // status NOT_SUPPORTED itself, in a 0x30-byte reply with -19 in the second
+            // result word (vktest capture seq 1352...1837). Answered the same here,
+            // without a host round trip; the shortened reply no longer parses as an
+            // RM control, so the KMD does not count it as a refusal.
+            put32(buf, NVDA_SIZE_AT, NVDA_COMMON_HEADER_BYTES as u32);
+            put32(buf, NVDA_RESULT_AT, 1);
+            put32(buf, NVDA_RESULT2_AT, ECC_RESULT2);
+            put32(buf, RM_STATUS_AT, NV_ERR_NOT_SUPPORTED);
         }
         0x0100_0124 => {
             // Device-scoped 0x48-byte request the D3D11 UMD makes when a swap
@@ -812,6 +888,201 @@ pub const NV0073_CTRL_CMD_SYSTEM_GET_NUM_HEADS: u32 = 0x0073_0102;
 pub const NV0073_CTRL_CMD_SYSTEM_GET_ACTIVE: u32 = 0x0073_010c;
 pub const NV0073_CTRL_CMD_SYSTEM_GET_RASTER: u32 = 0x0073_011a;
 const NV_ERR_NOT_SUPPORTED: u32 = 0x56;
+const NV_ERR_INVALID_ADDRESS: u32 = 0x1e;
+const NV_ERR_INVALID_ARGUMENT: u32 = 0x1f;
+
+pub const NV2080_CTRL_CMD_GPU_QUERY_ECC_STATUS: u32 = 0x2080_012f;
+/// The second result word NVIDIA's KMD answers with the refused ECC query (-19).
+pub const ECC_RESULT2: u32 = 0xffff_ffed;
+
+/// NV0080 NVENC_GET_CAPS: `{NvU32 capsTblSize; NvP64 capsTbl}` (0x10 bytes), the
+/// table being a pointer into the caller's address space. RM on a Linux host has no
+/// such control for a physical GPU (and could not reach a guest pointer anyway: it
+/// answered NV_ERR_INVALID_ADDRESS); NVIDIA's KMD answers it itself (vktest capture
+/// seq 1395: RM status 0, the 0x54-byte reply size kept).
+pub const NV0080_CTRL_CMD_NVENC_GET_CAPS: u32 = 0x0080_1b01;
+pub const NVENC_CAPS_TBL_SIZE: u32 = 6;
+
+/// An NVENC_GET_CAPS request: where the caller wants its table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NvencCaps {
+    pub table: u64,
+    pub size: u32,
+}
+
+/// `Some` when `buf` is an NVENC_GET_CAPS control with its 0x10-byte parameters.
+pub fn nvenc_caps_request(buf: &[u8]) -> Option<NvencCaps> {
+    let control = parse_rm_control(buf).ok()?;
+    if control.cmd != NV0080_CTRL_CMD_NVENC_GET_CAPS || control.params.len() != 0x10 {
+        return None;
+    }
+    let size = rc::get32(control.params, 0)?;
+    let lo = rc::get32(control.params, 8)?;
+    let hi = rc::get32(control.params, 12)?;
+    Some(NvencCaps {
+        table: u64::from(hi) << 32 | u64::from(lo),
+        size,
+    })
+}
+
+/// How the KMD's attempt to fill the caller's NVENC caps table went.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NvencCapsWrite {
+    /// The table was written.
+    Written,
+    /// `capsTblSize` was not the table's size: nothing written.
+    BadSize,
+    /// The table pointer was null or not writable.
+    BadAddress,
+}
+
+/// The table the KMD writes: no NVENC capability or workaround bits. (The capture
+/// does not hold NVIDIA's bytes, which live in the caller's memory; the Vulkan ICD
+/// reads only bit 0 of bytes 2 and 3.)
+pub const NVENC_CAPS_TABLE: [u8; NVENC_CAPS_TBL_SIZE as usize] = [0; 6];
+
+/// Whether the caller's table should be written for this request (size check).
+pub fn nvenc_caps_writable(request: NvencCaps) -> Result<(), NvencCapsWrite> {
+    if request.size != NVENC_CAPS_TBL_SIZE {
+        return Err(NvencCapsWrite::BadSize);
+    }
+    if request.table == 0 {
+        return Err(NvencCapsWrite::BadAddress);
+    }
+    Ok(())
+}
+
+/// The NVENC_GET_CAPS reply: result 1 in both result words, the size kept, RM
+/// status 0 when the table was written, else what RM answers for that case.
+pub fn answer_nvenc_caps(buf: &mut [u8], outcome: NvencCapsWrite) {
+    put32(buf, NVDA_RESULT_AT, 1);
+    put32(buf, NVDA_RESULT2_AT, 1);
+    let status = match outcome {
+        NvencCapsWrite::Written => 0,
+        NvencCapsWrite::BadSize => NV_ERR_INVALID_ARGUMENT,
+        NvencCapsWrite::BadAddress => NV_ERR_INVALID_ADDRESS,
+    };
+    put32(buf, RM_STATUS_AT, status);
+}
+
+/// `0x0100000d`: the request (and reply) size.
+pub const DISPLAY_TIMING_BYTES: usize = 0xfc0;
+
+/// The `0x0100000d` reply words that do not depend on the mode (vktest capture seq
+/// 3783, a 1024x768 DMT display on the RTX 5090): +0x40/+0x44 0x100, +0x48 0x61,
+/// +0x50 1, +0x5c 32 bpp, +0x68 format 0x15 (A8R8G8B8), four 1000000 words, +0x98 1,
+/// +0xe8 0x00020001, +0xf0 0x110, +0xfb0/+0xfb4 1.
+pub const DISPLAY_TIMING_FIXED: [(usize, u32); 15] = [
+    (0x40, 0x100),
+    (0x44, 0x100),
+    (0x48, 0x61),
+    (0x50, 1),
+    (0x5c, 32),
+    (0x68, 0x15),
+    (0x80, 1_000_000),
+    (0x84, 1_000_000),
+    (0x90, 1_000_000),
+    (0x94, 1_000_000),
+    (0x98, 1),
+    (0xe8, 0x0002_0001),
+    (0xf0, 0x110),
+    (0xfb0, 1),
+    (0xfb4, 1),
+];
+
+/// Whether `buf` is a `0x0100000d` display-timing query (the KMD fills the mode in).
+pub fn is_display_timing(buf: &[u8]) -> bool {
+    rc::get32(buf, NVDA_FUNCTION_AT) == Some(0x0100_000d) && buf.len() == DISPLAY_TIMING_BYTES
+}
+
+/// A reduced-blanking raster for `width` x `height` at `refresh_mhz` (CVT-RB v1
+/// porches: 48/32/80 pixels, 3 lines front porch, 6 lines sync, at least 460 us of
+/// vertical blanking). The capture's 1024x768 DMT mode used DMT's own timing; NVIDIA
+/// reports what the display's EDID gives, which the guest does not have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Raster {
+    pub h_front: u32,
+    pub h_sync: u32,
+    pub h_total: u32,
+    pub v_front: u32,
+    pub v_sync: u32,
+    pub v_total: u32,
+    pub pclk_khz: u32,
+}
+
+pub fn reduced_blanking(width: u32, height: u32, refresh_mhz: u32) -> Raster {
+    let hz_milli = u64::from(refresh_mhz.clamp(1_000, 1_000_000));
+    let h_total = width.saturating_add(160);
+    // v_total * (1 - 460 us * hz) >= height, in micro-units.
+    let keep = 1_000_000u64.saturating_sub(460 * hz_milli / 1000).max(100_000);
+    let v_total = ((u64::from(height) * 1_000_000).div_ceil(keep) as u32).max(height + 3 + 6 + 6);
+    let pclk_khz = (u64::from(h_total) * u64::from(v_total) * hz_milli / 1_000_000) as u32;
+    Raster {
+        h_front: 48,
+        h_sync: 32,
+        h_total,
+        v_front: 3,
+        v_sync: 6,
+        v_total,
+        pclk_khz,
+    }
+}
+
+/// The mode in a `0x0100000d` reply: +0x54/+0x58 size, +0x60 Hz, +0x64 mHz, the
+/// raster at +0xb0 (16-bit fields: visible, border, front porch, sync, total,
+/// polarity; horizontal then vertical), +0xcc pixel clock in 10 kHz, +0xd0 in kHz,
+/// +0xdc Hz, +0xe0 mHz, and the name at +0xf4 (`DMT:1024x768x60Hz` in the capture).
+pub fn set_display_timing(buf: &mut [u8], width: u32, height: u32, refresh_mhz: u32) {
+    let hz = (refresh_mhz + 500) / 1000;
+    let r = reduced_blanking(width, height, refresh_mhz);
+    let pair = |lo: u32, hi: u32| (lo & 0xffff) | (hi & 0xffff) << 16;
+    put32(buf, 0x54, width);
+    put32(buf, 0x58, height);
+    put32(buf, 0x60, hz);
+    put32(buf, 0x64, refresh_mhz);
+    put32(buf, 0xb0, pair(width, 0));
+    put32(buf, 0xb4, pair(r.h_front, r.h_sync));
+    put32(buf, 0xb8, pair(r.h_total, 1));
+    put32(buf, 0xbc, pair(height, 0));
+    put32(buf, 0xc0, pair(r.v_front, r.v_sync));
+    put32(buf, 0xc4, pair(r.v_total, 1));
+    put32(buf, 0xcc, r.pclk_khz / 10);
+    put32(buf, 0xd0, r.pclk_khz);
+    put32(buf, 0xdc, hz);
+    put32(buf, 0xe0, refresh_mhz);
+    let mut name = [0u8; 0x20];
+    name[..4].copy_from_slice(b"CVT:");
+    let mut n = 4;
+    for (i, value) in [width, height, hz].into_iter().enumerate() {
+        n += write_decimal(&mut name[n..], value);
+        let sep: &[u8] = if i < 2 { b"x" } else { b"Hz" };
+        name[n..n + sep.len()].copy_from_slice(sep);
+        n += sep.len();
+    }
+    if let Some(dst) = buf.get_mut(0xf4..0xf4 + name.len()) {
+        dst.copy_from_slice(&name);
+    }
+}
+
+/// `value` in decimal at the start of `out` (at most 7 digits); the digits written.
+fn write_decimal(out: &mut [u8], value: u32) -> usize {
+    let value = value.min(9_999_999);
+    let mut digits = [0u8; 7];
+    let mut len = 0;
+    let mut v = value;
+    loop {
+        digits[len] = b'0' + (v % 10) as u8;
+        len += 1;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    for i in 0..len {
+        out[i] = digits[len - 1 - i];
+    }
+    len
+}
 
 /// The raster in an NV0073 0x73011a reply (params at +0x44): display id +0, width +4,
 /// height +8, totals +0xc/+0x10 (the capture's 1344x806 for 1024x768), refresh +0x18.
@@ -1618,6 +1889,111 @@ mod tests {
         assert_eq!(&id[0x30..0x34], &61088u32.to_le_bytes());
         assert_eq!(&id[0x40..0x4c], b"r610_85-151\0");
         assert_eq!(&id[0x80..0x98], b"NVIDIA GeForce RTX 5090\0");
+    }
+
+    #[test]
+    fn d3d_status_and_statistics_escapes_match_the_capture() {
+        // 0x0100002d: d3d11test seq 1817.
+        let mut buf = local_request(0x0100_002d, 0x3c);
+        test_put32(&mut buf, 0x20, 0x2337_5286);
+        assert_eq!(apply_local(&mut buf, 0x4000_0280, 0), Ok(LocalOutcome::Applied));
+        assert_eq!(&buf[0x08..0x0c], &0x30u32.to_le_bytes());
+        assert_eq!(&buf[0x14..0x18], &1u32.to_le_bytes());
+        assert_eq!(&buf[0x20..0x24], &0x2337_5286u32.to_le_bytes());
+        assert_eq!(&buf[0x2c..0x3c], &[1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0]);
+        let mut short = local_request(0x0100_002d, 0x3b);
+        assert_eq!(apply_local(&mut short, 1, 0), Err(LocalError::Invalid));
+
+        // 0x010000bb: L3 b4 reply, payload untouched.
+        let mut buf = local_request(0x0100_00bb, 0x390);
+        test_put32(&mut buf, 0x30, 3);
+        let before = buf.clone();
+        assert_eq!(apply_local(&mut buf, 1, 0), Ok(LocalOutcome::Applied));
+        assert_eq!(&buf[0x08..0x0c], &0x30u32.to_le_bytes());
+        assert_eq!(&buf[0x14..0x18], &1u32.to_le_bytes());
+        assert_eq!(&buf[0x2c..0x30], &1u32.to_le_bytes());
+        assert_eq!(&buf[0x30..], &before[0x30..]);
+
+        // 0x010000ae: success, 0 at +0x30, size kept.
+        let mut buf = local_request(0x0100_00ae, 0x34);
+        assert_eq!(apply_local(&mut buf, 0, 0), Ok(LocalOutcome::Applied));
+        assert_eq!(&buf[0x08..0x0c], &0x34u32.to_le_bytes());
+        assert_eq!(&buf[0x2c..0x34], &[1, 0, 0, 0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn display_timing_matches_the_capture_layout() {
+        let mut buf = local_request(0x0100_000d, DISPLAY_TIMING_BYTES);
+        assert_eq!(apply_local(&mut buf, 0, 0), Ok(LocalOutcome::Applied));
+        assert!(is_display_timing(&buf));
+        assert_eq!(&buf[0x08..0x0c], &0xfc0u32.to_le_bytes());
+        let w = |at: usize| u32::from_le_bytes(buf[at..at + 4].try_into().unwrap());
+        assert_eq!((w(0x14), w(0x2c), w(0x40), w(0x48), w(0x68)), (1, 1, 0x100, 0x61, 0x15));
+        assert_eq!((w(0x54), w(0x58), w(0x60), w(0x64)), (1024, 768, 60, 60_004));
+        assert_eq!(w(0xb0), 1024);
+        assert_eq!(w(0xbc), 768);
+        assert_eq!(&buf[0xf4..0xf4 + 18], b"CVT:1024x768x60Hz\0");
+        assert_eq!(w(0xfb0), 1);
+        let mut big = local_request(0x0100_000d, DISPLAY_TIMING_BYTES);
+        assert_eq!(apply_local(&mut big, 0, 0), Ok(LocalOutcome::Applied));
+        set_display_timing(&mut big, 5120, 1440, 239_760);
+        let w = |at: usize| u32::from_le_bytes(big[at..at + 4].try_into().unwrap());
+        assert_eq!((w(0x54), w(0x58), w(0x60), w(0x64)), (5120, 1440, 240, 239_760));
+        let r = reduced_blanking(5120, 1440, 239_760);
+        assert_eq!(r.h_total, 5280);
+        assert!(r.v_total > 1440 + 15 && r.v_total < 1700, "{r:?}");
+        assert_eq!(w(0xc4) & 0xffff, r.v_total);
+        assert_eq!(w(0xd0), r.pclk_khz);
+        assert_eq!(&big[0xf4..0xf4 + 20], b"CVT:5120x1440x240Hz\0");
+        let mut short = local_request(0x0100_000d, DISPLAY_TIMING_BYTES - 4);
+        assert_eq!(apply_local(&mut short, 0, 0), Err(LocalError::Invalid));
+    }
+
+    #[test]
+    fn ecc_status_is_refused_locally_like_nvidia() {
+        let mut buf = escape_with_handles(
+            NV2080_CTRL_CMD_GPU_QUERY_ECC_STATUS,
+            0,
+            PSEUDO_SUBDEVICE,
+            &[0; 0x680],
+        );
+        assert_eq!(apply_local(&mut buf, 1, 0), Ok(LocalOutcome::Applied));
+        assert_eq!(&buf[0x08..0x0c], &0x30u32.to_le_bytes());
+        assert_eq!(&buf[0x14..0x18], &1u32.to_le_bytes());
+        assert_eq!(&buf[0x2c..0x30], &0xffff_ffedu32.to_le_bytes());
+        assert_eq!(&buf[0x40..0x44], &0x56u32.to_le_bytes());
+        assert!(parse_rm_control(&buf).is_err());
+    }
+
+    #[test]
+    fn nvenc_caps_request_and_reply() {
+        let mut params = [0u8; 0x10];
+        params[0..4].copy_from_slice(&6u32.to_le_bytes());
+        params[8..16].copy_from_slice(&0xa8_207f_9e90u64.to_le_bytes());
+        let mut buf = escape_with_handles(NV0080_CTRL_CMD_NVENC_GET_CAPS, 0, PSEUDO_DEVICE, &params);
+        let request = nvenc_caps_request(&buf).unwrap();
+        assert_eq!(request, NvencCaps { table: 0xa8_207f_9e90, size: 6 });
+        assert_eq!(nvenc_caps_writable(request), Ok(()));
+        assert_eq!(
+            nvenc_caps_writable(NvencCaps { table: 0, size: 6 }),
+            Err(NvencCapsWrite::BadAddress)
+        );
+        assert_eq!(
+            nvenc_caps_writable(NvencCaps { table: 1, size: 5 }),
+            Err(NvencCapsWrite::BadSize)
+        );
+        answer_nvenc_caps(&mut buf, NvencCapsWrite::Written);
+        let control = parse_rm_control(&buf).unwrap();
+        assert_eq!(control.status, 0);
+        assert_eq!(control.params, params);
+        assert_eq!(&buf[0x08..0x0c], &0x54u32.to_le_bytes());
+        answer_nvenc_caps(&mut buf, NvencCapsWrite::BadAddress);
+        assert_eq!(parse_rm_control(&buf).unwrap().status, 0x1e);
+        // Another control or another parameter size is not this request.
+        let other = escape_with_handles(0x0080_1b02, 0, PSEUDO_DEVICE, &params);
+        assert_eq!(nvenc_caps_request(&other), None);
+        let short = escape_with_handles(NV0080_CTRL_CMD_NVENC_GET_CAPS, 0, PSEUDO_DEVICE, &[0; 8]);
+        assert_eq!(nvenc_caps_request(&short), None);
     }
 
     #[test]
