@@ -3234,10 +3234,40 @@ pub(crate) fn publish_hot() {
     if large != 0 {
         crate::diag::record_named_bytes(b"NvAlignLg", large);
     }
+    let mismatched = NVGL_SIZE_MISMATCH.load(Ordering::Relaxed);
+    if mismatched != 0 {
+        crate::diag::record_named_bytes(b"NvGlSzMis", mismatched);
+    }
+    if NVGL_BIG[2].load(Ordering::Relaxed) != 0 {
+        for (name, cell) in [(&b"NvGlBigD0"[..], &NVGL_BIG[0]), (&b"NvGlBig116"[..], &NVGL_BIG[1]), (&b"NvGlBigSz"[..], &NVGL_BIG[2])] {
+            crate::diag::record_named_bytes(name, cell.load(Ordering::Relaxed));
+        }
+    }
     let unopened = NV_AL_NO_OPEN.load(Ordering::Relaxed);
     if unopened != 0 {
         crate::diag::record_named_bytes(b"NvAlNoOpen", unopened);
         crate::diag::record_named_bytes(b"NvAlNoOpMb", NV_AL_NO_OPEN_MB.load(Ordering::Relaxed));
+    }
+}
+
+static NVGL_SIZE_MISMATCH: AtomicU32 = AtomicU32::new(0);
+/// The last Vulkan record of 32 MiB and more: its +0xd0 units, +0x116 bytes >> 16
+/// and the size this KMD gave it >> 16 (`NvGlBigD0` / `NvGlBig116` / `NvGlBigSz`),
+/// and how many records had a +0x116 that disagreed with +0xd0/+0xcc
+/// (`NvGlSzMis`, the ICD's 32-MiB chunks). Published by the mirror pass.
+static NVGL_BIG: [AtomicU32; 3] = [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)];
+
+fn note_nvgl_size(bytes: &[u8], size: u64) {
+    use helios_kmd_logic::native_memory as native;
+    if native::nvgl_size_from_bytes(bytes) {
+        NVGL_SIZE_MISMATCH.fetch_add(1, Ordering::Relaxed);
+    }
+    let units = native::get32(bytes, native::SIZE_UNITS_AT).unwrap_or(0);
+    let requested = native::get64(bytes, native::NVGL_BYTE_SIZE_AT).unwrap_or(0);
+    if size >= 32 << 20 || requested >= 32 << 20 || units >= 0x200 {
+        NVGL_BIG[0].store(units, Ordering::Relaxed);
+        NVGL_BIG[1].store((requested >> 16).min(u64::from(u32::MAX)) as u32, Ordering::Relaxed);
+        NVGL_BIG[2].store((size >> 16).min(u64::from(u32::MAX)) as u32, Ordering::Relaxed);
     }
 }
 
@@ -3306,6 +3336,9 @@ unsafe fn create_native_one(
         status
     })?;
     let shared = native::is_shared_record(bytes);
+    if native::is_nvgl_record(bytes) {
+        note_nvgl_size(bytes, private.size);
+    }
     // CUDA's memory over its own user pages (D3DKMT pSystemMem): VidMm backs it
     // with those pages, the GPU reaches them through the system-page mappings.
     let user_memory = native::is_cuda_system_memory(bytes);

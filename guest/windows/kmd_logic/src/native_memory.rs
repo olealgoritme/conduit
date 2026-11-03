@@ -261,12 +261,11 @@ pub fn is_nvgl_record(bytes: &[u8]) -> bool {
 /// 0xc0000000 -> 0x40 units). An untyped record (+0x10 = 0) has no fraction: its
 /// +0xcc is not size and stays as the UMD wrote it.
 fn nvgl_size(bytes: &[u8]) -> Option<(u32, u32)> {
-    let units = get32(bytes, SIZE_UNITS_AT)?;
+    let (units, fraction) = nvgl_requested(bytes)?;
     let kind = get32(bytes, 0x10)?;
     if kind == 0 {
         return Some((units, 0));
     }
-    let fraction = get32(bytes, 0xcc)?;
     let step: u64 = if kind & NVGL_KIND_IMAGE != 0 { 1 << 32 } else { 0x1000_0000 };
     let rounded = u64::from(fraction).div_ceil(step) * step;
     let (mut units, mut fraction) = if rounded > u64::from(u32::MAX) {
@@ -279,6 +278,42 @@ fn nvgl_size(bytes: &[u8]) -> Option<(u32, u32)> {
         fraction = 0;
     }
     Some((units, fraction))
+}
+
+/// +0x116 of an NVGL record: the byte size the ICD asks for (u64, unaligned).
+/// In every record of the vktest capture it is exactly +0xd0 x 64 KiB + the
+/// +0xcc fraction (images leave it 0 and carry the size in +0x112). For an
+/// allocation of 64 MiB and more the ICD backs the memory with 32-MiB chunks
+/// (nvoglv64 0x180a7ffd0, DRS chunk size 32 MiB): it sets +0x116 to the chunk's
+/// size and leaves the record's +0xd0/+0xcc at the whole allocation, so the KMD
+/// that sizes by +0xd0 created one 64-MiB allocation where the ICD expected a
+/// 32-MiB chunk, and the ICD's mapping of the second chunk then named no
+/// allocation (dxgkrnl: "Invalid hAllocation", VK_ERROR_OUT_OF_DEVICE_MEMORY).
+pub const NVGL_BYTE_SIZE_AT: usize = 0x116;
+
+/// Whether an NVGL record is a chunk: its +0x116 byte size is a whole number of
+/// 64-KiB units, smaller than what +0xd0/+0xcc describe.
+pub fn nvgl_size_from_bytes(bytes: &[u8]) -> bool {
+    let Some(bytes_size) = get64(bytes, NVGL_BYTE_SIZE_AT)
+        .filter(|b| *b >= ALLOCATION_UNIT && *b % ALLOCATION_UNIT == 0)
+    else {
+        return false;
+    };
+    let units = u64::from(get32(bytes, SIZE_UNITS_AT).unwrap_or(0));
+    let fraction = u64::from(get32(bytes, 0xcc).unwrap_or(0));
+    bytes_size < units * ALLOCATION_UNIT + (fraction * ALLOCATION_UNIT >> 32)
+}
+
+/// (64-KiB units, 2^-32-unit fraction) the ICD asks for: +0x116 for a chunk
+/// (`nvgl_size_from_bytes`), else +0xd0/+0xcc.
+fn nvgl_requested(bytes: &[u8]) -> Option<(u32, u32)> {
+    if nvgl_size_from_bytes(bytes) {
+        let size = get64(bytes, NVGL_BYTE_SIZE_AT)?;
+        let units = u32::try_from(size / ALLOCATION_UNIT).ok()?;
+        let fraction = ((size % ALLOCATION_UNIT) << 16) as u32;
+        return Some((units, fraction));
+    }
+    Some((get32(bytes, SIZE_UNITS_AT)?, get32(bytes, 0xcc)?))
 }
 
 /// +0x10 bit 3 of an NVGL record: an image (the swap-chain images and the
@@ -897,6 +932,31 @@ mod tests {
 
     fn field(f: &[(usize, u32)], at: usize) -> u32 {
         f.iter().find(|(o, _)| *o == at).map(|(_, v)| *v).unwrap()
+    }
+
+    fn nvgl_record(kind: u32, units: u32, fraction: u32, bytes_size: u64) -> [u8; ALLOCATION_PRIVATE_BYTES] {
+        let mut b = d3d_record(&[(RECORD_TAG_AT, RECORD_TAG_NVGL), (0x10, kind), (SIZE_UNITS_AT, units), (0xcc, fraction)]);
+        b[NVGL_BYTE_SIZE_AT..NVGL_BYTE_SIZE_AT + 8].copy_from_slice(&bytes_size.to_le_bytes());
+        b
+    }
+
+    #[test]
+    fn nvgl_chunk_records_are_sized_by_their_byte_size() {
+        // Captured shapes agree: +0x116 = units x 64 KiB + the fraction's bytes.
+        for (units, fraction, bytes_size) in [(0x11, 0x22c0_0000, 0x11_22c0u64), (0x40, 0, 0x40_0000), (0x3, 0x8000_0000, 0x3_8000)] {
+            let b = nvgl_record(0x220_0800, units, fraction, bytes_size);
+            assert!(!nvgl_size_from_bytes(&b));
+        }
+        // Images leave +0x116 zero.
+        assert!(!nvgl_size_from_bytes(&nvgl_record(0x220_0808, 0x14, 0, 0)));
+        // A 32-MiB chunk of a 64-MiB allocation: +0xd0 says 0x400 units, +0x116 32 MiB.
+        let chunk = nvgl_record(0x220_0800, 0x400, 0, 32 << 20);
+        assert!(nvgl_size_from_bytes(&chunk));
+        assert_eq!(allocation_units(&chunk), Some(0x200));
+        let f = nvgl_writeback(&chunk).unwrap();
+        assert_eq!(f.iter().find(|(at, _)| *at == 0xd0).unwrap().1, 0x200);
+        // Without the chunk the whole size stays.
+        assert_eq!(allocation_units(&nvgl_record(0x220_0800, 0x400, 0, 64 << 20)), Some(0x400));
     }
 
     #[test]
