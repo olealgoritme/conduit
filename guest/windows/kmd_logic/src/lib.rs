@@ -55,6 +55,7 @@ pub mod dwm_restart;
 pub mod flip_flags;
 pub mod vidmm_caps;
 pub mod vidmm_vram;
+pub mod vk_fail;
 pub mod rm_vidmem;
 pub mod flip_pipeline;
 pub mod flip_retire;
