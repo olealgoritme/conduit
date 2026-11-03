@@ -244,7 +244,7 @@ unsafe fn query_driver_caps(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTE
         caps_offset!(MaxAllocationListSlotId),
         max_allocation_list_slot_id,
     );
-    let aperture_segment_commit_limit: SIZE_T = APERTURE_COMMIT_LIMIT as SIZE_T;
+    let aperture_segment_commit_limit: SIZE_T = aperture_commit_limit() as SIZE_T;
     out.set(
         caps_offset!(ApertureSegmentCommitLimit),
         aperture_segment_commit_limit,
@@ -572,7 +572,7 @@ unsafe fn query_driver_caps(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTE
     // `ApertureSegmentCommitLimit` was truncated to its low 16 bits, and 64 MiB
     // has none — so 0x01D6 read 0x01D6_0000 on every boot regardless of the
     // value, which made it useless for exactly the thing it exists to report.
-    crate::diag::record(0x01D6_0000 | ((APERTURE_COMMIT_LIMIT >> 20) as u32 & 0xFFFF));
+    crate::diag::record(0x01D6_0000 | ((aperture_commit_limit() >> 20) as u32 & 0xFFFF));
     crate::diag::record(
         0x01D7_0000
             | (((support_non_vga as u32) & 1) << 0)
@@ -780,8 +780,23 @@ const APERTURE_COMMIT_LIMIT: u64 = 64 * 1024 * 1024;
 /// Aperture window length. viogpu3d uses 1 GiB (`256 * 1024 * 4096`).
 const APERTURE_SEGMENT_SIZE: SIZE_T = 256 * 1024 * 4096;
 
-/// A commit limit above the segment it caps would be nonsense.
-const _: () = assert!(APERTURE_COMMIT_LIMIT <= APERTURE_SEGMENT_SIZE as u64);
+/// The commit limit in force: `NvApCommitMb` (MiB) in the NVIDIA personality, default 8 GiB.
+///
+/// `ApertureSegmentCommitLimit` caps the system memory VidMm lets GPU allocations commit
+/// (it reduces the OS-computed `SharedSystemMemory`). 64 MiB made VidMm block
+/// `CreateAllocation` under trim/eviction pressure while NVIDIA's UMD loads (Steel Nomad
+/// D3D12: the render thread sat in `DxgkCreateAllocation` while the GPU waited on a value that
+/// thread writes next — a deadlock that ended in CTX SWITCH TIMEOUT). The Helios personality
+/// keeps 64 MiB. `NvApCommitMb=64` restores the old value.
+fn aperture_commit_limit() -> u64 {
+    if !crate::ddi::wddm_surface::nvidia_selected() {
+        return APERTURE_COMMIT_LIMIT;
+    }
+    let mb = crate::diag::read_config_dword(crate::diag::KnobName::new(b"NvApCommitMb"), 8192);
+    let mb = u64::from(mb.clamp(64, 65536));
+    crate::diag::record_named_bytes(b"NvApCommitMbEff", mb as u32);
+    mb << 20
+}
 
 // WHY THE APERTURE IS ALWAYS SEGMENT 0 — from the live-KD decode of dxgmms2's
 // paging DMA-pool init (INITDMAPOOLS_HANDOVER.md, 2026-06-21).
