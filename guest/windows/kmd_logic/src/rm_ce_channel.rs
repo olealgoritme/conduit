@@ -332,6 +332,24 @@ pub fn ctxshare_params(h_vaspace: u32) -> [u8; CTXSHARE_BYTES] {
     a
 }
 
+/// `NV_CTXSHARE_ALLOCATION_FLAGS_SUBCONTEXT_SPECIFIED`: the VEID is `subctxId`.
+pub const CTXSHARE_FLAGS_SPECIFIED: u32 = 2;
+
+/// `NV_CTXSHARE_ALLOCATION_PARAMETERS { hVASpace, flags = SPECIFIED, subctxId = veid }`: the
+/// subcontext of a compute-only channel next to the graphics channel (VEID 0) of one TSG.
+pub fn ctxshare_specified_params(h_vaspace: u32, veid: u32) -> [u8; CTXSHARE_BYTES] {
+    let mut a = [0u8; CTXSHARE_BYTES];
+    put32(&mut a, 0, h_vaspace);
+    put32(&mut a, 4, CTXSHARE_FLAGS_SPECIFIED);
+    put32(&mut a, 8, veid);
+    a
+}
+
+/// `NV_CHANNEL_ALLOC_PARAMS.flags` of a compute-only channel on a non-zero VEID:
+/// `NVOS04_FLAGS_GROUP_CHANNEL_RUNQUEUE_ONE | NVOS04_FLAGS_GROUP_CHANNEL_THREAD_ONE`. GSP-RM
+/// refuses the compute object on a non-zero VEID channel of runqueue 0.
+pub const CHANNEL_FLAGS_ASYNC_COMPUTE: u32 = 0x1000_0010;
+
 /// What the GPFIFO channel is made of.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ChannelDesc {
@@ -343,17 +361,21 @@ pub struct ChannelDesc {
     pub h_ctxshare: u32,
     pub userd_offset: u64,
     pub engine_type: u32,
+    /// `NV_CHANNEL_ALLOC_PARAMS.flags`: 0, or [`CHANNEL_FLAGS_ASYNC_COMPUTE`].
+    pub flags: u32,
 }
 
 /// `NV_CHANNEL_ALLOC_PARAMS` (376 bytes): `hObjectError` (the error notifier lives at offset 0
 /// of that memory: the "error notifier setup" of the tool), `gpFifoOffset`, `gpFifoEntries`,
 /// `hContextShare`, `hUserdMemory[0]` and `userdOffset[0]` (USERD in the same memory), and
-/// `engineType`. Offsets 0, 8, 16, 24, 36, 72 and 136 (`offsetof` on the tool's struct).
+/// `engineType`, and `flags` at 20. Offsets 0, 8, 16, 20, 24, 36, 72 and 136 (`offsetof` on the
+/// tool's struct).
 pub fn channel_params(d: &ChannelDesc) -> [u8; CHANNEL_BYTES] {
     let mut a = [0u8; CHANNEL_BYTES];
     put32(&mut a, 0, d.h_ctl);
     put64(&mut a, 8, d.gpfifo_va);
     put32(&mut a, 16, d.entries);
+    put32(&mut a, 20, d.flags);
     put32(&mut a, 24, d.h_ctxshare);
     put32(&mut a, 36, d.h_ctl);
     put64(&mut a, 72, d.userd_offset);
@@ -1493,6 +1515,26 @@ mod tests {
     }
 
     #[test]
+    fn a_specified_subcontext_names_its_veid() {
+        let b = ctxshare_specified_params(0x4b4d_3001, 2);
+        assert_eq!(sparse(&b), [(0, 0x01), (1, 0x30), (2, 0x4d), (3, 0x4b), (4, 0x02), (8, 0x02)]);
+    }
+
+    #[test]
+    fn a_compute_only_channel_runs_on_runqueue_one() {
+        let b = channel_params(&ChannelDesc {
+            h_ctl: 0,
+            gpfifo_va: 0,
+            entries: 0,
+            h_ctxshare: 0,
+            userd_offset: 0,
+            engine_type: 0,
+            flags: CHANNEL_FLAGS_ASYNC_COMPUTE,
+        });
+        assert_eq!(sparse(&b), [(20, 0x10), (23, 0x10)]);
+    }
+
+    #[test]
     fn the_channel_is_the_tools_block() {
         let b = channel_params(&ChannelDesc {
             h_ctl: 0x4b4d_3003,
@@ -1501,6 +1543,7 @@ mod tests {
             h_ctxshare: 0x4b4d_3007,
             userd_offset: 4096,
             engine_type: COPY2,
+            flags: 0,
         });
         assert_eq!(b.len(), 376);
         assert_eq!(

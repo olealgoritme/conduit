@@ -231,6 +231,40 @@ impl QueuePrivate {
     pub const fn entries(self) -> u32 {
         self.ring_bytes / GP_ENTRY_BYTES
     }
+
+    /// `word_10` bits 7:0: the queue's kind (`QUEUE_KIND_*`).
+    pub const fn kind(self) -> u8 {
+        self.word_10 as u8
+    }
+}
+
+/// Queue kinds in the NVIDIA UMDs' CreateHwQueue data (610.88 captures). A D3D12 direct
+/// context opens one graphics queue (3D on subchannel 0) and two compute queues (only
+/// subchannels 1, 5 and 7); a Vulkan graphics context one graphics and one compute queue.
+/// NVIDIA's own driver puts a compute-only queue on a VEID of its own in the graphics
+/// queue's TSG (runqueue 1), so its methods never interleave with the 3D stream of VEID 0.
+pub const QUEUE_KIND_GRAPHICS: u8 = 0;
+pub const QUEUE_KIND_COMPUTE: u8 = 1;
+
+/// Subcontexts (VEIDs) per TSG on GB202.
+pub const VEIDS: u32 = 64;
+
+/// The lowest free non-zero VEID in `used` (bit n set = VEID n taken; VEID 0 is the
+/// graphics channel's).
+pub const fn pick_veid(used: u64) -> Option<u32> {
+    let free = !used & !1;
+    if free == 0 {
+        None
+    } else {
+        Some(free.trailing_zeros())
+    }
+}
+
+/// Whether a queue of `kind` gets a compute-only channel on a VEID of its own: only next
+/// to a graphics queue already in the context (a compute queue alone in a context keeps the
+/// graphics layout on VEID 0).
+pub const fn wants_own_veid(kind: u8, graphics_queues: u32) -> bool {
+    kind == QUEUE_KIND_COMPUTE && graphics_queues > 0
 }
 
 /// Parse a CUDA CreateHwQueue buffer.  A nonzero allocation is only an identity
@@ -390,6 +424,34 @@ mod tests {
         b[0x20..0x24].copy_from_slice(&CUDA_RING_BYTES.to_le_bytes());
         b[0x24..0x28].copy_from_slice(&0x44u32.to_le_bytes());
         b
+    }
+
+    #[test]
+    fn captured_queue_kinds() {
+        // d3d12test 610.88: direct context queues 0x1900, 0x0e01, 0x0e01; copy 0x0e02.
+        for (word, kind) in [(0x1900, 0), (0x0e01, 1), (0x0e02, 2), (0x0900, 0)] {
+            let mut b = queue();
+            b[0x10..0x14].copy_from_slice(&(word as u32).to_le_bytes());
+            assert_eq!(parse_queue_private(&b).unwrap().kind(), kind);
+        }
+    }
+
+    #[test]
+    fn veids_are_the_lowest_free_above_zero() {
+        assert_eq!(pick_veid(0), Some(1));
+        assert_eq!(pick_veid(1), Some(1));
+        assert_eq!(pick_veid(0b110), Some(3));
+        assert_eq!(pick_veid(!0u64 ^ (1 << 63)), Some(63));
+        assert_eq!(pick_veid(!0u64), None);
+        assert_eq!(pick_veid(!1u64), None);
+    }
+
+    #[test]
+    fn only_compute_queues_next_to_a_graphics_queue_get_a_veid() {
+        assert!(wants_own_veid(QUEUE_KIND_COMPUTE, 1));
+        assert!(!wants_own_veid(QUEUE_KIND_COMPUTE, 0));
+        assert!(!wants_own_veid(QUEUE_KIND_GRAPHICS, 1));
+        assert!(!wants_own_veid(2, 1));
     }
 
     #[test]
