@@ -302,6 +302,8 @@ pub static CONTROLS: &[Ctrl] = &[
     gsp(0x2080_a0d1, "NV2080 legacy GSP control 0xa0d1", 2024),
     c(0x906f_0101, "NV906F_CTRL_GET_CLASS_ENGINEID", Sender::Umd),
     c(0xa06c_0101, "NVA06C_CTRL_CMD_GPFIFO_SCHEDULE", Sender::Kmd),
+    // The guest KMD's DxgkDdiSuspendContext (`hws`): the TSG off the engine.
+    c(0xa06c_0105, "NVA06C_CTRL_CMD_PREEMPT", Sender::Kmd),
     c(0xa06c_0106, "NVA06C_CTRL_CMD_GET_INFO", Sender::Kmd),
     c(0xa06f_0104, "NVA06F_CTRL_CMD_BIND", Sender::Kmd),
     c(

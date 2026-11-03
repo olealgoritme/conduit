@@ -26,8 +26,10 @@
 //!   1 ms while any queue has outstanding work (10 ms after a second without
 //!   progress; stopped when nothing is outstanding). A notifier/event from the
 //!   host RM channel should replace it.
-//! * `SuspendContext` reports "already suspended" (STATUS_SUCCESS) without
-//!   preempting anything: see [`dxgkddi_suspend_context`].
+//! * `SuspendContext` (`NvSuspend`, default 1) takes the context's TSG off the
+//!   host runlist and preempts it with a wait before it returns STATUS_SUCCESS
+//!   ("suspended at the time of this call"); `ResumeContext` puts it back. See
+//!   [`dxgkddi_suspend_context`] and `helios_kmd_logic::ctx_suspend`.
 //! * `SetupPriorityBands`, `SetSchedulingLogBuffer`,
 //!   `SetContextSchedulingProperties`, `NotifyContextPriorityChange` store what
 //!   they are given and succeed; nothing consumes it yet (the host RM runlist
@@ -72,6 +74,7 @@ use crate::device::{ContextHandleRef, DeviceHandleRef};
 use crate::dxgk::*;
 use crate::sync::SpinLock;
 use crate::virtio::native_channel::{NativeContext, NativeQueue};
+use helios_kmd_logic::ctx_suspend::{self as suspend_logic, Step, SuspendStats};
 use helios_kmd_logic::hws::{self as logic, PollNext, Progress};
 use helios_kmd_logic::native_completion::{Cover, Detect, Inflight, LatHist, LAT_BUCKETS};
 use helios_kmd_logic::native_channel as native_format;
@@ -236,6 +239,29 @@ static SUBMIT_SUM_100NS: AtomicU64 = AtomicU64::new(0);
 static SUBMIT_MAX_100NS: AtomicU32 = AtomicU32::new(0);
 static SUSPENDS: AtomicU32 = AtomicU32::new(0);
 static RESUMES: AtomicU32 = AtomicU32::new(0);
+/// `NvSuspend` (u32::MAX = not read yet) and `NvSuspUs` (the preempt's manual timeout in
+/// us, 0 = RM's own).
+static SUSPEND_KNOB: AtomicU32 = AtomicU32::new(u32::MAX);
+static SUSPEND_US: AtomicU32 = AtomicU32::new(0);
+/// Suspends that took a TSG off the runlist and preempted it (`HwsSusReal`), found nothing
+/// on the runlist (no channel, already off: `HwsSusNone`), failed (`HwsSusFail`, last error
+/// `HwsSusErr` = 0x100 | NativeError), came above PASSIVE (`HwsSusIrql`, reported without a
+/// preempt), were for the Vulkan copy context (`HwsSusCopy`); contexts suspended now
+/// (`HwsSusNow`); resumes that put a TSG back (`HwsResReal`) or failed (`HwsResFail`, last
+/// error `HwsResErr`).
+static SUS_REAL: AtomicU32 = AtomicU32::new(0);
+static SUS_NONE: AtomicU32 = AtomicU32::new(0);
+static SUS_FAIL: AtomicU32 = AtomicU32::new(0);
+static SUS_ERR: AtomicU32 = AtomicU32::new(0);
+static SUS_IRQL: AtomicU32 = AtomicU32::new(0);
+static SUS_COPY: AtomicU32 = AtomicU32::new(0);
+static SUS_NOW: AtomicU32 = AtomicU32::new(0);
+static RES_REAL: AtomicU32 = AtomicU32::new(0);
+static RES_FAIL: AtomicU32 = AtomicU32::new(0);
+static RES_ERR: AtomicU32 = AtomicU32::new(0);
+/// DDI entry to TSG confirmed off the engine, for `HwsSusReal` suspends (`HwsSusAvgUs`,
+/// `HwsSusMaxUs`).
+static SUS_STATS: SpinLock<SuspendStats> = SpinLock::new(SuspendStats::new());
 static SCHED_PROPS: AtomicU32 = AtomicU32::new(0);
 static PRIO_CHANGES: AtomicU32 = AtomicU32::new(0);
 static BANDS: AtomicU32 = AtomicU32::new(0);
@@ -294,6 +320,22 @@ pub(crate) fn publish_counters() {
     crate::diag::record_named_bytes(b"HwsPollTick", r(&POLL_TICKS));
     crate::diag::record_named_bytes(b"HwsSuspend", r(&SUSPENDS));
     crate::diag::record_named_bytes(b"HwsResume", r(&RESUMES));
+    crate::diag::record_named_bytes(b"HwsSusReal", r(&SUS_REAL));
+    crate::diag::record_named_bytes(b"HwsSusNone", r(&SUS_NONE));
+    crate::diag::record_named_bytes(b"HwsSusFail", r(&SUS_FAIL));
+    crate::diag::record_named_bytes(b"HwsSusErr", r(&SUS_ERR));
+    crate::diag::record_named_bytes(b"HwsSusIrql", r(&SUS_IRQL));
+    crate::diag::record_named_bytes(b"HwsSusCopy", r(&SUS_COPY));
+    crate::diag::record_named_bytes(b"HwsSusNow", r(&SUS_NOW));
+    crate::diag::record_named_bytes(b"HwsResReal", r(&RES_REAL));
+    crate::diag::record_named_bytes(b"HwsResFail", r(&RES_FAIL));
+    crate::diag::record_named_bytes(b"HwsResErr", r(&RES_ERR));
+    {
+        let stats = *SUS_STATS.lock();
+        crate::diag::record_named_bytes(b"HwsSusAvgUs", stats.mean_us());
+        crate::diag::record_named_bytes(b"HwsSusMaxUs", stats.max_us);
+    }
+    crate::diag::record_named_bytes(b"NvSuspend", r(&SUSPEND_KNOB));
     crate::diag::record_named_bytes(b"HwsSchedProp", r(&SCHED_PROPS));
     crate::diag::record_named_bytes(b"HwsPrioChg", r(&PRIO_CHANGES));
     crate::diag::record_named_bytes(b"HwsBands", r(&BANDS));
@@ -378,6 +420,27 @@ fn read_recovery_knobs() {
         hang::DEFAULT_RC_RESET,
     );
     RC_RESET.store(rc, Ordering::Relaxed);
+    read_suspend_knobs();
+}
+
+/// Read `NvSuspend` / `NvSuspUs` (PASSIVE: CreateHwQueue, or the first Suspend/ResumeContext).
+fn read_suspend_knobs() {
+    let us = crate::diag::read_config_dword(crate::diag::KnobName::new(b"NvSuspUs"), 0);
+    SUSPEND_US.store(us, Ordering::Relaxed);
+    let knob = crate::diag::read_config_dword(
+        crate::diag::KnobName::new(b"NvSuspend"),
+        suspend_logic::DEFAULT_SUSPEND,
+    );
+    // Never u32::MAX ("not read").
+    SUSPEND_KNOB.store(knob.min(u32::MAX - 1), Ordering::Relaxed);
+}
+
+/// `NvSuspend` as a mode, read on first use. PASSIVE.
+fn suspend_mode() -> suspend_logic::Mode {
+    if SUSPEND_KNOB.load(Ordering::Relaxed) == u32::MAX {
+        read_suspend_knobs();
+    }
+    suspend_logic::mode(SUSPEND_KNOB.load(Ordering::Relaxed))
 }
 
 fn hang_timeout() -> Option<u64> {
@@ -759,9 +822,12 @@ pub(crate) fn poll_tick(adapter: &AdapterContext) {
                 progressed = true;
                 note_progress(slot, &mut r.lat, Detect::Poll, value, now);
             }
+            // A suspended context makes no progress by design: its hang clock restarts
+            // when it is resumed.
+            let suspended = queue.context().is_some_and(|c| c.is_suspended());
             let sample = hang::Sample {
                 now,
-                outstanding: slot.progress.outstanding(),
+                outstanding: slot.progress.outstanding() && !suspended,
                 progress: value,
                 gp_get: queue.gp_get(),
                 error: queue.channel_error(),
@@ -1672,19 +1738,24 @@ pub unsafe extern "C" fn dxgkddi_notify_context_priority_change(
     STATUS_SUCCESS
 }
 
-/// Returns STATUS_SUCCESS, which the DDI contract defines as "the context is
-/// already suspended", so no `DXGK_INTERRUPT_SUSPEND_CONTEXT_COMPLETED` is owed.
+/// `DxgkDdiSuspendContext` (PASSIVE). The contract (d3dkmddi.h, WDK
+/// `nc-d3dkmddi-dxgkddi_suspendcontext`): STATUS_SUCCESS means the context is suspended at
+/// the time of the call, STATUS_PENDING that it will be once `contextSuspendFence` is
+/// reported with `DXGK_INTERRUPT_SUSPEND_CONTEXT_COMPLETED`; after that "all references to
+/// it are gone from the GPU" and VidMm moves, evicts and unmaps its memory.
 ///
-/// WHY THAT IS TOLERABLE TODAY: this KMD does not own a GPU scheduler. A native
-/// context's channels are scheduled by the host RM on its runlist, where they
-/// are idle-preemptible at any time, and the guest never needs the GPU off a
-/// context to move its memory (allocations are host RM objects whose GPU VAs
-/// do not change under the context). Legacy (non-native) contexts have no
-/// channel at all. The suspend fence is recorded.
+/// `NvSuspend` 1 (default): the suspend is done here, synchronously. A native context's TSG
+/// (every channel of it: VEID 0 and the compute-only VEIDs) comes off the host runlist and
+/// is preempted with a wait (`NativeContext::suspend`); the Vulkan copy context's channel
+/// likewise (`nv_copy::suspend`). Only then STATUS_SUCCESS is returned, so no completion
+/// interrupt is owed and VidMm's paging follows a GPU that has really stopped. A context
+/// without a channel has nothing on the GPU. Work the UMD submits while suspended is
+/// written to the ring and the doorbell rung as usual; it runs after ResumeContext.
 ///
-/// TODO: real preemption — disable the TSG's runlist entry on the host
-/// (NVA06C_CTRL_CMD_GPFIFO_SCHEDULE false / preempt), then report the fence
-/// with SUSPEND_CONTEXT_COMPLETED and return STATUS_PENDING.
+/// A failed preempt (RM refused or timed out, `HwsSusFail`) is still reported as success:
+/// the TSG is off the runlist either way, and a TSG that does not come off the engine is
+/// one the hang watch reports. `NvSuspend` 0: the old stand-in, "already suspended" with
+/// nothing done.
 pub unsafe extern "C" fn dxgkddi_suspend_context(
     _h_adapter: IN_CONST_HANDLE,
     args: IN_CONST_PDXGKARG_SUSPENDCONTEXT,
@@ -1705,10 +1776,49 @@ pub unsafe extern "C" fn dxgkddi_suspend_context(
         s.suspend_fence
             .store(args.contextSuspendFence, Ordering::Relaxed);
     }
-    s.suspended.store(1, Ordering::Relaxed);
+    if s.suspended.swap(1, Ordering::AcqRel) == 0 {
+        SUS_NOW.fetch_add(1, Ordering::Relaxed);
+    }
+    let Some(passive) = crate::irql::PassiveLevel::try_assume() else {
+        SUS_IRQL.fetch_add(1, Ordering::Relaxed);
+        return STATUS_SUCCESS;
+    };
+    if suspend_mode() == suspend_logic::Mode::Report {
+        return STATUS_SUCCESS;
+    }
+    let timeout_us = SUSPEND_US.load(Ordering::Relaxed);
+    let start = crate::adapter::foreign_scanout::now_100ns();
+    let result = match context.native() {
+        Some(native) => Some(native.suspend(passive, timeout_us)),
+        None => {
+            let copy = crate::ddi::nv_copy::suspend(passive, args.hContext as usize, true, timeout_us);
+            if copy.is_some() {
+                SUS_COPY.fetch_add(1, Ordering::Relaxed);
+            }
+            copy
+        }
+    };
+    match result {
+        None | Some(Ok(Step::None)) => {
+            SUS_NONE.fetch_add(1, Ordering::Relaxed);
+        }
+        Some(Ok(_)) => {
+            SUS_REAL.fetch_add(1, Ordering::Relaxed);
+            let took = crate::adapter::foreign_scanout::now_100ns().saturating_sub(start);
+            SUS_STATS.lock().add(took);
+        }
+        Some(Err(error)) => {
+            SUS_FAIL.fetch_add(1, Ordering::Relaxed);
+            SUS_ERR.store(native_code(Err(error)), Ordering::Relaxed);
+        }
+    }
     STATUS_SUCCESS
 }
 
+/// `DxgkDdiResumeContext` (PASSIVE): the TSG a suspend took off goes back on the runlist and
+/// each of its queues' doorbells is rung again, for work queued meanwhile. A recovered TSG
+/// stays off. Always STATUS_SUCCESS (a refused reschedule leaves the context to the hang
+/// watch, `HwsResFail`).
 pub unsafe extern "C" fn dxgkddi_resume_context(
     _h_adapter: IN_CONST_HANDLE,
     args: IN_CONST_PDXGKARG_RESUMECONTEXT,
@@ -1723,8 +1833,47 @@ pub unsafe extern "C" fn dxgkddi_resume_context(
         return STATUS_INVALID_PARAMETER;
     };
     RESUMES.fetch_add(1, Ordering::Relaxed);
-    context.hws().suspended.store(0, Ordering::Relaxed);
+    if context.hws().suspended.swap(0, Ordering::AcqRel) == 1 {
+        SUS_NOW.fetch_sub(1, Ordering::Relaxed);
+    }
+    let Some(passive) = crate::irql::PassiveLevel::try_assume() else {
+        return STATUS_SUCCESS;
+    };
+    if suspend_mode() == suspend_logic::Mode::Report {
+        return STATUS_SUCCESS;
+    }
+    let result = match context.native() {
+        Some(native) => {
+            let result = native.resume(passive);
+            kick_context_queues(native);
+            Some(result)
+        }
+        None => crate::ddi::nv_copy::suspend(passive, args.hContext as usize, false, 0),
+    };
+    match result {
+        Some(Ok(Step::Schedule)) => {
+            RES_REAL.fetch_add(1, Ordering::Relaxed);
+        }
+        Some(Err(error)) => {
+            RES_FAIL.fetch_add(1, Ordering::Relaxed);
+            RES_ERR.store(native_code(Err(error)), Ordering::Relaxed);
+        }
+        _ => {}
+    }
     STATUS_SUCCESS
+}
+
+/// Ring the doorbell of every registered queue of `native` again (`NativeQueue::kick`).
+fn kick_context_queues(native: &NativeContext) {
+    let key = native as *const NativeContext as usize;
+    let r = REGISTRY.lock();
+    for slot in r.slots.iter().filter(|slot| slot.queue != 0) {
+        // SAFETY: registered queues are live while their slot is (see `Slot`).
+        let queue = unsafe { &*(slot.queue as *const NativeQueue) };
+        if queue.context().map_or(0, |c| c as *const NativeContext as usize) == key {
+            queue.kick();
+        }
+    }
 }
 
 /// Recovers the native contexts on the node that were reported faulted or hung

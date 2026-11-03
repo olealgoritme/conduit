@@ -22,11 +22,13 @@ use super::VirtioError;
 use crate::adapter::AdapterContext;
 use crate::device::ProcessContext;
 use crate::irql::PassiveLevel;
-use crate::sync::SpinLock;
+use crate::sync::{PassiveMutex, SpinLock};
 use alloc::vec::Vec;
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use helios_kmd_logic::ce_present::{self as cp, Token};
+pub(crate) use helios_kmd_logic::ctx_suspend::Step;
+use helios_kmd_logic::ctx_suspend::Sched;
 use helios_kmd_logic::native_channel as nc;
 use helios_kmd_logic::native_teardown as nt;
 use helios_kmd_logic::nvda as nd;
@@ -36,6 +38,8 @@ use wdk_sys::ntddk::{MmMapIoSpace, MmUnmapIoSpace};
 use wdk_sys::{PHYSICAL_ADDRESS, _MEMORY_CACHING_TYPE};
 
 const TIMEOUT_MS: u64 = 2_500;
+/// The longest a scheduling transition waits for another one on the same TSG.
+const SCHED_LOCK_MS: u64 = 5_000;
 const BLACKWELL_COMPUTE_B: u32 = 0xcec0;
 /// (subchannel, class) the D3D UMDs drive on a graphics channel: 3D, compute,
 /// inline-to-memory, copy (the copy class from the generation table).
@@ -504,7 +508,11 @@ pub(crate) struct NativeContext {
     pub(crate) ctxshare: u32,
     /// TSG scheduling is shared by every queue of the context and uses the
     /// 610.57.04-allow-listed NVA06C control, not the unlisted channel control.
-    scheduled: AtomicU32,
+    /// The packed `helios_kmd_logic::ctx_suspend::Sched`: changed only under
+    /// `sched_lock`, together with the RM call the change asks for (first
+    /// channel, Suspend/ResumeContext, recovery, destroy); read lock-free.
+    sched: AtomicU32,
+    sched_lock: PassiveMutex,
     /// dxgkrnl's own handle for this context (`DXGKARG_CREATECONTEXT.hContext` on
     /// input), which `DxgkCbInvalidateHwContext` names; 0 = unknown.
     dxg_context: usize,
@@ -540,19 +548,79 @@ impl NativeContext {
         self.dxg_context
     }
 
-    /// Take the context's TSG off the runlist (`NVA06C_CTRL_CMD_GPFIFO_SCHEDULE`
+    /// Take the context's TSG off the runlist for good (`NVA06C_CTRL_CMD_GPFIFO_SCHEDULE`
     /// false): RM preempts it and runs nothing of it again. Recovery of a faulted or
-    /// hung context; idempotent (a context never scheduled, or already taken off,
-    /// sends nothing). PASSIVE.
+    /// hung context; idempotent (a context never scheduled, already taken off or
+    /// suspended sends nothing), and a later ResumeContext does not put it back. PASSIVE.
     pub(crate) fn unschedule(&self, passive: PassiveLevel) -> Result<(), NativeError> {
-        if self.scheduled.swap(0, Ordering::AcqRel) == 0 {
-            return Ok(());
-        }
-        let tsg = self.tsg;
         self.with_client(passive, |io, client| {
-            let mut params = cc::schedule_params(false);
-            io.control(client, tsg, cc::CTRL_GPFIFO_SCHEDULE, &mut params)
+            self.transition(io, client, Sched::kill, None).map(|_| ())
         })
+    }
+
+    /// `DxgkDdiSuspendContext` (`helios_kmd_logic::ctx_suspend`): the TSG off the runlist
+    /// (every channel of it, VEID 0 and the compute-only VEIDs) and preempted with a wait
+    /// (`NVA06C_CTRL_CMD_PREEMPT { bWait }`, `timeout_us` 0 = RM's timeout), so nothing of
+    /// it is on the GPU when this returns Ok. `Step::None`: nothing was on the runlist (no
+    /// channel yet, already suspended, recovered). An error after the unschedule (the
+    /// preempt refused or timed out) leaves the TSG off the runlist. PASSIVE.
+    pub(crate) fn suspend(&self, passive: PassiveLevel, timeout_us: u32) -> Result<Step, NativeError> {
+        let mut step = Step::None;
+        self.with_client(passive, |io, client| {
+            step = self.transition(io, client, Sched::suspend, Some(timeout_us))?;
+            Ok(())
+        })?;
+        Ok(step)
+    }
+
+    /// `DxgkDdiResumeContext`: the TSG back on the runlist if it had a channel, was taken
+    /// off by a suspend and is not recovered. PASSIVE.
+    pub(crate) fn resume(&self, passive: PassiveLevel) -> Result<Step, NativeError> {
+        let mut step = Step::None;
+        self.with_client(passive, |io, client| {
+            step = self.transition(io, client, Sched::resume, None)?;
+            Ok(())
+        })?;
+        Ok(step)
+    }
+
+    /// dxgkrnl has the context suspended (lock-free; any IRQL).
+    pub(crate) fn is_suspended(&self) -> bool {
+        Sched::unpack(self.sched.load(Ordering::Acquire)).suspended
+    }
+
+    /// Apply `change` to the TSG's scheduling state under `sched_lock` and issue the
+    /// `GPFIFO_SCHEDULE` it asks for; `preempt` Some adds the waited preempt after an
+    /// unschedule. The lock is held across the RM calls so two transitions never
+    /// reorder on the host. Bounded: `Busy` when the lock is not free within 5 s.
+    fn transition(
+        &self,
+        io: Io<'_>,
+        client: &NativeClient,
+        change: impl FnOnce(&mut Sched) -> Step,
+        preempt: Option<u32>,
+    ) -> Result<Step, NativeError> {
+        let _guard = self
+            .sched_lock
+            .lock_within(io.passive, SCHED_LOCK_MS)
+            .ok_or(NativeError::Busy)?;
+        let mut state = Sched::unpack(self.sched.load(Ordering::Acquire));
+        let step = change(&mut state);
+        let result = match step {
+            Step::None => Ok(()),
+            Step::Schedule | Step::Unschedule => {
+                let mut params = cc::schedule_params(step == Step::Schedule);
+                io.control(client, self.tsg, cc::CTRL_GPFIFO_SCHEDULE, &mut params)
+            }
+        };
+        state.done(step, result.is_ok());
+        self.sched.store(state.pack(), Ordering::Release);
+        result?;
+        if let (Step::Unschedule, Some(timeout_us)) = (step, preempt) {
+            let mut params = helios_kmd_logic::ctx_suspend::preempt_params(timeout_us);
+            io.control(client, self.tsg, helios_kmd_logic::ctx_suspend::CTRL_PREEMPT, &mut params)?;
+        }
+        Ok(step)
     }
 
     /// Run `f` with this context's RM client, if its transport generation is live.
@@ -649,6 +717,13 @@ impl NativeContext {
         })();
         let epoch = native.epoch;
         result?;
+        let Some(sched_lock) = PassiveMutex::try_new(passive) else {
+            // The context share goes with its TSG.
+            if io.free(&native.client, nd::H_DEVICE, tsg).is_err() {
+                file_leftover(key, native.epoch, nd::H_DEVICE, tsg);
+            }
+            return Err(NativeError::NoMemory);
+        };
         Ok(Self {
             adapter: adapter as *const AdapterContext as *mut AdapterContext,
             process,
@@ -656,7 +731,8 @@ impl NativeContext {
             epoch,
             tsg,
             ctxshare,
-            scheduled: AtomicU32::new(0),
+            sched: AtomicU32::new(0),
+            sched_lock,
             dxg_context: 0,
             graphics_queues: AtomicU32::new(0),
             veids: AtomicU64::new(0),
@@ -690,15 +766,7 @@ impl NativeContext {
             adapter,
             epoch: native.epoch,
         };
-        if self.scheduled.swap(0, Ordering::AcqRel) != 0 {
-            let mut params = cc::schedule_params(false);
-            let _ = io.control(
-                &native.client,
-                self.tsg,
-                cc::CTRL_GPFIFO_SCHEDULE,
-                &mut params,
-            );
-        }
+        let _ = self.transition(io, &native.client, Sched::kill, None);
         // Queue destruction precedes context destruction, so this also frees
         // the context share without any live channel beneath it. dxgkrnl never
         // repeats DestroyContext: a TSG RM would not free is filed for
@@ -1284,6 +1352,23 @@ impl NativeQueue {
         }
     }
 
+    /// Ring the channel's doorbell again without moving GP_PUT (ResumeContext: work the
+    /// UMD queued while the TSG was off the runlist). A no-op for the GPU when nothing is
+    /// pending. DISPATCH-safe: the GP_PUT lock and one volatile store.
+    pub(crate) fn kick(&self) {
+        let doorbell = self.parts.usermode.va;
+        if doorbell == 0 || self.parts.token == 0 {
+            return;
+        }
+        let _put = self.gp_put.lock();
+        if self.dead.load(Ordering::Acquire) {
+            return;
+        }
+        full_barrier();
+        // SAFETY: as in `submit`: NOTIFY_CHANNEL_PENDING in the live usermode view.
+        unsafe { write32(doorbell + u64::from(cp::DOORBELL_OFFSET), self.parts.token) };
+    }
+
     /// DISPATCH-safe: one spinlock and three volatile stores/barriers.  No RM
     /// message, allocation, completion write, or host round trip is possible.
     /// `fence_id` (the submission's progress fence id) goes to the queue's submission
@@ -1621,6 +1706,26 @@ impl CopyChannel {
     /// The process key native memory files the process's mappings under.
     pub(crate) fn process_key(&self) -> usize {
         self.context.process_key()
+    }
+
+    /// The channel's own TSG (`ddi::nv_copy::suspend`).
+    pub(crate) fn context(&self) -> &NativeContext {
+        &self.context
+    }
+
+    /// As `NativeQueue::kick`. DISPATCH-safe.
+    pub(crate) fn kick(&self) {
+        let doorbell = self.parts.usermode.va;
+        if doorbell == 0 || self.parts.token == 0 {
+            return;
+        }
+        let _put = self.gp_put.lock();
+        if self.dead.load(Ordering::Acquire) {
+            return;
+        }
+        full_barrier();
+        // SAFETY: as in `submit`.
+        unsafe { write32(doorbell + u64::from(cp::DOORBELL_OFFSET), self.parts.token) };
     }
 
     /// The last sequence the channel finished (its progress semaphore). Any IRQL.
@@ -2133,7 +2238,6 @@ fn create_queue_objects_on(
 ) -> Result<(), NativeError> {
     let tsg = context.tsg;
     let ctxshare = context.ctxshare;
-    let scheduled = &context.scheduled;
     let handles = parts.handles.ok_or(NativeError::Invalid)?;
     let result = (|| {
         crate::diag::record_named_bytes(b"NvQStep", 1);
@@ -2314,16 +2418,9 @@ fn create_queue_objects_on(
         // `NvPreempt` (default 0): the TSG's context-switch preemption modes, once, through
         // its first VEID 0 channel, before the TSG is first scheduled.
         set_preemption(io, client, context, handles.at(5), vaspace, own.is_none(), parts.token);
-        if scheduled
-            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            let mut schedule = cc::schedule_params(true);
-            if let Err(error) = io.control(client, tsg, cc::CTRL_GPFIFO_SCHEDULE, &mut schedule) {
-                scheduled.store(0, Ordering::Release);
-                return Err(error);
-            }
-        }
+        // The TSG's first channel puts it on the runlist, unless dxgkrnl has the
+        // context suspended (then its ResumeContext does).
+        context.transition(io, client, Sched::channel_ready, None)?;
         Ok(())
     })();
     if let Err(error) = result {
