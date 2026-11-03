@@ -19,13 +19,20 @@
  *            --fill-mb (default 12288) is reached: where the heap really ends.
  *   budget   the heap budgets again after the fill (before freeing).
  *
+ *   kmt      D3DKMTQueryVideoMemoryInfo for the device's adapter (by its LUID):
+ *            Budget, CurrentUsage, CurrentReservation, AvailableForReservation of
+ *            the local and non-local groups, as dxgkrnl reports them.
+ *
+ * --single-mb N: only one DEVICE_LOCAL allocation of N MiB (after the listing),
+ * for a short trace (nvtrace / DxgKrnl ETW) of one failing allocation.
+ *
  * Every line is flushed. A watchdog ends the process after 120 s.
  * Exit code 0 when every image got memory, 1 otherwise, 2 on setup failure.
  *
  * Build (host, MinGW-w64; vulkan-1.dll is loaded at run time):
  *   x86_64-w64-mingw32-gcc -O2 -Wall -I<dir with vulkan/vulkan_core.h> \
  *       -o vk_memory_probe.exe vk_memory_probe.c -static
- * Run (any session; no window): vk_memory_probe.exe [--any] [--fill-mb N]
+ * Run (any session; no window): vk_memory_probe.exe [--any] [--fill-mb N] [--single-mb N]
  */
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -95,6 +102,57 @@ FN(vkFreeMemory);
 FN(vkBindImageMemory);
 FN(vkDestroyDevice);
 FN(vkDestroyInstance);
+
+/* D3DKMTQueryVideoMemoryInfo, from gdi32 at run time (d3dkmthk.h is not vendored). */
+typedef struct {
+    LUID AdapterLuid;
+    UINT hAdapter;
+} KmtOpenAdapterFromLuid;
+typedef struct {
+    HANDLE hProcess;
+    UINT hAdapter;
+    UINT MemorySegmentGroup; /* 0 local, 1 non-local */
+    UINT64 Budget;
+    UINT64 CurrentUsage;
+    UINT64 CurrentReservation;
+    UINT64 AvailableForReservation;
+    UINT PhysicalAdapterIndex;
+} KmtQueryVideoMemoryInfo;
+typedef LONG(APIENTRY *PFN_KmtOpenAdapterFromLuid)(KmtOpenAdapterFromLuid *);
+typedef LONG(APIENTRY *PFN_KmtQueryVideoMemoryInfo)(KmtQueryVideoMemoryInfo *);
+
+static void print_kmt_budget(const uint8_t luid[8], const char *when)
+{
+    HMODULE gdi = LoadLibraryA("gdi32.dll");
+    PFN_KmtOpenAdapterFromLuid open = gdi ? (PFN_KmtOpenAdapterFromLuid)(void (*)(void))GetProcAddress(gdi, "D3DKMTOpenAdapterFromLuid") : NULL;
+    PFN_KmtQueryVideoMemoryInfo query = gdi ? (PFN_KmtQueryVideoMemoryInfo)(void (*)(void))GetProcAddress(gdi, "D3DKMTQueryVideoMemoryInfo") : NULL;
+    if (!open || !query) {
+        out("kmt %s: gdi32 entry points missing\n", when);
+        return;
+    }
+    KmtOpenAdapterFromLuid oa;
+    memset(&oa, 0, sizeof oa);
+    memcpy(&oa.AdapterLuid, luid, 8);
+    LONG st = open(&oa);
+    if (st < 0) {
+        out("kmt %s: D3DKMTOpenAdapterFromLuid 0x%08lx\n", when, (unsigned long)st);
+        return;
+    }
+    for (UINT g = 0; g < 2; g++) {
+        KmtQueryVideoMemoryInfo q;
+        memset(&q, 0, sizeof q);
+        q.hAdapter = oa.hAdapter;
+        q.MemorySegmentGroup = g;
+        st = query(&q);
+        if (st < 0)
+            out("kmt %s %s: D3DKMTQueryVideoMemoryInfo 0x%08lx\n", when, g ? "non-local" : "local", (unsigned long)st);
+        else
+            out("kmt %s %-9s: budget %8llu MiB usage %8llu MiB reservation %8llu MiB availableForReservation %8llu MiB\n",
+                when, g ? "non-local" : "local", (unsigned long long)(q.Budget >> 20),
+                (unsigned long long)(q.CurrentUsage >> 20), (unsigned long long)(q.CurrentReservation >> 20),
+                (unsigned long long)(q.AvailableForReservation >> 20));
+    }
+}
 
 static VkPhysicalDevice phys;
 static VkDevice dev;
@@ -274,12 +332,14 @@ static int plain_alloc(uint64_t bytes, VkDeviceMemory *keep)
 int main(int argc, char **argv)
 {
     int any = 0;
-    uint64_t fill_mb = 12288;
+    uint64_t fill_mb = 12288, single_mb = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--any"))
             any = 1;
         else if (!strcmp(argv[i], "--fill-mb") && i + 1 < argc)
             fill_mb = strtoull(argv[++i], NULL, 0);
+        else if (!strcmp(argv[i], "--single-mb") && i + 1 < argc)
+            single_mb = strtoull(argv[++i], NULL, 0);
     }
     CreateThread(NULL, 0, watchdog, NULL, 0, NULL);
     HMODULE lib = LoadLibraryA("vulkan-1.dll");
@@ -327,7 +387,8 @@ int main(int argc, char **argv)
         out("FAIL: no NVIDIA physical device\n");
         return 2;
     }
-    VkPhysicalDeviceMaintenance3Properties m3 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_3_PROPERTIES};
+    VkPhysicalDeviceIDProperties idp = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES};
+    VkPhysicalDeviceMaintenance3Properties m3 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_3_PROPERTIES, .pNext = &idp};
     VkPhysicalDeviceProperties2 p = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &m3};
     vkGetPhysicalDeviceProperties2(phys, &p);
     out("limits: maxMemoryAllocationCount %u maxMemoryAllocationSize %llu MiB bufferImageGranularity 0x%llx maxImageDimension2D %u maxImageDimension3D %u sparseBinding %u\n",
@@ -345,6 +406,10 @@ int main(int argc, char **argv)
     out("VK_EXT_memory_budget: %s\n", has_budget ? "yes" : "no");
 
     print_budget("start");
+    if (idp.deviceLUIDValid)
+        print_kmt_budget(idp.deviceLUID, "start");
+    else
+        out("kmt: no device LUID\n");
     for (uint32_t i = 0; i < mem.memoryHeapCount; i++) {
         out("heap %u: %8llu MiB flags 0x%x%s\n", i, (unsigned long long)(mem.memoryHeaps[i].size >> 20),
             mem.memoryHeaps[i].flags,
@@ -383,6 +448,14 @@ int main(int argc, char **argv)
     DFN(vkBindImageMemory);
     DFN(vkDestroyDevice);
 
+    if (single_mb) {
+        int ok = plain_alloc(single_mb << 20, NULL);
+        vkDestroyDevice(dev, NULL);
+        vkDestroyInstance(inst, NULL);
+        out("%s: single %llu MiB allocation\n", ok ? "PASS" : "FAIL", (unsigned long long)single_mb);
+        return ok ? 0 : 1;
+    }
+
     int failed = 0;
     for (size_t i = 0; i < sizeof shapes / sizeof shapes[0]; i++)
         failed += try_image(&shapes[i]);
@@ -398,6 +471,8 @@ int main(int argc, char **argv)
     out("fill: %u x 512 MiB DEVICE_LOCAL allocations (%llu MiB) before %s\n", kept,
         (unsigned long long)kept * 512, (uint64_t)kept * 512 >= fill_mb ? "the --fill-mb cap" : "the first failure");
     print_budget("filled");
+    if (idp.deviceLUIDValid)
+        print_kmt_budget(idp.deviceLUID, "filled");
     for (uint32_t i = 0; i < kept; i++)
         vkFreeMemory(dev, keep[i], NULL);
 

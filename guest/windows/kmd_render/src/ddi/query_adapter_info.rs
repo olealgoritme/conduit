@@ -1142,7 +1142,25 @@ impl SegmentDescriptorSpec {
 /// Write the viogpu3d-style linear aperture descriptor (paging-buffer host).
 /// SAFETY: `seg` points to a writable `DXGK_SEGMENTDESCRIPTOR4`.
 unsafe fn write_aperture_descriptor(seg: *mut DXGK_SEGMENTDESCRIPTOR4, knobs: &AdapterKnobs) {
-    unsafe { SegmentDescriptorSpec::aperture(knobs.direct_flip).write_into_v4(seg) };
+    let mut spec = SegmentDescriptorSpec::aperture(knobs.direct_flip);
+    spec.application_target = aperture_application_target();
+    unsafe { spec.write_into_v4(seg) };
+}
+
+/// Test knob `NvApBudget` (default 0, NVIDIA personality only): 1 marks the
+/// aperture segment `ApplicationTarget`, so dxgkrnl budgets non-local memory for
+/// applications. Without it `D3DKMTQueryVideoMemoryInfo(NON_LOCAL).Budget` is 0
+/// and the Vulkan ICD reports heap 1 (8 GiB of system memory) with a 0-byte
+/// VK_EXT_memory_budget budget (`vk_memory_probe`, 405.300). Read at each
+/// QUERYSEGMENT (AddAdapter); `NvApBudgetOn` mirrors it. A rejected flag would
+/// fail AddAdapter (Code 43): remove the value offline to recover.
+fn aperture_application_target() -> bool {
+    if !crate::ddi::wddm_surface::nvidia_selected() {
+        return false;
+    }
+    let on = crate::diag::read_config_dword(crate::diag::KnobName::new(b"NvApBudget"), 0) != 0;
+    crate::diag::record_named_bytes(b"NvApBudgetOn", u32::from(on));
+    on
 }
 
 /// The same aperture, for WDDM 1.2/1.3 `DXGK_QUERYSEGMENTOUT3`.
