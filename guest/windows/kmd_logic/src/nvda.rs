@@ -716,6 +716,22 @@ pub fn apply_local(
                 None => put32(buf, NVDA_RESULT2_AT, DISPLAY_UNKNOWN_RESULT2),
             }
         }
+        0x0700_01be => {
+            // 0x78-byte display query with the NVAPI display id at +0x30, from NVAPI
+            // (`**VN`) and from the Vulkan ICD at device creation (`NVGL`, nvoglv64
+            // 0x180de03df: +0x38 |= 8; on success it reads the 16-bit +0x4e and the
+            // float +0x74, display luminance values). The vktest capture's one reply
+            // keeps the size, result 1, -1 in the second result word, 0x100 at +0x30
+            // (over the id) and +0x34, everything else zero.
+            exact(buf, 0x78)?;
+            put32(buf, NVDA_RESULT_AT, 1);
+            put32(buf, NVDA_RESULT2_AT, 0xffff_ffff);
+            put32(buf, 0x30, 0x100);
+            put32(buf, 0x34, 0x100);
+            for at in (0x38..0x78).step_by(4) {
+                put32(buf, at, 0);
+            }
+        }
         0x0100_0041 => {
             // 0xac0-byte NVAPI/UMD settings push (`**VN`; a table of 0x24 entries of
             // 0x40 bytes, ids 1..0x24). The L3 captures (60 pairs) answer a 0x30-byte
@@ -2163,6 +2179,18 @@ mod tests {
             let mut bad = local_request(function, len - 1);
             assert_eq!(apply_local(&mut bad, 1, 0), Err(LocalError::Invalid));
         }
+    }
+
+    #[test]
+    fn display_query_01be_matches_the_capture() {
+        let mut buf = local_request(0x0700_01be, 0x78);
+        test_put32(&mut buf, 0x2c, 0xffff_ffe9);
+        test_put32(&mut buf, 0x30, 0x8006_1083);
+        assert_eq!(apply_local(&mut buf, 0, 0), Ok(LocalOutcome::Applied));
+        let w = |at: usize| u32::from_le_bytes(buf[at..at + 4].try_into().unwrap());
+        assert_eq!((w(0x08), w(0x14), w(0x2c), w(0x30), w(0x34)), (0x78, 1, 0xffff_ffff, 0x100, 0x100));
+        assert!(buf[0x38..0x78].iter().all(|b| *b == 0));
+        assert_eq!(apply_local(&mut local_request(0x0700_01be, 0x74), 0, 0), Err(LocalError::Invalid));
     }
 
     #[test]
