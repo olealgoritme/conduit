@@ -5433,6 +5433,7 @@ pub fn unmap_aperture(
 /// leaves the record and its MDLs alive; the caller must not report reclamation
 /// or unlock pSystemMem early.
 pub fn destroy(passive: PassiveLevel, adapter: &AdapterContext, id: u32) -> Result<(), Error> {
+    crate::ddi::pg_check::forget(id);
     let guard = lock(passive, Kind::Destroy)?;
     let client = st().client()?;
     let io = Io {

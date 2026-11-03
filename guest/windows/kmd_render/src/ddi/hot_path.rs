@@ -262,6 +262,7 @@ pub(crate) fn publish() {
 
     // The values the paging and allocation paths wrote per call before (same names).
     crate::ddi::build_paging_buffer::publish_hot();
+    crate::ddi::pg_check::publish();
     crate::ddi::create_allocation::publish_hot();
     crate::virtio::native_memory::publish_hot();
     crate::virtio::native_scanout::publish_hot();

@@ -19,7 +19,10 @@
 //!
 //! Each queue keeps its last submissions (progress fence id, GPFIFO range; `NativeQueue::submit`);
 //! the first one the progress fence does not show complete is the snapshot's focus: the GPFIFO
-//! window is read around it and its segments (and two before) decoded. The ring, pushbuffers
+//! window is read around it and its segments (and two before) decoded. The NVIDIA UMDs open
+//! their submissions with runs of NOP entries (all zero): the focus starts at the stuck
+//! submission's first non-NOP entry (`ns::skip_nops`, at most `ns::NOP_SCAN` entries scanned),
+//! so the window and the decoded segments are its real work, not its NOP gap. The ring, pushbuffers
 //! and semaphores are read by GPU VA through the KMD's mapping table (`lookup_va`): VidMm's
 //! system pages for a native system-memory allocation, the RM object's CPU view otherwise.
 //!
@@ -193,6 +196,25 @@ struct Reader<'a> {
     adapter: &'a AdapterContext,
     deadline: u64,
     budget_hit: bool,
+}
+
+/// `out.len()` dwords at `va` of `process`'s space as the GPU fetches them (VidMm's system
+/// pages through the KMD's mapping table, or the allocation's RM memory), for
+/// `ddi::pg_check`. `ns::RD_*`. PASSIVE.
+pub(crate) fn read_gpu_words(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    process: usize,
+    va: u64,
+    out: &mut [u32],
+) -> u32 {
+    let mut reader = Reader {
+        passive,
+        adapter,
+        deadline: crate::adapter::foreign_scanout::now_100ns() + ns::READ_BUDGET_100NS,
+        budget_hit: false,
+    };
+    reader.words(process, va, out)
 }
 
 impl Reader<'_> {
@@ -529,6 +551,14 @@ fn write_queue(
         flags |= ns::Q_FOCUS_FROM_HISTORY;
     }
     let (focus_start, focus_end) = ns::focus_range(history, s.fence_now, s.kmd_gp_put, entries);
+    // The NVIDIA UMDs open their submissions with runs of NOP entries (all zero); the window
+    // and the decoded segments start at the stuck submission's first real entry instead.
+    let focus_start = if stuck.is_some() {
+        let found = first_real_entry(reader, process, s.gpfifo_va, focus_start, focus_end, entries);
+        ns::skip_nops(focus_start, focus_end, entries, found)
+    } else {
+        focus_start
+    };
     let first = ns::window_first(focus_start, entries);
     let window_n = (ns::WINDOW as u32).min(entries);
     // The ring through its GPU VA (VidMm's system pages when the ring is a native
@@ -624,6 +654,41 @@ fn write_queue(
         }
     }
     ns::end_queue(w, mark, segments);
+}
+
+/// The offset from `focus_start` of the first non-NOP entry of `[focus_start, focus_end)`
+/// (at most `ns::NOP_SCAN` entries read), `None` if all read are NOPs or a read failed.
+fn first_real_entry(
+    reader: &mut Reader<'_>,
+    process: usize,
+    gpfifo_va: u64,
+    focus_start: u32,
+    focus_end: u32,
+    entries: u32,
+) -> Option<u32> {
+    if entries == 0 {
+        return None;
+    }
+    let span = (focus_end % entries + entries - focus_start % entries) % entries;
+    let scan = span.min(ns::NOP_SCAN);
+    let mut buf = [0u32; 64];
+    let mut k = 0u32;
+    while k < scan {
+        let index = (focus_start + k) % entries;
+        let run = (scan - k).min(32).min(entries - index);
+        let words = &mut buf[..2 * run as usize];
+        if reader.words(process, gpfifo_va + 8 * u64::from(index), words) != ns::RD_OK {
+            return None;
+        }
+        for i in 0..run {
+            let e = ns::gp_entry(words[2 * i as usize], words[2 * i as usize + 1]);
+            if !ns::is_nop(e) {
+                return Some(k + i);
+            }
+        }
+        k += run;
+    }
+    None
 }
 
 #[allow(clippy::too_many_arguments)]

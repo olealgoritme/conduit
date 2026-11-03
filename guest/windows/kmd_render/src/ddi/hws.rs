@@ -1649,6 +1649,12 @@ pub unsafe extern "C" fn dxgkddi_submit_command_to_hw_queue(
     let key = unsafe { super::scheduler::native_queue_of(args.hHwQueue) }
         .map_or(0, |queue| queue as *const NativeQueue as usize);
     after_submit(adapter, key, Some(args.HwQueueProgressFenceId), 0);
+    // `NvPgCheck` 0x2: the submission's entries as the GPU fetches them (`ddi::pg_check`).
+    if crate::ddi::pg_check::knob().submit() {
+        if let Some(queue) = unsafe { super::scheduler::native_queue_of(args.hHwQueue) } {
+            crate::ddi::pg_check::check_submit(adapter, queue);
+        }
+    }
     STATUS_SUCCESS
 }
 

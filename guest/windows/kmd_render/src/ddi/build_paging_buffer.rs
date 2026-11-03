@@ -61,6 +61,7 @@ use crate::dxgk::*;
 use crate::virtio::rm_client::sysmem_flip::primary_changed;
 use helios_kmd_logic::device_lost as dl;
 use helios_kmd_logic::paging::{self as pg, Clamp};
+use helios_kmd_logic::pg_check as pck;
 use helios_kmd_logic::pg_gpu as pgg;
 use helios_kmd_logic::rm_refresh::Edge;
 
@@ -2329,6 +2330,10 @@ unsafe fn native_paging_operation(
         PagingOperation::VirtualTransfer(_) => 5,
         _ => 0,
     };
+    if result.is_err() && kind >= 2 {
+        // `NvPgCheck`: a content operation answered success without running.
+        crate::ddi::pg_check::note_op(allocation.native_id, kind, pck::dir::NONE, pck::path::REFUSED);
+    }
     Some(match result {
         Ok(()) => STATUS_SUCCESS,
         Err(()) => native_refused(kind, true),
@@ -2566,6 +2571,8 @@ unsafe fn native_update_leaf(
     is_system.try_reserve_exact(count).map_err(|_| ())?;
     let mut any_other = false;
     let mut segment_noted = false;
+    // `NvPgCheck`: what the PTEs name (`pg_check::placement_of`).
+    let (mut in_aperture, mut in_segment, mut invalid) = (0u32, 0u32, 0u32);
     for index in 0..count {
         let pte_index = if repeat { 0 } else { index };
         // SAFETY: Repeat selects one entry; otherwise DXGK supplies Num entries.
@@ -2580,6 +2587,7 @@ unsafe fn native_update_leaf(
             pieces.push(None);
             is_system.push(false);
             any_other = true;
+            invalid += 1;
             continue;
         }
         if repeat && count != 1 {
@@ -2634,6 +2642,11 @@ unsafe fn native_update_leaf(
         } else {
             is_system.push(false);
             any_other = true;
+            if segment == crate::ddi::gpummu::APERTURE_SEGMENT_ID {
+                in_aperture += 1;
+            } else {
+                in_segment += 1;
+            }
         }
         // PageAddress is VidMm's segment placement, never a host GPA.  The RM
         // memory offset comes only from AllocationOffsetInBytes + page index.
@@ -2650,6 +2663,10 @@ unsafe fn native_update_leaf(
         };
         pieces.push(Some(piece));
     }
+    crate::ddi::pg_check::note_place(
+        allocation.native_id,
+        pck::placement_of(system_pfns.len() as u32, in_aperture, in_segment, invalid),
+    );
     if !unsafe {
         adapter
             .paging_pte_shadow
@@ -2790,12 +2807,32 @@ unsafe fn native_transfer(
     }
     // `NvPgGpu` 0x1: on the paging copy engine (`native_memory::gpu_paging`); the CPU copy
     // below when it cannot.
+    let check_dir = if to_native { pck::dir::TO_NATIVE } else { pck::dir::FROM_NATIVE };
+    // `NvPgCheck` 0x1: both ends read back after the copy (`ddi::pg_check`).
+    let check = |path: u32| {
+        crate::ddi::pg_check::note_op(allocation.native_id, pck::op::TRANSFER, check_dir, path);
+        if let Some((pfns, byte_offset)) = unsafe { mdl_frames(mdl) } {
+            crate::ddi::pg_check::check_transfer(
+                passive,
+                adapter,
+                allocation.native_id,
+                offset,
+                size,
+                pfns,
+                pgg::mdl_start(transfer.MdlOffset, byte_offset),
+                pck::op::TRANSFER,
+                check_dir,
+                path,
+            );
+        }
+    };
     if allocation.native_segment != 0
         && crate::virtio::native_memory::gpu_wants(pgg::Op::Transfer, size)
         && unsafe {
             gpu_transfer_mdl(passive, adapter, allocation, mdl, transfer.MdlOffset, offset, size, to_native)
         }
     {
+        check(pck::path::GPU);
         return Ok(());
     }
     crate::virtio::native_memory::note_cpu_paging(size);
@@ -2825,10 +2862,35 @@ unsafe fn native_transfer(
     }
     .map_err(|_| ())?;
     if copied {
+        check(pck::path::CPU);
         Ok(())
     } else {
         Err(())
     }
+}
+
+/// The page frames of a locked MDL (one per page it spans) and its `ByteOffset`.
+///
+/// # Safety
+/// `mdl` is a live, locked MDL for as long as the slice is used.
+unsafe fn mdl_frames<'a>(mdl: PMDL) -> Option<(&'a [u64], u32)> {
+    if mdl.is_null() {
+        return None;
+    }
+    // SAFETY: valid MDL per the fn contract.
+    let (byte_offset, byte_count) = unsafe { ((*mdl).ByteOffset & 0xfff, (*mdl).ByteCount) };
+    let pages = usize::try_from(pgg::mdl_pages(byte_offset, byte_count)).ok()?;
+    if pages == 0 {
+        return None;
+    }
+    // SAFETY: a locked MDL's PFN array follows its header, one entry per page it spans.
+    let pfns = unsafe {
+        core::slice::from_raw_parts(
+            (mdl as *const u8).add(core::mem::size_of::<wdk_sys::MDL>()) as *const u64,
+            pages,
+        )
+    };
+    Some((pfns, byte_offset))
 }
 
 /// A `DXGK_OPERATION_TRANSFER` between native allocation `allocation` and the system pages of
@@ -2849,27 +2911,18 @@ unsafe fn gpu_transfer_mdl(
     size: u64,
     to_native: bool,
 ) -> bool {
-    if mdl.is_null() {
-        return false;
-    }
-    // SAFETY: valid MDL per the fn contract.
-    let (byte_offset, byte_count) = unsafe { ((*mdl).ByteOffset & 0xfff, (*mdl).ByteCount) };
-    let Ok(pages) = usize::try_from(pgg::mdl_pages(byte_offset, byte_count)) else {
+    // SAFETY: the live, locked MDL of the operation (fn contract).
+    let Some((pfns, byte_offset)) = (unsafe { mdl_frames(mdl) }) else {
         return false;
     };
+    // SAFETY: as above.
+    let byte_count = unsafe { (*mdl).ByteCount };
     let start = pgg::mdl_start(mdl_page, byte_offset);
     let begin = u64::from(byte_offset);
     let end = begin + u64::from(byte_count);
-    if pages == 0 || start < begin || start.checked_add(size).is_none_or(|last| last > end) {
+    if start < begin || start.checked_add(size).is_none_or(|last| last > end) {
         return false;
     }
-    // SAFETY: a locked MDL's PFN array follows its header, one entry per page it spans.
-    let pfns = unsafe {
-        core::slice::from_raw_parts(
-            (mdl as *const u8).add(core::mem::size_of::<wdk_sys::MDL>()) as *const u64,
-            pages,
-        )
-    };
     crate::virtio::native_memory::gpu_paging(
         passive,
         adapter,
@@ -2884,6 +2937,23 @@ unsafe fn gpu_transfer_mdl(
         },
         Some(crate::virtio::native_memory::GpuSystem { pfns, start }),
     )
+}
+
+/// `NvPgCheck`: note a fill of native allocation `allocation` that ran on `path` and read
+/// sampled pieces of it back (`ddi::pg_check`).
+#[allow(clippy::too_many_arguments)]
+fn fill_checked(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    allocation: crate::ddi::create_allocation::PagingAllocInfo,
+    offset: u64,
+    size: u64,
+    pattern: u32,
+    op: u32,
+    path: u32,
+) {
+    crate::ddi::pg_check::note_op(allocation.native_id, op, pck::dir::NONE, path);
+    crate::ddi::pg_check::check_fill(passive, adapter, allocation.native_id, offset, size, pattern, op, path);
 }
 
 unsafe fn native_fill(
@@ -2913,6 +2983,7 @@ unsafe fn native_fill(
             None,
         )
     {
+        fill_checked(passive, adapter, allocation, 0, size, fill.FillPattern, pck::op::FILL, pck::path::GPU);
         return Ok(());
     }
     crate::virtio::native_memory::note_cpu_paging(size);
@@ -2934,6 +3005,7 @@ unsafe fn native_fill(
     }
     .map_err(|_| ())?;
     if filled {
+        fill_checked(passive, adapter, allocation, 0, size, fill.FillPattern, pck::op::FILL, pck::path::CPU);
         Ok(())
     } else {
         Err(())
@@ -2968,6 +3040,7 @@ unsafe fn native_virtual_fill(
             None,
         )
     {
+        fill_checked(passive, adapter, allocation, offset, size, fill.FillPattern, pck::op::VIRTUAL_FILL, pck::path::GPU);
         return Ok(());
     }
     crate::virtio::native_memory::note_cpu_paging(size);
@@ -2989,10 +3062,41 @@ unsafe fn native_virtual_fill(
     }
     .map_err(|_| ())?;
     if filled {
+        fill_checked(passive, adapter, allocation, offset, size, fill.FillPattern, pck::op::VIRTUAL_FILL, pck::path::CPU);
         Ok(())
     } else {
         Err(())
     }
+}
+
+/// `NvPgCheck`: note a virtual transfer that ran on `path` and compare sampled pieces of its
+/// system pages (`pages`, the first holding `system_va`) and the RM memory.
+#[allow(clippy::too_many_arguments)]
+fn virtual_transfer_checked(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    allocation: crate::ddi::create_allocation::PagingAllocInfo,
+    offset: u64,
+    size: u64,
+    pages: &[u64],
+    system_va: u64,
+    to_system: bool,
+    path: u32,
+) {
+    let dir = if to_system { pck::dir::FROM_NATIVE } else { pck::dir::TO_NATIVE };
+    crate::ddi::pg_check::note_op(allocation.native_id, pck::op::VIRTUAL_TRANSFER, dir, path);
+    crate::ddi::pg_check::check_transfer(
+        passive,
+        adapter,
+        allocation.native_id,
+        offset,
+        size,
+        pages,
+        system_va & 0xfff,
+        pck::op::VIRTUAL_TRANSFER,
+        dir,
+        path,
+    );
 }
 
 unsafe fn native_virtual_transfer(
@@ -3056,6 +3160,7 @@ unsafe fn native_virtual_transfer(
             }),
         )
     {
+        virtual_transfer_checked(passive, adapter, allocation, offset, size, &pages, system_va, to_system, pck::path::GPU);
         return Ok(());
     }
     crate::virtio::native_memory::note_cpu_paging(size);
@@ -3102,6 +3207,7 @@ unsafe fn native_virtual_transfer(
     }
     .map_err(|_| why(5))?;
     if copied {
+        virtual_transfer_checked(passive, adapter, allocation, offset, size, &pages, system_va, to_system, pck::path::CPU);
         Ok(())
     } else {
         why(6);

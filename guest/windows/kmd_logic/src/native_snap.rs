@@ -189,6 +189,31 @@ pub fn focus_range(history: &[Submission], fence_now: u64, gp_put: u32, entries:
     }
 }
 
+/// A NOP GPFIFO entry: length 0, control opcode 0 (the sync bit aside). The NVIDIA UMDs leave
+/// runs of them (all-zero entries) inside their submissions; the real work follows.
+pub const fn is_nop(entry: GpEntry) -> bool {
+    entry.dwords == 0 && entry.opcode == 0
+}
+
+/// Entries of the focus range scanned for its first real one at most ([`skip_nops`]).
+pub const NOP_SCAN: u32 = 512;
+
+/// The focus start moved past a leading run of NOP entries: `first_real` is the offset of the
+/// first non-NOP entry from `focus_start` (`None`: all NOPs, or none read), so the window and
+/// its decoded segments show the submission's real entries instead of its NOP gap. Stays
+/// inside `[focus_start, focus_end)`; the window then begins [`WINDOW_BEFORE`] entries before
+/// the returned index.
+pub const fn skip_nops(focus_start: u32, focus_end: u32, entries: u32, first_real: Option<u32>) -> u32 {
+    if entries == 0 {
+        return focus_start;
+    }
+    let span = (focus_end % entries + entries - focus_start % entries) % entries;
+    match first_real {
+        Some(k) if k < span => (focus_start % entries + k) % entries,
+        _ => focus_start,
+    }
+}
+
 /// The segments to decode, in GPFIFO order: window positions (0-based offsets into `window`,
 /// whose first entry has ring index `first`) of up to [`SEGMENTS_BEFORE`] real segments before
 /// `focus_start` and then the focus range's own segments, [`MAX_SEGMENTS`] at most; control
@@ -1386,6 +1411,25 @@ pub fn write_ref(w: &mut Writer<'_>, r: &AddrRef, va_index: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nop_entries_and_skipping_them() {
+        assert!(is_nop(gp_entry(0, 0)));
+        // A control entry with the sync bit is still a NOP.
+        assert!(is_nop(gp_entry(0, 0x8000_0200)));
+        assert!(!is_nop(gp_entry(0x082c_d200, 0x0001_1a00)));
+        // PB_EXTENDED_BASE (opcode 4) is not.
+        assert!(!is_nop(gp_entry(0x100, 4)));
+        // Steel Nomad 293: [133..154) with its real entry at 153.
+        assert_eq!(skip_nops(133, 154, 8192, Some(20)), 153);
+        assert_eq!(skip_nops(133, 154, 8192, Some(0)), 133);
+        assert_eq!(skip_nops(133, 154, 8192, None), 133);
+        // Past the range: unchanged.
+        assert_eq!(skip_nops(133, 154, 8192, Some(21)), 133);
+        // Wrapping range.
+        assert_eq!(skip_nops(8190, 4, 8192, Some(3)), 1);
+        assert_eq!(skip_nops(5, 9, 0, Some(1)), 5);
+    }
 
     fn inc(sc: u32, method: u32, count: u32) -> u32 {
         (1 << 29) | (count << 16) | (sc << 13) | (method >> 2)

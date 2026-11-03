@@ -932,6 +932,17 @@ pub(crate) struct NativeQueue {
     history_n: AtomicU32,
 }
 
+/// A native queue's last submission, for `ddi::pg_check` (`NativeQueue::check_view`).
+#[derive(Clone, Copy)]
+pub(crate) struct SubmitView {
+    pub gpfifo_va: u64,
+    pub entries: u32,
+    pub before: u32,
+    pub after: u32,
+    pub ring_id: u32,
+    pub process_key: usize,
+}
+
 /// What a hang snapshot (`ddi::native_snap`) records of one native queue, read without a host
 /// call (`NativeQueue::snap`).
 pub(crate) struct QueueSnap {
@@ -1286,6 +1297,26 @@ impl NativeQueue {
 
     pub(crate) fn token(&self) -> Token {
         Token(self.parts.token)
+    }
+
+    /// What `ddi::pg_check` reads after a submission: the GPFIFO VA and entry count, the last
+    /// submission's range `(before, after)`, the ring allocation and the process key. `None`
+    /// before the first submission. Any IRQL up to DISPATCH (atomics only).
+    pub(crate) fn check_view(&self) -> Option<SubmitView> {
+        let n = self.history_n.load(Ordering::Acquire);
+        if n == 0 || self.gpfifo_va == 0 {
+            return None;
+        }
+        let i = (n.wrapping_sub(1)) as usize % helios_kmd_logic::native_snap::HISTORY;
+        let range = self.history_range[i].load(Ordering::Relaxed);
+        Some(SubmitView {
+            gpfifo_va: self.gpfifo_va,
+            entries: self.ring_bytes / 8,
+            before: range as u32,
+            after: (range >> 32) as u32,
+            ring_id: self.ring_id,
+            process_key: self.context().map_or(0, |c| c.process_key()),
+        })
     }
 
     /// The queue's state for a hang snapshot: USERD, the error notifier, the progress fence,
