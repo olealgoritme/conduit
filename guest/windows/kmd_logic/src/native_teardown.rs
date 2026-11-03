@@ -46,6 +46,37 @@ pub const fn td_gate_on(knob: u32) -> bool {
     knob & 1 != 0
 }
 
+/// `NvTdWaitMs` default: how long the exit gate lets an exiting process's outstanding work
+/// finish before it stops the queues.
+pub const DEFAULT_TD_WAIT_MS: u32 = 1000;
+
+/// The exit gate's next step for an exiting process (`exit_step`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitStep {
+    /// No queue of the process holds work: the unmap may go ahead.
+    Done,
+    /// Work is outstanding and the drain budget is not spent: wait and look again.
+    Wait,
+    /// Work is still outstanding after the budget: stop the queues (`Recover::Exit`).
+    Stop,
+}
+
+/// The exit gate's step for an exiting process whose queues are `busy` after `waited_100ns`
+/// of a `budget_ms` drain budget (`NvTdWaitMs`). Outstanding work is let finish first: its
+/// semaphore releases are what other processes' channels may be acquiring (DWM samples the
+/// surfaces of a LogonUI that exits at logon, and an exiting DWM's last frames carry the
+/// present fences), and a stopped channel never releases them, so the waiters' channels
+/// stall for good. Only work that does not finish in the budget is stopped. 0 stops at once.
+pub const fn exit_step(busy: bool, waited_100ns: u64, budget_ms: u32) -> ExitStep {
+    if !busy {
+        ExitStep::Done
+    } else if waited_100ns < budget_ms as u64 * 10_000 {
+        ExitStep::Wait
+    } else {
+        ExitStep::Stop
+    }
+}
+
 /// `PsGetProcessExitStatus` of a process that has not begun to exit (`STATUS_PENDING`).
 pub const STATUS_PENDING: i32 = 0x103;
 
@@ -254,6 +285,23 @@ mod tests {
         assert!(!td_gate_on(0));
         assert!(td_gate_on(3));
         assert!(!td_gate_on(2), "only bit 0 is the gate");
+    }
+
+    #[test]
+    fn outstanding_work_drains_before_the_gate_stops_it() {
+        let ms = |n: u64| n * 10_000;
+        // Idle: the unmap goes ahead, whatever was waited.
+        assert_eq!(exit_step(false, 0, DEFAULT_TD_WAIT_MS), ExitStep::Done);
+        assert_eq!(exit_step(false, ms(5000), DEFAULT_TD_WAIT_MS), ExitStep::Done);
+        // Busy inside the budget: wait for the work (and its semaphore releases).
+        assert_eq!(exit_step(true, 0, DEFAULT_TD_WAIT_MS), ExitStep::Wait);
+        assert_eq!(exit_step(true, ms(999), 1000), ExitStep::Wait);
+        // Busy after the budget: stopped.
+        assert_eq!(exit_step(true, ms(1000), 1000), ExitStep::Stop);
+        // Budget 0: stopped at once (the 405.294 gate).
+        assert_eq!(exit_step(true, 0, 0), ExitStep::Stop);
+        // No overflow at the largest budget.
+        assert_eq!(exit_step(true, u64::MAX, u32::MAX), ExitStep::Stop);
     }
 
     #[test]

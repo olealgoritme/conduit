@@ -293,6 +293,13 @@ static TD_LIVE: AtomicU32 = AtomicU32::new(0);
 /// gate and the EPROCESS reference it takes at CreateContext; 0 turns both off. u32::MAX =
 /// not read yet.
 static TD_GATE: AtomicU32 = AtomicU32::new(u32::MAX);
+/// `NvTdWaitMs` (read with `NvTdGate`): how long the gate lets an exiting process's
+/// outstanding work finish before it stops the queues (`native_teardown::exit_step`).
+static TD_WAIT_MS: AtomicU32 = AtomicU32::new(helios_kmd_logic::native_teardown::DEFAULT_TD_WAIT_MS);
+/// `NvTdDrain`: exiting processes whose outstanding work finished inside the budget (nothing
+/// stopped); `NvTdWaitMax`: the longest such wait, ms.
+static TD_DRAINED: AtomicU32 = AtomicU32::new(0);
+static TD_WAIT_MAX_MS: AtomicU32 = AtomicU32::new(0);
 
 /// Whether the exit gate is on (`NvTdGate`), read from the service key on first use. PASSIVE.
 pub(crate) fn exit_gate_on() -> bool {
@@ -303,6 +310,13 @@ pub(crate) fn exit_gate_on() -> bool {
             helios_kmd_logic::native_teardown::DEFAULT_TD_GATE,
         )
         .min(u32::MAX - 1);
+        TD_WAIT_MS.store(
+            crate::diag::read_config_dword(
+                crate::diag::KnobName::new(b"NvTdWaitMs"),
+                helios_kmd_logic::native_teardown::DEFAULT_TD_WAIT_MS,
+            ),
+            Ordering::Relaxed,
+        );
         TD_GATE.store(knob, Ordering::Relaxed);
     }
     helios_kmd_logic::native_teardown::td_gate_on(knob)
@@ -388,6 +402,8 @@ pub(crate) fn publish_counters() {
         (&b"NvTdExit"[..], &TD_EXIT),
         (&b"NvTdExitP"[..], &TD_EXIT_P),
         (&b"NvTdLive"[..], &TD_LIVE),
+        (&b"NvTdDrain"[..], &TD_DRAINED),
+        (&b"NvTdWaitMax"[..], &TD_WAIT_MAX_MS),
     ] {
         let n = counter.load(Ordering::Relaxed);
         if n != 0 {
@@ -991,16 +1007,22 @@ const NO_VICTIM: Victim = Victim {
 /// process down allocations first and its contexts last, so VidMm unmaps the VAs while the
 /// process's channels may still hold work: a DWM that exited with submissions outstanding
 /// took host Xid 31 FAULT_PTE (GPC reads) at the surfaces just dropped from its space.
-/// Once the process has begun to exit (`ProcessContext::exiting`), its contexts whose queues
-/// still hold work are stopped first, like a recovery without the context invalidation
-/// ([`Recover::Exit`]: off the runlist, queues dead, progress completed): `NvTdStop`
-/// queues, `NvTdExit` invalidations, `NvTdExitP` processes. A running process is left
+/// Once the process has begun to exit (`ProcessContext::exiting`), its outstanding work is
+/// let finish first, up to `NvTdWaitMs` (`native_teardown::exit_step`; `NvTdDrain`
+/// processes whose work finished, `NvTdWaitMax` the longest wait): stopping it at once
+/// (405.294) dropped the semaphore releases of that work, which other processes' channels
+/// acquire (DWM), and DWM's channel stalled for good, so DWM made no flips after a logon at
+/// which such a process exited. Contexts whose queues still hold work after the budget are
+/// stopped, like a recovery without the context invalidation ([`Recover::Exit`]: off the
+/// runlist, queues dead, progress completed): `NvTdStop` queues, `NvTdExit` invalidations,
+/// `NvTdExitP` processes. A running process is left
 /// alone (the UMD orders its own frees); `NvTdLive` counts its invalidations that came
 /// while one of its queues held work. PASSIVE.
 ///
 /// # Safety
 /// `h_process` is 0 or dxgkrnl's live `hKmdProcess` (DestroyProcess has not run for it).
 pub(crate) unsafe fn exit_gate(adapter: &AdapterContext, h_process: usize) {
+    use helios_kmd_logic::native_teardown::ExitStep;
     if h_process == 0 || !crate::ddi::wddm_surface::nvidia_selected() {
         return;
     }
@@ -1022,6 +1044,32 @@ pub(crate) unsafe fn exit_gate(adapter: &AdapterContext, h_process: usize) {
     TD_EXIT.fetch_add(1, Ordering::Relaxed);
     if process.note_exit_seen() {
         TD_EXIT_P.fetch_add(1, Ordering::Relaxed);
+    }
+    // The outstanding work finishes first (`native_teardown::exit_step`, `NvTdWaitMs`): its
+    // semaphore releases may be what other processes' channels acquire, and a stopped channel
+    // never releases them. Only work still outstanding after the budget is stopped.
+    let budget_ms = TD_WAIT_MS.load(Ordering::Relaxed);
+    let from = crate::adapter::foreign_scanout::now_100ns();
+    let mut waited = false;
+    loop {
+        let elapsed = crate::adapter::foreign_scanout::now_100ns().saturating_sub(from);
+        match helios_kmd_logic::native_teardown::exit_step(process_busy(h_process), elapsed, budget_ms) {
+            ExitStep::Done => {
+                if waited {
+                    TD_DRAINED.fetch_add(1, Ordering::Relaxed);
+                    TD_WAIT_MAX_MS.fetch_max((elapsed / 10_000) as u32, Ordering::Relaxed);
+                }
+                return;
+            }
+            ExitStep::Wait => {
+                let Some(passive) = crate::irql::PassiveLevel::try_assume() else {
+                    break;
+                };
+                waited = true;
+                crate::virtio::ctrl::sleep_ms(passive, 1);
+            }
+            ExitStep::Stop => break,
+        }
     }
     let _ = recover_native(adapter, Recover::Exit(h_process));
 }

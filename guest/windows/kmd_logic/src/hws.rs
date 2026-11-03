@@ -354,6 +354,7 @@ pub const COUNTERS: &[&str] = &[
     "HwsNatHang",
     "HwsNatForce",
     "HwsNatRecov",
+    "NvTdGateK",
     "HwsNatInval",
     "HwsNatInvSt",
     "HwsNatRstSt",
