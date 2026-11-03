@@ -111,16 +111,20 @@ pub mod watch {
 
 static NEXT_ID: AtomicU32 = AtomicU32::new(1);
 
-/// `NvPerfMem` (REG_DWORD, default 0): the memory-performance paths of
+/// `NvPerfMem` (REG_DWORD, default [`np::PERF_MEM_DEFAULT`] = 0x01, GPU-only
+/// records in video memory): the memory-performance paths of
 /// `helios_kmd_logic::native_perf::PerfMem`, read once (PASSIVE) and mirrored to
 /// `NvPerfMemOn`. 0 keeps every old path.
 pub(crate) fn perf() -> np::PerfMem {
     static VALUE: AtomicU32 = AtomicU32::new(u32::MAX);
     let mut value = VALUE.load(Ordering::Relaxed);
     if value == u32::MAX {
-        value = crate::diag::read_config_dword(crate::diag::KnobName::new(b"NvPerfMem"), 0);
+        value = crate::diag::read_config_dword(
+            crate::diag::KnobName::new(b"NvPerfMem"),
+            np::PERF_MEM_DEFAULT,
+        );
         if value == u32::MAX {
-            value = 0;
+            value = np::PERF_MEM_DEFAULT;
         }
         VALUE.store(value, Ordering::Relaxed);
         crate::diag::record_named_bytes(b"NvPerfMemOn", value);

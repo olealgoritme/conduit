@@ -210,6 +210,10 @@ struct AllocationContext {
     dedicated_present_buffer: bool,
     /// Nonzero only for a registered VidMm tracker allocation.
     vidmm_tracker_cookie: u32,
+    /// A native (NVDA) allocation dxgkrnl has passed to OpenAllocation (its
+    /// writeback ran). One destroyed without it was refused by dxgkrnl/VidMm after
+    /// CreateAllocation succeeded here (`NvAlNoOpen`).
+    native_opened: AtomicU32,
     /// The layout of the foreign (NVK-on-RM) resource this allocation adopted,
     /// recorded at create time; `None` for every other allocation. Immutable.
     /// The KMD's scan-out copy imports such a source as an explicit-modifier
@@ -2353,6 +2357,14 @@ unsafe fn destroy_allocation_ctx(
     adapter.producer.remove_allocation(allocation_handle);
     adapter.vidmm_trackers.remove(ctx.vidmm_tracker_cookie);
     if ctx.native_id != 0 {
+        if crate::virtio::nvda::enabled() && ctx.native_opened.load(Ordering::Relaxed) == 0 {
+            // `NvAlNoOpen` / `NvAlNoOpMb`: dxgkrnl destroyed a native allocation it
+            // never opened: VidMm refused it after this driver's CreateAllocation
+            // succeeded (no KMD-side failure, no `VkF` entry), e.g. its segment
+            // set or commit. `NvAlNoOpMb` is the last one's size in MiB.
+            NV_AL_NO_OPEN.fetch_add(1, Ordering::Relaxed);
+            NV_AL_NO_OPEN_MB.store(((ctx.size as u64) >> 20).min(u64::from(u32::MAX)) as u32, Ordering::Relaxed);
+        }
         unregister_scanout_allocation_handle(allocation_handle);
         let _ = adapter.retire_scanout_allocation(passive, allocation_handle, 0);
         let result = if adapter.is_current_generation(ctx.serial) {
@@ -3208,6 +3220,8 @@ static NV_ALIGN_LARGE: AtomicU32 = AtomicU32::new(0);
 static NV_GPU_ONLY: AtomicU32 = AtomicU32::new(0);
 /// `NvAlSeg`: the preferred segment of the last native allocation (`u32::MAX` = none yet).
 static NV_AL_SEG: AtomicU32 = AtomicU32::new(u32::MAX);
+static NV_AL_NO_OPEN: AtomicU32 = AtomicU32::new(0);
+static NV_AL_NO_OPEN_MB: AtomicU32 = AtomicU32::new(0);
 
 /// `NvAlSeg` and `NvAlignLg`, written per native allocation before, now by the
 /// registry mirror's pass (`ddi::hot_path::publish`). PASSIVE.
@@ -3219,6 +3233,11 @@ pub(crate) fn publish_hot() {
     let large = NV_ALIGN_LARGE.load(Ordering::Relaxed);
     if large != 0 {
         crate::diag::record_named_bytes(b"NvAlignLg", large);
+    }
+    let unopened = NV_AL_NO_OPEN.load(Ordering::Relaxed);
+    if unopened != 0 {
+        crate::diag::record_named_bytes(b"NvAlNoOpen", unopened);
+        crate::diag::record_named_bytes(b"NvAlNoOpMb", NV_AL_NO_OPEN_MB.load(Ordering::Relaxed));
     }
 }
 
@@ -3376,6 +3395,7 @@ unsafe fn create_native_one(
         system_backing_policy: SystemBackingPolicy::None,
         dedicated_present_buffer: false,
         vidmm_tracker_cookie: 0,
+        native_opened: AtomicU32::new(0),
         foreign: None,
     });
     if adapter
@@ -3930,6 +3950,7 @@ unsafe fn create_one_inner(
         system_backing_policy,
         dedicated_present_buffer,
         vidmm_tracker_cookie: 0,
+        native_opened: AtomicU32::new(0),
         foreign: match foreign_backing {
             ForeignBacking::Adopted(layout) => Some(layout),
             ForeignBacking::No => None,
@@ -4416,7 +4437,10 @@ unsafe fn native_open_writeback(
         |global| {
             // SAFETY: the create-time handle data is the AllocationContext this
             // driver returned; resolve_alloc checks its magic first.
-            Ok(unsafe { resolve_alloc(global as HANDLE) }.map_or(0, |ctx| ctx.native_id))
+            Ok(unsafe { resolve_alloc(global as HANDLE) }.map_or(0, |ctx| {
+                ctx.native_opened.store(1, Ordering::Relaxed);
+                ctx.native_id
+            }))
         },
     )
     .unwrap_or(0);
