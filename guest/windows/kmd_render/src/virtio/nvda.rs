@@ -838,6 +838,14 @@ pub fn escape(
     if status != STATUS_SUCCESS {
         crate::ddi::vk_fail::note(helios_kmd_logic::vk_fail::kind::ESCAPE, function, status, len);
     }
+    // DxgkDdiEscape may not return STATUS_NOT_IMPLEMENTED: dxgkrnl logs "Driver
+    // returned an invalid NTSTATUS code: 0xC0000002" (DxgKrnl ETW event 494) for
+    // it. A function this KMD does not answer is refused as an invalid request
+    // instead; the `VkF` ring keeps the NOT_IMPLEMENTED that names the cause, and
+    // `NvUmdUnsup` counts them.
+    if status == STATUS_NOT_IMPLEMENTED {
+        return STATUS_INVALID_PARAMETER;
+    }
     status
 }
 

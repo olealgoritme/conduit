@@ -2482,6 +2482,8 @@ unsafe fn watch_update(update: &DXGK_BUILDPAGINGBUFFER_UPDATEPAGETABLE, native: 
 }
 
 static FOREIGN_LEAF: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// `NvPgZero`: Zero PTEs in native leaf updates (left unmapped).
+static ZERO_PTES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 static FOREIGN_FAIL: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 /// `NvPgLeafSys`: 1 once VidMm's own process updated a native leaf (0 = never).
 static LEAF_SYSTEM_SEEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
@@ -2509,6 +2511,7 @@ pub(crate) fn publish_hot() {
         (&b"NvPgLeafInSeg"[..], &LEAF_IN_SEGMENT),
         (&b"NvFgnN"[..], &FOREIGN_LEAF),
         (&b"NvPgLeafSys"[..], &LEAF_SYSTEM_SEEN),
+        (&b"NvPgZero"[..], &ZERO_PTES),
     ] {
         let n = counter.load(Relaxed);
         if n != 0 {
@@ -2580,9 +2583,15 @@ unsafe fn native_update_leaf(
         let pte = unsafe { core::ptr::read_unaligned(update.pPageTableEntries.add(pte_index)) };
         let bits = unsafe { pte.__bindgen_anon_1.__bindgen_anon_1 };
         if bits.Zero() != 0 {
-            // Sparse zero was not advertised.
-            fail(2);
-            return Err(());
+            // A Zero PTE (`ZeroInPteSupported`, `NvZeroPte`) has no page: the VA is
+            // left unmapped, which reads zero in an `NvPtSparse` window and faults
+            // otherwise. `NvPgZero` counts them (mirror pass).
+            ZERO_PTES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            pieces.push(None);
+            is_system.push(false);
+            any_other = true;
+            invalid += 1;
+            continue;
         }
         if bits.Valid() == 0 {
             pieces.push(None);

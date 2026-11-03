@@ -116,8 +116,9 @@ pub unsafe fn fill_gpummu_caps(args: &DXGKARG_QUERYADAPTERINFO) -> NTSTATUS {
     let caps = unsafe { &mut *(args.pOutputData as *mut DXGK_GPUMMUCAPS) };
     unsafe { core::ptr::write_bytes(caps as *mut _ as *mut u8, 0, size_of::<DXGK_GPUMMUCAPS>()) };
 
-    // No optional capability bits — flags word stays 0.
-    caps.__bindgen_anon_1.Value = 0;
+    // No optional capability bits in the default personality. NVIDIA's personality
+    // advertises ZeroInPteSupported (`zero_pte_supported`).
+    caps.__bindgen_anon_1.Value = if zero_pte_supported() { GPUMMU_ZERO_IN_PTE } else { 0 };
     // GPU_PHYSICAL: page-table updates come through BuildPagingBuffer
     // UPDATE_PAGE_TABLE and are retired by the null engine. CPU_VIRTUAL was proven
     // wrong by KD: it crashes in VidMm's CPU-visible-address resolver before our
@@ -133,6 +134,27 @@ pub unsafe fn fill_gpummu_caps(args: &DXGKARG_QUERYADAPTERINFO) -> NTSTATUS {
     caps.PageTableLevelCount = PAGE_TABLE_LEVEL_COUNT;
     // LegacyBehaviors stays zeroed (no SourcePageTableVaInTransfer).
     STATUS_SUCCESS
+}
+
+/// `DXGK_GPUMMUCAPS.Flags` bit 2, `ZeroInPteSupported`.
+const GPUMMU_ZERO_IN_PTE: u32 = 0x4;
+
+/// `NvZeroPte` (default 1, NVIDIA personality only): advertise
+/// `ZeroInPteSupported`, as NVIDIA's KMD does (its GPUMMUCAPS are 0x2dd in the L3
+/// capture). The Vulkan ICD maps the VA past a large (>= 64 MiB) allocation with
+/// `Protection.Zero` and `hAllocation` NULL; without the capability dxgkrnl refuses
+/// that MapGpuVirtualAddress ("Invalid hAllocation", ETW event 494) and the ICD
+/// answers VK_ERROR_OUT_OF_DEVICE_MEMORY for every allocation from 64 MiB on.
+/// A Zero PTE reaches the KMD as an unmapped page (`native_update_leaf`, the
+/// foreign-leaf path): it faults on access unless `NvPtSparse` makes that window
+/// read zero. `NvZeroPteOn` mirrors the value.
+fn zero_pte_supported() -> bool {
+    if !crate::virtio::nvda::enabled() {
+        return false;
+    }
+    let on = crate::diag::read_config_dword(crate::diag::KnobName::new(b"NvZeroPte"), 1) != 0;
+    crate::diag::record_named_bytes(b"NvZeroPteOn", u32::from(on));
+    on
 }
 
 /// Fill one `DXGK_PAGE_TABLE_LEVEL_DESC` (`DXGKQAITYPE_PAGETABLELEVELDESC = 14`).
