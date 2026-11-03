@@ -3204,6 +3204,8 @@ pub(crate) unsafe fn native_ring_backing(
 /// GEM, blob, or Venus identity is manufactured for it.
 /// `NvAlignLg`: native Vulkan allocations given a 64-KiB or 2-MiB alignment.
 static NV_ALIGN_LARGE: AtomicU32 = AtomicU32::new(0);
+/// `NvPmGpuOnly`: native allocations placed by the GPU-only rule (NvPerfMem 0x01/0x02).
+static NV_GPU_ONLY: AtomicU32 = AtomicU32::new(0);
 
 /// NvAlignOff=1 (test knob): every native allocation keeps 4-KiB alignment.
 fn nvgl_alignment_off() -> bool {
@@ -3254,17 +3256,26 @@ unsafe fn create_native_one(
         _ => STATUS_INVALID_PARAMETER,
     })?;
     let shared = native::is_shared_record(bytes);
-    // Large-page Vulkan records get NVIDIA's 64-KiB / 2-MiB alignment (read from
-    // the input record, before `create` writes the writeback over it). The test
-    // knob NvAlignOff=1 keeps every native allocation at 4 KiB.
-    let large_page_alignment = if private.system_memory == 0 && !nvgl_alignment_off() {
-        native::nvgl_alignment(bytes)
-    } else {
-        None
-    };
     // CUDA's memory over its own user pages (D3DKMT pSystemMem): VidMm backs it
     // with those pages, the GPU reaches them through the system-page mappings.
     let user_memory = native::is_cuda_system_memory(bytes);
+    // `NvPerfMem` (helios_kmd_logic::native_perf): read from the input record,
+    // before `create` writes the writeback over it.
+    let perf = crate::virtio::native_memory::perf();
+    let gpu_only = helios_kmd_logic::native_perf::is_gpu_only_record(bytes);
+    // Large-page Vulkan records get NVIDIA's 64-KiB / 2-MiB alignment, and with
+    // NvPerfMem 0x04 GPU-only D3D and CUDA records too. The test knob
+    // NvAlignOff=1 keeps every native allocation at 4 KiB.
+    let large_page_alignment = if !nvgl_alignment_off() {
+        helios_kmd_logic::native_perf::large_page_alignment(
+            bytes,
+            private.size,
+            private.system_memory != 0 || user_memory,
+            perf.align_large(),
+        )
+    } else {
+        None
+    };
     let created = crate::virtio::native_memory::create(passive, adapter, &private, bytes)
         .map_err(|error| {
             // Which native-memory error refused it (Error discriminant + 1), and where.
@@ -3350,19 +3361,28 @@ unsafe fn create_native_one(
     // segment that does not exist (and system memory got an empty set), so
     // VidMm refused the allocation after CreateAllocation/OpenAllocation
     // succeeded: the first NVIDIA D3D11 allocation failed INVALID_PARAMETER.
-    let aperture = crate::ddi::gpummu::APERTURE_SEGMENT_ID;
-    let segment = if created.system_memory != 0 || user_memory {
-        aperture
-    } else {
-        adapter
-            .segment_table()
-            .and_then(|table| table.bar_seg_id())
-            .unwrap_or(aperture)
-    };
-    // These allocations are CpuVisible. WDDM requires every CPU-accessible
-    // allocation in a non-CPU-accessible memory segment (the BAR) to also list
-    // an aperture segment, as `vidmm_placement` does for the default path.
-    let supported = (1u32 << (segment - 1)) | (1u32 << (aperture - 1));
+    // CPU-visible allocations: WDDM requires every CPU-accessible allocation in a
+    // non-CPU-accessible memory segment (the BAR) to also list an aperture
+    // segment, as `vidmm_placement` does for the default path. GPU-only records
+    // (NvPerfMem 0x01/0x02) are not CpuVisible and stay in the memory segment
+    // (`native_perf::placement`; with the knob off this is the old rule).
+    let placement = helios_kmd_logic::native_perf::placement(
+        crate::ddi::gpummu::APERTURE_SEGMENT_ID,
+        adapter.segment_table().and_then(|table| table.bar_seg_id()),
+        created.system_memory != 0 || user_memory,
+        shared,
+        gpu_only,
+        perf.gpu_only_mode(),
+    );
+    let segment = placement.segment;
+    let supported = placement.supported;
+    if placement.gpu_only {
+        // NvPmGpuOnly: native allocations placed by the GPU-only rule.
+        let n = NV_GPU_ONLY.fetch_add(1, Ordering::Relaxed) + 1;
+        if helios_kmd_logic::native_perf::publish_due(n) {
+            crate::diag::record_named_bytes(b"NvPmGpuOnly", n);
+        }
+    }
     crate::diag::record_named_bytes(b"NvAlSeg", segment);
     info.SupportedWriteSegmentSet = supported;
     unsafe {
@@ -3379,21 +3399,15 @@ unsafe fn create_native_one(
         info.__bindgen_anon_3.MaximumRenamingListLength = 0;
         info.__bindgen_anon_3.PhysicalAdapterIndex = 0;
         // pSystemMem is VidMm's existing cached system backing, so Lock2 uses
-        // that exact user VA.  Device-local memory is CPU visible through the
-        // NVOS33/window aperture path, without a WB cache alias.
-        let flags = if created.system_memory != 0 || user_memory {
-            0x0000_0015 // CpuVisible | Cached | ExistingSysMem
-        } else if shared {
-            // dxgkrnl refuses a shareable CpuVisible allocation unless its
-            // segments are all aperture ("Shareable can only be used in
-            // combination with CpuVisible if the supported segment set contains
-            // exclusively aperture segments"): DWM's DDisplay primary failed
-            // INVALID_PARAMETER and DWM fail-fast as out of memory.
-            0
-        } else {
-            0x0000_0001 // CpuVisible (uncached/write-combined)
-        };
-        info.__bindgen_anon_4.FlagsWddm2.__bindgen_anon_1.Value = flags;
+        // that exact user VA (CpuVisible | Cached | ExistingSysMem).
+        // Device-local memory is CPU visible (uncached/write-combined) through
+        // the NVOS33/window aperture path, without a WB cache alias. A shareable
+        // allocation is not CpuVisible: dxgkrnl refuses a shareable CpuVisible
+        // allocation unless its segments are all aperture ("Shareable can only
+        // be used in combination with CpuVisible if the supported segment set
+        // contains exclusively aperture segments"): DWM's DDisplay primary
+        // failed INVALID_PARAMETER and DWM fail-fast as out of memory.
+        info.__bindgen_anon_4.FlagsWddm2.__bindgen_anon_1.Value = placement.flags;
     }
     Ok(())
 }
