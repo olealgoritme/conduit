@@ -5,11 +5,11 @@
 //! Runs only on the registry mirror thread (`ddi::mirror_thread`), at PASSIVE, at most once a
 //! second ([`publish`]; the thread wakes at least every second in the NVIDIA personality):
 //!
-//! * `NvSnapMs` (default 3000, 0 = off; clamped 500..600000): a native queue that is busy (its
-//!   progress fence short of the last submission, or USERD GP_GET short of the KMD's GP_PUT)
-//!   and whose progress fence and GP_GET stayed put this long triggers one automatic snapshot
-//!   (once per stall; at most `AUTO_MAX` per boot, 2 s apart). A queue whose error notifier
-//!   gets set triggers one too. Independent of `NvHangMs` (recovery).
+//! * `NvSnapMs` (default 3000, 0 = off; clamped 500..600000): a native queue whose progress
+//!   fence is short of its last submission and stayed put this long triggers an automatic
+//!   snapshot, and again every 5 s while the stall lasts (at most `AUTO_MAX` per boot, 2 s
+//!   apart). A queue whose error notifier gets set triggers one too. Independent of `NvHangMs`
+//!   (recovery). USERD GP_GET is recorded but not used: GB20x does not write it back.
 //! * `NvSnapNow` = nonzero: one snapshot now, every queue in detail; reset to 0.
 //! * `NvSnapVa` = VA >> 12: what the KMD has mapped at that VA in any process (allocation,
 //!   RM memory or system pages, VidMm residency, the page-table ring's last operation there,
@@ -17,8 +17,15 @@
 //!   query), `NvSnapVaN` (hits), `NvSnapVaK` (first hit kind | resident << 8), `NvSnapVaId`
 //!   (its allocation); reset to 0.
 //!
-//! A snapshot is `NvSnapBlob` (REG_BINARY, the latest) and `NvSnapB<seq % 4>` (the last four),
-//! with `NvSnapN` (snapshots), `NvSnapT` (interrupt time, ms), `NvSnapWhy` (reason | the
+//! Each queue keeps its last submissions (progress fence id, GPFIFO range; `NativeQueue::submit`);
+//! the first one the progress fence does not show complete is the snapshot's focus: the GPFIFO
+//! window is read around it and its segments (and two before) decoded. The ring, pushbuffers
+//! and semaphores are read by GPU VA through the KMD's mapping table (`lookup_va`): VidMm's
+//! system pages for a native system-memory allocation, the RM object's CPU view otherwise.
+//!
+//! A snapshot is `NvSnapBlob` (REG_BINARY, the latest) and `NvSnapB<seq % 4>` (the last four);
+//! kept apart from those: `NvSnapLong` (the automatic one with the longest stall), `NvSnapErr`
+//! (the first error-notifier one) and `NvSnapPre` (the automatic one before it). With `NvSnapN` (snapshots), `NvSnapT` (interrupt time, ms), `NvSnapWhy` (reason | the
 //! trigger channel id << 8), `NvSnapTok` (the trigger's work-submit token), `NvSnapStall` (its
 //! ms without progress), `NvSnapLen`, `NvSnapQ` (queue records), `NvSnapUs` (duration),
 //! `NvSnapAuto` (automatic ones this boot), `NvSnapFail` (snapshots that could not allocate),
@@ -67,6 +74,12 @@ static SEQ: AtomicU32 = AtomicU32::new(0);
 static AUTO_N: AtomicU32 = AtomicU32::new(0);
 static LAST_AUTO_T: AtomicU64 = AtomicU64::new(0);
 static FAILS: AtomicU32 = AtomicU32::new(0);
+/// Retention: the longest stall an automatic snapshot has shown this boot (ms, `NvSnapLong`),
+/// whether the first error-notifier snapshot was kept (`NvSnapErr`, with the automatic one
+/// before it as `NvSnapPre`), and that last automatic snapshot.
+static LONG_MS: AtomicU32 = AtomicU32::new(0);
+static ERR_KEPT: AtomicU32 = AtomicU32::new(0);
+static LAST_AUTO: SpinLock<Option<Vec<u8>>> = SpinLock::new(None);
 
 /// The mirror pass's step (PASSIVE, on the mirror thread): knobs, the stall watch, and a
 /// snapshot or a VA query when one is due. NVIDIA personality only.
@@ -153,8 +166,10 @@ pub(crate) fn publish(adapter: &AdapterContext) {
     }
 }
 
+/// Work the progress fence does not show complete. (USERD GP_GET is not used: GB20x does not
+/// write it back, so it reads 0 on every queue.)
 fn busy(s: &hws::SnapSlot) -> bool {
-    s.flags & ns::Q_OUTSTANDING != 0 || (s.kmd_gp_put != 0 && s.gp_get != s.kmd_gp_put)
+    s.flags & ns::Q_OUTSTANDING != 0
 }
 
 fn stalled_ms(queue: usize, now: u64) -> u32 {
@@ -170,10 +185,6 @@ struct Copied {
     slot: hws::SnapSlot,
     snap: QueueSnap,
     hw_tsg: u32,
-    first: u32,
-    window: [(u32, u32); ns::WINDOW],
-    window_n: u32,
-    ring_status: u32,
 }
 
 /// The reads' shared context.
@@ -363,20 +374,7 @@ fn take(passive: PassiveLevel, adapter: &AdapterContext, reason: u32, trigger: u
         let queue = unsafe { &*(s.queue as *const NativeQueue) };
         let snap = queue.snap();
         let hw_tsg = queue.context().map_or(0xffff, |c| c.hw_tsg_id(passive));
-        let entries = snap.ring_entries;
-        let first = ns::window_first(snap.userd[cp_gp_get()], entries);
-        let window_n = (ns::WINDOW as u32).min(entries);
-        let mut window = [(0u32, 0u32); ns::WINDOW];
-        let ring_status = queue.snap_ring(passive, adapter, first, &mut window[..window_n as usize]);
-        copied.push(Copied {
-            slot: *s,
-            snap,
-            hw_tsg,
-            first,
-            window,
-            window_n,
-            ring_status,
-        });
+        copied.push(Copied { slot: *s, snap, hw_tsg });
     }
     hws::snap_unpin();
 
@@ -444,6 +442,7 @@ fn take(passive: PassiveLevel, adapter: &AdapterContext, reason: u32, trigger: u
     let len = w.len();
     let blob = &buf[..len];
     crate::diag::record_named_binary(b"NvSnapBlob", blob);
+    keep(reason, seq, blob, copied.iter().filter(|c| busy(&c.slot)).map(|c| stalled_ms(c.slot.queue, now)).max().unwrap_or(0));
     let ring = [b'N', b'v', b'S', b'n', b'a', b'p', b'B', b'0' + (seq % 4) as u8];
     crate::diag::record_named_binary(&ring, blob);
     crate::diag::record_named_bytes(b"NvSnapN", seq);
@@ -456,14 +455,43 @@ fn take(passive: PassiveLevel, adapter: &AdapterContext, reason: u32, trigger: u
     crate::diag::record_named_bytes(b"NvSnapUs", us);
 }
 
+/// Keep the snapshots worth keeping beside the latest (`NvSnapBlob`) and the last four
+/// (`NvSnapB0..3`), which a run of later triggers overwrites: `NvSnapLong` the automatic one
+/// with the longest stall of a busy queue (`NvSnapLongMs`, `NvSnapLongN` its seq), the first
+/// error-notifier one `NvSnapErr` (`NvSnapErrN`) and the automatic one taken last before it
+/// `NvSnapPre` (`NvSnapPreN`): the state closest before RM put the channel in error.
+fn keep(reason: u32, seq: u32, blob: &[u8], longest_ms: u32) {
+    if reason == ns::reason::AUTO {
+        if longest_ms > LONG_MS.load(Ordering::Relaxed) {
+            LONG_MS.store(longest_ms, Ordering::Relaxed);
+            crate::diag::record_named_binary(b"NvSnapLong", blob);
+            crate::diag::record_named_bytes(b"NvSnapLongMs", longest_ms);
+            crate::diag::record_named_bytes(b"NvSnapLongN", seq);
+        }
+        let mut copy = Vec::new();
+        if copy.try_reserve_exact(blob.len()).is_ok() {
+            copy.extend_from_slice(blob);
+            // seq in the copy's header is the blob's own.
+            let old = LAST_AUTO.lock().replace(copy);
+            drop(old);
+        }
+    }
+    if reason == ns::reason::ERROR && ERR_KEPT.swap(1, Ordering::Relaxed) == 0 {
+        crate::diag::record_named_binary(b"NvSnapErr", blob);
+        crate::diag::record_named_bytes(b"NvSnapErrN", seq);
+        let pre = LAST_AUTO.lock().take();
+        if let Some(pre) = pre {
+            crate::diag::record_named_binary(b"NvSnapPre", &pre);
+            let pre_seq = pre.get(16..20).map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+            crate::diag::record_named_bytes(b"NvSnapPreN", pre_seq);
+        }
+    }
+}
+
 /// USERD GP_GET as a dword index.
 const fn cp_gp_get() -> usize {
     (helios_kmd_logic::ce_present::USERD_GP_GET / 4) as usize
 }
-
-/// USERD `Get` / `GetHi` (the pushbuffer GET pointer) as dword indices.
-const USERD_GET: usize = 0x44 / 4;
-const USERD_GET_HI: usize = 0x60 / 4;
 
 #[allow(clippy::too_many_arguments)]
 fn write_queue(
@@ -493,6 +521,39 @@ fn write_queue(
             flags |= bit;
         }
     }
+    let entries = s.ring_entries.max(1);
+    let history_kept = (s.history_n as usize).min(ns::HISTORY);
+    let history = &s.history[..history_kept];
+    let stuck = ns::stuck_submission(history, s.fence_now);
+    if stuck.is_some() {
+        flags |= ns::Q_FOCUS_FROM_HISTORY;
+    }
+    let (focus_start, focus_end) = ns::focus_range(history, s.fence_now, s.kmd_gp_put, entries);
+    let first = ns::window_first(focus_start, entries);
+    let window_n = (ns::WINDOW as u32).min(entries);
+    // The ring through its GPU VA (VidMm's system pages when the ring is a native
+    // system-memory allocation): what the GPU fetches, not the allocation's RM object.
+    let mut raw = [0u32; 2 * ns::WINDOW];
+    let mut ring_status = ns::RD_OK;
+    let mut done = 0u32;
+    while done < window_n && ring_status == ns::RD_OK {
+        let index = (first + done) % entries;
+        let run = (window_n - done).min(entries - index);
+        let at = 2 * done as usize;
+        ring_status = reader.words(
+            process,
+            s.gpfifo_va + 8 * u64::from(index),
+            &mut raw[at..at + 2 * run as usize],
+        );
+        done += run;
+    }
+    let mut window_words = [(0u32, 0u32); ns::WINDOW];
+    for (i, e) in window_words.iter_mut().enumerate().take(window_n as usize) {
+        *e = (raw[2 * i], raw[2 * i + 1]);
+    }
+    let mut last = [0u32; 2];
+    let last_index = (s.kmd_gp_put % entries + entries - 1) % entries;
+    let last_status = reader.words(process, s.gpfifo_va + 8 * u64::from(last_index), &mut last);
     let fields = ns::QueueFields {
         slot: c.slot.index,
         node: c.slot.node,
@@ -518,14 +579,22 @@ fn write_queue(
         stall_ms: stalled_ms(c.slot.queue, now),
         notifier_info32: s.notifier_info32,
         notifier_word: s.notifier_word,
-        ring_status: c.ring_status,
-        window_first: c.first,
-        window_n: c.window_n,
+        ring_status,
+        window_first: first,
+        window_n,
+        focus_start,
+        focus_end,
+        last_lo: last[0],
+        last_hi: last[1],
+        last_status,
+        history_n: s.history_n,
     };
-    let mark = ns::begin_queue(w, &fields, &s.userd, &c.window);
+    let mut history_rec = [ns::Submission::default(); ns::HISTORY];
+    history_rec[..history_kept].copy_from_slice(history);
+    let mark = ns::begin_queue(w, &fields, &s.userd, &window_words, &history_rec);
     let mut window = [ns::GpEntry::default(); ns::WINDOW];
-    if c.ring_status == ns::RD_OK {
-        for (i, (lo, hi)) in c.window.iter().enumerate().take(c.window_n as usize) {
+    if ring_status == ns::RD_OK {
+        for (i, (lo, hi)) in window_words.iter().enumerate().take(window_n as usize) {
             window[i] = ns::gp_entry(*lo, *hi);
         }
     }
@@ -533,28 +602,23 @@ fn write_queue(
     let _ = table.intern(process as u64, s.gpfifo_va);
     let _ = table.intern(process as u64, s.fence_gpu);
     let mut segments = 0u32;
-    if detail && c.ring_status == ns::RD_OK {
-        let pb_get = (u64::from(s.userd[USERD_GET_HI]) & 0x1ff_ffff) << 32 | u64::from(s.userd[USERD_GET]);
-        let window = &window[..c.window_n as usize];
-        let (picks, n) = ns::pick_segments(window, c.first, s.ring_entries, gp_get, s.kmd_gp_put, pb_get);
+    if detail && ring_status == ns::RD_OK {
+        let window = &window[..window_n as usize];
+        let (picks, n) = ns::pick_segments(window, first, entries, focus_start, focus_end);
         // One decoder state over the segments in GPFIFO order (subchannel bindings
         // default to the D3D layout; SET_OBJECTs seen update them).
         *scanner = ns::Scanner::new(ns::DEFAULT_CLASSES);
-        let entries = s.ring_entries.max(1);
-        let get_pos = ((gp_get % entries + entries - c.first % entries) % entries) as usize;
+        let span = (focus_end % entries + entries - focus_start % entries) % entries;
         for &p in &picks[..n] {
             let p = p as usize;
             let entry = window[p];
-            let mut sflags = 0;
-            if pb_get >= entry.va && pb_get < entry.va + 4 * u64::from(entry.dwords) {
-                sflags |= ns::S_CONTAINS_PB_GET;
-            }
-            if p == get_pos {
-                sflags |= ns::S_AT_GP_GET;
-            } else if p + 1 == get_pos {
-                sflags |= ns::S_BEFORE_GP_GET;
-            }
-            let index = (c.first + p as u32) % entries;
+            let index = (first + p as u32) % entries;
+            let into = (index + entries - focus_start % entries) % entries;
+            let sflags = if into < span.max(1) {
+                ns::S_FOCUS | if into == 0 { ns::S_FOCUS_FIRST } else { 0 }
+            } else {
+                ns::S_BEFORE
+            };
             write_segment(w, reader, table, scanner, words, process, entry, index, sflags);
             segments += 1;
         }

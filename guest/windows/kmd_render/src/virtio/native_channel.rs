@@ -853,6 +853,11 @@ pub(crate) struct NativeQueue {
     /// `ddi::native_snap`).
     gpfifo_va: u64,
     pid: u32,
+    /// The last `native_snap::HISTORY` submissions (`submit`, under the GP_PUT lock): progress
+    /// fence id, and GPFIFO range `before | after << 32`; `history_n` submissions ever.
+    history_fence: [AtomicU64; helios_kmd_logic::native_snap::HISTORY],
+    history_range: [AtomicU64; helios_kmd_logic::native_snap::HISTORY],
+    history_n: AtomicU32,
 }
 
 /// What a hang snapshot (`ddi::native_snap`) records of one native queue, read without a host
@@ -877,6 +882,9 @@ pub(crate) struct QueueSnap {
     pub ctxshare: u32,
     pub process_key: usize,
     pub context_key: usize,
+    /// The last submissions, oldest first, and how many were ever made.
+    pub history: [helios_kmd_logic::native_snap::Submission; helios_kmd_logic::native_snap::HISTORY],
+    pub history_n: u32,
 }
 
 extern "system" {
@@ -1018,6 +1026,9 @@ impl NativeQueue {
             // SAFETY: a scalar read of the current process id (CreateHwQueue runs in the
             // creating process).
             pid: unsafe { PsGetCurrentProcessId() } as usize as u32,
+            history_fence: core::array::from_fn(|_| AtomicU64::new(0)),
+            history_range: core::array::from_fn(|_| AtomicU64::new(0)),
+            history_n: AtomicU32::new(0),
         })
     }
 
@@ -1205,15 +1216,10 @@ impl NativeQueue {
         Token(self.parts.token)
     }
 
-    /// The KMD's GP_PUT (the GP_PUT lock). Any IRQL up to DISPATCH.
-    pub(crate) fn kmd_gp_put(&self) -> u32 {
-        *self.gp_put.lock()
-    }
-
     /// The queue's state for a hang snapshot: USERD, the error notifier, the progress fence,
     /// handles. No host call; the GP_PUT lock for the KMD's GP_PUT. Any IRQL up to DISPATCH.
     pub(crate) fn snap(&self) -> QueueSnap {
-        use helios_kmd_logic::native_snap::USERD_DWORDS;
+        use helios_kmd_logic::native_snap::{HISTORY as HISTORY_N, USERD_DWORDS};
         let ctl = self.parts.ctl.va;
         let mut userd = [0u32; USERD_DWORDS];
         let (mut info32, mut word) = (0, 0);
@@ -1230,6 +1236,24 @@ impl NativeQueue {
             }
         }
         let context = self.context();
+        let mut history = [helios_kmd_logic::native_snap::Submission::default(); HISTORY_N];
+        let (kmd_gp_put, history_n) = {
+            // The GP_PUT lock: `submit` writes the history under it.
+            let put = self.gp_put.lock();
+            let n = self.history_n.load(Ordering::Acquire);
+            let kept = (n as usize).min(HISTORY_N);
+            for (k, slot) in history.iter_mut().take(kept).enumerate() {
+                // Oldest first.
+                let i = (n as usize - kept + k) % HISTORY_N;
+                let range = self.history_range[i].load(Ordering::Relaxed);
+                *slot = helios_kmd_logic::native_snap::Submission {
+                    fence: self.history_fence[i].load(Ordering::Relaxed),
+                    before: range as u32,
+                    after: (range >> 32) as u32,
+                };
+            }
+            (*put, n)
+        };
         QueueSnap {
             pid: self.pid,
             token: self.parts.token,
@@ -1237,7 +1261,7 @@ impl NativeQueue {
             graphics: self.graphics,
             dead: self.dead.load(Ordering::Acquire),
             copy_bound: self.copy_bound.load(Ordering::Relaxed),
-            kmd_gp_put: *self.gp_put.lock(),
+            kmd_gp_put,
             userd,
             notifier_info32: info32,
             notifier_word: word,
@@ -1253,64 +1277,16 @@ impl NativeQueue {
             ctxshare: context.map_or(0, |c| c.ctxshare),
             process_key: context.map_or(0, |c| c.process_key()),
             context_key: context.map_or(0, |c| c as *const NativeContext as usize),
+            history,
+            history_n,
         }
-    }
-
-    /// Read `out.len()` GPFIFO entries from ring index `first` on (wrapping) through the
-    /// KMD's CPU view of the ring's allocation. `(lo, hi)` per entry; a native-snapshot read
-    /// status (`helios_kmd_logic::native_snap::RD_*`). PASSIVE.
-    pub(crate) fn snap_ring(
-        &self,
-        passive: PassiveLevel,
-        adapter: &AdapterContext,
-        first: u32,
-        out: &mut [(u32, u32)],
-    ) -> u32 {
-        use helios_kmd_logic::native_snap as ns;
-        let entries = self.ring_bytes / 8;
-        if entries == 0 || self.ring_id == 0 {
-            return ns::RD_NOT_MAPPED;
-        }
-        let mut done = 0usize;
-        while done < out.len() {
-            let index = (first + done as u32) % entries;
-            let run = (out.len() - done).min((entries - index) as usize);
-            let mut words = [0u32; 2 * ns::WINDOW];
-            let n = run.min(ns::WINDOW);
-            // SAFETY: PASSIVE; the closure copies at most `n` entries out.
-            let read = unsafe {
-                super::native_memory::with_cpu_range(
-                    passive,
-                    adapter,
-                    self.ring_id,
-                    self.ring_offset + u64::from(index) * 8,
-                    n as u64 * 8,
-                    |relative, native, len| {
-                        let at = relative as usize / 4;
-                        let k = (len as usize / 4).min((2 * n).saturating_sub(at));
-                        for i in 0..k {
-                            words[at + i] = (native as *const u32).add(i).read_volatile();
-                        }
-                        true
-                    },
-                )
-            };
-            match read {
-                Ok(true) => {}
-                Ok(false) => return ns::RD_NOT_MAPPED,
-                Err(_) => return ns::RD_ERROR,
-            }
-            for i in 0..n {
-                out[done + i] = (words[2 * i], words[2 * i + 1]);
-            }
-            done += n;
-        }
-        ns::RD_OK
     }
 
     /// DISPATCH-safe: one spinlock and three volatile stores/barriers.  No RM
     /// message, allocation, completion write, or host round trip is possible.
-    pub(crate) fn submit(&self, private: &[u8]) -> Result<(), NativeError> {
+    /// `fence_id` (the submission's progress fence id) goes to the queue's submission
+    /// history with the GPFIFO range written, for hang snapshots (`ddi::native_snap`).
+    pub(crate) fn submit(&self, private: &[u8], fence_id: u64) -> Result<(), NativeError> {
         let adapter = unsafe { self.adapter.as_ref() }.ok_or(NativeError::Transport)?;
         // The cached epoch: the same value as `with_virtio(..nvrm_epoch)`, without the
         // transport spinlock on every submission.
@@ -1341,6 +1317,14 @@ impl NativeQueue {
         // SAFETY: NOTIFY_CHANNEL_PENDING is four bytes at +0x90 in the 64-KiB
         // BLACKWELL_USERMODE_A mapping.  This is the RM-issued real token.
         unsafe { write32(doorbell + u64::from(cp::DOORBELL_OFFSET), self.parts.token) };
+        let n = self.history_n.load(Ordering::Relaxed);
+        let i = n as usize % helios_kmd_logic::native_snap::HISTORY;
+        self.history_fence[i].store(fence_id, Ordering::Relaxed);
+        self.history_range[i].store(
+            u64::from(*previous) | u64::from(submit.new_gp_put) << 32,
+            Ordering::Relaxed,
+        );
+        self.history_n.store(n.wrapping_add(1), Ordering::Release);
         *previous = submit.new_gp_put;
         Ok(())
     }

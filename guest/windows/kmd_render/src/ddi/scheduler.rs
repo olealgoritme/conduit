@@ -531,7 +531,7 @@ pub unsafe extern "C" fn dxgkddi_submit_command_to_hw_queue(
             private.len() as u32,
         )
     };
-    match queue.native.submit(private) {
+    match queue.native.submit(private, args.HwQueueProgressFenceId) {
         Ok(()) => STATUS_SUCCESS,
         // A recovered queue: its context is (being) invalidated and the channel
         // runs nothing more, so the submission is completed as it arrives and

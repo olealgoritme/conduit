@@ -4,9 +4,12 @@
 //! host decoder is `pr198-tools/agent-snap/snapdec.py`.
 //!
 //! A snapshot answers "where is each queue stuck": per native HW queue its channel (the
-//! work-submit token's channel id is the `channel 0x..` of a host Xid), GP_GET / GP_PUT, the
-//! progress fence (submitted / completed), USERD, the GPFIFO entries around GP_GET, and for the
-//! last few pushbuffer segments up to GP_GET their first and last dwords, every semaphore
+//! work-submit token's channel id is the `channel 0x..` of a host Xid), GP_PUT, the progress
+//! fence (submitted / completed), USERD (GB20x does not write GP_GET back to it, so GP_GET
+//! there reads 0), the queue's last [`HISTORY`] submissions (fence id and GPFIFO range), and
+//! from those the first incomplete submission: the GPFIFO entries around it, read through
+//! the ring's GPU VA, and for its segments (and [`SEGMENTS_BEFORE`] before) their first and
+//! last dwords, every semaphore
 //! operation in them ([`SemOp`]: host `SEM_EXECUTE`, 3D / compute `REPORT_SEMAPHORE_EXECUTE` and
 //! `SET_REPORT_SEMAPHORE_D`, copy `LAUNCH_DMA` releases) and every GPU VA they point the front
 //! end or the MME at ([`AddrRef`]: MME DMA reads / writes, inline-to-memory, QMDs, constant
@@ -34,7 +37,10 @@
 //! 104 fence now u64 | 112 fence GPU VA u64 | 120 ms without progress | 124 notifier info32
 //! 128 notifier word | 132 ring read status | 136 USERD dwords [USERD_DWORDS]
 //! 392 window first index | 396 window entries | 400 segments | 404 0
-//! 408 window entries [WINDOW] x (lo, hi) | 472 segment records
+//! 408 window entries [WINDOW] x (lo, hi) | 536 focus start | 540 focus end (the GPFIFO range
+//! of the first incomplete submission; u32::MAX none) | 544 entry at GP_PUT-1 lo | 548 hi
+//! 552 its read status | 556 history entries | 560 history [HISTORY] x (fence u64, before,
+//! after) | 816 segment records
 //! segment record:
 //!   0 bytes | 4 GP index | 8 VA u64 | 16 length (dwords) | 20 read status | 24 scanned dwords
 //!  28 scan status (SCAN_*) | 32 lost at | 36 semaphore ops seen | 40 semaphore ops recorded
@@ -134,76 +140,97 @@ pub const fn gp_entry(lo: u32, hi: u32) -> GpEntry {
     }
 }
 
-/// GPFIFO entries recorded around GP_GET.
-pub const WINDOW: usize = 8;
-/// The window starts this many entries before GP_GET.
-pub const WINDOW_BEFORE: u32 = 6;
+/// GPFIFO entries recorded around the focus (the stuck submission).
+pub const WINDOW: usize = 16;
+/// The window starts this many entries before the focus.
+pub const WINDOW_BEFORE: u32 = 4;
 /// Segments decoded per queue at most.
-pub const MAX_SEGMENTS: usize = 6;
+pub const MAX_SEGMENTS: usize = 8;
+/// Segments decoded before the focus (the end of the last completed submission).
+pub const SEGMENTS_BEFORE: u32 = 2;
+/// Submissions remembered per queue (`NativeQueue`'s history).
+pub const HISTORY: usize = 16;
 
-/// The first ring index of the window around `gp_get` in a ring of `entries`.
-pub const fn window_first(gp_get: u32, entries: u32) -> u32 {
+/// The first ring index of the window around `focus` in a ring of `entries`.
+pub const fn window_first(focus: u32, entries: u32) -> u32 {
     if entries == 0 {
         return 0;
     }
     let back = if WINDOW_BEFORE < entries { WINDOW_BEFORE } else { entries - 1 };
-    (gp_get % entries + entries - back) % entries
+    (focus % entries + entries - back) % entries
 }
 
-/// The segments to decode, in GPFIFO order: the window positions (0-based offsets into
-/// `window`, whose first entry has ring index `first`) of the up-to-[`MAX_SEGMENTS`] entries
-/// ending at GP_GET (GP_GET itself only when it is not GP_PUT, i.e. still to run), skipping
-/// control entries, and the entry whose segment contains `pb_get` (USERD's pushbuffer GET)
-/// when it lies in the window. Returns `(positions, count)`.
+/// One submission of a queue: its progress fence id and the GPFIFO range it wrote
+/// (`[before, after)`, ring indices).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Submission {
+    pub fence: u64,
+    pub before: u32,
+    pub after: u32,
+}
+
+/// The first submission the progress fence does not show complete: the one the channel is
+/// in (or waiting before). `None` when the history holds none (all complete, or too old).
+pub fn stuck_submission(history: &[Submission], fence_now: u64) -> Option<Submission> {
+    history
+        .iter()
+        .filter(|h| h.fence != 0 && h.fence > fence_now)
+        .min_by_key(|h| h.fence)
+        .copied()
+}
+
+/// The GPFIFO range to decode: the stuck submission's own entries, or (none known) the
+/// entries just before GP_PUT. `(start, end)` ring indices, `end` exclusive.
+pub fn focus_range(history: &[Submission], fence_now: u64, gp_put: u32, entries: u32) -> (u32, u32) {
+    match stuck_submission(history, fence_now) {
+        Some(h) => (h.before, h.after),
+        None if entries != 0 => ((gp_put % entries + entries - 1) % entries, gp_put % entries),
+        None => (0, 0),
+    }
+}
+
+/// The segments to decode, in GPFIFO order: window positions (0-based offsets into `window`,
+/// whose first entry has ring index `first`) of up to [`SEGMENTS_BEFORE`] real segments before
+/// `focus_start` and then the focus range's own segments, [`MAX_SEGMENTS`] at most; control
+/// entries are skipped. Returns `(positions, count)`.
 pub fn pick_segments(
     window: &[GpEntry],
     first: u32,
     entries: u32,
-    gp_get: u32,
-    gp_put: u32,
-    pb_get: u64,
+    focus_start: u32,
+    focus_end: u32,
 ) -> ([u8; MAX_SEGMENTS], usize) {
     let mut out = [0u8; MAX_SEGMENTS];
-    let mut n = 0usize;
     if entries == 0 || window.is_empty() {
         return (out, 0);
     }
-    let get_pos = ((gp_get % entries + entries - first % entries) % entries) as usize;
-    let last = if gp_get % entries != gp_put % entries { get_pos } else { get_pos.wrapping_sub(1) };
-    let mut contains_get = None;
-    if pb_get != 0 {
-        contains_get = window.iter().position(|e| {
-            e.dwords != 0 && pb_get >= e.va && pb_get < e.va + 4 * e.dwords as u64
-        });
-    }
-    // Walk back from `last` collecting real segments.
-    let mut pos = last;
+    let pos = |index: u32| ((index % entries + entries - first % entries) % entries) as usize;
+    let start = pos(focus_start);
+    let span = ((focus_end % entries + entries - focus_start % entries) % entries) as usize;
     let mut picked = [false; WINDOW];
-    while pos < window.len() && n < MAX_SEGMENTS {
-        if window[pos].dwords != 0 {
-            picked[pos] = true;
+    // Before the focus.
+    let mut before = 0u32;
+    let mut p = start;
+    while p > 0 && before < SEGMENTS_BEFORE {
+        p -= 1;
+        if p < window.len() && window[p].dwords != 0 {
+            picked[p] = true;
+            before += 1;
+        }
+    }
+    let mut n = before as usize;
+    let mut q = start;
+    while q < window.len() && q < start + span.max(1) && n < MAX_SEGMENTS {
+        if window[q].dwords != 0 {
+            picked[q] = true;
             n += 1;
         }
-        if pos == 0 {
-            break;
-        }
-        pos -= 1;
-    }
-    if let Some(p) = contains_get {
-        if p < WINDOW && !picked[p] {
-            if n == MAX_SEGMENTS {
-                // Drop the oldest picked one.
-                if let Some(old) = picked.iter().position(|x| *x) {
-                    picked[old] = false;
-                }
-            }
-            picked[p] = true;
-        }
+        q += 1;
     }
     let mut k = 0usize;
-    for (p, on) in picked.iter().enumerate() {
+    for (i, on) in picked.iter().enumerate() {
         if *on && k < MAX_SEGMENTS {
-            out[k] = p as u8;
+            out[k] = i as u8;
             k += 1;
         }
     }
@@ -811,21 +838,23 @@ pub enum Trigger {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StallSample {
     pub now: u64,
-    /// Work the progress fence does not show complete, or USERD GP_GET short of the
-    /// KMD's GP_PUT.
+    /// Work the progress fence does not show complete.
     pub busy: bool,
     pub progress: u64,
     pub gp_get: u32,
     pub error: bool,
 }
 
+/// While a stall lasts, it fires again this often (100 ns): the snapshot closest to a later
+/// fault is the one worth keeping.
+pub const REPEAT_100NS: u64 = 50_000_000;
+
 /// The snapshot's own stall detection (independent of `native_hang`'s recovery watch).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct StallWatch {
     progress: u64,
-    gp_get: u32,
     since: Option<u64>,
-    fired: bool,
+    fired: Option<u64>,
     error_seen: bool,
 }
 
@@ -833,31 +862,33 @@ impl StallWatch {
     pub const fn new() -> Self {
         Self {
             progress: 0,
-            gp_get: 0,
             since: None,
-            fired: false,
+            fired: None,
             error_seen: false,
         }
     }
 
+    /// `busy` is work the progress fence does not show complete. GP_GET is not used: GB20x
+    /// does not write it back to USERD.
     pub fn tick(&mut self, s: StallSample, timeout: Option<u64>) -> Trigger {
         if s.error && !self.error_seen {
             self.error_seen = true;
             return Trigger::Error;
         }
-        let moved = s.progress != self.progress || s.gp_get != self.gp_get;
-        if !s.busy || self.since.is_none() || moved {
+        if !s.busy || self.since.is_none() || s.progress != self.progress {
             self.progress = s.progress;
-            self.gp_get = s.gp_get;
             self.since = s.busy.then_some(s.now);
-            self.fired = false;
+            self.fired = None;
             return Trigger::None;
         }
         match (timeout, self.since) {
-            (Some(t), Some(since)) if !self.fired && s.now.saturating_sub(since) >= t => {
-                self.fired = true;
-                Trigger::Stall
-            }
+            (Some(t), Some(since)) if s.now.saturating_sub(since) >= t => match self.fired {
+                Some(at) if s.now.saturating_sub(at) < REPEAT_100NS => Trigger::None,
+                _ => {
+                    self.fired = Some(s.now);
+                    Trigger::Stall
+                }
+            },
             _ => Trigger::None,
         }
     }
@@ -872,12 +903,12 @@ impl StallWatch {
 // ── the blob ─────────────────────────────────────────────────────────────────────────────────
 
 pub const MAGIC: u32 = u32::from_le_bytes(*b"NSNP");
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 pub const HDR_BYTES: usize = 64;
 pub const REC_QUEUE: u32 = 1;
 pub const REC_VA: u32 = 2;
 pub const USERD_DWORDS: usize = 64;
-pub const QREC_FIXED: usize = 408 + WINDOW * 8;
+pub const QREC_FIXED: usize = 432 + WINDOW * 8 + HISTORY * 16;
 pub const SEG_FIXED: usize = 80;
 pub const SEM_BYTES: usize = 40;
 pub const REF_BYTES: usize = 32;
@@ -908,11 +939,14 @@ pub const Q_DETAIL: u32 = 0x40;
 pub const Q_ERROR: u32 = 0x80;
 pub const Q_TRIGGER: u32 = 0x100;
 pub const Q_COPY_BOUND: u32 = 0x200;
+/// The focus is the first incomplete submission of the history (else the entry before GP_PUT).
+pub const Q_FOCUS_FROM_HISTORY: u32 = 0x400;
 
-/// Segment flags.
-pub const S_CONTAINS_PB_GET: u32 = 1;
-pub const S_AT_GP_GET: u32 = 2;
-pub const S_BEFORE_GP_GET: u32 = 4;
+/// Segment flags: part of the first incomplete submission (`S_FOCUS`), its first entry
+/// (`S_FOCUS_FIRST`), or of the work before it (`S_BEFORE`).
+pub const S_FOCUS: u32 = 1;
+pub const S_FOCUS_FIRST: u32 = 2;
+pub const S_BEFORE: u32 = 4;
 
 /// VA lookup hits.
 pub const HIT_NONE: u32 = 0;
@@ -1089,6 +1123,15 @@ pub struct QueueFields {
     pub ring_status: u32,
     pub window_first: u32,
     pub window_n: u32,
+    /// The GPFIFO range of the first incomplete submission (`focus_range`), u32::MAX none.
+    pub focus_start: u32,
+    pub focus_end: u32,
+    /// The ring entry at GP_PUT - 1 read back through the GPU VA (a check that the ring
+    /// reads the memory the GPU fetches: nonzero once anything was submitted).
+    pub last_lo: u32,
+    pub last_hi: u32,
+    pub last_status: u32,
+    pub history_n: u32,
 }
 
 /// Where a record started and where its count to patch sits.
@@ -1105,6 +1148,7 @@ pub fn begin_queue(
     q: &QueueFields,
     userd: &[u32; USERD_DWORDS],
     window: &[(u32, u32); WINDOW],
+    history: &[Submission; HISTORY],
 ) -> Mark {
     let start = w.len();
     w.u32(0);
@@ -1136,6 +1180,14 @@ pub fn begin_queue(
     for (lo, hi) in window.iter() {
         w.u32(*lo);
         w.u32(*hi);
+    }
+    for v in [q.focus_start, q.focus_end, q.last_lo, q.last_hi, q.last_status, q.history_n] {
+        w.u32(v);
+    }
+    for h in history.iter() {
+        w.u64(h.fence);
+        w.u32(h.before);
+        w.u32(h.after);
     }
     Mark { start, count_at }
 }
@@ -1378,27 +1430,38 @@ mod tests {
 
     #[test]
     fn window_and_segments() {
-        assert_eq!(window_first(10, 1024), 4);
-        assert_eq!(window_first(2, 1024), 1020);
+        assert_eq!(window_first(10, 1024), 6);
+        assert_eq!(window_first(2, 1024), 1022);
         assert_eq!(window_first(0, 4), 1);
+        let h = |fence: u64, before: u32, after: u32| Submission { fence, before, after };
+        let history = [h(56, 140, 142), h(57, 142, 145), h(58, 145, 148), h(59, 148, 150), Submission::default()];
+        assert_eq!(stuck_submission(&history, 57), Some(h(58, 145, 148)));
+        assert_eq!(stuck_submission(&history, 59), None);
+        assert_eq!(focus_range(&history, 57, 154, 8192), (145, 148));
+        assert_eq!(focus_range(&history, 59, 154, 8192), (153, 154));
+        assert_eq!(focus_range(&history, 59, 0, 8192), (8191, 0));
         let seg = |va: u64| GpEntry { va, dwords: 16, ..GpEntry::default() };
         let mut w = [GpEntry::default(); WINDOW];
         for (i, e) in w.iter_mut().enumerate() {
             *e = seg(0x1000 * (i as u64 + 1));
         }
-        // gp_get at window position 6; idle (get == put): positions 0..=5, the last 6.
-        let (p, n) = pick_segments(&w, 100, 1024, 106, 106, 0);
-        assert_eq!(&p[..n], &[0, 1, 2, 3, 4, 5]);
-        // Busy (get != put): GP_GET's own entry is included, the oldest dropped.
-        let (p, n) = pick_segments(&w, 100, 1024, 106, 107, 0);
-        assert_eq!(&p[..n], &[1, 2, 3, 4, 5, 6]);
-        // A control entry is skipped; the PB GET segment (position 0) comes back.
+        // Focus 145..148 with the window from 141: positions 4..7, and 2 before.
+        let first = window_first(145, 8192);
+        assert_eq!(first, 141);
+        let (p, n) = pick_segments(&w, first, 8192, 145, 148);
+        assert_eq!(&p[..n], &[2, 3, 4, 5, 6]);
+        // A control entry before the focus is skipped.
         w[3].dwords = 0;
-        let (p, n) = pick_segments(&w, 100, 1024, 106, 107, 0x1008);
-        assert_eq!(&p[..n], &[0, 1, 2, 4, 5, 6]);
-        // Ring wrap: first 1020, get 2 -> position 6.
-        let (p, n) = pick_segments(&w, 1020, 1024, 2, 2, 0);
-        assert_eq!(&p[..n], &[0, 1, 2, 4, 5]);
+        let (p, n) = pick_segments(&w, first, 8192, 145, 148);
+        assert_eq!(&p[..n], &[1, 2, 4, 5, 6]);
+        // A long focus is cut at MAX_SEGMENTS.
+        let (p, n) = pick_segments(&w, first, 8192, 145, 157);
+        assert_eq!(n, MAX_SEGMENTS);
+        assert_eq!(&p[..n], &[1, 2, 4, 5, 6, 7, 8, 9]);
+        // Ring wrap: focus 8191..1.
+        let first = window_first(8191, 8192);
+        let (p, n) = pick_segments(&w, first, 8192, 8191, 1);
+        assert_eq!(&p[..n], &[1, 2, 4, 5]);
     }
 
     #[test]
@@ -1574,29 +1637,33 @@ mod tests {
         let t = Some(3_000 * 10_000u64);
         let ms = |n: u64| n * 10_000;
         let mut w = StallWatch::new();
-        let s = |now: u64, busy: bool, progress: u64, gp_get: u32| StallSample {
+        let s = |now: u64, busy: bool, progress: u64| StallSample {
             now,
             busy,
             progress,
-            gp_get,
+            gp_get: 0,
             error: false,
         };
-        assert_eq!(w.tick(s(ms(0), true, 5, 1), t), Trigger::None);
-        assert_eq!(w.tick(s(ms(2_000), true, 5, 1), t), Trigger::None);
+        assert_eq!(w.tick(s(ms(0), true, 5), t), Trigger::None);
+        assert_eq!(w.tick(s(ms(2_000), true, 5), t), Trigger::None);
         assert_eq!(w.stalled_ms(ms(2_000)), 2_000);
-        assert_eq!(w.tick(s(ms(3_000), true, 5, 1), t), Trigger::Stall);
-        assert_eq!(w.tick(s(ms(9_000), true, 5, 1), t), Trigger::None);
+        assert_eq!(w.tick(s(ms(3_000), true, 5), t), Trigger::Stall);
+        assert_eq!(w.tick(s(ms(7_000), true, 5), t), Trigger::None);
+        // The stall goes on: again after REPEAT.
+        assert_eq!(w.tick(s(ms(8_000), true, 5), t), Trigger::Stall);
+        assert_eq!(w.tick(s(ms(9_000), true, 5), t), Trigger::None);
         // Progress re-arms.
-        assert_eq!(w.tick(s(ms(9_500), true, 6, 1), t), Trigger::None);
-        assert_eq!(w.tick(s(ms(12_500), true, 6, 1), t), Trigger::Stall);
-        // Idle clears.
-        assert_eq!(w.tick(s(ms(13_000), false, 6, 1), t), Trigger::None);
+        assert_eq!(w.tick(s(ms(9_500), true, 6), t), Trigger::None);
+        assert_eq!(w.tick(s(ms(12_500), true, 6), t), Trigger::Stall);
+        // Idle (nothing outstanding) clears.
+        assert_eq!(w.tick(s(ms(13_000), false, 6), t), Trigger::None);
         assert_eq!(w.stalled_ms(ms(20_000)), 0);
+        assert_eq!(w.tick(s(ms(30_000), false, 6), t), Trigger::None);
         // Off.
-        assert_eq!(w.tick(s(ms(14_000), true, 6, 1), None), Trigger::None);
-        assert_eq!(w.tick(s(ms(99_000), true, 6, 1), None), Trigger::None);
+        assert_eq!(w.tick(s(ms(31_000), true, 6), None), Trigger::None);
+        assert_eq!(w.tick(s(ms(99_000), true, 6), None), Trigger::None);
         // An error once.
-        let mut e = s(ms(100_000), true, 6, 1);
+        let mut e = s(ms(100_000), true, 6);
         e.error = true;
         assert_eq!(w.tick(e, t), Trigger::Error);
         assert_eq!(w.tick(e, None), Trigger::None);
@@ -1624,11 +1691,16 @@ mod tests {
             let va = 0x1_0010_0000u64 + 0x1000 * i as u64;
             *e = crate::nv_copy::GpEntry { va, dwords: 32 }.encode();
         }
+        let mut history = [Submission::default(); HISTORY];
+        history[0] = Submission { fence: 76, before: 8, after: 10 };
+        history[1] = Submission { fence: 77, before: 10, after: 12 };
+        let (focus_start, focus_end) = focus_range(&history, 76, 12, 1024);
+        assert_eq!((focus_start, focus_end), (10, 12));
         let q = QueueFields {
             slot: 3,
             node: 0,
             pid: 4242,
-            flags: Q_GRAPHICS | Q_OUTSTANDING | Q_DETAIL | Q_TRIGGER,
+            flags: Q_GRAPHICS | Q_OUTSTANDING | Q_DETAIL | Q_TRIGGER | Q_FOCUS_FROM_HISTORY,
             token,
             hw_tsg: 0x1c,
             process: 0xffff_8000_1234_0000,
@@ -1642,11 +1714,16 @@ mod tests {
             fence_now: 76,
             fence_gpu: 0x2_0000_0000,
             stall_ms: 3100,
-            window_first: window_first(11, 1024),
+            window_first: window_first(focus_start, 1024),
             window_n: WINDOW as u32,
+            focus_start,
+            focus_end,
+            last_lo: window[7].0,
+            last_hi: window[7].1,
+            history_n: 2,
             ..QueueFields::default()
         };
-        let mark = begin_queue(&mut w, &q, &userd, &window);
+        let mark = begin_queue(&mut w, &q, &userd, &window, &history);
         let qrec = w.len() - mark.start;
         assert_eq!(qrec, QREC_FIXED);
         // One segment: an MME DMA read of an address, a host acquire, a release.
@@ -1674,6 +1751,14 @@ mod tests {
             sc.feed(d);
         }
         let seg_va = 0x1_0010_0000u64 + 0x1000 * 4;
+        let (picks, n) = pick_segments(
+            &window.map(|(lo, hi)| gp_entry(lo, hi)),
+            q.window_first,
+            1024,
+            focus_start,
+            focus_end,
+        );
+        assert_eq!(&picks[..n], &[2, 3, 4, 5]);
         let seg_index = table.intern(q.process, seg_va).unwrap().0;
         let f = SegFields {
             index: 10,
@@ -1690,7 +1775,7 @@ mod tests {
             refs_seen: sc.refs_seen,
             n_refs: sc.refs().len() as u32,
             va_index: seg_index,
-            flags: S_BEFORE_GP_GET | S_CONTAINS_PB_GET,
+            flags: S_FOCUS | S_FOCUS_FIRST,
             ..SegFields::default()
         };
         let sm = begin_segment(&mut w, &f);
