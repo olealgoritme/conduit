@@ -1804,6 +1804,16 @@ pub mod knobs {
     /// applies it. Read `FlGSyncWt` (waits that ran) first: 0 means the experiment did
     /// not run.
     pub const FLG_SYNC_MS: KnobName = KnobName::new(b"FlGSyncMs");
+    /// `NvGlYield` (default 0 = off): pause the Vulkan/OpenGL ICD's busy-wait on its
+    /// device-lost check (NVDA 0x01000021) once a streak passes `NvGlYieldMin` polls:
+    /// 1 = yield the vCPU, N >= 2 = sleep N us (timer-rounded, at most 2000).
+    /// `virtio::nvda::wait_poll_pause`; `NvGlPause` counts.
+    pub const NV_GL_YIELD: KnobName = KnobName::new(b"NvGlYield");
+    /// `NvGlYieldMin` (default 0 = 16): polls of one streak answered at once.
+    pub const NV_GL_YIELD_MIN: KnobName = KnobName::new(b"NvGlYieldMin");
+    /// `NvEncCaps` (default 1): NVDA NV0080 NVENC_GET_CAPS answered by the KMD (RM
+    /// status 0, a zero caps table written to the caller); 0 = forward to the host RM.
+    pub const NV_ENC_CAPS: KnobName = KnobName::new(b"NvEncCaps");
 }
 
 /// Read a service-key REG_DWORD knob, or `default` if absent.

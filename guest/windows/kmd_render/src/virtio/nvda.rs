@@ -90,6 +90,9 @@ pub fn publish_counters() {
     crate::diag::record_named_bytes(b"NvUmdFn", LAST_FUNCTION.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(b"NvUmdCmd", LAST_CONTROL.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(b"NvUmdRegFd", REGISTER_FD_REFUSED.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"NvGlPause", GL_PAUSES.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"NvEncCapsN", ENC_CAPS.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"NvEncCapsBad", ENC_CAPS_BAD.load(Ordering::Relaxed));
 }
 
 #[derive(Clone, Copy)]
@@ -729,6 +732,94 @@ fn dump_watched_vas(passive: PassiveLevel, adapter: &AdapterContext, h_device: u
     crate::diag::record_named_bytes(b"NvDmpN", dumps);
 }
 
+static GL_YIELD: AtomicU32 = AtomicU32::new(KNOB_UNREAD);
+static GL_YIELD_MIN: AtomicU32 = AtomicU32::new(KNOB_UNREAD);
+static GL_PAUSES: AtomicU32 = AtomicU32::new(0);
+static ENC_CAPS_KNOB: AtomicU32 = AtomicU32::new(KNOB_UNREAD);
+static ENC_CAPS: AtomicU32 = AtomicU32::new(0);
+static ENC_CAPS_BAD: AtomicU32 = AtomicU32::new(0);
+
+fn cached_knob(cell: &AtomicU32, name: crate::diag::KnobName, default: u32) -> u32 {
+    let value = cell.load(Ordering::Relaxed);
+    if value != KNOB_UNREAD {
+        return value;
+    }
+    let read = crate::diag::read_config_dword(name, default);
+    cell.store(read, Ordering::Relaxed);
+    read
+}
+
+/// Test knobs `NvGlYield` (default 0: answer at once, as NVIDIA's KMD does) and
+/// `NvGlYieldMin` (default 0 = 16 polls): the ICD's device-lost check (0x01000021)
+/// is the body of its busy-wait loops, so a long GPU wait spins a vCPU on it. Past
+/// `NvGlYieldMin` polls of one streak (`vk_fail::wait_key`), 1 yields the vCPU to a
+/// ready thread before answering, N >= 2 sleeps N us (rounded up to the timer
+/// resolution, at most 2 ms). `NvGlPause` counts the paused polls.
+fn wait_poll_pause(_passive: PassiveLevel, streak: u32) {
+    use helios_kmd_logic::vk_fail::{poll_pause, PollPause};
+    let mode = cached_knob(&GL_YIELD, crate::diag::knobs::NV_GL_YIELD, 0);
+    if mode == 0 {
+        return;
+    }
+    let min = cached_knob(&GL_YIELD_MIN, crate::diag::knobs::NV_GL_YIELD_MIN, 0);
+    let us = match poll_pause(mode, min, streak) {
+        PollPause::None => return,
+        PollPause::Yield => 0,
+        PollPause::DelayUs(us) => us,
+    };
+    GL_PAUSES.fetch_add(1, Ordering::Relaxed);
+    // SAFETY: PASSIVE (an escape), relative interval; 0 is a yield to a ready thread.
+    unsafe {
+        let mut interval: wdk_sys::LARGE_INTEGER = core::mem::zeroed();
+        interval.QuadPart = -(i64::from(us) * 10);
+        let _ = wdk_sys::ntddk::KeDelayExecutionThread(0, 0, &mut interval);
+    }
+}
+
+/// Knob `NvEncCaps` (default 1): NV0080 NVENC_GET_CAPS answered by the KMD as
+/// NVIDIA's does (RM status 0, a zero table written to the caller's `capsTbl`); 0
+/// forwards it to the host RM again (which refuses it: no such control for a
+/// physical GPU there, and a guest pointer it cannot reach).
+fn nvenc_caps_local() -> bool {
+    cached_knob(&ENC_CAPS_KNOB, crate::diag::knobs::NV_ENC_CAPS, 1) != 0
+}
+
+extern "C" {
+    /// `src/seh_shim.c`: ProbeForWrite + copy under __try; 1 when written.
+    fn helios_copy_to_user_seh(user: *mut core::ffi::c_void, source: *const u8, len: u32) -> i32;
+}
+
+/// Write the NVENC caps table into the caller's memory and answer the control
+/// (`NvEncCapsN` answered, `NvEncCapsBad` refused for size or address).
+fn answer_nvenc_caps(buf: &mut [u8], request: nd::NvencCaps) {
+    let outcome = match nd::nvenc_caps_writable(request) {
+        Err(e) => e,
+        Ok(()) => {
+            let table = nd::NVENC_CAPS_TABLE;
+            // SAFETY: the escape runs at PASSIVE in the caller's process; the shim
+            // probes the user address and turns any fault into 0.
+            let written = unsafe {
+                helios_copy_to_user_seh(
+                    request.table as usize as *mut core::ffi::c_void,
+                    table.as_ptr(),
+                    table.len() as u32,
+                )
+            };
+            if written == 1 {
+                nd::NvencCapsWrite::Written
+            } else {
+                nd::NvencCapsWrite::BadAddress
+            }
+        }
+    };
+    if outcome == nd::NvencCapsWrite::Written {
+        ENC_CAPS.fetch_add(1, Ordering::Relaxed);
+    } else {
+        ENC_CAPS_BAD.fetch_add(1, Ordering::Relaxed);
+    }
+    nd::answer_nvenc_caps(buf, outcome);
+}
+
 /// Serve one NVDA private buffer. The caller has already matched NVDA_MAGIC.
 /// `h_device` may be zero for NVAPI's adapter-scoped calls. CUDA's two
 /// context-scoped local replies validate both raw WDDM scopes in pure logic.
@@ -772,8 +863,17 @@ fn escape_inner(
     crate::ddi::hot_path::FUNCTIONS.note(header.function);
     crate::ddi::hot_path::tick();
     if header.function == WAIT_POLL_FUNCTION {
-        crate::ddi::vk_fail::note_wait_poll(rc::get32(buf, 0x20).unwrap_or(0));
+        let key = helios_kmd_logic::vk_fail::wait_key(h_device, h_context);
+        let streak = crate::ddi::vk_fail::note_wait_poll(key);
         dump_watched_vas(passive, adapter, h_device);
+        wait_poll_pause(passive, streak);
+    }
+    if let Some(request) = nd::nvenc_caps_request(buf) {
+        if nvenc_caps_local() {
+            crate::ddi::hot_path::count(&crate::ddi::hot_path::NVDA_LOCAL);
+            answer_nvenc_caps(buf, request);
+            return STATUS_SUCCESS;
+        }
     }
     // Pure local replies never initialize the KMD RM client and never touch the
     // transport. This also returns shortened 0x30 replies directly, while the
@@ -805,6 +905,8 @@ fn escape_inner(
                 nd::set_raster(buf, width, height, hz);
             } else if nd::is_display_info(buf) {
                 nd::set_display_info_mode(buf, width, height);
+            } else if nd::is_display_timing(buf) {
+                nd::set_display_timing(buf, width, height, adapter.effective_refresh_mhz().max(1000));
             }
             return STATUS_SUCCESS;
         }

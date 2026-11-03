@@ -16,7 +16,7 @@
 //!   `VkFiiC` code, `VkFiiS` status (NTSTATUS, RM status or host errno),
 //!   `VkFiiH` hint, `VkFiiT` interrupt-time ms of the latest occurrence,
 //!   `VkFiiR` back-to-back repeats; the same for `VkRii*`.
-//! * `VkWait*`: the ICD's wait poll (NVDA 0x01000021, `vf::WaitStreaks`):
+//! * `VkWait*`: the ICD's wait poll (NVDA 0x01000021, `vf::WaitStreaks`, keyed by context):
 //!   `VkWaitN` polls, the streak polled last (`VkWaitTok` token, `VkWaitCurMs`
 //!   its length, `VkWaitCurN` its polls, `VkWaitAgeMs` since its last poll), the
 //!   longest (`VkWaitMaxMs`, `VkWaitMaxTok`, `VkWaitMaxN`). A streak past 1 s is
@@ -107,14 +107,20 @@ pub(crate) fn note_rm_ioctl(req: &[u8], resp: &[u8], n: usize) {
     }
 }
 
-/// The Vulkan ICD polled its wait escape (0x01000021) for `token`: a streak past
-/// `WAIT_REPORT_MS` (and every doubling) goes into `VkF` as `LONG_WAIT`. PASSIVE.
-pub(crate) fn note_wait_poll(token: u32) {
+/// The Vulkan ICD polled its wait escape (0x01000021) under `key`
+/// (`vf::wait_key`): a streak past `WAIT_REPORT_MS` (and every doubling) goes into
+/// `VkF` as `LONG_WAIT`. Returns the streak's polls so far. PASSIVE.
+pub(crate) fn note_wait_poll(key: u32) -> u32 {
     let now = crate::adapter::AdapterContext::interrupt_time_ms();
-    let report = WAITS.lock().poll(token, now);
+    let (report, count) = {
+        let mut waits = WAITS.lock();
+        let report = waits.poll(key, now);
+        (report, waits.last().count)
+    };
     if let Some(ms) = report {
-        note(vf::kind::LONG_WAIT, token, 0, ms);
+        note(vf::kind::LONG_WAIT, key, 0, ms);
     }
+    count
 }
 
 /// A KMD `RmBatch`'s answer (`virtio::nvrm::forward_kmd_batch`): each failed
