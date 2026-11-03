@@ -31,6 +31,7 @@ use helios_kmd_logic::nvda as nd;
 use helios_kmd_logic::pt_ring as ptr;
 use helios_kmd_logic::rm_ce_channel as cc;
 use helios_kmd_logic::rm_client as rc;
+use helios_kmd_logic::va_window as vw;
 use wdk_sys::ntddk::{
     MmMapIoSpace, MmMapLockedPagesSpecifyCache, MmUnmapIoSpace, MmUnmapLockedPages,
 };
@@ -255,6 +256,7 @@ pub(crate) fn publish_hot() {
         rec(cost.names[3], r(&cost.max_micros));
     }
     publish_phases();
+    publish_va();
     let copied = r(&COPY_KIB);
     if copied != 0 || r(&COPY_US) != 0 {
         rec(b"PgCopyKiB", copied);
@@ -784,9 +786,8 @@ struct State {
     client: Option<NativeClient>,
     allocations: Vec<Allocation>,
     spaces: Vec<(usize, u32)>,
-    /// Per-process space -> its windows: (space, window, first VA, end VA), see
-    /// [`LOW_WINDOW_BASE`] and [`HIGH_WINDOW_BASE`].
-    windows: Vec<(u32, u32, u64, u64)>,
+    /// Per-process space -> its windows (`helios_kmd_logic::va_window`).
+    windows: vw::Windows,
     /// System pages of NON-native allocations (dxgkrnl's monitored fences and
     /// the like) mapped into a process's space (`update_foreign_leaf`).
     foreign: Vec<HostMapping>,
@@ -814,7 +815,7 @@ impl State {
             client: None,
             allocations: Vec::new(),
             spaces: Vec::new(),
-            windows: Vec::new(),
+            windows: vw::Windows::new(),
             foreign: Vec::new(),
             descs: DescTable::new(),
             by_process: Vec::new(),
@@ -1198,12 +1199,14 @@ fn ensure_space(io: &Io<'_>, process: usize) -> Result<u32, Error> {
     // the new per-process spaces are what the graphics copy engine fails on.
     let device_space =
         crate::diag::read_config_dword(crate::diag::KnobName::new(b"NvVaDevice"), 0) == 1;
+    let started = now();
     let reply = io.rm_alloc(
         nd::H_DEVICE,
         space,
         cc::FERMI_VASPACE_A,
         &if device_space { cc::vaspace_params() } else { cc::vaspace_params_vidmm() },
     )?;
+    va_note(vw::Op::SpaceMake, started);
     if device_space {
         st().spaces.push((process, space));
         return Ok(space);
@@ -1218,60 +1221,64 @@ fn ensure_space(io: &Io<'_>, process: usize) -> Result<u32, Error> {
         b"NvSpaceBase",
         (rc::get64(&reply, 40).unwrap_or(u64::MAX) >> 16) as u32,
     );
-    // One virtual object over all of VidMm's low VAs, before RM maps anything
-    // of its own into the space: RM's first-fit internal mappings (GR context
-    // buffers) then land above 4.5 GiB, in the [4 GiB, 8 GiB) range the KMD
-    // reserves from VidMm, and every VidMm VA below 4 GiB is mapped inside
-    // this window at its exact address.
-    let window = match st().mint() {
-        Ok(window) => window,
-        Err(error) => {
-            let _ = io.rm_free(nd::H_DEVICE, space);
-            return Err(error);
-        }
-    };
-    let mut params = cc::virtual_params(
-        io.client.root,
-        space,
-        Some(LOW_WINDOW_BASE),
-        LOW_WINDOW_END - LOW_WINDOW_BASE,
-    );
+    // Two virtual objects over VidMm's VAs (`vw::LAYOUT`), before RM maps anything
+    // of its own into the space. Low window: one object over all of VidMm's low VAs,
+    // so RM's first-fit internal mappings (GR context buffers) land above 4.5 GiB, in
+    // the [4 GiB, 8 GiB) range the KMD reserves from VidMm, and every VidMm VA below
+    // 4 GiB is mapped inside this window at its exact address. High window: the same
+    // above the reserved range, so RM's own first-fit mappings stay inside it instead
+    // of growing into VAs VidMm hands out (they reached 0x2_3200_0000, and every later
+    // fixed mapping there was refused with NO_MEMORY). The high window is optional:
+    // without it, mappings there fall back to fixed virtual objects.
+    //
+    // LAZY by default (`vw::window_flags`, `NvVaWin`): RM then only reserves the range;
+    // without it, it reserved and pinned every page table of it up front (1.2 s for
+    // the high window, the same again to free it, all under this mutex).
     // `NvPtSparse` (default 0, `pt_ring::window_flags`): unmapped VAs of the window read zero
-    // instead of faulting (bit 0 low window, bit 1 high window).
+    // instead of faulting (bit 0 low window, bit 1 high window); RM never makes those lazy.
     let sparse = crate::diag::read_config_dword(crate::diag::KnobName::new(b"NvPtSparse"), 0);
-    sparse_window(&mut params, ptr::window_flags(sparse, false));
-    if let Err(error) = io.rm_alloc(nd::H_DEVICE, window, cc::NV50_MEMORY_VIRTUAL, &params) {
+    let knob = crate::diag::read_config_dword(crate::diag::KnobName::new(b"NvVaWin"), 0);
+    if st().windows.reserve(vw::LAYOUT.len()).is_err() {
         let _ = io.rm_free(nd::H_DEVICE, space);
-        return Err(error);
+        return Err(Error::NoMemory);
+    }
+    let mut made = [0u32; vw::LAYOUT.len()];
+    for (i, (base, end, high)) in vw::LAYOUT.into_iter().enumerate() {
+        // The guard of `st()` must end before the match, which locks STATE again.
+        let minted = st().mint();
+        let window = match minted {
+            Ok(window) => window,
+            Err(error) if !high => {
+                let _ = io.rm_free(nd::H_DEVICE, space);
+                return Err(error);
+            }
+            Err(_) => break,
+        };
+        let mut params = cc::virtual_params(io.client.root, space, Some(base), end - base);
+        let extra = vw::window_flags(knob, ptr::window_flags(sparse, high));
+        add_window_flags(&mut params, extra);
+        let started = now();
+        match io.rm_alloc(nd::H_DEVICE, window, cc::NV50_MEMORY_VIRTUAL, &params) {
+            Ok(_) => {
+                va_note(vw::Op::WinMake, started);
+                made[i] = window;
+            }
+            Err(error) if !high => {
+                // Frees the space's windows with it.
+                let _ = io.rm_free(nd::H_DEVICE, space);
+                return Err(error);
+            }
+            Err(error) => crate::diag::record_named_bytes(b"NvHighWin", error as u32 + 1),
+        }
     }
     {
         let mut state = st();
         state.spaces.push((process, space));
-        let _ = state.windows.try_reserve(2);
-        state.windows.push((space, window, LOW_WINDOW_BASE, LOW_WINDOW_END));
-    }
-    // The same above the [4 GiB, 8 GiB) range the KMD reserves from VidMm: RM's own
-    // first-fit mappings stay inside that range instead of growing into VAs VidMm
-    // hands out (they reached 0x2_3200_0000, and every later fixed mapping there was
-    // refused with NO_MEMORY). Optional: without it, mappings fall back to fixed
-    // virtual objects.
-    // The guard of `st()` must end before the block, which locks STATE again.
-    let minted = st().mint();
-    if let Ok(high) = minted {
-        let mut params = cc::virtual_params(
-            io.client.root,
-            space,
-            Some(HIGH_WINDOW_BASE),
-            HIGH_WINDOW_END - HIGH_WINDOW_BASE,
-        );
-        sparse_window(&mut params, ptr::window_flags(sparse, true));
-        match io.rm_alloc(nd::H_DEVICE, high, cc::NV50_MEMORY_VIRTUAL, &params) {
-            Ok(_) => {
-                let mut state = st();
-                let _ = state.windows.try_reserve(1);
-                state.windows.push((space, high, HIGH_WINDOW_BASE, HIGH_WINDOW_END));
+        for (window, (base, end, _)) in made.into_iter().zip(vw::LAYOUT) {
+            if window != 0 {
+                // Room was reserved; the layout's windows neither overlap nor repeat.
+                let _ = state.windows.add(vw::Window { space, handle: window, base, end });
             }
-            Err(error) => crate::diag::record_named_bytes(b"NvHighWin", error as u32 + 1),
         }
     }
     crate::diag::record_named_bytes(b"NvSpaceProc", process as u32);
@@ -1293,49 +1300,57 @@ fn ensure_space(io: &Io<'_>, process: usize) -> Result<u32, Error> {
     Ok(space)
 }
 
-/// OR `extra` into the `NVOS32` flags (+8) of a window's `NV_MEMORY_ALLOCATION_PARAMS`, and
-/// count sparse windows (`NvPtSparseN`).
-fn sparse_window(params: &mut [u8], extra: u32) {
+/// OR `extra` into the `NVOS32` flags (+8) of a window's `NV_MEMORY_ALLOCATION_PARAMS`,
+/// count sparse windows (`NvPtSparseN`) and note the flags (`NvVaWinFlg`).
+fn add_window_flags(params: &mut [u8], extra: u32) {
+    VA_FLAGS.store(extra, Ordering::Relaxed);
     if extra == 0 {
         return;
     }
     let flags = rc::get32(params, 8).unwrap_or(0) | extra;
     params[8..12].copy_from_slice(&flags.to_le_bytes());
-    static N: AtomicU32 = AtomicU32::new(0);
-    crate::diag::record_named_bytes(b"NvPtSparseN", N.fetch_add(1, Ordering::Relaxed) + 1);
+    if extra & ptr::NVOS32_ALLOC_FLAGS_SPARSE != 0 {
+        static N: AtomicU32 = AtomicU32::new(0);
+        crate::diag::record_named_bytes(b"NvPtSparseN", N.fetch_add(1, Ordering::Relaxed) + 1);
+    }
 }
 
-/// The low window of a per-process space: [64 KiB, 4 GiB), VidMm's fences
-/// (0x10000) and the UMDs' low VAs included.
-const LOW_WINDOW_BASE: u64 = 0x1_0000;
-const LOW_WINDOW_END: u64 = 0x1_0000_0000;
-/// The high window of a per-process space: [8 GiB, 64 GiB), where VidMm places
-/// allocations above the reserved [4 GiB, 8 GiB) and CUDA reserves its fixed range. A window over the whole 16 TiB
-/// exhausted RM's page-table pool (pool_alloc NO_MEMORY); VAs above 64 GiB still
-/// map through fixed virtual objects.
-const HIGH_WINDOW_BASE: u64 = 0x2_0000_0000;
-const HIGH_WINDOW_END: u64 = 0x10_0000_0000;
+/// Window and space RM calls, per `vw::Op` (`NvVaWin*`, `NvVaSp*`), published by
+/// [`publish_hot`] (a registry write each is ~100 us; these are taken under the mutex).
+static VA_STATS: SpinLock<[vw::Stat; vw::OPS]> = SpinLock::new([vw::Stat::ZERO; vw::OPS]);
+/// The extra flags of the last window made (`NvVaWinFlg`), `u32::MAX` before the first.
+static VA_FLAGS: AtomicU32 = AtomicU32::new(u32::MAX);
 
-/// The window of `space` that holds [va, end), if any.
+/// Count one `op` that began at `started` (`now()`).
+fn va_note(op: vw::Op, started: u64) {
+    let us = vw::us(now().saturating_sub(started));
+    VA_STATS.lock()[op as usize].note(us);
+}
+
+fn publish_va() {
+    let stats = *VA_STATS.lock();
+    for (stat, [n, total, max]) in stats.iter().zip(vw::COUNTERS) {
+        crate::diag::record_named_bytes(n.as_bytes(), stat.n);
+        crate::diag::record_named_bytes(total.as_bytes(), stat.total_us);
+        crate::diag::record_named_bytes(max.as_bytes(), stat.max_us);
+    }
+    crate::diag::record_named_bytes(vw::FLAGS_COUNTER.as_bytes(), VA_FLAGS.load(Ordering::Relaxed));
+}
+
+/// The window of `space` that holds [va, end), if any (`vw::LAYOUT`).
 fn window_for(space: u32, va: u64, end: u64) -> Option<u32> {
-    st()
-        .windows
-        .iter()
-        .find(|(owner, _, base, limit)| *owner == space && va >= *base && end <= *limit)
-        .map(|(_, window, _, _)| *window)
+    st().windows.find(space, va, end)
 }
 
 fn windows_of(space: u32) -> Vec<u32> {
-    st()
-        .windows
-        .iter()
-        .filter(|(owner, _, _, _)| *owner == space)
-        .map(|(_, window, _, _)| *window)
-        .collect()
+    let mut out = Vec::new();
+    // No memory: no window is freed on its own; the space's free takes them along.
+    let _ = st().windows.of(space, &mut out);
+    out
 }
 
 fn is_window(virt: u32) -> bool {
-    st().windows.iter().any(|(_, window, _, _)| *window == virt)
+    st().windows.is_window(virt)
 }
 
 
@@ -5256,12 +5271,19 @@ pub fn release_process(passive: PassiveLevel, adapter: &AdapterContext, process:
             .map(|(_, space)| *space);
         if let Some(space) = space {
             for window in windows_of(space) {
+                let started = now();
                 if io.rm_free(nd::H_DEVICE, window).is_ok() {
-                    st().windows.retain(|(_, live, _, _)| *live != window);
+                    va_note(vw::Op::WinFree, started);
+                    st().windows.remove(window);
                 }
             }
+            let started = now();
             if io.rm_free(nd::H_DEVICE, space).is_ok() {
-                st().spaces.retain(|(owner, _)| *owner != process);
+                va_note(vw::Op::SpaceFree, started);
+                let mut state = st();
+                // A window RM would not free alone went with its space.
+                state.windows.remove_space(space);
+                state.spaces.retain(|(owner, _)| *owner != process);
             } else {
                 kept += 1;
             }
