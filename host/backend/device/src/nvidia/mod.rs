@@ -1310,6 +1310,7 @@ mod nested;
 mod open;
 mod os_event;
 mod osdesc;
+mod preempt_log;
 mod resp;
 mod rm_fd;
 mod rm_import;
