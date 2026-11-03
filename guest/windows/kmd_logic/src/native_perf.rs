@@ -48,7 +48,14 @@ pub struct PerfMem(pub u32);
 /// Vulkan timeline ran out of memory for its images ("Could not get memory for
 /// an image!") with no KMD-side refusal. The aperture stays in their segment set
 /// as VidMm's eviction fallback.
-pub const PERF_MEM_DEFAULT: u32 = PerfMem::GPU_ONLY_VRAM;
+///
+/// Plus [`PerfMem::CPU_VISIBLE_APERTURE`]: a CPU-visible native allocation in our memory
+/// segment (CpuVisible=0, SupportsCpuHostAperture) makes every D3DKMTLock2 a "complex"
+/// lock that VidMm's paging worker serves by suspending the device's contexts and
+/// evicting; with NVIDIA's UMD the context it suspends can be the very one waiting on the
+/// locking thread (Steel Nomad D3D12: Xid 109 CTX SWITCH TIMEOUT). NVIDIA keeps UMD
+/// CPU-visible allocations in system memory; in the aperture they get a simple lock.
+pub const PERF_MEM_DEFAULT: u32 = PerfMem::GPU_ONLY_VRAM | PerfMem::CPU_VISIBLE_APERTURE;
 
 impl PerfMem {
     /// GPU-only allocations are not CpuVisible and prefer the memory segment
@@ -66,6 +73,9 @@ impl PerfMem {
     pub const TLB_DEFER: u32 = 0x20;
     /// A system-page leaf update that names the pages already mapped there is skipped.
     pub const SKIP_UNCHANGED: u32 = 0x40;
+    /// CPU-visible (non-shared, non-GPU-only) native allocations live in the aperture
+    /// segment only (simple CPU locks, no suspend/evict round trips).
+    pub const CPU_VISIBLE_APERTURE: u32 = 0x80;
 
     const fn has(self, bit: u32) -> bool {
         self.0 & bit != 0
@@ -93,6 +103,9 @@ impl PerfMem {
     }
     pub const fn skip_unchanged(self) -> bool {
         self.has(Self::SKIP_UNCHANGED)
+    }
+    pub const fn cpu_visible_aperture(self) -> bool {
+        self.has(Self::CPU_VISIBLE_APERTURE)
     }
 }
 
@@ -146,6 +159,20 @@ pub fn placement(
     gpu_only: bool,
     mode: GpuOnlyMode,
 ) -> Placement {
+    placement_with(aperture, memory_segment, system, shared, gpu_only, mode, false)
+}
+
+/// [`placement`], with `cpu_aperture` ([`PerfMem::CPU_VISIBLE_APERTURE`]): a CPU-visible
+/// non-shared allocation that is not placed by the GPU-only rule goes to the aperture only.
+pub fn placement_with(
+    aperture: u32,
+    memory_segment: Option<u32>,
+    system: bool,
+    shared: bool,
+    gpu_only: bool,
+    mode: GpuOnlyMode,
+    cpu_aperture: bool,
+) -> Placement {
     let segment = if system {
         aperture
     } else {
@@ -171,6 +198,14 @@ pub fn placement(
             supported,
             flags: 0,
             gpu_only: true,
+        };
+    }
+    if cpu_aperture && !shared {
+        return Placement {
+            segment: aperture,
+            supported: segment_bit(aperture),
+            flags: FLAG_CPU_VISIBLE,
+            gpu_only: false,
         };
     }
     Placement {
@@ -396,6 +431,15 @@ mod tests {
     #[test]
     fn gpu_only_records_go_to_video_memory_by_default() {
         assert_eq!(PerfMem(PERF_MEM_DEFAULT).gpu_only_mode(), GpuOnlyMode::VramFirst);
+        assert!(PerfMem(PERF_MEM_DEFAULT).cpu_visible_aperture());
+        // CPU-visible, not shared, not GPU-only: aperture only.
+        let p = placement_with(1, Some(2), false, false, false, GpuOnlyMode::VramFirst, true);
+        assert_eq!((p.segment, p.supported, p.flags), (1, 0b01, FLAG_CPU_VISIBLE));
+        // Shared keeps the old rule; GPU-only keeps VRAM.
+        let p = placement_with(1, Some(2), false, true, false, GpuOnlyMode::VramFirst, true);
+        assert_eq!((p.segment, p.supported, p.flags), (2, 0b11, 0));
+        let p = placement_with(1, Some(2), false, false, true, GpuOnlyMode::VramFirst, true);
+        assert_eq!((p.segment, p.flags), (2, 0));
         let p = placement(1, Some(2), false, false, true, PerfMem(PERF_MEM_DEFAULT).gpu_only_mode());
         assert_eq!((p.segment, p.supported, p.flags, p.gpu_only), (2, 0b11, 0, true));
     }

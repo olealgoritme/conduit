@@ -3424,13 +3424,14 @@ unsafe fn create_native_one(
     // segment, as `vidmm_placement` does for the default path. GPU-only records
     // (NvPerfMem 0x01/0x02) are not CpuVisible and stay in the memory segment
     // (`native_perf::placement`; with the knob off this is the old rule).
-    let placement = helios_kmd_logic::native_perf::placement(
+    let placement = helios_kmd_logic::native_perf::placement_with(
         crate::ddi::gpummu::APERTURE_SEGMENT_ID,
         adapter.segment_table().and_then(|table| table.bar_seg_id()),
         created.system_memory != 0 || user_memory,
         shared,
         gpu_only,
         perf.gpu_only_mode(),
+        perf.cpu_visible_aperture(),
     );
     let segment = placement.segment;
     let supported = placement.supported;
