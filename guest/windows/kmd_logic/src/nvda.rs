@@ -673,6 +673,47 @@ pub fn apply_local(
             put32(buf, NVDA_RESULT2_AT, 1);
             put32(buf, 0x30, 0);
         }
+        0x0700_00f1 => {
+            // 0x40-byte adapter-scoped NVAPI query (Flags 8): the display at +0x34,
+            // given as an NVAPI display id (0x8006108n) or as a one-bit display mask
+            // (0x100, 0x2000), answered with its index k in two forms: +0x38 = 0x110 + k,
+            // +0x3c = 0x1100 + k, 0x100 at +0x30, +0x34 kept (all 662 replies in the
+            // vktest and L3 captures follow `display_index`). A display it cannot name
+            // keeps the request's -23 in the second result word.
+            exact(buf, 0x40)?;
+            put32(buf, NVDA_RESULT_AT, 1);
+            put32(buf, 0x30, 0x100);
+            match display_index(rc::get32(buf, 0x34).unwrap_or(0)) {
+                Some(k) => {
+                    put32(buf, NVDA_RESULT2_AT, 1);
+                    put32(buf, 0x38, 0x110 + k);
+                    put32(buf, 0x3c, 0x1100 + k);
+                }
+                None => {
+                    put32(buf, NVDA_RESULT2_AT, DISPLAY_UNKNOWN_RESULT2);
+                    put32(buf, 0x38, 0);
+                    put32(buf, 0x3c, 0);
+                }
+            }
+        }
+        0x0700_0113 => {
+            // 0x3c-byte adapter-scoped NVAPI query: the one-bit display mask at +0x34
+            // (+0x30 0x100 from the caller) to its NVAPI display id at +0x38 (mask 0x100
+            // -> 0x80061083, 0x2000 -> 0x80061086 in all 51 captured replies).
+            exact(buf, 0x3c)?;
+            put32(buf, NVDA_RESULT_AT, 1);
+            let mask = rc::get32(buf, 0x34).unwrap_or(0);
+            match display_index(mask).filter(|_| mask.is_power_of_two() && mask < 0x8000_0000) {
+                Some(k) => {
+                    put32(buf, NVDA_RESULT2_AT, 1);
+                    put32(buf, 0x38, display_id_of(k));
+                }
+                None => {
+                    put32(buf, NVDA_RESULT2_AT, DISPLAY_UNKNOWN_RESULT2);
+                    put32(buf, 0x38, 0);
+                }
+            }
+        }
         0x0100_000d => {
             // 0xfc0-byte adapter-scoped NVAPI display-timing query (Flags 8, no
             // hDevice; the vktest capture seq 3783 from nvapi64_impl via the ICD).
@@ -889,6 +930,34 @@ pub const NV0073_CTRL_CMD_SYSTEM_GET_ACTIVE: u32 = 0x0073_010c;
 pub const NV0073_CTRL_CMD_SYSTEM_GET_RASTER: u32 = 0x0073_011a;
 const NV_ERR_NOT_SUPPORTED: u32 = 0x56;
 const NV_ERR_INVALID_ADDRESS: u32 = 0x1e;
+
+/// The second result word NVAPI's display queries carry in (-23) and keep when the
+/// display is not one the KMD can name.
+pub const DISPLAY_UNKNOWN_RESULT2: u32 = 0xffff_ffe9;
+/// NVAPI display ids of the RTX 5090's outputs: 0x80061080 | n.
+pub const NVAPI_DISPLAY_ID_BASE: u32 = 0x8006_1080;
+
+/// The output index k of `0x070000f1` / `0x07000113` from an NVAPI display id
+/// (0x8006108n: k = n ^ 3) or a one-bit display mask (bit 8 + k), as in every
+/// captured reply (ids 0x80..0x87 -> k 3,2,1,0,(7: 0x84 not captured),6,5,4; masks 0x100 -> 0,
+/// 0x2000 -> 5).
+pub fn display_index(display: u32) -> Option<u32> {
+    if display & !7 == NVAPI_DISPLAY_ID_BASE {
+        return Some((display & 7) ^ 3);
+    }
+    if display.is_power_of_two() {
+        let bit = display.trailing_zeros();
+        if (8..16).contains(&bit) {
+            return Some(bit - 8);
+        }
+    }
+    None
+}
+
+/// The NVAPI display id of output index `k` (the inverse of [`display_index`]).
+pub const fn display_id_of(k: u32) -> u32 {
+    NVAPI_DISPLAY_ID_BASE | ((k & 7) ^ 3)
+}
 const NV_ERR_INVALID_ARGUMENT: u32 = 0x1f;
 
 pub const NV2080_CTRL_CMD_GPU_QUERY_ECC_STATUS: u32 = 0x2080_012f;
@@ -1947,6 +2016,57 @@ mod tests {
         assert_eq!(&big[0xf4..0xf4 + 20], b"CVT:5120x1440x240Hz\0");
         let mut short = local_request(0x0100_000d, DISPLAY_TIMING_BYTES - 4);
         assert_eq!(apply_local(&mut short, 0, 0), Err(LocalError::Invalid));
+    }
+
+    #[test]
+    fn nvapi_display_queries_match_the_captures() {
+        // (+0x34 in, +0x38 out, +0x3c out) as captured for 0x070000f1.
+        for (display, a, b) in [
+            (0x100, 0x110, 0x1100),
+            (0x2000, 0x115, 0x1105),
+            (0x8006_1080, 0x113, 0x1103),
+            (0x8006_1081, 0x112, 0x1102),
+            (0x8006_1082, 0x111, 0x1101),
+            (0x8006_1083, 0x110, 0x1100),
+            (0x8006_1085, 0x116, 0x1106),
+            (0x8006_1086, 0x115, 0x1105),
+            (0x8006_1087, 0x114, 0x1104),
+        ] {
+            let mut buf = local_request(0x0700_00f1, 0x40);
+            test_put32(&mut buf, 0x2c, 0xffff_ffe9);
+            test_put32(&mut buf, 0x30, 0);
+            test_put32(&mut buf, 0x34, display);
+            assert_eq!(apply_local(&mut buf, 0, 0), Ok(LocalOutcome::Applied));
+            let w = |at: usize| u32::from_le_bytes(buf[at..at + 4].try_into().unwrap());
+            assert_eq!(
+                (w(0x08), w(0x14), w(0x2c), w(0x30), w(0x34), w(0x38), w(0x3c)),
+                (0x40, 1, 1, 0x100, display, a, b),
+                "{display:#x}"
+            );
+        }
+        let mut unknown = local_request(0x0700_00f1, 0x40);
+        test_put32(&mut unknown, 0x34, 0x1234);
+        assert_eq!(apply_local(&mut unknown, 0, 0), Ok(LocalOutcome::Applied));
+        assert_eq!(&unknown[0x2c..0x30], &0xffff_ffe9u32.to_le_bytes());
+        // 0x07000113: mask -> NVAPI display id.
+        for (mask, id) in [(0x100, 0x8006_1083u32), (0x2000, 0x8006_1086)] {
+            let mut buf = local_request(0x0700_0113, 0x3c);
+            test_put32(&mut buf, 0x30, 0x100);
+            test_put32(&mut buf, 0x34, mask);
+            assert_eq!(apply_local(&mut buf, 0, 0), Ok(LocalOutcome::Applied));
+            let w = |at: usize| u32::from_le_bytes(buf[at..at + 4].try_into().unwrap());
+            assert_eq!((w(0x08), w(0x14), w(0x2c), w(0x30), w(0x38)), (0x3c, 1, 1, 0x100, id));
+        }
+        let mut id_in = local_request(0x0700_0113, 0x3c);
+        test_put32(&mut id_in, 0x34, 0x8006_1083);
+        assert_eq!(apply_local(&mut id_in, 0, 0), Ok(LocalOutcome::Applied));
+        assert_eq!(&id_in[0x2c..0x30], &0xffff_ffe9u32.to_le_bytes());
+        for k in 0..8 {
+            assert_eq!(display_index(display_id_of(k)), Some(k));
+            assert_eq!(display_index(0x100 << k), Some(k));
+        }
+        assert_eq!(apply_local(&mut local_request(0x0700_00f1, 0x3f), 0, 0), Err(LocalError::Invalid));
+        assert_eq!(apply_local(&mut local_request(0x0700_0113, 0x40), 0, 0), Err(LocalError::Invalid));
     }
 
     #[test]
