@@ -3262,13 +3262,29 @@ unsafe fn create_native_one(
             native::PrivateError::UnsupportedCompression(_) => 10,
         };
         crate::diag::record_named_bytes(b"NvAlParse", code);
-        error
+        (code, error)
     });
-    let private = private.map_err(|error| match error {
-        native::PrivateError::UnsupportedKind(_)
-        | native::PrivateError::UnsupportedTiling(_)
-        | native::PrivateError::UnsupportedCompression(_) => STATUS_NOT_SUPPORTED,
-        _ => STATUS_INVALID_PARAMETER,
+    let private = private.map_err(|(code, error)| {
+        let status = match error {
+            native::PrivateError::UnsupportedKind(_)
+            | native::PrivateError::UnsupportedTiling(_)
+            | native::PrivateError::UnsupportedCompression(_) => STATUS_NOT_SUPPORTED,
+            _ => STATUS_INVALID_PARAMETER,
+        };
+        // `VkF`: the refused field's value (kind / tiling / compression) as the hint.
+        let value = match error {
+            native::PrivateError::UnsupportedKind(v)
+            | native::PrivateError::UnsupportedTiling(v)
+            | native::PrivateError::UnsupportedCompression(v) => v,
+            _ => native::allocation_units(bytes).unwrap_or(0) as u32,
+        };
+        crate::ddi::vk_fail::note(
+            helios_kmd_logic::vk_fail::kind::CREATE_ALLOCATION,
+            helios_kmd_logic::vk_fail::alloc_code::PARSE | code,
+            status,
+            value,
+        );
+        status
     })?;
     let shared = native::is_shared_record(bytes);
     // CUDA's memory over its own user pages (D3DKMT pSystemMem): VidMm backs it
@@ -3294,8 +3310,15 @@ unsafe fn create_native_one(
     let created = crate::virtio::native_memory::create(passive, adapter, &private, bytes)
         .map_err(|error| {
             // Which native-memory error refused it (Error discriminant + 1), and where.
+            let step = crate::virtio::native_memory::last_step();
             crate::diag::record_named_bytes(b"NvAlCreate", 1 + error as u32);
-            crate::diag::record_named_bytes(b"NvAlStep", crate::virtio::native_memory::last_step());
+            crate::diag::record_named_bytes(b"NvAlStep", step);
+            crate::ddi::vk_fail::note(
+                helios_kmd_logic::vk_fail::kind::CREATE_ALLOCATION,
+                helios_kmd_logic::vk_fail::alloc_code::CREATE | (1 + error as u32) | (step & 0xffff) << 16,
+                error.ntstatus(),
+                (private.size >> 16) as u32,
+            );
             error.ntstatus()
         })?;
     let Ok(size) = SIZE_T::try_from(created.size) else {

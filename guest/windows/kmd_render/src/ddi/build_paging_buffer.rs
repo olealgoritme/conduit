@@ -2266,6 +2266,10 @@ unsafe fn native_paging_operation(
         );
     }
     if let PagingOperation::UpdatePageTable(update) = operation {
+        PAGING_HINT.store(
+            (update.FirstPteVirtualAddress >> 16) as u32,
+            core::sync::atomic::Ordering::Relaxed,
+        );
         if update.PageTableLevel != 0 {
             // RM owns every non-leaf level of its GPU_DEVICE VA space.
             crate::ddi::hot_path::count(&crate::ddi::hot_path::PT_UPPER);
@@ -2328,6 +2332,8 @@ unsafe fn native_paging_operation(
 }
 
 static NATIVE_REFUSED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// The VA >> 16 of the last native leaf update handled (`VkF` hint of a refusal).
+static PAGING_HINT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 static LEAF_IN_SYSTEM: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 static LEAF_IN_APERTURE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 static LEAF_IN_SEGMENT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
@@ -2339,6 +2345,8 @@ static LEAF_IN_SEGMENT: core::sync::atomic::AtomicU32 = core::sync::atomic::Atom
 /// 6 residency, 7 above PASSIVE) and `NvPgFailN` counts them.
 fn native_refused(kind: u32, passive: bool) -> NTSTATUS {
     let count = NATIVE_REFUSED.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+    // `VkF` (atomics and a spinlock: fine above PASSIVE too).
+    crate::ddi::vk_fail::note(helios_kmd_logic::vk_fail::kind::PAGING, kind, 0, PAGING_HINT.load(core::sync::atomic::Ordering::Relaxed));
     if passive {
         crate::diag::record_named_bytes(b"NvPgFail", kind);
         crate::diag::record_named_bytes(b"NvPgFailN", count);

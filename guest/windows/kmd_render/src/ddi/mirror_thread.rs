@@ -390,6 +390,8 @@ fn run_pass(mask: u32) -> bool {
     // The hot-path cost block (`Hp*`) and the values the paging / allocation paths used to
     // write per call (`ddi::hot_path`): rates over the window since the last pass.
     crate::ddi::hot_path::publish();
+    // The failing-call rings (`VkF*`, `VkR*`), when they moved.
+    crate::ddi::vk_fail::publish();
     // `StgRing` (`StageTrace`): one relaxed load while the knob is 0, rate limited inside.
     crate::ddi::stage_trace::publish();
     // `NvPtRing` (page-table operation ring): one knob read per 2 s, snapshots when on.

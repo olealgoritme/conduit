@@ -20,17 +20,25 @@
 //! built, is dead or its ring is full, the HPD worker runs the work on the CPU
 //! instead ([`service`], through `native_memory::patch_gpu_bytes`).
 //!
+//! The channel path takes a record's every segment (up to what one ring
+//! submission holds, `nv_copy::MAX_RECORD_ENTRIES`; the CPU fallback's 16 entries
+//! and 0x4000-dword segments are its own limits). A submission that finds the
+//! ring full waits in a backlog the HWS poll drains in order; its fence waits
+//! for it as for any other.
+//!
 //! Counters: channel path `NvCcxMade` / `NvCcxMkFail` channels built / not
 //! built, `NvCcxSub` submissions, `NvCcxDone` sequences seen complete,
-//! `NvCcxBusy` ring full, `NvCcxNone` submissions with no usable channel and no
-//! fallback (their work does not run), `NvCcxFault` / `NvCcxHang` reports,
+//! `NvCcxBusy` ring full (the submission went to the backlog), `NvCcxBack` /
+//! `NvCcxBackMax` submissions in the backlog now / at most, `NvCcxNone`
+//! submissions with no usable channel and no fallback (their work does not run;
+//! each also in `VkCcRej` and the `VkF` ring), `NvCcxFault` / `NvCcxHang` reports,
 //! `NvCcxForced` channels completed by the KMD; CPU fallback `NvCcAdm` jobs
 //! admitted, `NvCcRun` run, `NvCcCopy` / `NvCcBytes` copies and bytes,
 //! `NvCcRel` releases, `NvCcUns` / `NvCcUnsV` launches not implemented and the
 //! last LAUNCH_DMA value, `NvCcIgn` methods ignored, `NvCcTrunc` segments cut
 //! short, `NvCcFail` / `NvCcFailVa` failed accesses and the last VA (>> 8),
 //! `NvCcFull` jobs refused (table full); both `NvCcNoRec` NVDA-context
-//! submissions without a record.
+//! submissions without a record (their work does not run either).
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -90,6 +98,26 @@ const NO_CHANNEL: ChannelSlot = ChannelSlot {
 };
 
 static CHANNELS: SpinLock<[ChannelSlot; CHANNELS_MAX]> = SpinLock::new([NO_CHANNEL; CHANNELS_MAX]);
+
+/// A channel submission that found the ring full: its sequence is already the
+/// slot's `submitted` (its fence waits for it), its entries go to the ring from
+/// the HWS poll once there is room, in order. Taken only under `CHANNELS`
+/// (lock order CHANNELS, then BACKLOG).
+struct Pending {
+    slot: usize,
+    seq: u64,
+    entries: Vec<logic::GpEntry>,
+}
+
+static BACKLOG: SpinLock<Vec<Pending>> = SpinLock::new(Vec::new());
+/// Submissions waiting in the backlog now (`NvCcxBack`), and the most at once (`NvCcxBackMax`).
+static BACKLOG_NOW: AtomicU32 = AtomicU32::new(0);
+static BACKLOG_MAX: AtomicU32 = AtomicU32::new(0);
+
+fn reject(reason: u32, hint: u32) {
+    crate::ddi::vk_fail::COPY_REJECTED.fetch_add(1, Ordering::Relaxed);
+    crate::ddi::vk_fail::note(helios_kmd_logic::vk_fail::kind::COPY_CONTEXT, reason, 0, hint);
+}
 /// `NvCcCpu`: the CPU fallback is enabled.
 static CPU_FALLBACK: AtomicU32 = AtomicU32::new(0);
 
@@ -194,10 +222,15 @@ pub(crate) fn destroy_context(h_context: usize) {
     }
     let taken = {
         let mut channels = CHANNELS.lock();
-        channels
+        let found = channels
             .iter_mut()
-            .find(|entry| entry.channel != 0 && entry.context == h_context)
-            .map(|entry| core::mem::replace(entry, NO_CHANNEL))
+            .enumerate()
+            .find(|(_, entry)| entry.channel != 0 && entry.context == h_context)
+            .map(|(slot, entry)| (slot, core::mem::replace(entry, NO_CHANNEL)));
+        found.map(|(slot, entry)| {
+            drop_backlog(slot);
+            entry
+        })
     };
     let Some(entry) = taken else {
         return;
@@ -246,48 +279,54 @@ pub(crate) unsafe fn admit(
             submit.DmaBufferPrivateDataSize as usize,
         )
     };
-    let Some(submission) = logic::find_submission(private, submit.DmaBufferSize) else {
-        NO_RECORD.fetch_add(1, Ordering::Relaxed);
-        return None;
-    };
-    if submission.count == 0 {
-        return None;
-    }
-    let on_channel = {
-        let mut channels = CHANNELS.lock();
-        let found = channels
-            .iter_mut()
-            .enumerate()
-            .find(|(_, entry)| entry.channel != 0 && entry.context == h_context);
-        match found {
-            Some((slot, entry)) => {
-                // SAFETY: as in `gate_ready`.
-                let channel = unsafe { &*(entry.channel as *const CopyChannel) };
-                let seq = entry.submitted + 1;
-                match channel.submit(submission.entries(), seq) {
-                    Ok(()) => {
-                        entry.submitted = seq;
-                        Some(logic::gate(slot, seq))
-                    }
-                    Err(crate::virtio::native_channel::NativeError::Busy) => {
-                        BUSY.fetch_add(1, Ordering::Relaxed);
-                        None
-                    }
-                    Err(_) => None,
-                }
-            }
-            None => None,
+    use helios_kmd_logic::vk_fail::copy_reason as why;
+    let record = match logic::find_record(private, submit.DmaBufferSize) {
+        Ok(record) => record,
+        Err(error) => {
+            NO_RECORD.fetch_add(1, Ordering::Relaxed);
+            // The DMA fence completes at once and the work never runs.
+            reject(why::NO_RECORD, error.code() << 24 | (private.len() as u32 & 0xff_ffff));
+            return None;
         }
     };
-    if let Some(gate) = on_channel {
-        SUBMITTED.fetch_add(1, Ordering::Relaxed);
-        crate::ddi::hws::kick_poll(adapter);
-        return Some(gate);
+    let segments = record.segments(private);
+    if segments == 0 {
+        return None;
+    }
+    if has_channel {
+        // The channel path: every segment of the record, however many and however long.
+        let mut entries = Vec::new();
+        if entries.try_reserve_exact(segments).is_err() {
+            reject(why::BUSY, segments as u32);
+            return None;
+        }
+        entries.extend(record.entries(private));
+        match submit_to_channel(h_context, entries) {
+            Ok(gate) => {
+                SUBMITTED.fetch_add(1, Ordering::Relaxed);
+                crate::ddi::hws::kick_poll(adapter);
+                return Some(gate);
+            }
+            Err(reason) => {
+                if CPU_FALLBACK.load(Ordering::Relaxed) == 0 {
+                    NONE.fetch_add(1, Ordering::Relaxed);
+                    reject(reason, segments as u32);
+                    return None;
+                }
+            }
+        }
     }
     if CPU_FALLBACK.load(Ordering::Relaxed) == 0 {
         NONE.fetch_add(1, Ordering::Relaxed);
+        reject(why::NO_CHANNEL, segments as u32);
         return None;
     }
+    // The CPU fallback (test knob): its 16-entry copy of the record.
+    let Some(submission) = logic::find_submission(private, submit.DmaBufferSize) else {
+        NO_RECORD.fetch_add(1, Ordering::Relaxed);
+        reject(why::CPU_TOO_LONG, segments as u32);
+        return None;
+    };
     let seq = {
         let mut jobs = JOBS.lock();
         match jobs.iter_mut().find(|slot| slot.is_none()) {
@@ -305,11 +344,119 @@ pub(crate) unsafe fn admit(
     };
     let Some(seq) = seq else {
         FULL.fetch_add(1, Ordering::Relaxed);
+        reject(why::CPU_FULL, segments as u32);
         return None;
     };
     ADMITTED.fetch_add(1, Ordering::Relaxed);
     adapter.signal_hpd_for(helios_kmd_logic::hpd_wake::cause::OTHER);
     Some(logic::gate(logic::GATE_CPU_SLOT, seq))
+}
+
+/// Put `entries` on `h_context`'s channel as its next sequence: straight into the
+/// ring, or (ring full, or earlier submissions still waiting) into the backlog the
+/// HWS poll drains. `Ok(gate)`, or the `copy_reason` it could not be taken for.
+/// DISPATCH.
+fn submit_to_channel(h_context: usize, entries: Vec<logic::GpEntry>) -> Result<u64, u32> {
+    use helios_kmd_logic::vk_fail::copy_reason as why;
+    let mut channels = CHANNELS.lock();
+    let Some((slot, entry)) = channels
+        .iter_mut()
+        .enumerate()
+        .find(|(_, entry)| entry.channel != 0 && entry.context == h_context)
+    else {
+        return Err(why::NO_CHANNEL);
+    };
+    // SAFETY: as in `gate_ready`.
+    let channel = unsafe { &*(entry.channel as *const CopyChannel) };
+    let seq = entry.submitted + 1;
+    let mut backlog = BACKLOG.lock();
+    let waiting = backlog.iter().any(|p| p.slot == slot);
+    if !waiting {
+        match channel.submit(&entries, seq) {
+            Ok(()) => {
+                entry.submitted = seq;
+                return Ok(logic::gate(slot, seq));
+            }
+            Err(crate::virtio::native_channel::NativeError::Busy) => {
+                BUSY.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(_) => return Err(why::CHANNEL_ERROR),
+        }
+    }
+    // Behind the ring: keep the order, the poll pushes it when there is room.
+    if backlog.try_reserve(1).is_err() {
+        return Err(why::BUSY);
+    }
+    backlog.push(Pending {
+        slot,
+        seq,
+        entries,
+    });
+    entry.submitted = seq;
+    let depth = backlog.len() as u32;
+    BACKLOG_NOW.store(depth, Ordering::Relaxed);
+    BACKLOG_MAX.fetch_max(depth, Ordering::Relaxed);
+    drop(backlog);
+    drop(channels);
+    crate::ddi::vk_fail::COPY_DEFERRED.fetch_add(1, Ordering::Relaxed);
+    if depth == 1 {
+        // The start of a backlog episode (not every submission behind it).
+        crate::ddi::vk_fail::note(helios_kmd_logic::vk_fail::kind::COPY_DEFERRED, depth, 0, slot as u32);
+    }
+    Ok(logic::gate(slot, seq))
+}
+
+/// The backlog's entries that fit now, in order per channel (DISPATCH, under
+/// `CHANNELS`). A channel that refuses for anything but a full ring is dead or
+/// gone: its waiting work is dropped and its fences complete (`forced`).
+fn drain_backlog(channels: &mut [ChannelSlot; CHANNELS_MAX]) -> bool {
+    let mut backlog = BACKLOG.lock();
+    if backlog.is_empty() {
+        return false;
+    }
+    let mut moved = false;
+    let mut blocked = 0u64;
+    let mut i = 0;
+    while i < backlog.len() {
+        let slot = backlog[i].slot;
+        let bit = 1u64 << (slot % 64);
+        if blocked & bit != 0 {
+            i += 1;
+            continue;
+        }
+        let Some(entry) = channels.get_mut(slot).filter(|entry| entry.channel != 0) else {
+            backlog.remove(i);
+            continue;
+        };
+        // SAFETY: as in `gate_ready`.
+        let channel = unsafe { &*(entry.channel as *const CopyChannel) };
+        match channel.submit(&backlog[i].entries, backlog[i].seq) {
+            Ok(()) => {
+                backlog.remove(i);
+                moved = true;
+            }
+            Err(crate::virtio::native_channel::NativeError::Busy) => {
+                blocked |= bit;
+                i += 1;
+            }
+            Err(_) => {
+                let seq = backlog[i].seq;
+                entry.forced = entry.forced.max(seq);
+                backlog.remove(i);
+                crate::ddi::vk_fail::COPY_REJECTED.fetch_add(1, Ordering::Relaxed);
+                moved = true;
+            }
+        }
+    }
+    BACKLOG_NOW.store(backlog.len() as u32, Ordering::Relaxed);
+    moved
+}
+
+/// Drop `slot`'s waiting work (its channel is gone or dead). Under `CHANNELS`.
+fn drop_backlog(slot: usize) {
+    let mut backlog = BACKLOG.lock();
+    backlog.retain(|p| p.slot != slot);
+    BACKLOG_NOW.store(backlog.len() as u32, Ordering::Relaxed);
 }
 
 /// One HWS poll tick (DISPATCH): `(outstanding, progressed)` over the copy
@@ -321,7 +468,8 @@ pub(crate) fn poll(adapter: &AdapterContext, now: u64, hang_timeout: Option<u64>
     let mut progressed = false;
     {
         let mut channels = CHANNELS.lock();
-        for entry in channels.iter_mut().filter(|entry| entry.channel != 0) {
+        drain_backlog(&mut channels);
+        for (slot, entry) in channels.iter_mut().enumerate().filter(|(_, entry)| entry.channel != 0) {
             // SAFETY: as in `gate_ready`.
             let channel = unsafe { &*(entry.channel as *const CopyChannel) };
             let value = channel.progress();
@@ -351,6 +499,7 @@ pub(crate) fn poll(adapter: &AdapterContext, now: u64, hang_timeout: Option<u64>
                     FORCED.fetch_add(1, Ordering::Relaxed);
                     channel.mark_dead();
                     entry.forced = entry.submitted;
+                    drop_backlog(slot);
                     progressed = true;
                 }
             }
@@ -375,6 +524,8 @@ fn publish_channel() {
     crate::diag::record_named_bytes(b"NvCcxHang", r(&HANGS));
     crate::diag::record_named_bytes(b"NvCcxForced", r(&FORCED));
     crate::diag::record_named_bytes(b"NvCcNoRec", r(&NO_RECORD));
+    crate::diag::record_named_bytes(b"NvCcxBack", r(&BACKLOG_NOW));
+    crate::diag::record_named_bytes(b"NvCcxBackMax", r(&BACKLOG_MAX));
 }
 
 /// The HPD worker (PASSIVE): run the CPU fallback's jobs in order, each fence's
