@@ -622,10 +622,9 @@ pub(crate) struct SnapSlot {
     pub node: u32,
     pub submitted: u64,
     pub signalled: u64,
-    /// The progress fence, USERD GP_GET, the KMD's GP_PUT and the error notifier, read now.
+    /// The progress fence, USERD GP_GET and the error notifier, read now.
     pub progress: u64,
     pub gp_get: u32,
-    pub kmd_gp_put: u32,
     pub error: bool,
     /// `native_snap::Q_OUTSTANDING | Q_FLAGGED | Q_IN_GRACE | Q_WATCH_DEAD`.
     pub flags: u32,
@@ -639,7 +638,6 @@ pub(crate) const SNAP_EMPTY: SnapSlot = SnapSlot {
     signalled: 0,
     progress: 0,
     gp_get: 0,
-    kmd_gp_put: 0,
     error: false,
     flags: 0,
 };
@@ -678,8 +676,6 @@ pub(crate) fn snap_slots(out: &mut [SnapSlot], pin: bool) -> usize {
             signalled: slot.progress.signalled,
             progress: queue.read_progress(),
             gp_get: queue.gp_get(),
-            // Lock order registry -> GP_PUT, as the poll's ForceComplete (`mark_dead`).
-            kmd_gp_put: queue.kmd_gp_put(),
             error: queue.channel_error().is_some(),
             flags,
         };
