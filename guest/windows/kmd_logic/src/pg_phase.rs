@@ -417,9 +417,11 @@ pub enum Kind {
     WithIo = 10,
     Client = 11,
     Forget = 12,
+    /// `native_memory::gpu_paging`: the RM map / unmap calls of a copy-engine paging op.
+    GpuPaging = 13,
 }
 
-pub const KINDS: usize = 13;
+pub const KINDS: usize = 14;
 
 /// Mutex holds per [`Kind`]: count, total and longest hold; and the waits for
 /// it: count, total, longest, and the kind that held it when the longest began.

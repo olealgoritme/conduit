@@ -1321,6 +1321,7 @@ pub mod rmpolicy;
 mod scanout;
 mod sched;
 mod simple;
+mod slow_log;
 #[cfg(feature = "trace")]
 mod trace;
 pub mod umd_version;

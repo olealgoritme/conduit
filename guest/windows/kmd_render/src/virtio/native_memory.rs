@@ -25,6 +25,7 @@ use helios_kmd_logic::rm_batch as rb;
 use helios_kmd_logic::native_memory as nm;
 use helios_kmd_logic::native_perf as np;
 use helios_kmd_logic::native_teardown as nt;
+use helios_kmd_logic::pg_gpu;
 use helios_kmd_logic::pg_phase::{self as pg, Acc, Kind, Phase};
 use helios_kmd_logic::nvda as nd;
 use helios_kmd_logic::pt_ring as ptr;
@@ -265,6 +266,7 @@ pub(crate) fn publish_hot() {
         rec(b"PgViewKiB", r(&VIEW_KIB));
         rec(b"PgViewUs", r(&VIEW_US));
     }
+    publish_gpu();
     let evicted = EVICTED.load(Ordering::Relaxed);
     if evicted != 0 {
         crate::diag::record_named_bytes(b"NvEvict", evicted);
@@ -353,8 +355,9 @@ fn bump(counter: &AtomicU32, name: &[u8]) {
 static QUIESCE_REFUSED: AtomicU32 = AtomicU32::new(0);
 /// `with_cpu_range` temporary-view copies (`PgCopy*`, published by the mirror
 /// pass): `PgCopyKiB` KiB copied, `PgCopyUs` time in the copies,
-/// `PgCopyFree` copies run without the mutex (`NvPaging` 0x8), `PgCopyLeak` views
-/// whose host half could not be released after one (the mutex timed out).
+/// `PgCopyFree` copies run without the mutex (`NvPaging` 0x8; BuildPagingBuffer's
+/// by default, unless `NvPaging` 0x20), `PgCopyLeak` views whose host half could
+/// not be released after one (the mutex timed out).
 static COPY_KIB: AtomicU32 = AtomicU32::new(0);
 static COPY_US: AtomicU32 = AtomicU32::new(0);
 static COPIES_UNLOCKED: AtomicU32 = AtomicU32::new(0);
@@ -801,6 +804,8 @@ struct State {
     orphan_pins: Vec<Pin>,
     idle_spaces: Vec<usize>,
     next_handle: u32,
+    /// The VA space of the paging copy channel and its two windows (`gpu_paging`).
+    pg_space: Option<PgSpace>,
 }
 
 impl State {
@@ -817,6 +822,7 @@ impl State {
             orphan_pins: Vec::new(),
             idle_spaces: Vec::new(),
             next_handle: FIRST_DYNAMIC_HANDLE,
+            pg_space: None,
         }
     }
 
@@ -1122,6 +1128,7 @@ pub fn install_client(
         state.descs.clear();
         state.by_process.clear();
         state.index_broken = false;
+        state.pg_space = None;
         state
             .spaces
             .try_reserve_exact(1)
@@ -4286,6 +4293,31 @@ pub unsafe fn with_cpu_range(
     id: u32,
     offset: u64,
     length: u64,
+    f: impl FnMut(u64, *mut u8, u64) -> bool,
+) -> Result<bool, Error> {
+    unsafe { with_cpu_range_as(passive, adapter, id, offset, length, false, f) }
+}
+
+/// [`with_cpu_range`] for BuildPagingBuffer's own operations: the copy through a temporary view
+/// runs without the mutex unless `NvPaging` 0x20 (`Paging::paging_copy_unlocked`).
+pub unsafe fn with_cpu_range_paging(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    id: u32,
+    offset: u64,
+    length: u64,
+    f: impl FnMut(u64, *mut u8, u64) -> bool,
+) -> Result<bool, Error> {
+    unsafe { with_cpu_range_as(passive, adapter, id, offset, length, true, f) }
+}
+
+unsafe fn with_cpu_range_as(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    id: u32,
+    offset: u64,
+    length: u64,
+    paging_op: bool,
     mut f: impl FnMut(u64, *mut u8, u64) -> bool,
 ) -> Result<bool, Error> {
     let mut guard = Some(lock(passive, Kind::CpuRange)?);
@@ -4365,8 +4397,9 @@ pub unsafe fn with_cpu_range(
         return Ok(view_copy(length, || f(0, address as *mut u8, length)));
     }
 
-    // `NvPaging` 0x8: the copy runs without the mutex (the temporary view is this
-    // call's alone; only its RM map and unmap need the mutex). 0x10: the view is
+    // `NvPaging` 0x8 (BuildPagingBuffer's copies: unless 0x20): the copy runs without
+    // the mutex (the temporary view is this call's alone; only its RM map and unmap
+    // need the mutex). 0x10: the view is
     // write-combined, and a full fence drains the combining buffers after the copy.
     let knob = paging();
     let cache = if knob.copy_wc() {
@@ -4391,7 +4424,12 @@ pub unsafe fn with_cpu_range(
         }
         let mut mapping =
             cpu_map_as(&io, &snapshot, map_offset, map_end - map_offset, None, None, cache)?;
-        if knob.copy_unlocked() {
+        let unlocked = if paging_op {
+            knob.paging_copy_unlocked()
+        } else {
+            knob.copy_unlocked()
+        };
+        if unlocked {
             guard = None;
             COPIES_UNLOCKED.fetch_add(1, Ordering::Relaxed);
         }
@@ -4446,6 +4484,463 @@ pub unsafe fn with_cpu_range(
         completed += chunk_len;
     }
     Ok(true)
+}
+
+// ── VidMm paging on the copy engine (`NvPgGpu`, `helios_kmd_logic::pg_gpu`) ─────────────────
+//
+// `gpu_paging` runs a paging FILL / TRANSFER of a native video-memory allocation on the KMD's
+// paging copy channel (`native_channel::pg_channel`) instead of the CPU: per chunk, the
+// allocation's range is mapped into the paging space's video window and the system pages
+// (an RM OS descriptor over them, shared / cached as the leaf updates' are) into its system
+// window, the push runs and is waited for, and both are unmapped again. Only the RM calls run
+// under the native-memory mutex (`NvPgGpu` 0x100 holds it throughout). Anything the copy
+// engine cannot take returns `false` and the caller copies on the CPU as before.
+//
+// Counters (mirror pass, `publish_gpu`): `PgGpuKnob`; `PgGpuN0..3` operations done on the copy
+// engine (transfer, fill, virtual fill, virtual transfer), `PgGpuKiB` their KiB, `PgGpuUs` /
+// `PgGpuMaxUs` their time (map, copy, unmap; the paging latency), `PgGpuWaitUs` the part
+// spent waiting for the copy engine, `PgGpuMapUs` the RM map / unmap part, `PgGpuChunks`
+// chunks; `PgGpuFallN` operations given back to the CPU and `PgGpuFallWhy` the last reason
+// (low byte, `fall::*`; the error above it); `PgGpuCpuN` / `PgGpuCpuKiB` paging copies done
+// on the CPU (`with_cpu_range` from BuildPagingBuffer); `PgGpuNoGo` / `PgGpuNoGoWhy` the path
+// turned off for the transport generation (a paging-space mapping that could not be undone);
+// the channel's `PgGpuChState` (`rm_ce_channel::Svc` word), `PgGpuChErr` (bring-up step << 24 |
+// error), `PgGpuEngine`, `PgGpuToken`, `PgGpuHung` releases that did not land.
+
+/// The paging copy channel's VA space and its two windows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PgSpace {
+    space: u32,
+    vid: u32,
+    sys: u32,
+}
+
+/// Why an operation went back to the CPU (`PgGpuFallWhy` low byte).
+mod fall {
+    pub const LOCK: u32 = 1;
+    pub const CLIENT: u32 = 2;
+    pub const ALLOCATION: u32 = 3;
+    pub const SYSTEM_BACKED: u32 = 4;
+    pub const SPACE: u32 = 5;
+    pub const CHANNEL: u32 = 6;
+    pub const SHAPE: u32 = 7;
+    pub const VID_MAP: u32 = 8;
+    pub const DESCRIPTOR: u32 = 9;
+    pub const SYS_MAP: u32 = 10;
+    pub const RUN: u32 = 11;
+    pub const UNMAP: u32 = 12;
+    pub const NO_GO: u32 = 13;
+}
+
+static GPU_N: [AtomicU32; 4] = [const { AtomicU32::new(0) }; 4];
+static GPU_KIB: AtomicU32 = AtomicU32::new(0);
+static GPU_US: AtomicU32 = AtomicU32::new(0);
+static GPU_MAX_US: AtomicU32 = AtomicU32::new(0);
+static GPU_MAP_US: AtomicU32 = AtomicU32::new(0);
+static GPU_CHUNKS: AtomicU32 = AtomicU32::new(0);
+static GPU_FALL: AtomicU32 = AtomicU32::new(0);
+static GPU_FALL_WHY: AtomicU32 = AtomicU32::new(0);
+static GPU_NOGO: AtomicU32 = AtomicU32::new(0);
+static GPU_NOGO_N: AtomicU32 = AtomicU32::new(0);
+static CPU_PAGING_N: AtomicU32 = AtomicU32::new(0);
+static CPU_PAGING_KIB: AtomicU32 = AtomicU32::new(0);
+
+/// `NvPgGpu` and `NvPgGpuMin`, read once (PASSIVE).
+pub(crate) fn gpu_knob() -> (pg_gpu::Knob, u32) {
+    static KNOB: AtomicU32 = AtomicU32::new(u32::MAX);
+    static MIN: AtomicU32 = AtomicU32::new(0);
+    let mut value = KNOB.load(Ordering::Relaxed);
+    if value == u32::MAX {
+        let read = crate::diag::read_config_dword(
+            crate::diag::KnobName::new(b"NvPgGpu"),
+            pg_gpu::DEFAULT_KNOB,
+        );
+        let min = crate::diag::read_config_dword(
+            crate::diag::KnobName::new(b"NvPgGpuMin"),
+            pg_gpu::DEFAULT_MIN_BYTES,
+        );
+        MIN.store(min, Ordering::Relaxed);
+        value = if read == u32::MAX { pg_gpu::DEFAULT_KNOB } else { read };
+        KNOB.store(value, Ordering::Relaxed);
+    }
+    (pg_gpu::Knob(value), MIN.load(Ordering::Relaxed))
+}
+
+/// Whether a paging operation `op` of `bytes` goes to the copy engine first.
+pub(crate) fn gpu_wants(op: pg_gpu::Op, bytes: u64) -> bool {
+    let (knob, min) = gpu_knob();
+    pg_gpu::wants(knob, op, bytes, min) && GPU_NOGO.load(Ordering::Relaxed) == 0
+}
+
+/// A paging copy that ran on the CPU (`PgGpuCpuN` / `PgGpuCpuKiB`).
+pub(crate) fn note_cpu_paging(bytes: u64) {
+    CPU_PAGING_N.fetch_add(1, Ordering::Relaxed);
+    CPU_PAGING_KIB.fetch_add(u32::try_from(bytes >> 10).unwrap_or(u32::MAX), Ordering::Relaxed);
+}
+
+fn publish_gpu() {
+    let r = |a: &AtomicU32| a.load(Ordering::Relaxed);
+    let rec = crate::diag::record_named_bytes;
+    let (knob, _) = gpu_knob();
+    if knob.0 == 0 {
+        // Off: only how much BuildPagingBuffer copied on the CPU.
+        if r(&CPU_PAGING_N) != 0 {
+            rec(b"PgGpuCpuN", r(&CPU_PAGING_N));
+            rec(b"PgGpuCpuKiB", r(&CPU_PAGING_KIB));
+        }
+        return;
+    }
+    rec(b"PgGpuKnob", knob.0);
+    for (i, name) in [b"PgGpuN0", b"PgGpuN1", b"PgGpuN2", b"PgGpuN3"].iter().enumerate() {
+        rec(&name[..], r(&GPU_N[i]));
+    }
+    rec(b"PgGpuKiB", r(&GPU_KIB));
+    rec(b"PgGpuUs", r(&GPU_US));
+    rec(b"PgGpuMaxUs", r(&GPU_MAX_US));
+    let wait = super::native_channel::pg_channel::WAIT_US.load(Ordering::Relaxed);
+    rec(b"PgGpuWaitUs", u32::try_from(wait).unwrap_or(u32::MAX));
+    rec(b"PgGpuMapUs", r(&GPU_MAP_US));
+    rec(b"PgGpuChunks", r(&GPU_CHUNKS));
+    rec(b"PgGpuCpuN", r(&CPU_PAGING_N));
+    rec(b"PgGpuCpuKiB", r(&CPU_PAGING_KIB));
+    rec(b"PgGpuFallN", r(&GPU_FALL));
+    rec(b"PgGpuFallWhy", r(&GPU_FALL_WHY));
+    rec(b"PgGpuNoGo", r(&GPU_NOGO_N));
+    rec(b"PgGpuNoGoWhy", r(&GPU_NOGO));
+    let (err, engine, token, hung, _) = super::native_channel::pg_channel::counters();
+    rec(b"PgGpuChState", super::native_channel::pg_channel::state_word());
+    rec(b"PgGpuChErr", err);
+    rec(b"PgGpuEngine", engine);
+    rec(b"PgGpuToken", token);
+    rec(b"PgGpuHung", hung);
+}
+
+/// The system side of a copy-engine paging operation: its page frames (locked by VidMm for the
+/// operation) and the operation's first byte, counted from the start of `pfns[0]`.
+#[derive(Clone, Copy)]
+pub struct GpuSystem<'a> {
+    pub pfns: &'a [u64],
+    pub start: u64,
+}
+
+/// Turn the path off for the transport generation of `epoch` (a paging-space mapping stayed).
+fn gpu_no_go(epoch: u64, why: u32) {
+    if st().client.as_ref().map(|c| c.epoch) == Some(epoch) {
+        GPU_NOGO.store(why, Ordering::Relaxed);
+        GPU_NOGO_N.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// The paging space, made on first use: a new VA space (RM places the channel's own objects
+/// in it) and two fixed windows (`pg_gpu::VID_WINDOW_VA`, `pg_gpu::SYS_WINDOW_VA`) the
+/// operations map into at fixed offsets. Under the mutex.
+fn ensure_pg_space(io: &Io<'_>) -> Result<PgSpace, Error> {
+    if let Some(space) = st().pg_space {
+        return Ok(space);
+    }
+    let space = st().mint()?;
+    io.rm_alloc(nd::H_DEVICE, space, cc::FERMI_VASPACE_A, &cc::vaspace_params_vidmm())?;
+    let mut made = PgSpace { space, vid: 0, sys: 0 };
+    let windows = [
+        (pg_gpu::VID_WINDOW_VA, pg_gpu::VID_WINDOW_BYTES),
+        (pg_gpu::SYS_WINDOW_VA, pg_gpu::SYS_WINDOW_BYTES),
+    ];
+    for (i, (va, len)) in windows.into_iter().enumerate() {
+        let minted = st().mint();
+        let window = match minted {
+            Ok(w) => w,
+            Err(error) => {
+                let _ = io.rm_free(nd::H_DEVICE, space);
+                return Err(error);
+            }
+        };
+        let params = cc::virtual_params(io.client.root, space, Some(va), len);
+        if let Err(error) = io.rm_alloc(nd::H_DEVICE, window, cc::NV50_MEMORY_VIRTUAL, &params) {
+            // Frees the windows made so far with it.
+            let _ = io.rm_free(nd::H_DEVICE, space);
+            return Err(error);
+        }
+        if i == 0 {
+            made.vid = window;
+        } else {
+            made.sys = window;
+        }
+    }
+    st().pg_space = Some(made);
+    Ok(made)
+}
+
+/// What one chunk mapped.
+struct PgMapped {
+    /// The OS descriptor of the system window, if one is mapped.
+    desc: Option<u32>,
+}
+
+fn pg_unmap_one(io: &Io<'_>, window: u32, memory: u32, va: u64) -> Result<(), Error> {
+    let block = nm::nvos47_unmap(io.client.root, nd::H_DEVICE, window, memory, va);
+    let mut response = [0u8; REPLY_MAX];
+    let n = io.exchange(
+        io.client.ctl,
+        rc::nv_cmd(cc::ESC_RM_UNMAP_MEMORY_DMA, cc::NVOS47_BYTES as u32),
+        &block,
+        &[],
+        &mut response,
+    )?;
+    rc::rm_reply(response.get(..n).ok_or(Error::Host)?, cc::NVOS47_STATUS_AT)
+        .map(|_| ())
+        .map_err(|_| Error::Host)
+}
+
+/// Map one chunk: `vm` of `memory` into the video window, the pages `sp` of `system` into the
+/// system window. On failure nothing stays mapped (`Err(reason)`), unless an unmap failed
+/// too (then the path is off: [`gpu_no_go`]).
+fn pg_map_chunk(
+    io: &Io<'_>,
+    id: u32,
+    memory: u32,
+    space: PgSpace,
+    vm: pg_gpu::VidMap,
+    system: Option<(GpuSystem<'_>, pg_gpu::SysPages)>,
+) -> Result<PgMapped, u32> {
+    let piece = nm::MappingPiece {
+        va: pg_gpu::VID_WINDOW_VA,
+        memory_offset: vm.map_offset,
+        len: vm.map_len,
+    };
+    let mut mapped = Err(Error::Invalid);
+    if vm.big {
+        let flags = np::with_page_size(LOCAL_4K_MAP_FLAGS, np::MAP_PAGE_BIG);
+        mapped = map_in_window(io, memory, space.vid, flags, piece);
+    }
+    if mapped.is_err() {
+        mapped = map_in_window(io, memory, space.vid, LOCAL_4K_MAP_FLAGS, piece);
+    }
+    if let Err(error) = mapped {
+        return Err(fall::VID_MAP | (error as u32) << 8);
+    }
+    let undo_vid = |io: &Io<'_>| {
+        if pg_unmap_one(io, space.vid, memory, pg_gpu::VID_WINDOW_VA).is_err() {
+            gpu_no_go(io.client.epoch, fall::UNMAP);
+        }
+    };
+    let Some((system, sp)) = system else {
+        return Ok(PgMapped { desc: None });
+    };
+    let Some(pfns) = system.pfns.get(sp.first..sp.first + sp.count) else {
+        undo_vid(io);
+        return Err(fall::SHAPE);
+    };
+    let len = sp.count as u64 * pg_gpu::PAGE;
+    let (desc, new) = match take_desc(pfns, id) {
+        Ok(taken) => taken,
+        Err(error) => {
+            undo_vid(io);
+            return Err(fall::DESCRIPTOR | (error as u32) << 8);
+        }
+    };
+    if new {
+        if let Err(error) = alloc_system_descriptor(io, desc, pfns, len) {
+            undo_vid(io);
+            return Err(fall::DESCRIPTOR | (error as u32) << 8);
+        }
+        DESC_NEW.fetch_add(1, Ordering::Relaxed);
+    }
+    let piece = nm::MappingPiece {
+        va: pg_gpu::SYS_WINDOW_VA,
+        memory_offset: 0,
+        len,
+    };
+    if let Err(error) = map_in_window(io, desc, space.sys, cc::MAP_FLAGS_SYSMEM, piece) {
+        give_back_desc(io, desc, new);
+        undo_vid(io);
+        return Err(fall::SYS_MAP | (error as u32) << 8);
+    }
+    if new {
+        // Unrecorded (no memory): it is freed at its unmap below.
+        let _ = st().descs.insert(desc, pfns, id);
+    }
+    Ok(PgMapped { desc: Some(desc) })
+}
+
+/// Unmap one chunk's windows. `Err` when a window could not be emptied (the path is then off).
+fn pg_unmap_chunk(io: &Io<'_>, memory: u32, space: PgSpace, mapped: &PgMapped) -> Result<(), ()> {
+    let mut ok = true;
+    if let Some(desc) = mapped.desc {
+        if pg_unmap_one(io, space.sys, desc, pg_gpu::SYS_WINDOW_VA).is_ok() {
+            // Freed unless another mapping shows it or it is kept idle (`NvPaging` 0x2).
+            if release_desc(io, desc).is_err() {
+                // The descriptor stays allocated; the window is empty.
+            }
+        } else {
+            ok = false;
+        }
+    }
+    if pg_unmap_one(io, space.vid, memory, pg_gpu::VID_WINDOW_VA).is_err() {
+        ok = false;
+    }
+    if ok {
+        Ok(())
+    } else {
+        Err(())
+    }
+}
+
+/// Run a paging operation of native allocation `id` on the copy engine: `work` over
+/// `[offset, offset + length)` of its video memory, with `system`'s pages for a transfer.
+/// `true`: done (the bytes are in place when this returns); `false`: nothing is pending on
+/// the GPU and the caller copies on the CPU. PASSIVE (BuildPagingBuffer).
+pub fn gpu_paging(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    op: pg_gpu::Op,
+    id: u32,
+    offset: u64,
+    length: u64,
+    work: pg_gpu::Work,
+    system: Option<GpuSystem<'_>>,
+) -> bool {
+    let start = now();
+    let result = gpu_paging_inner(passive, adapter, id, offset, length, work, system);
+    let us = np::ticks_to_us(now().saturating_sub(start));
+    match result {
+        Ok(chunks) => {
+            GPU_N[op.index()].fetch_add(1, Ordering::Relaxed);
+            GPU_KIB.fetch_add(u32::try_from(length >> 10).unwrap_or(u32::MAX), Ordering::Relaxed);
+            GPU_US.fetch_add(us, Ordering::Relaxed);
+            GPU_MAX_US.fetch_max(us, Ordering::Relaxed);
+            GPU_CHUNKS.fetch_add(chunks, Ordering::Relaxed);
+            true
+        }
+        Err(why) => {
+            GPU_FALL.fetch_add(1, Ordering::Relaxed);
+            GPU_FALL_WHY.store(why, Ordering::Relaxed);
+            false
+        }
+    }
+}
+
+fn gpu_paging_inner(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    id: u32,
+    offset: u64,
+    length: u64,
+    work: pg_gpu::Work,
+    system: Option<GpuSystem<'_>>,
+) -> Result<u32, u32> {
+    use super::native_channel::pg_channel;
+    if GPU_NOGO.load(Ordering::Relaxed) != 0 {
+        return Err(fall::NO_GO);
+    }
+    let (knob, _) = gpu_knob();
+    let op_guard = pg_channel::lock(passive, LOCK_MAX_MS).ok_or(fall::LOCK)?;
+    let map_started = now();
+    let mut guard = Some(lock(passive, Kind::GpuPaging).map_err(|_| fall::LOCK)?);
+    let client = st().client().map_err(|_| fall::CLIENT)?;
+    let io = Io {
+        passive,
+        adapter,
+        client,
+    };
+    let (memory, size) = {
+        let state = st();
+        let a = state.allocation(id).map_err(|_| fall::ALLOCATION)?;
+        if a.poisoned {
+            return Err(fall::ALLOCATION);
+        }
+        if a.system_memory != 0 {
+            return Err(fall::SYSTEM_BACKED);
+        }
+        (a.memory, a.size)
+    };
+    let space = ensure_pg_space(&io).map_err(|error| fall::SPACE | (error as u32) << 8)?;
+    if !knob.hold_lock() {
+        guard = None;
+    }
+    let mut map_ticks = now().saturating_sub(map_started);
+    let ready = pg_channel::ensure(passive, adapter, &client, space.space, &op_guard);
+    if let Err(error) = ready {
+        return Err(fall::CHANNEL | (error as u32) << 8);
+    }
+    let mut done = 0u64;
+    let mut chunks = 0u32;
+    let result = loop {
+        if done >= length {
+            break Ok(chunks);
+        }
+        let n = pg_gpu::chunk_len(length, done);
+        let Some(vm) = offset.checked_add(done).and_then(|at| pg_gpu::vid_map(at, n, size)) else {
+            break Err(fall::SHAPE);
+        };
+        let sp = match system {
+            Some(s) => match s
+                .start
+                .checked_add(done)
+                .and_then(|at| pg_gpu::sys_pages(at, n, s.pfns.len()))
+            {
+                Some(sp) => Some((s, sp)),
+                None => break Err(fall::SHAPE),
+            },
+            None => None,
+        };
+        let t = now();
+        if guard.is_none() {
+            match lock(passive, Kind::GpuPaging) {
+                Ok(g) => guard = Some(g),
+                Err(_) => break Err(fall::LOCK),
+            }
+        }
+        if st().client.as_ref().map(|c| c.epoch) != Some(client.epoch) {
+            break Err(fall::CLIENT);
+        }
+        let mapped = match pg_map_chunk(&io, id, memory, space, vm, sp) {
+            Ok(mapped) => mapped,
+            Err(why) => break Err(why),
+        };
+        if !knob.hold_lock() {
+            guard = None;
+        }
+        map_ticks += now().saturating_sub(t);
+        let vid_va = pg_gpu::VID_WINDOW_VA + vm.delta;
+        let sys_va = pg_gpu::SYS_WINDOW_VA + sp.map_or(0, |(_, p)| p.intra);
+        let ran = pg_channel::run(passive, adapter, &client, &op_guard, n, |p, first, sem, seq| {
+            pg_gpu::push(p, helios_kmd_logic::ce_present::Gen::Gb202, first, work, vid_va, sys_va, n, sem, seq)
+        });
+        let t = now();
+        if guard.is_none() {
+            match lock(passive, Kind::GpuPaging) {
+                Ok(g) => guard = Some(g),
+                Err(_) => {
+                    // The windows stay mapped: no later operation may use them.
+                    gpu_no_go(client.epoch, fall::UNMAP);
+                    break Err(fall::LOCK);
+                }
+            }
+        }
+        let unmapped = pg_unmap_chunk(&io, memory, space, &mapped);
+        if !knob.hold_lock() {
+            guard = None;
+        }
+        map_ticks += now().saturating_sub(t);
+        if let Err(error) = ran {
+            if unmapped.is_err() {
+                gpu_no_go(client.epoch, fall::UNMAP);
+            }
+            break Err(fall::RUN | (error as u32) << 8);
+        }
+        done += n;
+        chunks += 1;
+        if unmapped.is_err() {
+            gpu_no_go(client.epoch, fall::UNMAP);
+            // This chunk is done; the rest cannot use the windows.
+            if done < length {
+                break Err(fall::UNMAP);
+            }
+        }
+    };
+    drop(guard);
+    GPU_MAP_US.fetch_add(np::ticks_to_us(map_ticks), Ordering::Relaxed);
+    result
 }
 
 /// Map a native CPU-host-aperture request.  pSystemMem is already the direct
@@ -4830,6 +5325,9 @@ pub fn discard(id: u32) -> Result<(), Error> {
 /// Forget host objects after the transport-wide close sweep.  Kernel CPU views
 /// and MDLs still belong to the guest and are released here, at PASSIVE.
 pub fn forget(passive: PassiveLevel) {
+    // The paging copy channel first (its lock comes before this module's mutex).
+    super::native_channel::pg_channel::forget(passive);
+    GPU_NOGO.store(0, Ordering::Relaxed);
     // Unbounded: a skipped forget would leave the old generation's client in place
     // and every later `create` refused as NotReady. Holders' round trips are
     // bounded, so this wait ends.
@@ -4847,6 +5345,7 @@ pub fn forget(passive: PassiveLevel) {
     state.by_process.clear();
     state.index_broken = false;
     state.idle_spaces.clear();
+    state.pg_space = None;
     // Pins kept because the host's answer was unknown: the sweep closed every
     // object that could name them.
     let mut orphans = core::mem::take(&mut state.orphan_pins);

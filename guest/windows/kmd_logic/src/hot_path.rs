@@ -82,6 +82,10 @@ impl HotPath {
 /// * [`Paging::COPY_WC`] (0x10): that temporary view is write-combined instead
 ///   of uncached (writes, i.e. fills and uploads, are combined into bursts),
 ///   with a store fence after the copy.
+/// * [`Paging::COPY_LOCKED`] (0x20): BuildPagingBuffer's own CPU copies keep the
+///   mutex too. Without it they copy unlocked whatever 0x8 says: VidMm destroys
+///   no allocation while one of its paging operations runs, and the temporary
+///   view is the copy's alone ([`Paging::paging_copy_unlocked`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Paging(pub u32);
 
@@ -91,6 +95,7 @@ impl Paging {
     pub const ONE_LOCK: u32 = 0x4;
     pub const COPY_UNLOCKED: u32 = 0x8;
     pub const COPY_WC: u32 = 0x10;
+    pub const COPY_LOCKED: u32 = 0x20;
 
     pub const fn batch(self) -> bool {
         self.0 & Self::BATCH != 0
@@ -106,6 +111,14 @@ impl Paging {
     }
     pub const fn copy_wc(self) -> bool {
         self.0 & Self::COPY_WC != 0
+    }
+    pub const fn copy_locked(self) -> bool {
+        self.0 & Self::COPY_LOCKED != 0
+    }
+    /// Whether a BuildPagingBuffer copy lets go of the mutex while it copies: by default,
+    /// unless [`Self::COPY_LOCKED`].
+    pub const fn paging_copy_unlocked(self) -> bool {
+        self.copy_unlocked() || !self.copy_locked()
     }
 }
 
@@ -309,6 +322,10 @@ mod tests {
         assert!(Paging(0x10).copy_wc() && !Paging(0x10).copy_unlocked());
         let all = Paging(0x1f);
         assert!(all.batch() && all.desc_cache() && all.one_lock() && all.copy_unlocked() && all.copy_wc());
+        // BuildPagingBuffer's copies run unlocked unless 0x20 (and 0x8 still wins).
+        assert!(Paging(0).paging_copy_unlocked() && !Paging(0).copy_unlocked());
+        assert!(!Paging(0x20).paging_copy_unlocked() && Paging(0x20).copy_locked());
+        assert!(Paging(0x28).paging_copy_unlocked());
     }
 
     #[test]

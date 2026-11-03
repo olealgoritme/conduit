@@ -38,6 +38,7 @@
 //! | `HpRc0`..`HpRc7`, `HpRcN0`..`HpRcN7`, `HpRcOvf` | forwarded RM control census: cmd, count |
 //! | `Pg*` | the page-table update fast paths (`NvPaging`): batches, OS-descriptor reuse, the per-process index; see `virtio/native_memory.rs` `publish_hot` |
 //! | `PgPh*` / `PgPv*` | where system-page / video-memory leaf updates spend their time, per phase (`helios_kmd_logic::pg_phase`); `PgHo*` / `PgNmWait*` native-memory mutex holds per kind and waits; `PgSt*` STATE spinlock waits / holds; `PgCopy*` / `PgView*` CPU copies of `with_cpu_range`; see `virtio/native_memory.rs` `publish_phases` |
+//! | `PgGpu*` | VidMm paging operations on the copy engine (`NvPgGpu`, `helios_kmd_logic::pg_gpu`): operations, KiB, time, fallbacks to the CPU, the paging channel; see `virtio/native_memory.rs` `publish_gpu` |
 //! | `HpKnob` | `NvHotPath` in force |
 //! | `HpWinMs` | the window the rates were taken over |
 

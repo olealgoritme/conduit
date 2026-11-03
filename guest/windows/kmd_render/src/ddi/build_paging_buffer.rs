@@ -61,6 +61,7 @@ use crate::dxgk::*;
 use crate::virtio::rm_client::sysmem_flip::primary_changed;
 use helios_kmd_logic::device_lost as dl;
 use helios_kmd_logic::paging::{self as pg, Clamp};
+use helios_kmd_logic::pg_gpu as pgg;
 use helios_kmd_logic::rm_refresh::Edge;
 
 /// DISPATCH-safe paging tracers (ntoseye reads these by symbol — no IRQL
@@ -2682,10 +2683,21 @@ unsafe fn native_transfer(
     {
         return Err(());
     }
+    // `NvPgGpu` 0x1: on the paging copy engine (`native_memory::gpu_paging`); the CPU copy
+    // below when it cannot.
+    if allocation.native_segment != 0
+        && crate::virtio::native_memory::gpu_wants(pgg::Op::Transfer, size)
+        && unsafe {
+            gpu_transfer_mdl(passive, adapter, allocation, mdl, transfer.MdlOffset, offset, size, to_native)
+        }
+    {
+        return Ok(());
+    }
+    crate::virtio::native_memory::note_cpu_paging(size);
     let window = unsafe { mdl_system_va(passive, mdl) }.ok_or(())?;
     let system = window.slice_at_page(transfer.MdlOffset, size).ok_or(())?;
     let copied = unsafe {
-        crate::virtio::native_memory::with_cpu_range(
+        crate::virtio::native_memory::with_cpu_range_paging(
             passive,
             adapter,
             allocation.native_id,
@@ -2714,6 +2726,61 @@ unsafe fn native_transfer(
     }
 }
 
+/// A `DXGK_OPERATION_TRANSFER` between native allocation `allocation` and the system pages of
+/// `mdl` on the paging copy engine (`native_memory::gpu_paging`): `true` when it ran there.
+/// The range is the CPU path's (`MdlWindow::slice_at_page`): from page `mdl_page` of the MDL's
+/// PFN array (page 0 from its `ByteOffset`), and it must lie inside the MDL's bytes.
+///
+/// # Safety
+/// `mdl` is the live, locked MDL of the operation.
+#[allow(clippy::too_many_arguments)]
+unsafe fn gpu_transfer_mdl(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    allocation: crate::ddi::create_allocation::PagingAllocInfo,
+    mdl: PMDL,
+    mdl_page: u32,
+    offset: u64,
+    size: u64,
+    to_native: bool,
+) -> bool {
+    if mdl.is_null() {
+        return false;
+    }
+    // SAFETY: valid MDL per the fn contract.
+    let (byte_offset, byte_count) = unsafe { ((*mdl).ByteOffset & 0xfff, (*mdl).ByteCount) };
+    let Ok(pages) = usize::try_from(pgg::mdl_pages(byte_offset, byte_count)) else {
+        return false;
+    };
+    let start = pgg::mdl_start(mdl_page, byte_offset);
+    let begin = u64::from(byte_offset);
+    let end = begin + u64::from(byte_count);
+    if pages == 0 || start < begin || start.checked_add(size).is_none_or(|last| last > end) {
+        return false;
+    }
+    // SAFETY: a locked MDL's PFN array follows its header, one entry per page it spans.
+    let pfns = unsafe {
+        core::slice::from_raw_parts(
+            (mdl as *const u8).add(core::mem::size_of::<wdk_sys::MDL>()) as *const u64,
+            pages,
+        )
+    };
+    crate::virtio::native_memory::gpu_paging(
+        passive,
+        adapter,
+        pgg::Op::Transfer,
+        allocation.native_id,
+        offset,
+        size,
+        if to_native {
+            pgg::Work::ToVideo
+        } else {
+            pgg::Work::FromVideo
+        },
+        Some(crate::virtio::native_memory::GpuSystem { pfns, start }),
+    )
+}
+
 unsafe fn native_fill(
     passive: PassiveLevel,
     adapter: &AdapterContext,
@@ -2727,8 +2794,25 @@ unsafe fn native_fill(
     if size > allocation.size {
         return Err(());
     }
+    if allocation.native_segment != 0
+        && size % 4 == 0
+        && crate::virtio::native_memory::gpu_wants(pgg::Op::Fill, size)
+        && crate::virtio::native_memory::gpu_paging(
+            passive,
+            adapter,
+            pgg::Op::Fill,
+            allocation.native_id,
+            0,
+            size,
+            pgg::Work::Fill(fill.FillPattern),
+            None,
+        )
+    {
+        return Ok(());
+    }
+    crate::virtio::native_memory::note_cpu_paging(size);
     let filled = unsafe {
-        crate::virtio::native_memory::with_cpu_range(
+        crate::virtio::native_memory::with_cpu_range_paging(
             passive,
             adapter,
             allocation.native_id,
@@ -2765,8 +2849,25 @@ unsafe fn native_virtual_fill(
     {
         return Err(());
     }
+    if allocation.native_segment != 0
+        && size % 4 == 0
+        && crate::virtio::native_memory::gpu_wants(pgg::Op::VirtualFill, size)
+        && crate::virtio::native_memory::gpu_paging(
+            passive,
+            adapter,
+            pgg::Op::VirtualFill,
+            allocation.native_id,
+            offset,
+            size,
+            pgg::Work::Fill(fill.FillPattern),
+            None,
+        )
+    {
+        return Ok(());
+    }
+    crate::virtio::native_memory::note_cpu_paging(size);
     let filled = unsafe {
-        crate::virtio::native_memory::with_cpu_range(
+        crate::virtio::native_memory::with_cpu_range_paging(
             passive,
             adapter,
             allocation.native_id,
@@ -2828,8 +2929,33 @@ unsafe fn native_virtual_transfer(
         why(4);
         return Err(());
     };
+    // `NvPgGpu` 0x8: the pages are the ones the CPU path visits (`for_each_paging_system_run`),
+    // the first one holding `system_va`.
+    if allocation.native_segment != 0
+        && crate::virtio::native_memory::gpu_wants(pgg::Op::VirtualTransfer, size)
+        && crate::virtio::native_memory::gpu_paging(
+            passive,
+            adapter,
+            pgg::Op::VirtualTransfer,
+            allocation.native_id,
+            offset,
+            size,
+            if to_system {
+                pgg::Work::FromVideo
+            } else {
+                pgg::Work::ToVideo
+            },
+            Some(crate::virtio::native_memory::GpuSystem {
+                pfns: &pages,
+                start: system_va & 0xfff,
+            }),
+        )
+    {
+        return Ok(());
+    }
+    crate::virtio::native_memory::note_cpu_paging(size);
     let copied = unsafe {
-        crate::virtio::native_memory::with_cpu_range(
+        crate::virtio::native_memory::with_cpu_range_paging(
             passive,
             adapter,
             allocation.native_id,
