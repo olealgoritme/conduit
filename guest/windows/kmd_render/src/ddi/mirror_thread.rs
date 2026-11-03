@@ -305,12 +305,28 @@ fn lower_priority() {
 unsafe extern "C" fn routine(_context: *mut c_void) {
     lower_priority();
     loop {
-        // SAFETY: initialised event; no timeout: a request or stop wakes it.
-        let _ = unsafe {
-            KeWaitForSingleObject(REQ.0.get() as PVOID, 0, 0, 0, core::ptr::null_mut())
+        // In the NVIDIA personality the thread also wakes once a second without a request: the
+        // native hang snapshot's watch and knobs (`ddi::native_snap`) must run while nothing
+        // else asks for a pass (a hung GPU stops the flips that usually do).
+        let snap_watch = crate::ddi::wddm_surface::nvidia_selected();
+        let mut wake: wdk_sys::LARGE_INTEGER = unsafe { core::mem::zeroed() };
+        wake.QuadPart = -(SNAP_WAKE_MS * 10_000);
+        // SAFETY: initialised event; a request or stop wakes it (or the snapshot's timeout).
+        let woke = unsafe {
+            KeWaitForSingleObject(
+                REQ.0.get() as PVOID,
+                0,
+                0,
+                0,
+                if snap_watch { &mut wake as *mut _ } else { core::ptr::null_mut() },
+            )
         };
         if STOPPING.load(Ordering::Acquire) != 0 {
             break;
+        }
+        if snap_watch && woke == STATUS_TIMEOUT {
+            snap_pass();
+            continue;
         }
         let mask = WANTED.swap(0, Ordering::AcqRel) | BASE;
         let full = run_pass(mask);
@@ -331,6 +347,29 @@ unsafe extern "C" fn routine(_context: *mut c_void) {
     // SAFETY: the latch `stop` waits on; then the thread ends.
     unsafe { KeSetEvent(EXITED.0.get(), 0, 0) };
     let _ = unsafe { PsTerminateSystemThread(STATUS_SUCCESS) };
+}
+
+/// `KeWaitForSingleObject`'s timeout status.
+const STATUS_TIMEOUT: i32 = 0x0000_0102;
+
+/// How often the thread wakes for the native hang snapshot's watch without a request (ms).
+const SNAP_WAKE_MS: i64 = 1_000;
+
+/// A pass of the native hang snapshot's step alone (`ddi::native_snap`): the thread woke for
+/// it, nothing else was asked.
+fn snap_pass() {
+    let a = ADAPTER.load(Ordering::Acquire);
+    if a == 0 || STOPPING.load(Ordering::Acquire) != 0 {
+        return;
+    }
+    crate::diag::mirror_begin_pass(
+        CHANGED.load(Ordering::Relaxed) != 0,
+        YIELD.load(Ordering::Relaxed),
+    );
+    // SAFETY: as in `run_pass`.
+    let adapter = unsafe { &*(a as *const AdapterContext) };
+    crate::ddi::native_snap::publish(adapter);
+    crate::diag::mirror_end_pass();
 }
 
 /// One pass: the steps `mask` names, then the base block and this module's own counters. Returns
@@ -367,6 +406,11 @@ fn run_pass(mask: u32) -> bool {
         if mask & PACING != 0 && STOPPING.load(Ordering::Acquire) == 0 {
             adapter.pacing_publish();
             PACES.fetch_add(1, Ordering::Relaxed);
+        }
+        // The native hang snapshot's watch, knobs and snapshots (`NvSnap*`): at most once a
+        // second, NVIDIA personality only.
+        if STOPPING.load(Ordering::Acquire) == 0 {
+            crate::ddi::native_snap::publish(adapter);
         }
         // `NvHostRmVersion` for the installer: once per transport generation (a few tries at
         // most), a no-op lock check on every other pass.

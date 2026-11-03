@@ -1069,6 +1069,23 @@ pub fn record_named_changed(name: &[u8], value: u32) {
     mirror::wrote(key, value);
 }
 
+/// [`record_named_bytes`] that always writes, whatever the mirror cache holds: for a value the
+/// operator sets by hand and the driver resets (`NvSnapNow`, `NvSnapVa`), which the cache cannot
+/// know changed. PASSIVE_LEVEL only.
+pub fn record_named_force(name: &[u8], value: u32) {
+    let mut buf = [0u16; 16];
+    let n = name.len().min(14);
+    let mut i = 0;
+    while i < n {
+        buf[i] = name[i] as u16;
+        i += 1;
+    }
+    buf[n] = 0;
+    let key = mirror::key(&buf[..n]);
+    record_named(&buf[..=n], value);
+    mirror::wrote(key, value);
+}
+
 /// Whether the calling thread is inside a pass of the registry mirror thread.
 pub(crate) fn mirror_in_pass() -> bool {
     mirror::in_pass()
