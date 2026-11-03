@@ -1131,7 +1131,9 @@ impl NativeQueue {
     /// message, allocation, completion write, or host round trip is possible.
     pub(crate) fn submit(&self, private: &[u8]) -> Result<(), NativeError> {
         let adapter = unsafe { self.adapter.as_ref() }.ok_or(NativeError::Transport)?;
-        let epoch = adapter.with_virtio(|v| v.nvrm_epoch()).unwrap_or(0);
+        // The cached epoch: the same value as `with_virtio(..nvrm_epoch)`, without the
+        // transport spinlock on every submission.
+        let epoch = adapter.nvrm_epoch_fast();
         if epoch == 0 || epoch != self.epoch {
             return Err(NativeError::Transport);
         }
@@ -1508,7 +1510,7 @@ impl CopyChannel {
     pub(crate) fn submit(&self, entries: &[helios_kmd_logic::nv_copy::GpEntry], seq: u64) -> Result<(), NativeError> {
         use helios_kmd_logic::nv_copy::{self as nv, ring};
         let adapter = unsafe { self.context.adapter.as_ref() }.ok_or(NativeError::Transport)?;
-        let epoch = adapter.with_virtio(|v| v.nvrm_epoch()).unwrap_or(0);
+        let epoch = adapter.nvrm_epoch_fast();
         if epoch == 0 || epoch != self.context.epoch {
             return Err(NativeError::Transport);
         }

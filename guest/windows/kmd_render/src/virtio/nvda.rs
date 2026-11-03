@@ -477,7 +477,8 @@ fn ready(session: &Session) -> Ready {
 
 fn ensure_ready(passive: PassiveLevel, adapter: &AdapterContext) -> Result<Ready, Error> {
     let adapter_key = adapter as *const AdapterContext as usize;
-    let epoch = adapter.with_virtio(|v| v.nvrm_epoch()).unwrap_or(0);
+    // Lock-free (every forwarded RM control comes through here).
+    let epoch = adapter.nvrm_epoch_fast();
     if epoch == 0 {
         return Err(Error::Transport);
     }
