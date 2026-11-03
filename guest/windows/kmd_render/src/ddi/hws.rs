@@ -73,6 +73,7 @@ use crate::dxgk::*;
 use crate::sync::SpinLock;
 use crate::virtio::native_channel::{NativeContext, NativeQueue};
 use helios_kmd_logic::hws::{self as logic, PollNext, Progress};
+use helios_kmd_logic::native_completion::{Cover, Detect, Inflight, LatHist, LAT_BUCKETS};
 use helios_kmd_logic::native_channel as native_format;
 use helios_kmd_logic::native_hang::{self as hang, Action, Watch};
 
@@ -217,6 +218,22 @@ static SUBMITS: AtomicU32 = AtomicU32::new(0);
 static SUBMIT_FAIL: AtomicU32 = AtomicU32::new(0);
 static MF_SIGNALS: AtomicU32 = AtomicU32::new(0);
 static POLL_TICKS: AtomicU32 = AtomicU32::new(0);
+/// Event-driven completion (`virtio::native_completion`): scans run for an
+/// event, those that found progress and those that found none; progress moves
+/// seen at submit, by the poll and by an event; poll ticks that chose the
+/// covered (long) period; submissions not timed (in-flight ring full).
+static EV_SCANS: AtomicU32 = AtomicU32::new(0);
+static EV_HITS: AtomicU32 = AtomicU32::new(0);
+static EV_MISSES: AtomicU32 = AtomicU32::new(0);
+static SEEN_SUBMIT: AtomicU32 = AtomicU32::new(0);
+static SEEN_POLL: AtomicU32 = AtomicU32::new(0);
+static SEEN_EVENT: AtomicU32 = AtomicU32::new(0);
+static POLL_COVERED: AtomicU32 = AtomicU32::new(0);
+static LAT_UNTIMED: AtomicU32 = AtomicU32::new(0);
+/// Native `SubmitCommandToHwQueue`: DDI entry to the doorbell, summed and the
+/// longest (100 ns units), published per submission in ns.
+static SUBMIT_SUM_100NS: AtomicU64 = AtomicU64::new(0);
+static SUBMIT_MAX_100NS: AtomicU32 = AtomicU32::new(0);
 static SUSPENDS: AtomicU32 = AtomicU32::new(0);
 static RESUMES: AtomicU32 = AtomicU32::new(0);
 static SCHED_PROPS: AtomicU32 = AtomicU32::new(0);
@@ -293,6 +310,51 @@ pub(crate) fn publish_counters() {
     crate::diag::record_named_bytes(b"HwsNatUnsSt", r(&NAT_UNSCHED_ST));
     crate::diag::record_named_bytes(b"HwsNatCause", r(&NAT_LAST_CAUSE));
     crate::diag::record_named_bytes(b"HwsNatTdrF", r(&NAT_TDR_FAIL));
+    crate::diag::record_named_bytes(b"HwsEvScan", r(&EV_SCANS));
+    crate::diag::record_named_bytes(b"HwsEvHit", r(&EV_HITS));
+    crate::diag::record_named_bytes(b"HwsEvMiss", r(&EV_MISSES));
+    crate::diag::record_named_bytes(b"HwsSeenSub", r(&SEEN_SUBMIT));
+    crate::diag::record_named_bytes(b"HwsSeenPoll", r(&SEEN_POLL));
+    crate::diag::record_named_bytes(b"HwsSeenEv", r(&SEEN_EVENT));
+    crate::diag::record_named_bytes(b"HwsPollCov", r(&POLL_COVERED));
+    crate::diag::record_named_bytes(b"HwsLatUntimed", r(&LAT_UNTIMED));
+    let submits = u64::from(r(&SUBMITS).max(1));
+    let avg_ns = SUBMIT_SUM_100NS.load(Ordering::Relaxed) * 100 / submits;
+    crate::diag::record_named_bytes(b"HwsSubAvgNs", u32::try_from(avg_ns).unwrap_or(u32::MAX));
+    crate::diag::record_named_bytes(
+        b"HwsSubMaxNs",
+        r(&SUBMIT_MAX_100NS).saturating_mul(100),
+    );
+    publish_latency();
+    crate::virtio::native_completion::publish_counters();
+}
+
+/// The submit-to-signal histograms, by who saw the completion: `HwsLat{S,P,E}0..7`
+/// (buckets `<100, <250, <500, <1000, <2000, <4000, <8000, >=8000` us), `...Avg`
+/// and `...Max` in us. PASSIVE.
+fn publish_latency() {
+    const NAMES: [[&[u8]; LAT_BUCKETS + 2]; 3] = [
+        [
+            b"HwsLatS0", b"HwsLatS1", b"HwsLatS2", b"HwsLatS3", b"HwsLatS4", b"HwsLatS5",
+            b"HwsLatS6", b"HwsLatS7", b"HwsLatSAvg", b"HwsLatSMax",
+        ],
+        [
+            b"HwsLatP0", b"HwsLatP1", b"HwsLatP2", b"HwsLatP3", b"HwsLatP4", b"HwsLatP5",
+            b"HwsLatP6", b"HwsLatP7", b"HwsLatPAvg", b"HwsLatPMax",
+        ],
+        [
+            b"HwsLatE0", b"HwsLatE1", b"HwsLatE2", b"HwsLatE3", b"HwsLatE4", b"HwsLatE5",
+            b"HwsLatE6", b"HwsLatE7", b"HwsLatEAvg", b"HwsLatEMax",
+        ],
+    ];
+    let lat = REGISTRY.lock().lat;
+    for (hist, names) in lat.iter().zip(NAMES.iter()) {
+        for (count, name) in hist.buckets.iter().zip(names.iter()) {
+            crate::diag::record_named_bytes(name, *count);
+        }
+        crate::diag::record_named_bytes(names[LAT_BUCKETS], hist.mean_us());
+        crate::diag::record_named_bytes(names[LAT_BUCKETS + 1], hist.max_us);
+    }
 }
 
 /// Read `NvHangMs` / `NvRcReset` from the service key (PASSIVE, CreateHwQueue).
@@ -397,13 +459,22 @@ struct Slot {
     progress: Progress,
     /// Fault / hang detection and recovery state (`native_hang`).
     watch: Watch,
+    /// Whether this queue's completions arrive as events (`native_completion`).
+    cover: Cover,
+    /// Submissions not seen complete yet, for the latency histograms.
+    inflight: Inflight<INFLIGHT>,
 }
+
+/// Submissions timed per queue at once (more are counted `HwsLatUntimed`).
+const INFLIGHT: usize = 16;
 
 const EMPTY: Slot = Slot {
     queue: 0,
     node: 0,
     progress: Progress::starting_at(0),
     watch: Watch::new(),
+    cover: Cover::new(),
+    inflight: Inflight::new(),
 };
 
 struct Registry {
@@ -418,6 +489,8 @@ struct Registry {
     /// Recoveries in progress: while nonzero the queues they picked are used
     /// outside this lock, so no slot may be removed (DestroyHwQueue waits).
     recovering: u32,
+    /// Submit-to-signal latency, indexed by `Detect` (submit, poll, event).
+    lat: [LatHist; 3],
 }
 
 static REGISTRY: SpinLock<Registry> = SpinLock::new(Registry {
@@ -426,7 +499,29 @@ static REGISTRY: SpinLock<Registry> = SpinLock::new(Registry {
     idle_ticks: 0,
     pending_nodes: 0,
     recovering: 0,
+    lat: [LatHist::new(); 3],
 });
+
+/// A progress move of `slot` to `value`, seen by `by` at `now`: the coverage
+/// note, the retired submissions' latencies, the counter.
+fn note_progress(slot: &mut Slot, lat: &mut [LatHist; 3], by: Detect, value: u64, now: u64) {
+    slot.cover.note(by);
+    let hist = &mut lat[by as usize];
+    slot.inflight.retire(value, now, |d| hist.add(d));
+    let counter = match by {
+        Detect::Submit => &SEEN_SUBMIT,
+        Detect::Poll => &SEEN_POLL,
+        Detect::Event => &SEEN_EVENT,
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
+}
+
+/// The fallback poll's period (100 ns, positive): long only while the event path
+/// is up and `covered`.
+fn poll_period(covered: bool) -> i64 {
+    let events = crate::virtio::native_completion::active();
+    crate::virtio::native_completion::periods().period(events && covered)
+}
 
 fn node_bit(node: u32) -> u32 {
     if node < 32 {
@@ -446,6 +541,8 @@ fn register_queue(queue: &NativeQueue, node: u32) -> bool {
                 node,
                 progress: Progress::starting_at(initial),
                 watch: Watch::new(),
+                cover: Cover::new(),
+                inflight: Inflight::new(),
             };
             true
         }
@@ -538,9 +635,13 @@ pub(crate) fn poll_tick(adapter: &AdapterContext) {
     // The Vulkan ICD's copy channels (`ddi::nv_copy`), outside the registry lock.
     let (copy_busy, copy_moved) = crate::ddi::nv_copy::poll(adapter, now, hang_timeout);
     let next = {
-        let mut r = REGISTRY.lock();
+        let mut guard = REGISTRY.lock();
+        let r: &mut Registry = &mut guard;
         let mut any_outstanding = copy_busy;
         let mut progressed = copy_moved;
+        // Every queue with work outstanding is seen by events; the copy-context
+        // channels (`ddi::nv_copy`) are polled only.
+        let mut covered = !copy_busy;
         for slot in r.slots.iter_mut().filter(|slot| slot.queue != 0) {
             // SAFETY: a registered queue is live until DestroyHwQueue removed its
             // slot under this lock (see `Slot::queue`).
@@ -549,6 +650,7 @@ pub(crate) fn poll_tick(adapter: &AdapterContext) {
             if slot.progress.observe(value) {
                 nodes |= node_bit(slot.node);
                 progressed = true;
+                note_progress(slot, &mut r.lat, Detect::Poll, value, now);
             }
             let sample = hang::Sample {
                 now,
@@ -573,6 +675,8 @@ pub(crate) fn poll_tick(adapter: &AdapterContext) {
                     // nothing waits on it; its context stays valid until dxgkrnl or
                     // the UMD tears it down.
                     NAT_FORCED.fetch_add(1, Ordering::Relaxed);
+                    // Not a completion to time.
+                    slot.inflight.clear();
                     queue.mark_dead();
                     queue.complete_progress(hang::completion_value(slot.progress.submitted, value));
                     nodes |= node_bit(slot.node);
@@ -582,6 +686,9 @@ pub(crate) fn poll_tick(adapter: &AdapterContext) {
             // A report waiting for its reset keeps the poll alive for the grace
             // fallback, outstanding work or not.
             any_outstanding |= slot.progress.outstanding() || slot.watch.in_grace();
+            if slot.progress.outstanding() && !slot.cover.event_driven() {
+                covered = false;
+            }
         }
         nodes |= core::mem::take(&mut r.pending_nodes);
         if progressed || !any_outstanding {
@@ -589,7 +696,11 @@ pub(crate) fn poll_tick(adapter: &AdapterContext) {
         } else {
             r.idle_ticks = r.idle_ticks.saturating_add(1);
         }
-        let next = logic::poll_next(any_outstanding, r.idle_ticks);
+        let period = poll_period(covered);
+        if any_outstanding && covered && crate::virtio::native_completion::active() {
+            POLL_COVERED.fetch_add(1, Ordering::Relaxed);
+        }
+        let next = logic::poll_next_with(any_outstanding, r.idle_ticks, period);
         r.armed = matches!(next, PollNext::Rearm(_));
         next
     };
@@ -800,17 +911,26 @@ pub(crate) fn kick_poll(adapter: &AdapterContext) {
 /// storage, and make sure the poll runs.
 fn after_submit(adapter: &AdapterContext, queue: usize, fence_id: Option<u64>, extra_nodes: u32) {
     let mut nodes = 0u32;
+    let now = crate::adapter::foreign_scanout::now_100ns();
+    let mut covered = false;
     let arm_now = {
-        let mut r = REGISTRY.lock();
+        let mut guard = REGISTRY.lock();
+        let r: &mut Registry = &mut guard;
         if let Some(slot) = r.slots.iter_mut().find(|slot| slot.queue == queue && queue != 0) {
             if let Some(id) = fence_id {
                 slot.progress.note_submit(id);
+                if !slot.inflight.push(id, now) {
+                    LAT_UNTIMED.fetch_add(1, Ordering::Relaxed);
+                }
             }
             // SAFETY: as in `poll_tick`.
             let q = unsafe { &*(slot.queue as *const NativeQueue) };
-            if slot.progress.observe(q.read_progress()) {
+            let value = q.read_progress();
+            if slot.progress.observe(value) {
                 nodes |= node_bit(slot.node);
+                note_progress(slot, &mut r.lat, Detect::Submit, value, now);
             }
+            covered = slot.cover.event_driven();
         }
         r.pending_nodes |= extra_nodes;
         r.idle_ticks = 0;
@@ -819,7 +939,54 @@ fn after_submit(adapter: &AdapterContext, queue: usize, fence_id: Option<u64>, e
         arm_now
     };
     if arm_now {
-        arm(adapter, -logic::POLL_PERIOD_100NS);
+        arm(adapter, -poll_period(covered));
+    }
+    signal_nodes(adapter, nodes);
+}
+
+/// A completion event came (`virtio::native_completion`, from the interrupt DPC
+/// once the virtio lock is released): read every queue's progress fence now and
+/// raise `MONITORED_FENCE_SIGNALED` for the nodes that moved. The fallback poll
+/// is left as it is, only armed if work is outstanding and it is not. <= DISPATCH.
+pub(crate) fn event_scan(adapter: &AdapterContext) {
+    EV_SCANS.fetch_add(1, Ordering::Relaxed);
+    let now = crate::adapter::foreign_scanout::now_100ns();
+    let mut nodes = 0u32;
+    let arm_due = {
+        let mut guard = REGISTRY.lock();
+        let r: &mut Registry = &mut guard;
+        let mut any_outstanding = false;
+        let mut covered = true;
+        for slot in r.slots.iter_mut().filter(|slot| slot.queue != 0) {
+            // SAFETY: as in `poll_tick`.
+            let queue = unsafe { &*(slot.queue as *const NativeQueue) };
+            let value = queue.read_progress();
+            if slot.progress.observe(value) {
+                nodes |= node_bit(slot.node);
+                note_progress(slot, &mut r.lat, Detect::Event, value, now);
+            }
+            if slot.progress.outstanding() {
+                any_outstanding = true;
+                covered &= slot.cover.event_driven();
+            }
+        }
+        if nodes != 0 {
+            r.idle_ticks = 0;
+        }
+        if any_outstanding && !r.armed {
+            r.armed = true;
+            Some(poll_period(covered))
+        } else {
+            None
+        }
+    };
+    if let Some(period) = arm_due {
+        arm(adapter, -period);
+    }
+    if nodes != 0 {
+        EV_HITS.fetch_add(1, Ordering::Relaxed);
+    } else {
+        EV_MISSES.fetch_add(1, Ordering::Relaxed);
     }
     signal_nodes(adapter, nodes);
 }
@@ -988,6 +1155,13 @@ pub unsafe extern "C" fn dxgkddi_create_hw_queue(
     };
     // PASSIVE: the recovery knobs, read again with every native queue.
     read_recovery_knobs();
+    // PASSIVE: the completion events, set up once per client generation.
+    if let (Some(passive), Some(adapter)) = (
+        crate::irql::PassiveLevel::try_assume(),
+        unsafe { context.adapter_ptr().as_ref() },
+    ) {
+        crate::virtio::native_completion::ensure(passive, adapter);
+    }
     let status = unsafe { super::scheduler::create_native_queue(context.adapter_ptr(), native, args) };
     if status != STATUS_SUCCESS {
         QUEUE_FAIL.fetch_add(1, Ordering::Relaxed);
@@ -1121,12 +1295,18 @@ pub unsafe extern "C" fn dxgkddi_submit_command_to_hw_queue(
         unsafe { submit_soft_legacy(adapter, queue, submit, cpu as usize) };
         return STATUS_SUCCESS;
     }
+    // The native path's own cost, DDI entry to the doorbell (`HwsSubAvgNs`).
+    let entered = crate::adapter::foreign_scanout::now_100ns();
     // SAFETY: forwarded unchanged; it validates the handle and args.
     let status = unsafe { super::scheduler::dxgkddi_submit_command_to_hw_queue(h_adapter, args) };
+    let rung = crate::adapter::foreign_scanout::now_100ns();
     if status != STATUS_SUCCESS {
         SUBMIT_FAIL.fetch_add(1, Ordering::Relaxed);
         return status;
     }
+    let took = rung.saturating_sub(entered);
+    SUBMIT_SUM_100NS.fetch_add(took, Ordering::Relaxed);
+    SUBMIT_MAX_100NS.fetch_max(u32::try_from(took).unwrap_or(u32::MAX), Ordering::Relaxed);
     SUBMITS.fetch_add(1, Ordering::Relaxed);
     // SAFETY: validated by the submit above (non-null args, our queue, our adapter).
     let args = unsafe { &*args };

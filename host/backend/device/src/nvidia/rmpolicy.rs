@@ -237,6 +237,12 @@ pub static CONTROLS: &[Ctrl] = &[
         "NV2080_CTRL_CMD_GPU_GET_ENGINES_V2",
         Sender::Both,
     ),
+    // The guest KMD's GR completion notification (`native_completion`).
+    c(
+        0x2080_0301,
+        "NV2080_CTRL_CMD_EVENT_SET_NOTIFICATION",
+        Sender::Kmd,
+    ),
     c(0x2080_0403, "NV2080_CTRL_CMD_TIMER_GET_TIME", Sender::Umd),
     c(
         0x2080_0406,
@@ -315,6 +321,8 @@ pub static CLASSES: &[(u32, &str)] = &[
     (0x0040, "NV01_MEMORY_LOCAL_USER"),
     (0x0041, "NV01_ROOT_CLIENT"),
     (0x0071, "NV01_MEMORY_SYSTEM_OS_DESCRIPTOR"),
+    // The guest KMD's HW-queue completion events (`native_completion`).
+    (0x0079, "NV01_EVENT_OS_EVENT"),
     (0x0080, "NV01_DEVICE_0"),
     (0x2080, "NV20_SUBDEVICE_0"),
     (0x5080, "NV50_DEFERRED_API_CLASS"),
@@ -368,6 +376,8 @@ const ESC_RM_MAP_MEMORY_DMA: u32 = 0x57;
 const ESC_RM_UNMAP_MEMORY_DMA: u32 = 0x58;
 const ESC_CARD_INFO: u32 = 0xc8;
 const ESC_REGISTER_FD: u32 = 0xc9;
+const ESC_ALLOC_OS_EVENT: u32 = 0xce;
+const ESC_FREE_OS_EVENT: u32 = 0xcf;
 const ESC_CHECK_VERSION_STR: u32 = 0xd2;
 
 /// The escapes served, and where each keeps its client handle and its status.
@@ -409,6 +419,15 @@ pub static ESCAPES: &[Escape] = &[
     ),
     Escape::new(ESC_CARD_INFO, "NV_ESC_CARD_INFO", None, None),
     Escape::new(ESC_REGISTER_FD, "NV_ESC_REGISTER_FD", None, None),
+    // nv_ioctl_alloc_os_event_t { hClient, hDevice, fd, Status }: the guest KMD's
+    // completion event files (`native_completion`).
+    Escape::new(
+        ESC_ALLOC_OS_EVENT,
+        "NV_ESC_ALLOC_OS_EVENT",
+        Some(0),
+        Some(12),
+    ),
+    Escape::new(ESC_FREE_OS_EVENT, "NV_ESC_FREE_OS_EVENT", Some(0), Some(12)),
     Escape::new(
         ESC_CHECK_VERSION_STR,
         "NV_ESC_CHECK_VERSION_STR",
@@ -1249,6 +1268,22 @@ mod tests {
         for nr in [ESC_CARD_INFO, ESC_CHECK_VERSION_STR, ESC_REGISTER_FD] {
             assert_eq!(judge(&o, nr, &[0; 72], &[]), Verdict::Allow);
         }
+    }
+
+    #[test]
+    fn the_kmd_completion_events_are_served_on_its_own_client_only() {
+        let o = with_client();
+        let mut ev = [0u8; 16];
+        ev[0..4].copy_from_slice(&CLIENT.to_le_bytes());
+        for nr in [ESC_ALLOC_OS_EVENT, ESC_FREE_OS_EVENT] {
+            assert_eq!(judge(&o, nr, &ev, &[]), Verdict::Allow, "{nr:#x}");
+            let mut foreign = ev;
+            foreign[0..4].copy_from_slice(&0xc1d0_0bad_u32.to_le_bytes());
+            assert!(denied(&judge(&o, nr, &foreign, &[])), "{nr:#x}");
+            assert_eq!(status_at(nr, 16), Some(12));
+        }
+        assert_eq!(class_name(0x79), Some("NV01_EVENT_OS_EVENT"));
+        assert!(control(0x2080_0301).is_some());
     }
 
     #[test]

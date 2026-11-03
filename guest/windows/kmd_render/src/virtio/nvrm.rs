@@ -2029,6 +2029,7 @@ pub fn retire_transport(
     adapter.set_virtio(None);
     // Its handles were closed by the sweep (or died with the transport): forget them.
     super::native_memory::forget(passive);
+    super::native_completion::forget();
     super::rm_client::forget();
     super::nvda::forget();
     // `ForeignFlip`: the shown allocation and its presenter belong to the old generation.

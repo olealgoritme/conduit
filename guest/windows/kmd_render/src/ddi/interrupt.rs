@@ -81,6 +81,11 @@ pub(crate) fn drain_used_and_complete(adapter: &AdapterContext) {
             v.drain_nvrm_events()
         })
         .unwrap_or(false);
+    // A native HW-queue completion event came (`virtio::native_completion`): read
+    // the progress fences and signal dxgkrnl now, with no transport lock held.
+    if crate::virtio::native_completion::take_pending() {
+        crate::ddi::hws::event_scan(adapter);
+    }
     if fence_work {
         // A fence a present waits on fired: the PASSIVE worker sends the flip and
         // closes the handle (the host round trips are not DPC work).

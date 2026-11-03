@@ -209,7 +209,22 @@ pub const fn poll_next(any_outstanding: bool, idle_ticks: u32) -> PollNext {
     }
 }
 
-/// `DXGKARG_SETSCHEDULINGLOGBUFFER` sanity: a nonzero entry count needs a CPU
+/// [`poll_next`] with the event-driven completion path
+/// (`native_completion`): `period_100ns` (positive) replaces the 1 ms period;
+/// the 10 ms slow period after a fruitless second is kept, never shortening
+/// a longer `period_100ns`. `poll_next_with(o, i, POLL_PERIOD_100NS) ==
+/// poll_next(o, i)`.
+pub const fn poll_next_with(any_outstanding: bool, idle_ticks: u32, period_100ns: i64) -> PollNext {
+    if !any_outstanding {
+        PollNext::Stop
+    } else if idle_ticks >= POLL_SLOW_AFTER && period_100ns < POLL_SLOW_PERIOD_100NS {
+        PollNext::Rearm(-POLL_SLOW_PERIOD_100NS)
+    } else {
+        PollNext::Rearm(-period_100ns)
+    }
+}
+
+/// `DXGKARG_SETSCHEDULINGLOGBUFFER` sanity:a nonzero entry count needs a CPU
 /// view to write through. (Zero entries with no buffer is accepted as "no log".)
 pub const fn log_buffer_ok(number_of_entries: u32, cpu_va: u64) -> bool {
     number_of_entries == 0 || cpu_va != 0
@@ -332,6 +347,46 @@ pub const COUNTERS: &[&str] = &[
     "HwsNatUnsSt",
     "HwsNatCause",
     "HwsNatTdrF",
+    "HwsEvScan",
+    "HwsEvHit",
+    "HwsEvMiss",
+    "HwsSeenSub",
+    "HwsSeenPoll",
+    "HwsSeenEv",
+    "HwsPollCov",
+    "HwsLatUntimed",
+    "HwsSubAvgNs",
+    "HwsSubMaxNs",
+    "HwsLatS0",
+    "HwsLatS1",
+    "HwsLatS2",
+    "HwsLatS3",
+    "HwsLatS4",
+    "HwsLatS5",
+    "HwsLatS6",
+    "HwsLatS7",
+    "HwsLatSAvg",
+    "HwsLatSMax",
+    "HwsLatP0",
+    "HwsLatP1",
+    "HwsLatP2",
+    "HwsLatP3",
+    "HwsLatP4",
+    "HwsLatP5",
+    "HwsLatP6",
+    "HwsLatP7",
+    "HwsLatPAvg",
+    "HwsLatPMax",
+    "HwsLatE0",
+    "HwsLatE1",
+    "HwsLatE2",
+    "HwsLatE3",
+    "HwsLatE4",
+    "HwsLatE5",
+    "HwsLatE6",
+    "HwsLatE7",
+    "HwsLatEAvg",
+    "HwsLatEMax",
 ];
 
 #[cfg(test)]
@@ -417,6 +472,21 @@ mod tests {
                 assert!(due <= -POLL_PERIOD_100NS);
             }
         }
+    }
+
+    #[test]
+    fn poll_with_a_period_matches_the_old_rule_at_1ms() {
+        for o in [false, true] {
+            for idle in [0, 1, POLL_SLOW_AFTER - 1, POLL_SLOW_AFTER, u32::MAX] {
+                assert_eq!(poll_next_with(o, idle, POLL_PERIOD_100NS), poll_next(o, idle));
+            }
+        }
+        // The covered period, and the stuck slow-down that never shortens it.
+        assert_eq!(poll_next_with(true, 0, 40_000), PollNext::Rearm(-40_000));
+        assert_eq!(poll_next_with(true, POLL_SLOW_AFTER, 40_000), PollNext::Rearm(-100_000));
+        assert_eq!(poll_next_with(true, POLL_SLOW_AFTER, 200_000), PollNext::Rearm(-200_000));
+        assert_eq!(poll_next_with(false, 0, 5_000), PollNext::Stop);
+        assert_eq!(poll_next_with(true, 0, 5_000), PollNext::Rearm(-5_000));
     }
 
     #[test]

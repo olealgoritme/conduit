@@ -23,6 +23,7 @@ pub mod gpu;
 pub mod hal;
 pub mod msi;
 pub mod native_channel;
+pub mod native_completion;
 pub mod native_memory;
 pub mod native_scanout;
 pub mod nvda;
