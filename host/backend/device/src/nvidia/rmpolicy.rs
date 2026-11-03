@@ -197,6 +197,12 @@ pub static CONTROLS: &[Ctrl] = &[
         "NV0080_CTRL_CMD_GPU_GET_CLASSLIST_V2",
         Sender::Both,
     ),
+    // The guest KMD's GfxP buffer sizes (`NvPreempt` GFXP).
+    c(
+        0x0080_1707,
+        "NV0080_CTRL_CMD_FIFO_GET_ENGINE_CONTEXT_PROPERTIES",
+        Sender::Kmd,
+    ),
     c(
         0x0080_1806,
         "NV0080_CTRL_CMD_DMA_ADV_SCHED_GET_VA_CAPS",
@@ -254,10 +260,26 @@ pub static CONTROLS: &[Ctrl] = &[
         "NV2080_CTRL_CMD_GR_GET_ZCULL_INFO",
         Sender::Umd,
     ),
+    // The guest KMD's TSG preemption modes (`NvPreempt`).
+    c(
+        0x2080_1210,
+        "NV2080_CTRL_CMD_GR_SET_CTXSW_PREEMPTION_MODE",
+        Sender::Kmd,
+    ),
+    c(
+        0x2080_1211,
+        "NV2080_CTRL_CMD_GR_CTXSW_PREEMPTION_BIND",
+        Sender::Kmd,
+    ),
     c(
         0x2080_121b,
         "NV2080_CTRL_CMD_GR_GET_GLOBAL_SM_ORDER",
         Sender::Umd,
+    ),
+    c(
+        0x2080_1235,
+        "NV2080_CTRL_CMD_GR_GET_CTXSW_MODES",
+        Sender::Kmd,
     ),
     c(
         0x2080_1315,
@@ -280,6 +302,7 @@ pub static CONTROLS: &[Ctrl] = &[
     gsp(0x2080_a0d1, "NV2080 legacy GSP control 0xa0d1", 2024),
     c(0x906f_0101, "NV906F_CTRL_GET_CLASS_ENGINEID", Sender::Umd),
     c(0xa06c_0101, "NVA06C_CTRL_CMD_GPFIFO_SCHEDULE", Sender::Kmd),
+    c(0xa06c_0106, "NVA06C_CTRL_CMD_GET_INFO", Sender::Kmd),
     c(0xa06f_0104, "NVA06F_CTRL_CMD_BIND", Sender::Kmd),
     c(
         0xc36f_0108,
