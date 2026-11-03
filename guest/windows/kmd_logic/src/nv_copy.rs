@@ -129,6 +129,122 @@ pub fn find_submission(buf: &[u8], command_length: u32) -> Option<Submission> {
         .find_map(|at| parse_submission(&buf[at..], command_length))
 }
 
+/// The most entries a record may declare on the channel path: one channel
+/// submission takes them and its release ([`ring::MAX_SUBMIT_ENTRIES`]). The
+/// largest record NVIDIA's private-data size allows (4512 bytes, entries from
+/// +0x354) has 457.
+pub const MAX_RECORD_ENTRIES: usize = ring::MAX_SUBMIT_ENTRIES as usize - 1;
+
+/// Why a submission's private data held no record the channel path takes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecordError {
+    /// No NVDA / version 0x00010004 / +0x354 header anywhere in the data.
+    NotFound,
+    /// The header's count (+0x18) is not the submission's `CommandLength`.
+    CountMismatch,
+    /// More than [`MAX_RECORD_ENTRIES`] entries, or none.
+    Count,
+    /// The entries run past the private data.
+    OutOfBounds,
+    /// A segment of nonzero length at GPU VA 0.
+    NullVa,
+}
+
+impl RecordError {
+    /// 1-based code for diagnostics.
+    pub const fn code(self) -> u32 {
+        match self {
+            Self::NotFound => 1,
+            Self::CountMismatch => 2,
+            Self::Count => 3,
+            Self::OutOfBounds => 4,
+            Self::NullVa => 5,
+        }
+    }
+}
+
+/// The ICD's copy record inside a submission's private data, validated for the
+/// channel path: the GPU fetches the segments itself, so unlike
+/// [`parse_submission`] (the CPU fallback's 16-entry copy) neither the entry
+/// count up to [`MAX_RECORD_ENTRIES`] nor a segment's length is limited here
+/// (the GPFIFO entry's own 21-bit length field is the bound).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Record {
+    /// Where the entries start in the private data.
+    pub entries_at: usize,
+    /// The declared entry count (control entries of length 0 included).
+    pub count: usize,
+}
+
+impl Record {
+    /// The segments, GPFIFO control entries (length 0) skipped.
+    pub fn entries<'a>(&self, buf: &'a [u8]) -> impl Iterator<Item = GpEntry> + 'a {
+        let at = self.entries_at;
+        (0..self.count).filter_map(move |i| {
+            let e = at + i * 8;
+            let entry = GpEntry::decode(get32(buf, e)?, get32(buf, e + 4)?);
+            (entry.dwords != 0).then_some(entry)
+        })
+    }
+
+    /// How many segments [`Record::entries`] yields.
+    pub fn segments(&self, buf: &[u8]) -> usize {
+        self.entries(buf).count()
+    }
+}
+
+fn record_at(buf: &[u8], at: usize, command_length: u32) -> Result<Record, RecordError> {
+    let header = buf.get(at..).ok_or(RecordError::NotFound)?;
+    let offset = get32(header, ENTRIES_OFFSET_AT).ok_or(RecordError::NotFound)? as usize;
+    let count = get32(header, ENTRY_COUNT_AT).ok_or(RecordError::NotFound)?;
+    if count != command_length {
+        return Err(RecordError::CountMismatch);
+    }
+    if count == 0 || count as usize > MAX_RECORD_ENTRIES {
+        return Err(RecordError::Count);
+    }
+    let entries_at = at.checked_add(offset).ok_or(RecordError::OutOfBounds)?;
+    let end = entries_at
+        .checked_add(count as usize * 8)
+        .ok_or(RecordError::OutOfBounds)?;
+    if end > buf.len() {
+        return Err(RecordError::OutOfBounds);
+    }
+    let record = Record {
+        entries_at,
+        count: count as usize,
+    };
+    if record.entries(buf).any(|entry| entry.va == 0) {
+        return Err(RecordError::NullVa);
+    }
+    Ok(record)
+}
+
+/// [`find_submission`] for the channel path: the first 4-byte-aligned header
+/// (magic, version, entry offset 0x354) in `buf`, validated as a [`Record`].
+/// When several headers match, the first valid one wins, else the first
+/// header's error is returned.
+pub fn find_record(buf: &[u8], command_length: u32) -> Result<Record, RecordError> {
+    let Some(last) = buf.len().checked_sub(ENTRIES_AT + 8) else {
+        return Err(RecordError::NotFound);
+    };
+    let mut first_error = RecordError::NotFound;
+    for at in (0..=last).step_by(4) {
+        if get32(buf, at) != Some(NVDA_MAGIC)
+            || get32(buf, at + 4) != Some(SUBMIT_VERSION)
+            || get32(buf, at + ENTRIES_OFFSET_AT) != Some(ENTRIES_AT as u32)
+        {
+            continue;
+        }
+        match record_at(buf, at, command_length) {
+            Ok(record) => return Ok(record),
+            Err(error) if first_error == RecordError::NotFound => first_error = error,
+            Err(_) => {}
+        }
+    }
+    Err(first_error)
+}
+
 impl GpEntry {
     /// The two GPFIFO dwords for this segment (main level, no sync).
     pub const fn encode(self) -> (u32, u32) {
@@ -155,8 +271,11 @@ pub mod ring {
     pub const RELEASE_SLOTS: u64 = 512;
     /// The progress semaphore (64 bits): the last sequence the channel finished.
     pub const SEMAPHORE_AT: u64 = RELEASE_AT + RELEASE_SLOT_BYTES * RELEASE_SLOTS;
-    /// Entries one submission may use: its segments and its release.
-    pub const MAX_SUBMIT_ENTRIES: u32 = super::MAX_ENTRIES as u32 + 1;
+    /// Entries one submission may use: its segments and its release. Anything
+    /// the ring can hold at once (one entry always stays empty): the channel
+    /// path takes whole records ([`super::MAX_RECORD_ENTRIES`]), not only the
+    /// CPU fallback's 16 entries.
+    pub const MAX_SUBMIT_ENTRIES: u32 = ENTRIES - 1;
     const _: () = assert!(SEMAPHORE_AT + 8 <= BYTES);
     const _: () = assert!(GPFIFO_BYTES as u64 <= RELEASE_AT);
     // Every submission takes at least two entries (a segment and its release),
@@ -757,5 +876,113 @@ mod tests {
                 truncated: true
             }
         );
+    }
+
+    /// A record of `n` entries (segments of 4 dwords at 0x4000_0000 + i * 0x100)
+    /// in a 4512-byte private-data block.
+    fn long_record(n: usize) -> Vec<u8> {
+        let mut b = std::vec![0u8; 4512];
+        b[..0x10].copy_from_slice(&[
+            0x41, 0x44, 0x56, 0x4e, 0x04, 0x00, 0x01, 0x00, 0, 0, 0, 0, 0x54, 0x03, 0, 0,
+        ]);
+        b[0x18..0x1c].copy_from_slice(&(n as u32).to_le_bytes());
+        for i in 0..n {
+            let (lo, hi) = GpEntry {
+                va: 0x4000_0000 + i as u64 * 0x100,
+                dwords: 4,
+            }
+            .encode();
+            let at = ENTRIES_AT + i * 8;
+            if at + 8 > b.len() {
+                break;
+            }
+            b[at..at + 4].copy_from_slice(&lo.to_le_bytes());
+            b[at + 4..at + 8].copy_from_slice(&hi.to_le_bytes());
+        }
+        b
+    }
+
+    #[test]
+    fn the_channel_path_takes_the_captured_records_too() {
+        let record = code_upload_record();
+        let r = find_record(&record, 5).unwrap();
+        let channel: Vec<GpEntry> = r.entries(&record).collect();
+        assert_eq!(channel, parse_submission(&record, 5).unwrap().entries());
+        assert_eq!(r.segments(&record), 5);
+        assert_eq!(find_record(&record, 4), Err(RecordError::CountMismatch));
+        assert_eq!(find_record(&std::vec![0u8; 4512], 1), Err(RecordError::NotFound));
+        assert_eq!(find_record(&[], 1), Err(RecordError::NotFound));
+    }
+
+    #[test]
+    fn records_past_sixteen_entries_and_long_segments_reach_the_channel() {
+        // 17 and 200 entries: the CPU fallback's copy refuses them (`NvCcNoRec`, the
+        // work silently skipped before), the channel path takes all of them.
+        for n in [17usize, 200, 457] {
+            let b = long_record(n);
+            assert_eq!(parse_submission(&b, n as u32), None);
+            let r = find_record(&b, n as u32).unwrap();
+            assert_eq!(r.segments(&b), n);
+            let last = r.entries(&b).last().unwrap();
+            assert_eq!(last.va, 0x4000_0000 + (n as u64 - 1) * 0x100);
+        }
+        // 458 entries do not fit in 4512 bytes.
+        assert_eq!(find_record(&long_record(458), 458), Err(RecordError::OutOfBounds));
+        // A segment past the CPU fallback's 0x4000 dwords.
+        let mut b = long_record(1);
+        let (lo, hi) = GpEntry {
+            va: 0x5000_0000,
+            dwords: 0x8000,
+        }
+        .encode();
+        b[ENTRIES_AT..ENTRIES_AT + 4].copy_from_slice(&lo.to_le_bytes());
+        b[ENTRIES_AT + 4..ENTRIES_AT + 8].copy_from_slice(&hi.to_le_bytes());
+        assert_eq!(parse_submission(&b, 1), None);
+        let r = find_record(&b, 1).unwrap();
+        assert_eq!(
+            r.entries(&b).collect::<Vec<_>>(),
+            std::vec![GpEntry {
+                va: 0x5000_0000,
+                dwords: 0x8000
+            }]
+        );
+        // One whole record always fits one channel submission with its release.
+        assert!(MAX_RECORD_ENTRIES + 1 <= ring::MAX_SUBMIT_ENTRIES as usize);
+        assert!(ring::MAX_SUBMIT_ENTRIES < ring::ENTRIES);
+        assert!(457 <= MAX_RECORD_ENTRIES);
+    }
+
+    #[test]
+    fn record_refusals() {
+        // Control entries (length 0) are skipped, a null segment refuses.
+        let mut b = long_record(3);
+        b[ENTRIES_AT + 8..ENTRIES_AT + 16].copy_from_slice(&[0u8; 8]);
+        let r = find_record(&b, 3).unwrap();
+        assert_eq!(r.segments(&b), 2);
+        let (_, hi) = GpEntry { va: 0, dwords: 4 }.encode();
+        b[ENTRIES_AT + 12..ENTRIES_AT + 16].copy_from_slice(&hi.to_le_bytes());
+        assert_eq!(find_record(&b, 3), Err(RecordError::NullVa));
+        // Zero entries, and more than a submission can take.
+        let mut b = long_record(1);
+        b[0x18..0x1c].copy_from_slice(&0u32.to_le_bytes());
+        assert_eq!(find_record(&b, 0), Err(RecordError::Count));
+        let big = (MAX_RECORD_ENTRIES + 1) as u32;
+        b[0x18..0x1c].copy_from_slice(&big.to_le_bytes());
+        assert_eq!(find_record(&b, big), Err(RecordError::Count));
+        // A valid record after a broken header is still found.
+        let mut b = std::vec![0u8; 4512];
+        let good = long_record(2);
+        b[..0x10].copy_from_slice(&good[..0x10]);
+        b[0x18] = 9;
+        b[0x400..0x400 + 0x354 + 16].copy_from_slice(&good[..0x354 + 16]);
+        let r = find_record(&b, 2).unwrap();
+        assert_eq!(r.entries_at, 0x400 + ENTRIES_AT);
+        assert_eq!(RecordError::NullVa.code(), 5);
+        // Arbitrary bytes never panic.
+        for len in [0usize, 4, 0x35c, 0x360, 4512] {
+            for fill in [0u8, 0xff, 0x41] {
+                let _ = find_record(&std::vec![fill; len], 1);
+            }
+        }
     }
 }
