@@ -2927,6 +2927,20 @@ pub struct ScanoutSource {
     pub system_backed: bool,
 }
 
+/// Where the GPU's mappings of a shown primary point (`NvScDbg*`): (RM memory
+/// handle, mappings, mappings of VidMm system pages, system-backed, resident).
+pub fn scanout_debug(id: u32) -> Option<(u32, u32, u32, bool, u32)> {
+    let state = st();
+    let a = state.allocation(id).ok()?;
+    let sys = a.mappings.iter().filter(|m| m.desc != 0).count() as u32;
+    let res = match a.resident {
+        None => 0,
+        Some((_, false)) => 1,
+        Some((_, true)) => 2,
+    };
+    Some((a.memory, a.mappings.len() as u32, sys, a.system_memory != 0, res))
+}
+
 pub fn scanout_source(id: u32) -> Result<ScanoutSource, Error> {
     let state = st();
     let a = state.allocation(id)?;
@@ -5500,6 +5514,7 @@ pub fn destroy(passive: PassiveLevel, adapter: &AdapterContext, id: u32) -> Resu
         }
     }
     if gem != 0 {
+        super::native_scanout::note_shown_destroyed();
         super::native_scanout::release_gem(&io, gem);
         st().allocation_mut(id)?.scanout_gem = 0;
     }

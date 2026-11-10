@@ -194,6 +194,13 @@ fn present_async(passive: PassiveLevel, adapter: &AdapterContext, drm: u32, gem:
     }
 }
 
+/// A primary that was on the host's screen is being destroyed (`NvScRel`).
+pub(crate) fn note_shown_destroyed() {
+    static N: AtomicU32 = AtomicU32::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+    crate::diag::record_named_bytes(b"NvScRel", n);
+}
+
 fn fail(step: Step, code: u32) {
     let n = FAILS.fetch_add(1, Ordering::Relaxed) + 1;
     crate::diag::record_named_bytes(b"NvScFail", n);
@@ -226,6 +233,25 @@ fn show(adapter: &AdapterContext, native_id: u32, mode: (u32, u32)) {
             return;
         }
     };
+    // `NvScDbg*`: the last 8 shown primaries: id, RM memory, where its GPU mappings point.
+    {
+        static SLOT: AtomicU32 = AtomicU32::new(0);
+        let i = SLOT.fetch_add(1, Ordering::Relaxed) & 7;
+        if let Some((memory, maps, sys, backed, res)) = native_memory::scanout_debug(native_id) {
+            let mut name = *b"NvScDbg0I";
+            name[7] = b'0' + i as u8;
+            crate::diag::record_named_bytes(&name, native_id);
+            name[8] = b'M';
+            crate::diag::record_named_bytes(&name, memory);
+            name[8] = b'P';
+            crate::diag::record_named_bytes(
+                &name,
+                (maps & 0xfff) | ((sys & 0xfff) << 12) | (u32::from(backed) << 24) | (res << 28),
+            );
+            name[8] = b'G';
+            crate::diag::record_named_bytes(&name, source.gem);
+        }
+    }
     let s = source.surface;
     if (s.width, s.height) != mode {
         let n = EXTENT.fetch_add(1, Ordering::Relaxed) + 1;

@@ -1176,13 +1176,24 @@ unsafe fn write_aperture_descriptor(
 ///
 /// QUERYSEGMENT3 and the legacy QUERYSEGMENT do not carry the groups: the NVIDIA
 /// personality reports WDDM 3.2, which dxgkrnl queries with QUERYSEGMENT4 only.
-fn nv_budget_groups() -> bool {
+///
+/// Split test values: 2 = only the aperture's `NonLocalBudgetGroup`, 4 = only the memory
+/// segment's `LocalBudgetGroup` (each half alone, to find which one hangs the guest).
+/// `NvBudgetGrpOn` records bit 0 = aperture group, bit 1 = memory group.
+/// Returns (aperture group, memory segment group).
+fn nv_budget_groups() -> (bool, bool) {
     if !crate::ddi::wddm_surface::nvidia_selected() {
-        return false;
+        return (false, false);
     }
-    let on = crate::diag::read_config_dword(crate::diag::KnobName::new(b"NvBudgetGrp"), 1) != 0;
-    crate::diag::record_named_bytes(b"NvBudgetGrpOn", u32::from(on));
-    on
+    let knob = crate::diag::read_config_dword(crate::diag::KnobName::new(b"NvBudgetGrp"), 1);
+    let (aperture, memory) = match knob {
+        0 => (false, false),
+        2 => (true, false),
+        4 => (false, true),
+        _ => (true, true),
+    };
+    crate::diag::record_named_bytes(b"NvBudgetGrpOn", u32::from(aperture) | u32::from(memory) << 1);
+    (aperture, memory)
 }
 
 /// Test knob `NvApBudget` (default 0, NVIDIA personality only): 1 marks the
@@ -1351,7 +1362,7 @@ unsafe fn query_segments(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTERIN
         let reported = adapter.reported_segment_count();
         let writable = table.len().min(reported);
         // One read for the whole table: the groups must agree across its segments.
-        let budget_groups = nv_budget_groups();
+        let (aperture_group, memory_group) = nv_budget_groups();
         if writable != table.len() {
             crate::diag::fault(crate::diag::FaultCounter::SegCntMis, table.len());
         }
@@ -1370,13 +1381,13 @@ unsafe fn query_segments(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTERIN
             };
             match spec {
                 crate::ddi::segment_table::SegmentSpec::Aperture => unsafe {
-                    write_aperture_descriptor(d, &knobs, budget_groups)
+                    write_aperture_descriptor(d, &knobs, aperture_group)
                 },
                 crate::ddi::segment_table::SegmentSpec::RamCpuHost { base, size } => {
                     crate::diag::record(0x0903_0000 | (((base >> 12) as u32) & 0xFFFF));
                     crate::diag::record(0x0904_0000 | (((size >> 12) as u32) & 0xFFFF));
                     // SAFETY: d is a writable descriptor slot (above).
-                    unsafe { write_cpu_host_memory_descriptor(d, base, size, budget_groups) };
+                    unsafe { write_cpu_host_memory_descriptor(d, base, size, memory_group) };
                 }
                 crate::ddi::segment_table::SegmentSpec::Bar {
                     gpa,
@@ -1399,7 +1410,7 @@ unsafe fn query_segments(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTERIN
                             size,
                             cpu_aperture_size,
                             &knobs,
-                            budget_groups,
+                            memory_group,
                         )
                     };
                 }
