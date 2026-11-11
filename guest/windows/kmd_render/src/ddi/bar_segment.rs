@@ -27,18 +27,31 @@ static LIMIT_IGNORED_LOGGED: core::sync::atomic::AtomicBool =
 /// The registry override, host heap, or fallback window supplies the capacity;
 /// the backend's enforced VRAM limit bounds it. This is VidMm accounting and
 /// does not enlarge the CPU-visible mapping window.
+///
+/// `rm_framebuffer` is the card's video memory from the host RM, `Some` only in the NVIDIA
+/// personality (`nvda::probe_framebuffer`): it then takes the place of the Venus heap
+/// (`VidVSrc` 5, `VidVFb` its MiB). `None` keeps the Venus resolution exactly.
 pub(super) fn resolve_vidmm_vram_mb(
     knobs: &mut crate::adapter::AdapterKnobs,
+    rm_framebuffer: Option<u64>,
     device_local_bytes: Option<u64>,
     host_visible_bytes: Option<u64>,
     backend_limit_mb: u64,
 ) {
-    let resolved = helios_kmd_logic::vidmm_vram::resolve(
-        knobs.vidmm_vram_mb,
-        device_local_bytes,
-        host_visible_bytes,
-        backend_limit_mb,
-    );
+    let resolved = match rm_framebuffer {
+        Some(bytes) => helios_kmd_logic::vidmm_vram::resolve_rm_framebuffer(
+            knobs.vidmm_vram_mb,
+            Some(bytes),
+            host_visible_bytes,
+            backend_limit_mb,
+        ),
+        None => helios_kmd_logic::vidmm_vram::resolve(
+            knobs.vidmm_vram_mb,
+            device_local_bytes,
+            host_visible_bytes,
+            backend_limit_mb,
+        ),
+    };
     crate::diag::record_named_bytes(
         b"VidVLmt",
         backend_limit_mb.min(u64::from(u32::MAX)) as u32,
@@ -63,6 +76,32 @@ pub(super) fn resolve_vidmm_vram_mb(
         device_local_bytes.map_or(0, |b| (b >> 20).min(u64::from(u32::MAX)) as u32),
     );
     crate::diag::record_named_bytes(b"VidVram", knobs.vidmm_vram_mb);
+}
+
+/// The card's video memory from the host RM, for [`resolve_vidmm_vram_mb`]: the NVIDIA
+/// personality only (`None` in the Helios one, with no RM traffic and no mirror), and only
+/// when `VidMmVramMB` is absent (an explicit value overrides it, so it is not asked).
+/// Mirrored as `VidVFb` (MiB, 0 = not known); `nvda::probe_framebuffer` says why. Own frame:
+/// StartDevice's stack budget. PASSIVE.
+#[inline(never)]
+pub(super) fn nvidia_framebuffer(
+    passive: crate::irql::PassiveLevel,
+    adapter: &crate::adapter::AdapterContext,
+    knobs: &crate::adapter::AdapterKnobs,
+) -> Option<u64> {
+    if !crate::ddi::wddm_surface::nvidia_selected() {
+        return None;
+    }
+    let bytes = if knobs.vidmm_vram_mb == crate::adapter::VIDMM_VRAM_MB_AUTO {
+        crate::virtio::nvda::probe_framebuffer(passive, adapter).and_then(|fb| fb.bytes())
+    } else {
+        None
+    };
+    crate::diag::record_named_bytes(
+        b"VidVFb",
+        bytes.map_or(0, |b| (b >> 20).min(u64::from(u32::MAX)) as u32),
+    );
+    bytes
 }
 
 pub(super) fn vidmm_vram_size(knobs: &crate::adapter::AdapterKnobs) -> Option<u64> {

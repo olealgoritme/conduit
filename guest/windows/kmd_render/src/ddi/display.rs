@@ -1512,9 +1512,25 @@ unsafe fn dxgkddi_present_inner(
             // succeed (`SetVidPnSourceAddress` follows with the global handle, resource id 0, which
             // the worker completes as a kept picture); the DMA contract writes a keep record for
             // the address the allocation list assigned.
-            if unsafe {
-                crate::ddi::create_allocation::present_alloc_is_placeholder(adapter, src_handle)
-            } {
+            //
+            // NVIDIA personality: the flipped allocation is one NVIDIA's own UMD created (a
+            // native NVDA record), which this DDI's Helios source resolution does not know.
+            // NVIDIA's driver answers these flip Presents with success and no DMA; the flip
+            // itself arrives through SetVidPnSourceAddressWithMultiPlaneOverlay3, which
+            // resolves the native allocation (`NvPrFlip` counts them).
+            let native_flip = crate::ddi::wddm_surface::nvidia_selected();
+            if native_flip {
+                static NATIVE_FLIPS: AtomicU32 = AtomicU32::new(0);
+                let n = NATIVE_FLIPS.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+                if n == 1 || n % 256 == 0 {
+                    crate::diag::record_named_bytes(b"NvPrFlip", n);
+                }
+            }
+            if native_flip
+                || unsafe {
+                    crate::ddi::create_allocation::present_alloc_is_placeholder(adapter, src_handle)
+                }
+            {
                 if args.pDmaBuffer.is_null() {
                     crate::ddi::flip_keep::note_placeholder_flip();
                     crate::diag::record_named_bytes(b"PBMmio", 1);
@@ -2681,6 +2697,30 @@ pub unsafe extern "C" fn dxgkddi_commit_vidpn(
     crate::ddi::flip_announce::invalidate_all();
     let status = crate::ddi::vidpn::legalize_vidpn(unsafe {
         crate::ddi::vidpn::commit_vidpn(adapter, commit as *const DXGKARG_COMMITVIDPN)
+    });
+    crate::ddi::stall_diag::mode_result(8, status);
+    crate::ddi::stall_diag::publish_mode();
+    status
+}
+
+/// `DxgkDdiSetTimingsFromVidPn` (NVIDIA personality): see `vidpn::set_timings_from_vidpn`.
+pub unsafe extern "C" fn dxgkddi_set_timings_from_vidpn(
+    adapter: IN_CONST_HANDLE,
+    set_timings: *mut DXGKARG_SETTIMINGSFROMVIDPN,
+) -> NTSTATUS {
+    crate::ddi::stall_diag::mode_step(7);
+    crate::ddi::stall_diag::publish_mode();
+    let p = adapter as *const AdapterContext;
+    if p.is_null() || !unsafe { (*p).display_half() } {
+        return STATUS_NOT_SUPPORTED;
+    }
+    crate::diag::record_named_bytes(b"VpCM", 2);
+    crate::ddi::diag_dump_cpu_host_atomics();
+    let adapter = unsafe { &*p };
+    // `FlipAnnounce`: the accepted allocations were checked against the OLD mode's extent.
+    crate::ddi::flip_announce::invalidate_all();
+    let status = crate::ddi::vidpn::legalize_vidpn(unsafe {
+        crate::ddi::vidpn::set_timings_from_vidpn(adapter, set_timings)
     });
     crate::ddi::stall_diag::mode_result(8, status);
     crate::ddi::stall_diag::publish_mode();
@@ -4037,6 +4077,20 @@ unsafe fn program_vidpn_source_inner(
         crate::diag::record_named_bytes(b"VpSA", source_address_n);
     }
 
+    // NVIDIA UMD personality: DWM's primaries are native RM allocations with no Venus
+    // resource. Shown by a host flip of their RM memory (`native_scanout`); the flip
+    // completes whatever the host answers.
+    if let Some((native_id, primary_address)) =
+        unsafe { crate::ddi::create_allocation::native_scanout_id(adapter, h_alloc) }
+    {
+        crate::virtio::native_scanout::program(
+            adapter,
+            native_id,
+            primary_address,
+            adapter.scanout_extent(),
+        );
+        return Ok(ScanoutOutcome::Programmed);
+    }
     let source =
         match unsafe { crate::ddi::create_allocation::scanout_alloc_info(adapter, h_alloc) } {
             Some(source) => source,

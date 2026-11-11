@@ -116,6 +116,9 @@ one that keeps changing while it is read (at most eight tries) counts as no
 limit. `VidVram`, `VidVSrc`, `VidVHeap` and `VidVLmt`
 in the service key show the chosen capacity, its source, the host heap and
 the backend limit. `VidVSrc=4` means the backend limit supplied the capacity.
+With NVIDIA's own UMDs (`NvUmd`) there is no Venus heap: the figure is the
+card's framebuffer as the host RM reports it at driver start (`VidVSrc=5`,
+`VidVFb`), under the same override and limit rules.
 
 **Install from a release.** Every release carries
 `conduit-windows-gpu-driver-<version>.zip` (built and test-signed by

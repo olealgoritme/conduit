@@ -744,6 +744,7 @@ fn channel(io: &Io<'_>, p: &Parts) -> Result<(), Fail> {
         h_ctxshare: cc::H_CTXSHARE,
         userd_offset: cc::USERD_OFFSET,
         engine_type: engine.engine_type,
+        flags: 0,
     });
     alloc(io, &p.h, cc::H_TSG, cc::H_CHANNEL, gen.classes().gpfifo, &params)
 }

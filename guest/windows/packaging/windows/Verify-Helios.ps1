@@ -75,16 +75,51 @@ try {
     $failures.Add($_.Exception.Message)
 }
 
+# Which user-mode drivers the adapter runs: NVIDIA's own (Set-HeliosUmd.ps1
+# -Nvidia, RTX personality only) or the Helios UMDs.
+$nvidiaUmdState = Read-HeliosNvidiaState
+$nvidiaUmd = $null -ne $nvidiaUmdState -and [string]$nvidiaUmdState.mode -eq "nvidia"
+if ($nvidiaUmd) {
+    try {
+        if (-not (Test-HeliosNvidiaPersonality $instanceId)) {
+            throw "NVIDIA's user-mode drivers are staged, but the adapter ($instanceId) is not the RTX personality."
+        }
+        $expected = Get-HeliosNvidiaExpectedVersion
+        $destination = [string]$nvidiaUmdState.destination
+        $kernel = Join-Path $destination "nvlddmkm.sys"
+        if (-not (Test-Path -LiteralPath $kernel -PathType Leaf)) { throw "The staged NVIDIA files are missing from $destination." }
+        $staged = ConvertTo-HeliosNvidiaVersion (Get-Item -LiteralPath $kernel).VersionInfo.FileVersion
+        Assert-HeliosNvidiaVersion $staged $expected (Get-HeliosHostRmVersion)
+        foreach ($name in (Get-HeliosNvidiaRequiredFiles)) {
+            if (-not (Test-Path -LiteralPath (Join-Path $destination $name) -PathType Leaf)) { $failures.Add("Staged NVIDIA file missing: $name") }
+        }
+        foreach ($entry in @($nvidiaUmdState.systemFiles)) {
+            if (-not (Test-Path -LiteralPath ([string]$entry.path) -PathType Leaf)) { $failures.Add("NVIDIA system file missing: $($entry.path)") }
+        }
+        Write-Host "NVIDIA user-mode drivers: $staged (host RM $(Get-HeliosHostRmVersion))."
+    } catch { $failures.Add($_.Exception.Message) }
+} elseif (Test-HeliosNvidiaPersonality $instanceId) {
+    $nvUmd = (Get-Item -LiteralPath (Get-HeliosServiceKey) -ErrorAction SilentlyContinue)
+    if (-not $nvUmd -or $nvUmd.GetValue("NvUmd", $null) -ne 0) {
+        $failures.Add("The RTX personality runs the Helios UMDs, but the service key's NvUmd is not 0 (run Set-HeliosUmd.ps1 -Helios).")
+    }
+}
+
 # Registration is indexed by API version, independently for AMD64 and WoW64.
 # Windows loads an absolute DriverStore path from each slot; validate both the
 # selected architecture and installed bytes against the bundle's recorded hash.
 # Slot 0 (D3D9) is dxgkrnl's "no D3D9 driver" marker, which makes d3d9.dll run
 # D3D9 through D3D9On12 on the D3D12 UMD (helios_kmd_render.inx).
-$noDriverSlot = "<>"
+$noDriverSlot = if ($nvidiaUmd) { $null } else { "<>" }
 $driverDirectories = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
 foreach ($registration in @(
-    @{ name = "UserModeDriverName"; architecture = "x64"; files = @($noDriverSlot, "helios_umd.dll", "helios_umd.dll", "helios_umd12.dll") },
-    @{ name = "UserModeDriverNameWoW"; architecture = "x86"; files = @($noDriverSlot, "helios_umd32.dll", "helios_umd32.dll", "helios_umd12_32.dll") }
+    if ($nvidiaUmd) {
+        @{ name = "UserModeDriverName"; architecture = "x64"; files = @("nvldumdx.dll", "nvldumdx.dll", "nvldumdx.dll", "nvldumdx.dll") },
+        @{ name = "UserModeDriverNameWoW"; architecture = "x86"; files = @("nvldumd.dll", "nvldumd.dll", "nvldumd.dll", "nvldumd.dll") }
+    } else {
+        @{ name = "UserModeDriverName"; architecture = "x64"; files = @($noDriverSlot, "helios_umd.dll", "helios_umd.dll", "helios_umd12.dll") },
+        @{ name = "UserModeDriverNameWoW"; architecture = "x86"; files = @($noDriverSlot, "helios_umd32.dll", "helios_umd32.dll", "helios_umd12_32.dll") }
+    }
 )) {
     try {
         if (-not $classKey) { throw "No display software key for $($registration.name)." }
@@ -127,9 +162,13 @@ if ($driverDirectories.Count -ne 1) {
 }
 if ($classKey) {
     $installedDrivers = @((Get-Item -LiteralPath $classKey).GetValue("InstalledDisplayDrivers", $null))
-    $expectedDrivers = @("helios_umd", "helios_umd12", "helios_umd32", "helios_umd12_32")
-    if ($installedDrivers.Count -ne 4 -or (Compare-Object $expectedDrivers $installedDrivers)) {
-        $failures.Add("InstalledDisplayDrivers does not list all four distinct Helios UMDs.")
+    $expectedDrivers = if ($nvidiaUmd) {
+        @("nvldumdx", "nvldumd")
+    } else {
+        @("helios_umd", "helios_umd12", "helios_umd32", "helios_umd12_32")
+    }
+    if ($installedDrivers.Count -ne $expectedDrivers.Count -or (Compare-Object $expectedDrivers $installedDrivers)) {
+        $failures.Add("InstalledDisplayDrivers does not match the active UMD personality.")
     }
 }
 
@@ -155,8 +194,10 @@ function Get-HeliosClassValue([string]$Name) {
     return (@($value) -join ";")
 }
 foreach ($check in @(
-    @{ name = "OpenGLDriverName"; label = "OpenGL"; nvk = "\\helios_gl64\.dll$"; venus = (Join-Path ([string]$state.installRoot) "runtime\mesa\libgallium_wgl.dll") },
-    @{ name = "OpenGLDriverNameWow"; label = "OpenGL x86"; nvk = "\\helios_gl32\.dll$"; venus = (Join-Path ([string]$state.installRoot) "runtime\mesa\x86\libgallium_wgl.dll") }
+    if (-not $nvidiaUmd) {
+        @{ name = "OpenGLDriverName"; label = "OpenGL"; nvk = "\\helios_gl64\.dll$"; venus = (Join-Path ([string]$state.installRoot) "runtime\mesa\libgallium_wgl.dll") },
+        @{ name = "OpenGLDriverNameWow"; label = "OpenGL x86"; nvk = "\\helios_gl32\.dll$"; venus = (Join-Path ([string]$state.installRoot) "runtime\mesa\x86\libgallium_wgl.dll") }
+    }
 )) {
     $value = Get-HeliosClassValue $check.name
     if ($value -match $check.nvk) {
@@ -168,8 +209,13 @@ foreach ($check in @(
     }
 }
 foreach ($check in @(
-    @{ name = "VulkanDriverName"; label = "Vulkan (NVK)"; nvk = "\\helios_nvk64\.json$" },
-    @{ name = "VulkanDriverNameWow"; label = "Vulkan x86 (NVK)"; nvk = "\\helios_nvk32\.json$" }
+    if ($nvidiaUmd) {
+        @{ name = "VulkanDriverName"; label = "Vulkan (NVIDIA)"; nvk = "\\nv-vk64\.json$" },
+        @{ name = "VulkanDriverNameWow"; label = "Vulkan x86 (NVIDIA)"; nvk = "\\nv-vk32\.json$" }
+    } else {
+        @{ name = "VulkanDriverName"; label = "Vulkan (NVK)"; nvk = "\\helios_nvk64\.json$" },
+        @{ name = "VulkanDriverNameWow"; label = "Vulkan x86 (NVK)"; nvk = "\\helios_nvk32\.json$" }
+    }
 )) {
     $value = Get-HeliosClassValue $check.name
     if ($value -match $check.nvk) {
@@ -177,7 +223,7 @@ foreach ($check in @(
         if (Test-Path -LiteralPath $json -PathType Leaf) { Write-Host "$($check.label): registered $json" }
         else { $failures.Add("$($check.label) is registered as $json, which does not exist.") }
     } else {
-        $failures.Add("NVK is not registered as the adapter's Vulkan driver ($($check.name)='$value').")
+        $failures.Add("$($check.label) is not registered as the adapter's Vulkan driver ($($check.name)='$value').")
     }
 }
 

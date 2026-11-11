@@ -170,6 +170,22 @@ impl AdapterContext {
         true
     }
 
+    /// NVIDIA personality (`ddi::hws`): set the progress poll's one-shot to the
+    /// relative, negative 100 ns `due`. `false` = no poll timer this adapter
+    /// lifetime. Legal at <= DISPATCH (`ExSetTimer`); replaces a pending expiry.
+    pub(crate) fn arm_hws_poll(&self, due: i64) -> bool {
+        use core::sync::atomic::Ordering;
+        let timer = self.hws_poll_timer.load(Ordering::Acquire);
+        if timer == 0 || due >= 0 {
+            return false;
+        }
+        // SAFETY: a valid system timer for the adapter lifetime (deleted only at
+        // RemoveDevice, with cancel+wait); a high-resolution timer takes a relative
+        // due time.
+        unsafe { ExSetTimer(timer as ExTimer, due, 0, core::ptr::null_mut()) };
+        true
+    }
+
     /// The worker's wait returned: cancel the high-resolution wake if it is still pending (an
     /// event ended the wait first) and say whether it fired. PASSIVE.
     pub(crate) fn end_hpd_hr_wake(&self) -> bool {
@@ -391,6 +407,20 @@ impl AdapterContext {
         // the delete cancelled the timer first. Storing 0 BEFORE the delete let such a callback
         // read 0 and call `ExSetTimer(NULL)` (the watchdog), or fall to the KTIMER fallback and
         // arm a DPC inside a context about to be freed (the heartbeat).
+        let hws_timer = self.hws_poll_timer.load(Ordering::Acquire);
+        if hws_timer != 0 {
+            // SAFETY: as below. NVIDIA personality only; cancel+wait drains a poll
+            // callback in flight (it touches only the static registry and dxgkrnl).
+            unsafe {
+                ExDeleteTimer(
+                    hws_timer as ExTimer,
+                    BOOLEAN_TRUE,
+                    BOOLEAN_TRUE,
+                    core::ptr::null_mut(),
+                );
+            }
+            self.hws_poll_timer.store(0, Ordering::Release);
+        }
         let wd_timer = self.vsync_wd_timer.load(Ordering::Acquire);
         let ex_timer = self.vsync_ex_timer.load(Ordering::Acquire);
         let hr_timer = self.hpd_hr_timer.load(Ordering::Acquire);
@@ -899,7 +929,36 @@ impl AdapterContext {
             self.hpd_hr_timer
                 .store(hr_timer as usize, core::sync::atomic::Ordering::Release);
         }
+        // NVIDIA personality only: the interim HW-queue progress poll (`ddi::hws`). The
+        // default personality allocates nothing here. NULL = progress is observed only at
+        // submit time this adapter lifetime.
+        if crate::ddi::wddm_surface::nvidia_selected() {
+            // SAFETY: as above.
+            let hws_timer = unsafe {
+                ExAllocateTimer(
+                    Some(hws_poll_timer_callback),
+                    self as *const _ as PVOID,
+                    EX_TIMER_HIGH_RESOLUTION,
+                )
+            };
+            if !hws_timer.is_null() {
+                self.hws_poll_timer
+                    .store(hws_timer as usize, core::sync::atomic::Ordering::Release);
+            }
+        }
     }
+}
+
+/// `EXT_CALLBACK` of the NVIDIA personality's HW-queue progress poll
+/// (DISPATCH_LEVEL). Same context rule as [`vsync_ex_timer_callback`].
+unsafe extern "system" fn hws_poll_timer_callback(_timer: ExTimer, context: PVOID) {
+    if context.is_null() {
+        return;
+    }
+    // SAFETY: the final adapter address, live until `ExDeleteTimer(wait=TRUE)` has
+    // drained this callback at RemoveDevice.
+    let adapter = unsafe { &*(context as *const AdapterContext) };
+    crate::ddi::hws::poll_tick(adapter);
 }
 
 /// Common DISPATCH_LEVEL tick for the high-resolution Ex callback and the
@@ -1025,6 +1084,24 @@ unsafe fn service_vsync_tick(adapter: &AdapterContext) {
         tick_time_100ns,
         &step,
     );
+    // The hardware flip queue (`ddi::hwfq`) advances on every tick, also while the
+    // vsync interrupt is off; the gate only decides whether dxgkrnl is told.
+    if crate::ddi::hwfq::enabled() {
+        if let Some(dxgkrnl) = adapter.dxgkrnl_opt() {
+            let deliver = adapter.vsync_enabled.load(Ordering::Acquire) != 0;
+            crate::ddi::hwfq::tick(dxgkrnl, crate::ddi::vidpn::CHILD_UID, deliver);
+        }
+        // A flip shown at DIRQL only published its allocation: the PASSIVE worker
+        // programs the host scanout.
+        if adapter.pending_vidpn_allocation.load(Ordering::Acquire) != 0 {
+            adapter.signal_hpd();
+        }
+        adapter
+            .vsync_last_100ns
+            .store(tick_time_100ns, Ordering::Relaxed);
+        adapter.vsync_count.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
     // ControlInterrupt may close only the delivery gate at DIRQL. Keep the
     // one-shot heartbeat free-running while disabled so a later enable needs no
     // illegal timer operation and resumes on the next nominal retrace.

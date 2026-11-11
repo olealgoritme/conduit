@@ -571,6 +571,12 @@ impl VirtioGpu {
     /// Returns whether the HPD worker has work now: a fence a carrier is waiting on
     /// fired (a queued `SCANOUT_PRESENT` to send, a handle to close).
     fn deliver_nvrm_ready(&mut self, handle: u32, status: i32) -> bool {
+        // A native HW-queue completion file (`virtio::native_completion`): nobody
+        // registered on it, and its scan runs once this lock is released
+        // (`ddi::interrupt::drain_used_and_complete`). Atomics only.
+        if crate::virtio::native_completion::on_ready(handle) {
+            return false;
+        }
         // A fence fires once, so every notification for one is a fire. Counted
         // whatever became of it (woken, latched), before the lookup is lost. The
         // first one also routes to what the fence was attached to

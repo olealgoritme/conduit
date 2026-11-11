@@ -1999,6 +1999,196 @@ mod tests {
         be.teardown();
     }
 
+    /// RM, refusing the first `refusals` registrations it is asked for the way
+    /// it does when the kernel will not pin the pages long-term: a page in a
+    /// MIGRATE_CMA pageblock it could not migrate out (FOLL_LONGTERM), so
+    /// `os_lock_user_pages` fails and the I/O-memory fallback answers
+    /// NV_ERR_INVALID_ADDRESS. After that it registers like
+    /// [`RegisteringHost`].
+    #[derive(Clone)]
+    struct PinRefusingHost {
+        inner: RegisteringHost,
+        refusals: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl HostDriver for PinRefusingHost {
+        fn ioctl(&self, fd: RawFd, request: u64, arg: &mut [u8]) -> std::result::Result<(), i32> {
+            use std::sync::atomic::Ordering::SeqCst;
+            let free = request & 0xFF == 0x29;
+            if !free
+                && self
+                    .refusals
+                    .fetch_update(SeqCst, SeqCst, |n| n.checked_sub(1))
+                    .is_ok()
+            {
+                self.inner.calls.lock().unwrap().push(request);
+                let at = self.inner.status_at;
+                arg[at..at + 4].copy_from_slice(&0x1eu32.to_le_bytes());
+                return Ok(());
+            }
+            self.inner.ioctl(fd, request, arg)
+        }
+    }
+
+    fn pin_refusing(refusals: usize) -> (PinRefusingHost, NvidiaBackend, u64) {
+        let d = osdesc();
+        let inner = RegisteringHost::new(
+            d.vid_heap.address_at,
+            d.vid_heap_status_at,
+            d.vid_heap_hmemory_at,
+            2,
+        );
+        let host = PinRefusingHost {
+            inner,
+            refusals: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(refusals)),
+        };
+        let (mut be, h) = backend_for_registration(&host.inner);
+        be.set_host(Box::new(host.clone()));
+        (host, be, h)
+    }
+
+    fn heap_rm_status(resp: &[u8]) -> u32 {
+        let body = size_of::<MsgHeader>() + size_of::<IoctlResp>();
+        let st = osdesc().vid_heap_status_at;
+        u32::from_le_bytes(resp[body + st..body + st + 4].try_into().unwrap())
+    }
+
+    /// A pin the kernel refused is usually refused for a moment: the page was
+    /// busy while it was being migrated out of a MIGRATE_CMA pageblock, and
+    /// each attempt keeps what it did migrate. The registration is made again
+    /// rather than the GPU VA being left unmapped.
+    #[test]
+    fn a_registration_whose_pin_was_refused_is_made_again() {
+        let d = osdesc();
+        let (host, mut be, h) = pin_refusing(2);
+
+        let mut resp = vec![0u8; 4096];
+        be.dispatch(
+            &ioctl_msg_with_runs(
+                h,
+                abi::ioctl::NV_ESC_RM_VID_HEAP_CONTROL,
+                &heap_registration(&d, 0xc1d0_0001),
+                &[(1024 * TPAGE, TPAGE), (0, TPAGE)],
+            ),
+            &mut resp,
+        );
+
+        assert_eq!(parse_resp(&resp).status, 0);
+        assert_eq!(
+            heap_rm_status(&resp),
+            0,
+            "the third attempt was answered NV_OK"
+        );
+        assert_eq!(
+            host.inner.calls().len(),
+            3,
+            "two refusals, then the one that held"
+        );
+        assert_eq!(
+            host.inner.seen(),
+            vec![
+                crate::guestmem::fake::mark(1024 * TPAGE),
+                crate::guestmem::fake::mark(0)
+            ],
+            "the attempt that held was given the same guest pages"
+        );
+        assert_eq!(
+            be.registration_count(),
+            1,
+            "the span is held for the object"
+        );
+        assert_eq!(be.registrations_retried, 1);
+        be.teardown();
+    }
+
+    /// A refusal that does not go away is RM's answer, passed on as it stands
+    /// after a bounded number of attempts, and nothing is held for it.
+    #[test]
+    fn a_pin_refused_on_every_attempt_is_passed_on() {
+        let d = osdesc();
+        let (host, mut be, h) = pin_refusing(usize::MAX);
+
+        let mut resp = vec![0u8; 4096];
+        be.dispatch(
+            &ioctl_msg_with_runs(
+                h,
+                abi::ioctl::NV_ESC_RM_VID_HEAP_CONTROL,
+                &heap_registration(&d, 0xc1d0_0001),
+                &[(0, 2 * TPAGE)],
+            ),
+            &mut resp,
+        );
+
+        assert_eq!(parse_resp(&resp).status, 0);
+        assert_eq!(
+            heap_rm_status(&resp),
+            0x1e,
+            "RM's own status reaches the guest"
+        );
+        assert_eq!(
+            host.inner.calls().len(),
+            1 + super::osdesc::PIN_RETRY_DELAYS.len(),
+            "one attempt and one per retry delay, and no more"
+        );
+        assert_eq!(
+            be.registration_count(),
+            0,
+            "nothing was registered, nothing held"
+        );
+        assert_eq!(be.registrations_unpinned, 1);
+        be.teardown();
+    }
+
+    /// Any other refusal is not a pin that might hold a moment later, and is
+    /// not asked again.
+    #[test]
+    fn a_registration_refused_for_another_reason_is_not_made_again() {
+        let d = osdesc();
+        let host = StatusRefusingHost(std::sync::Arc::default(), d.vid_heap_status_at);
+        let inner = RegisteringHost::new(
+            d.vid_heap.address_at,
+            d.vid_heap_status_at,
+            d.vid_heap_hmemory_at,
+            2,
+        );
+        let (mut be, h) = backend_for_registration(&inner);
+        be.set_host(Box::new(host.clone()));
+
+        let mut resp = vec![0u8; 4096];
+        be.dispatch(
+            &ioctl_msg_with_runs(
+                h,
+                abi::ioctl::NV_ESC_RM_VID_HEAP_CONTROL,
+                &heap_registration(&d, 0xc1d0_0001),
+                &[(0, 2 * TPAGE)],
+            ),
+            &mut resp,
+        );
+
+        assert_eq!(
+            heap_rm_status(&resp),
+            0x51,
+            "NV_ERR_NO_MEMORY, as RM said it"
+        );
+        assert_eq!(*host.0.lock().unwrap(), 1, "asked once");
+        assert_eq!(be.registration_count(), 0);
+        be.teardown();
+    }
+
+    /// RM answering NV_ERR_NO_MEMORY to everything, counting the calls.
+    #[derive(Clone)]
+    struct StatusRefusingHost(std::sync::Arc<std::sync::Mutex<usize>>, usize);
+
+    impl HostDriver for StatusRefusingHost {
+        fn ioctl(&self, _fd: RawFd, request: u64, arg: &mut [u8]) -> std::result::Result<(), i32> {
+            if request & 0xFF != 0x29 {
+                *self.0.lock().unwrap() += 1;
+                arg[self.1..self.1 + 4].copy_from_slice(&0x51u32.to_le_bytes());
+            }
+            Ok(())
+        }
+    }
+
     /// A table too long for one message stays in guest memory, and the
     /// message says where: the host still reads exactly the guest's pages.
     #[test]
@@ -3387,6 +3577,218 @@ mod tests {
         assert_eq!(seen, vec![100_000]);
     }
 
+    // ------------------------------------------------------------------
+    // The NVIDIA UMD personality's RM policy (rmpolicy.rs) and the UMD
+    // release lock (umd_version.rs), through `dispatch`.
+    // ------------------------------------------------------------------
+
+    const POLICY_CLIENT: u32 = 0xc1d0_0042;
+
+    /// A backend in `mode` whose guest holds the client `POLICY_CLIENT`.
+    fn policy_backend(
+        host: &CountingHost,
+        mode: super::super::rmpolicy::Mode,
+    ) -> (NvidiaBackend, u64) {
+        let (mut be, h) = backend_on(host);
+        be.set_rm_policy(mode);
+        let mut root = rm_alloc(0x41);
+        root[8..12].copy_from_slice(&POLICY_CLIENT.to_le_bytes());
+        send_nested(&mut be, h, abi::ioctl::NV_ESC_RM_ALLOC, &root, 0);
+        (be, h)
+    }
+
+    fn rm_status(resp: &[u8], at: usize) -> u32 {
+        let body = size_of::<MsgHeader>() + size_of::<IoctlResp>();
+        u32::from_le_bytes(resp[body + at..body + at + 4].try_into().unwrap())
+    }
+
+    fn policy_control(cmd: u32, size: u32) -> Vec<u8> {
+        let mut c = rm_control(cmd, size);
+        c[0..4].copy_from_slice(&POLICY_CLIENT.to_le_bytes());
+        c[4..8].copy_from_slice(&POLICY_CLIENT.to_le_bytes());
+        c
+    }
+
+    /// NV2080_CTRL_CMD_PERF_BOOST: RM serves it to an unprivileged caller, and
+    /// NVIDIA's UMDs never send it. Enforced, it never reaches the host and
+    /// the guest reads NV_ERR_INSUFFICIENT_PERMISSIONS.
+    #[test]
+    fn an_unlisted_control_is_refused_when_enforced() {
+        use super::super::rmpolicy::{Mode, NV_ERR_INSUFFICIENT_PERMISSIONS};
+        let host = CountingHost::default();
+        let (mut be, h) = policy_backend(&host, Mode::Enforce);
+        let size = abi::rmallow::v615_71_09::CTRL
+            .iter()
+            .find(|e| e.cmd == 0x2080_200a)
+            .expect("PERF_BOOST is exported by RM")
+            .params_size;
+        let before = host.calls().len();
+        let resp = send_nested(
+            &mut be,
+            h,
+            abi::ioctl::NV_ESC_RM_CONTROL,
+            &policy_control(0x2080_200a, size),
+            size as usize,
+        );
+        assert_eq!(host.calls().len(), before, "{:x?}", host.calls());
+        assert_eq!(rm_status(&resp, 28), NV_ERR_INSUFFICIENT_PERMISSIONS);
+    }
+
+    /// Log-only serves the same control and only counts it.
+    #[test]
+    fn log_only_serves_what_enforce_would_refuse() {
+        use super::super::rmpolicy::Mode;
+        let host = CountingHost::default();
+        let (mut be, h) = policy_backend(&host, Mode::Log);
+        let size = abi::rmallow::v615_71_09::CTRL
+            .iter()
+            .find(|e| e.cmd == 0x2080_200a)
+            .unwrap()
+            .params_size;
+        let before = host.calls().len();
+        send_nested(
+            &mut be,
+            h,
+            abi::ioctl::NV_ESC_RM_CONTROL,
+            &policy_control(0x2080_200a, size),
+            size as usize,
+        );
+        assert_eq!(host.calls().len(), before + 1);
+        assert!(be.rm_misses.summary().contains("RM_CONTROL 0x2080200a"));
+    }
+
+    /// A listed control on the guest's own client reaches the host; the same
+    /// control naming a client this guest never made does not.
+    #[test]
+    fn a_listed_control_is_served_only_on_an_own_client() {
+        use super::super::rmpolicy::Mode;
+        let host = CountingHost::default();
+        let (mut be, h) = policy_backend(&host, Mode::Enforce);
+        let size = abi::rmallow::v615_71_09::CTRL
+            .iter()
+            .find(|e| e.cmd == 0x2080_0142)
+            .expect("GPU_GET_ID is exported by RM")
+            .params_size;
+        let before = host.calls().len();
+        send_nested(
+            &mut be,
+            h,
+            abi::ioctl::NV_ESC_RM_CONTROL,
+            &policy_control(0x2080_0142, size),
+            size as usize,
+        );
+        assert_eq!(host.calls().len(), before + 1);
+
+        let mut foreign = policy_control(0x2080_0142, size);
+        foreign[0..4].copy_from_slice(&0xc1d0_0001u32.to_le_bytes());
+        send_nested(
+            &mut be,
+            h,
+            abi::ioctl::NV_ESC_RM_CONTROL,
+            &foreign,
+            size as usize,
+        );
+        assert_eq!(host.calls().len(), before + 1, "{:x?}", host.calls());
+    }
+
+    /// The CUDA clock-limit control is answered NV_OK here when enforced.
+    #[test]
+    fn the_cuda_clock_limit_is_answered_here() {
+        use super::super::rmpolicy::Mode;
+        let host = CountingHost::default();
+        let (mut be, h) = policy_backend(&host, Mode::Enforce);
+        let before = host.calls().len();
+        let mut c = policy_control(0x0080_1909, 1);
+        c[28..32].copy_from_slice(&0xffu32.to_le_bytes());
+        let resp = send_nested(&mut be, h, abi::ioctl::NV_ESC_RM_CONTROL, &c, 1);
+        assert_eq!(host.calls().len(), before);
+        assert_eq!(rm_status(&resp, 28), 0);
+        assert_eq!(be.rm_absorbed, 1);
+    }
+
+    /// Off, the policy is not consulted at all.
+    #[test]
+    fn the_policy_off_changes_nothing() {
+        use super::super::rmpolicy::Mode;
+        let host = CountingHost::default();
+        let (mut be, h) = policy_backend(&host, Mode::Off);
+        let size = abi::rmallow::v615_71_09::CTRL
+            .iter()
+            .find(|e| e.cmd == 0x2080_200a)
+            .unwrap()
+            .params_size;
+        let before = host.calls().len();
+        send_nested(
+            &mut be,
+            h,
+            abi::ioctl::NV_ESC_RM_CONTROL,
+            &policy_control(0x2080_200a, size),
+            size as usize,
+        );
+        assert_eq!(host.calls().len(), before + 1);
+        assert!(be.rm_misses.is_empty());
+    }
+
+    fn umd_report(
+        be: &mut NvidiaBackend,
+        major: u32,
+        minor: u32,
+    ) -> protocol::messages::UmdVersionReply {
+        let mut v = hdr(MsgType::UmdVersion, 0);
+        v.extend_from_slice(
+            &protocol::messages::UmdVersion {
+                kind: protocol::messages::UMD_KIND_NVIDIA_WINDOWS,
+                major,
+                minor,
+                reserved: 0,
+            }
+            .to_bytes(),
+        );
+        let mut resp = vec![0u8; 64];
+        let n = be.dispatch(&v, &mut resp);
+        assert_eq!(parse_resp(&resp).status, 0);
+        protocol::messages::UmdVersionReply::from_bytes(&resp[size_of::<MsgHeader>()..n]).unwrap()
+    }
+
+    /// A release the host RM is not: the guest is told, and from then on no
+    /// RM call of its reaches the host. A matching report lifts it.
+    #[test]
+    fn a_mismatched_umd_release_shuts_rm_off_for_the_guest() {
+        use protocol::messages::{UMD_VERDICT_MATCH, UMD_VERDICT_MISMATCH};
+        let host = CountingHost::default();
+        let (mut be, h) = backend_on(&host);
+        be.set_umd_pin(Some(super::super::umd_version::Pin::Exact(
+            super::super::umd_version::WinVersion::new(615, 71),
+        )));
+        let r = umd_report(&mut be, 610, 88);
+        assert_eq!(r.verdict, UMD_VERDICT_MISMATCH);
+        assert_eq!((r.host_major, r.host_minor, r.host_patch), (615, 71, 9));
+
+        let resp = send_nested(&mut be, h, abi::ioctl::NV_ESC_RM_ALLOC, &rm_alloc(0x41), 0);
+        assert!(host.calls().is_empty(), "{:x?}", host.calls());
+        assert_eq!(
+            rm_status(&resp, 40),
+            super::super::rmpolicy::NV_ERR_INSUFFICIENT_PERMISSIONS
+        );
+
+        assert_eq!(umd_report(&mut be, 615, 71).verdict, UMD_VERDICT_MATCH);
+        send_nested(&mut be, h, abi::ioctl::NV_ESC_RM_ALLOC, &rm_alloc(0x41), 0);
+        assert_eq!(host.calls().len(), 1);
+    }
+
+    /// A report the backend cannot read is refused as a message, not judged.
+    #[test]
+    fn a_malformed_umd_report_is_an_error() {
+        let host = CountingHost::default();
+        let (mut be, _) = backend_on(&host);
+        let mut v = hdr(MsgType::UmdVersion, 0);
+        v.extend_from_slice(&[0u8; 8]);
+        let mut resp = vec![0u8; 64];
+        be.dispatch(&v, &mut resp);
+        assert!(parse_resp(&resp).status < 0);
+        assert!(be.umd_report.is_none());
+    }
+
     #[cfg(feature = "trace")]
     mod trace_tests {
         use super::*;
@@ -3653,6 +4055,269 @@ mod tests {
             );
         }
     }
+
+    // ------------------------------------------------------------------
+    // RmBatch (batch.rs): several Ioctls in one round trip.
+    // ------------------------------------------------------------------
+
+    /// A fake host that records each call's parameter bytes, unchanged.
+    #[derive(Clone, Default)]
+    struct BytesHost(std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>);
+
+    impl HostDriver for BytesHost {
+        fn ioctl(&self, _fd: RawFd, _request: u64, arg: &mut [u8]) -> std::result::Result<(), i32> {
+            self.0.lock().unwrap().push(arg.to_vec());
+            Ok(())
+        }
+    }
+
+    impl BytesHost {
+        fn calls(&self) -> Vec<Vec<u8>> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    fn batch_backend(host: &BytesHost) -> (NvidiaBackend, u64) {
+        let mut be = NvidiaBackend::for_test();
+        be.set_host_driver_version(abi::version::DriverVersion::new(615, 71, 9))
+            .expect("615.71.09 has tables");
+        be.set_host(Box::new(host.clone()));
+        let null = std::fs::File::open("/dev/null").expect("/dev/null");
+        let h = be.handles.insert(OwnedFd::from(null));
+        (be, h)
+    }
+
+    /// NVOS00 (RM_FREE): hRoot, hObjectParent, hObjectOld, status (at 12).
+    fn batch_free(h: u64, tag: u32, status: u32) -> Vec<u8> {
+        let mut p = vec![0u8; 16];
+        p[0..4].copy_from_slice(&tag.to_le_bytes());
+        p[4..8].copy_from_slice(&0x4b4d_0001u32.to_le_bytes());
+        p[8..12].copy_from_slice(&(0x4e57_1000 + tag).to_le_bytes());
+        p[12..16].copy_from_slice(&status.to_le_bytes());
+        ioctl_msg(h, abi::ioctl::NV_ESC_RM_FREE, &p)
+    }
+
+    fn batch_entry(req: &[u8], resp_cap: u32, status_at: u32, flags: u32) -> Vec<u8> {
+        use protocol::messages::{RmBatchEntry, rm_batch_pad8};
+        let mut out = Vec::new();
+        append(
+            &mut out,
+            &RmBatchEntry {
+                req_len: req.len() as u32,
+                resp_cap,
+                status_at,
+                flags,
+            },
+        );
+        out.extend_from_slice(req);
+        out.resize(size_of::<RmBatchEntry>() + rm_batch_pad8(req.len()), 0);
+        out
+    }
+
+    fn batch_msg(entries: &[Vec<u8>]) -> Vec<u8> {
+        let mut out = hdr(MsgType::RmBatch, 0);
+        out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        for e in entries {
+            out.extend_from_slice(e);
+        }
+        out
+    }
+
+    /// (len, rm_status, flags, reply bytes) of each entry of a batch reply.
+    fn batch_replies(resp: &[u8], caps: &[u32]) -> Vec<(u32, u32, u32, Vec<u8>)> {
+        use protocol::messages::{RmBatchReply, RmBatchResp, rm_batch_pad8};
+        let mut out = Vec::new();
+        let mut at = size_of::<MsgHeader>() + size_of::<RmBatchResp>();
+        for &cap in caps {
+            let r = read_struct::<RmBatchReply>(resp, at);
+            let body = at + size_of::<RmBatchReply>();
+            out.push((r.len, r.rm_status, r.flags, resp[body..body + r.len as usize].to_vec()));
+            at = body + rm_batch_pad8(cap as usize);
+        }
+        out
+    }
+
+    #[test]
+    fn a_batch_serves_its_entries_in_order_as_single_ioctls() {
+        use protocol::messages::*;
+        let host = BytesHost::default();
+        let (mut be, h) = batch_backend(&host);
+        let a = batch_free(h, 1, 0);
+        let b = batch_free(h, 2, 0);
+        let req = batch_msg(&[
+            batch_entry(&a, 512, RM_BATCH_NO_STATUS, 0),
+            batch_entry(&b, 512, 12, 0),
+        ]);
+        let mut resp = vec![0u8; 4096];
+        let n = be.dispatch(&req, &mut resp);
+        assert_eq!(n, 16 + 8 + 2 * (16 + 512));
+        let top = parse_resp(&resp);
+        assert_eq!(top.msg_type, MsgType::RmBatch as u32);
+        assert_eq!(top.status, 0);
+        let counts = read_struct::<RmBatchResp>(&resp, size_of::<MsgHeader>());
+        assert_eq!((counts.count, counts.served), (2, 2));
+        // Each reply is what the call alone gets.
+        let solo_host = BytesHost::default();
+        let (mut solo, h2) = batch_backend(&solo_host);
+        assert_eq!(h2, h);
+        let mut single = vec![0u8; 512];
+        let n1 = solo.dispatch(&a, &mut single);
+        let got = batch_replies(&resp, &[512, 512]);
+        assert_eq!(got[0].3, single[..n1].to_vec());
+        assert_eq!(got[0].2, RM_BATCH_REPLY_SERVED);
+        assert_eq!(got[1].1, 0, "RM status read at 12");
+        assert_eq!(got[1].2, RM_BATCH_REPLY_SERVED);
+        let calls = host.calls();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0][0], 1);
+        assert_eq!(calls[1][0], 2);
+    }
+
+    #[test]
+    fn a_failed_batch_entry_skips_the_rest_of_its_group_only() {
+        use protocol::messages::*;
+        let host = BytesHost::default();
+        let (mut be, h) = batch_backend(&host);
+        let g = |n: u32| n << 16;
+        // A handle the backend never opened: refused by the host side.
+        let bad = batch_free(h + 100, 1, 0);
+        let req = batch_msg(&[
+            batch_entry(&bad, 64, RM_BATCH_NO_STATUS, RM_BATCH_SKIP_GROUP_ON_FAIL | g(1)),
+            batch_entry(&batch_free(h, 2, 0), 64, RM_BATCH_NO_STATUS, g(1)),
+            batch_entry(&batch_free(h, 3, 0), 64, RM_BATCH_NO_STATUS, g(2)),
+        ]);
+        let mut resp = vec![0u8; 4096];
+        be.dispatch(&req, &mut resp);
+        let counts = read_struct::<RmBatchResp>(&resp, size_of::<MsgHeader>());
+        assert_eq!((counts.count, counts.served), (3, 2));
+        let got = batch_replies(&resp, &[64, 64, 64]);
+        assert_eq!(got[0].2, RM_BATCH_REPLY_SERVED | RM_BATCH_REPLY_FAILED);
+        assert_eq!((got[1].0, got[1].2), (0, 0), "skipped");
+        assert_eq!(got[2].2, RM_BATCH_REPLY_SERVED);
+        let calls = host.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0][0], 3);
+    }
+
+    #[test]
+    fn a_batch_entry_fails_on_rm_s_status_and_abort_stops_the_rest() {
+        use protocol::messages::*;
+        let host = BytesHost::default();
+        let (mut be, h) = batch_backend(&host);
+        // The fake host leaves the parameters as sent: status 0x1f comes back.
+        let req = batch_msg(&[
+            batch_entry(&batch_free(h, 1, 0x1f), 512, 12, RM_BATCH_ABORT_ON_FAIL),
+            batch_entry(&batch_free(h, 2, 0), 512, 12, 5 << 16),
+        ]);
+        let mut resp = vec![0u8; 4096];
+        be.dispatch(&req, &mut resp);
+        let got = batch_replies(&resp, &[512, 512]);
+        assert_eq!(got[0].1, 0x1f);
+        assert_eq!(got[0].2, RM_BATCH_REPLY_SERVED | RM_BATCH_REPLY_FAILED);
+        assert_eq!(got[1].2, 0);
+        assert_eq!(host.calls().len(), 1);
+    }
+
+    #[test]
+    fn a_malformed_batch_serves_nothing() {
+        use protocol::messages::*;
+        let host = BytesHost::default();
+        let (mut be, h) = batch_backend(&host);
+        let a = batch_free(h, 1, 0);
+        let mut resp = vec![0u8; 4096];
+        let mut errno = |req: &[u8], resp: &mut [u8]| {
+            be.dispatch(req, resp);
+            parse_resp(resp).status
+        };
+        // A batch inside a batch.
+        let inner = batch_msg(&[batch_entry(&a, 512, RM_BATCH_NO_STATUS, 0)]);
+        let outer = batch_msg(&[
+            batch_entry(&a, 512, RM_BATCH_NO_STATUS, 0),
+            batch_entry(&inner, 512, RM_BATCH_NO_STATUS, 0),
+        ]);
+        assert_eq!(errno(&outer, &mut resp), -libc::EINVAL);
+        // An Open inside.
+        let req = batch_msg(&[batch_entry(&open_msg(DeviceKind::Ctl), 512, RM_BATCH_NO_STATUS, 0)]);
+        assert_eq!(errno(&req, &mut resp), -libc::EINVAL);
+        // More reply room asked for than there is.
+        let req = batch_msg(&[
+            batch_entry(&a, 4096, RM_BATCH_NO_STATUS, 0),
+            batch_entry(&a, 4096, RM_BATCH_NO_STATUS, 0),
+        ]);
+        assert_eq!(errno(&req, &mut resp), -libc::EINVAL);
+        // Too many entries.
+        let many: Vec<Vec<u8>> = (0..65).map(|_| batch_entry(&a, 16, RM_BATCH_NO_STATUS, 0)).collect();
+        let mut big = vec![0u8; 65 * 64];
+        assert_eq!(errno(&batch_msg(&many), &mut big), -libc::EINVAL);
+        // Unknown entry flags.
+        let req = batch_msg(&[batch_entry(&a, 512, RM_BATCH_NO_STATUS, 1 << 7)]);
+        assert_eq!(errno(&req, &mut resp), -libc::EINVAL);
+        // A truncated entry.
+        let mut req = batch_msg(&[batch_entry(&a, 512, RM_BATCH_NO_STATUS, 0)]);
+        req.truncate(req.len() - 16);
+        assert_eq!(errno(&req, &mut resp), -libc::EINVAL);
+        // A header naming a handle.
+        let mut req = batch_msg(&[batch_entry(&a, 512, RM_BATCH_NO_STATUS, 0)]);
+        req[4..8].copy_from_slice(&7u32.to_le_bytes());
+        assert_eq!(errno(&req, &mut resp), -libc::EINVAL);
+        assert!(host.calls().is_empty(), "{:x?}", host.calls());
+    }
+
+    /// RM's allowlist and the RM policy judge every entry: what is refused
+    /// alone is refused inside a batch, with the same reply, and never
+    /// reaches the host; the entries around it are still served.
+    #[test]
+    fn rm_policy_and_the_allowlist_judge_each_batch_entry() {
+        use protocol::messages::*;
+        for policy in [None, Some(rmpolicy::Mode::Enforce)] {
+            let host = BytesHost::default();
+            let (mut be, h) = batch_backend(&host);
+            let solo_host = BytesHost::default();
+            let (mut solo, _) = batch_backend(&solo_host);
+            if let Some(mode) = policy {
+                be.set_rm_policy(mode);
+                solo.set_rm_policy(mode);
+            }
+            // NV0000_CTRL_CMD_GPUACCT_SET_ACCOUNTING_STATE: privileged in RM,
+            // in no table; under the policy also on a client this guest never made.
+            let mut refused = hdr(MsgType::Ioctl, h);
+            let top = rm_control(0x0000_0b01, 8);
+            append(
+                &mut refused,
+                &IoctlReq {
+                    cmd: abi::ioctl::_IOWR(abi::ioctl::NV_ESC_RM_CONTROL, 32) as u32,
+                    data_len: 32,
+                    nested_offset: 32,
+                    nested_len: 8,
+                    deep_ptr_offset: 0,
+                    deep_len: 0,
+                },
+            );
+            refused.extend_from_slice(&top);
+            refused.extend_from_slice(&[0u8; 8]);
+            let mut single = vec![0u8; 512];
+            let n = solo.dispatch(&refused, &mut single);
+            assert!(solo_host.calls().is_empty(), "refused alone");
+            // A free: served without the policy; under it, on a client this
+            // guest never made, refused as well. Whatever it gets alone.
+            let free = batch_free(h, 2, 0);
+            let mut single_free = vec![0u8; 512];
+            let nf = solo.dispatch(&free, &mut single_free);
+
+            let req = batch_msg(&[batch_entry(&refused, 512, 28, 0), batch_entry(&free, 512, 12, 0)]);
+            let mut resp = vec![0u8; 4096];
+            be.dispatch(&req, &mut resp);
+            let got = batch_replies(&resp, &[512, 512]);
+            assert_eq!(got[0].3, single[..n].to_vec(), "{policy:?}");
+            assert_ne!(got[0].2 & RM_BATCH_REPLY_FAILED, 0);
+            assert_eq!(got[1].3, single_free[..nf].to_vec(), "{policy:?}");
+            // The host heard exactly what it heard from the single calls.
+            assert_eq!(host.calls(), solo_host.calls(), "{policy:?}");
+            assert_eq!(host.calls().len(), usize::from(policy.is_none()));
+        }
+    }
+
 }
 
 /// Explicit sync (docs/SYNC.md): host sync_files in and out of the handle

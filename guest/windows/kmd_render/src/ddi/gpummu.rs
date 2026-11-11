@@ -1,47 +1,24 @@
-//! Decorative GpuMmu geometry — the single source of truth for the fake-but-
-//! coherent WDDM GPU memory model (Step 2 of the IDD render plan).
+//! WDDM GpuMmu geometry for the default Venus model and the native NVDA model.
 //!
-//! WHY THIS EXISTS. To make VidMm accept Helios as a render adapter (so DWM can
-//! composite the whole desktop on Helios → venus → host GPU), the driver declares
-//! a GpuMmu memory model. But Helios has no guest GPU MMU: venus addresses host
-//! resources by opaque id and the **host GPU owns the real MMU**, so the guest
-//! page tables are *decorative* — their content is never read by any hardware
-//! (WDDM_FAKE_VIDMM_RESEARCH.md §A3.7). What is NOT optional is the *structural*
-//! bookkeeping VidMm maintains regardless: the declared `DXGK_GPUMMUCAPS` /
-//! per-level `DXGK_PAGE_TABLE_LEVEL_DESC` geometry must be **self-consistent**,
-//! and every page-table DDI (`GetRootPageTableSize`, `SetRootPageTable`,
-//! `BuildPagingBuffer`/`UpdatePageTable`) must return success and values
-//! consistent with this geometry, even when their hardware effect is nil.
+//! With `NvUmd` off the original decorative 40-bit geometry is unchanged.  The
+//! native 610.88 path advertises the hardware-shaped 44-bit, four-level walk
+//! (12 + 9 + 9 + 9 + 5), 4-KiB tables and a 32-entry root.  Its leaf updates are
+//! translated into real fixed RM mappings by `virtio::native_memory`.
 //!
-//! THE GEOMETRY (system-memory page tables, one CPU page per table):
-//!   - 40-bit GPU virtual addresses, 4-KiB pages (12-bit page offset).
-//!     The live 0x10E:0x49 op applies PTEs at GPU VA 0x8001064300, so 40 bits
-//!     covers the current VidMm-assigned range.
-//!   - 4 translation levels: 9-bit leaf + 9-bit L1 + 9-bit L2 + 1-bit root.
-//!     Every table is one 4-KiB CPU page. This is deliberate: WDDM reserves
-//!     `DXGK_PAGE_TABLE_LEVEL_DESC::*SegmentId = 0` for system memory, but the
-//!     docs also cap system-memory page tables at 4 KiB. The previous 2-level
-//!     19-bit root required a 4-MiB root allocation and forced us into a fake
-//!     device segment, which is exactly where `0x10E:0x49` fired.
-//!
-//! THE PAGE-TABLE UPDATE MODE. The 2026-06-21 ntoseye decode of the 0x10E:0x49
-//! crash showed `CPU_VIRTUAL` dies inside
-//! `VIDMM_PAGE_TABLE_BASE::GetCpuVisibleAddress`: VidMm tries to resolve a CPU VA
-//! for page-table segment 2 and fatals when that segment's internal attribute word
-//! lacks the accepted CPU-update capability bits. That held for RAM, unbacked-BAR,
-//! and venus-backed variants, so the backing was not the deciding contract. Use
-//! `GPU_PHYSICAL` instead: VidMm routes PTE writes through `BuildPagingBuffer`
-//! (`UPDATE_PAGE_TABLE`) + `SubmitCommand`, which our null engine consumes and
-//! no-ops — nothing ever CPU-touches decorative page-table bytes.
+//! Optional capabilities stay off in both models: large pages, dual PTEs,
+//! sparse zero pages, explicit invalidation and every other unimplemented cap.
 
 use core::mem::size_of;
 
 use crate::dxgk::_DXGK_PAGETABLEUPDATEMODE::DXGK_PAGETABLEUPDATE_GPU_PHYSICAL;
 use crate::dxgk::*;
 
-/// Total GPU virtual-address width (bits). 40 covers VidMm's current
-/// 0x8001064300 page-table init range and keeps the root table bounded.
+/// Total GPU virtual-address width in the default model. 40 covers VidMm's
+/// current 0x8001064300 page-table init range and keeps the default root small.
 pub const VIRTUAL_ADDRESS_BIT_COUNT: u32 = 40;
+/// Native 610.88 geometry: 44 bits = 12 + 9 + 9 + 9 + 5.
+pub const NATIVE_VIRTUAL_ADDRESS_BIT_COUNT: u32 = 44;
+pub const NATIVE_ROOT_PAGE_TABLE_INDEX_BIT_COUNT: u32 = 5;
 /// Bits consumed by the in-page byte offset (4-KiB pages).
 pub const PAGE_SHIFT_BITS: u32 = 12;
 /// Bits that index a leaf page table (512 entries ⇒ 9 bits).
@@ -110,6 +87,13 @@ const _: () = assert!(
 const _: () = assert!(PAGE_TABLE_LEVEL_COUNT == 4);
 const _: () = assert!(LEAF_PAGE_TABLE_SIZE_BYTES == 4096);
 const _: () = assert!(ROOT_PAGE_TABLE_INDEX_BIT_COUNT <= 9);
+const _: () = assert!(
+    PAGE_SHIFT_BITS
+        + LEAF_PAGE_TABLE_INDEX_BIT_COUNT
+        + 2 * INTERMEDIATE_PAGE_TABLE_INDEX_BIT_COUNT
+        + NATIVE_ROOT_PAGE_TABLE_INDEX_BIT_COUNT
+        == NATIVE_VIRTUAL_ADDRESS_BIT_COUNT
+);
 const _: () = assert!(PAGE_TABLE_SIZE_BYTES == 4096);
 /// The coupling `root_page_table_size_bytes` relies on: a root table addressing
 /// every index the declared bit count allows must fit in ONE page. This is the
@@ -132,19 +116,65 @@ pub unsafe fn fill_gpummu_caps(args: &DXGKARG_QUERYADAPTERINFO) -> NTSTATUS {
     let caps = unsafe { &mut *(args.pOutputData as *mut DXGK_GPUMMUCAPS) };
     unsafe { core::ptr::write_bytes(caps as *mut _ as *mut u8, 0, size_of::<DXGK_GPUMMUCAPS>()) };
 
-    // No optional capability bits — flags word stays 0.
-    caps.__bindgen_anon_1.Value = 0;
+    // No optional capability bits in the default personality. NVIDIA's personality
+    // advertises ZeroInPteSupported (`zero_pte_supported`).
+    caps.__bindgen_anon_1.Value = (if zero_pte_supported() { GPUMMU_ZERO_IN_PTE } else { 0 })
+        | (if explicit_invalidation() { GPUMMU_EXPLICIT_INVALIDATION } else { 0 });
     // GPU_PHYSICAL: page-table updates come through BuildPagingBuffer
     // UPDATE_PAGE_TABLE and are retired by the null engine. CPU_VIRTUAL was proven
     // wrong by KD: it crashes in VidMm's CPU-visible-address resolver before our
     // paging DDI can participate.
     caps.PageTableUpdateMode = DXGK_PAGETABLEUPDATE_GPU_PHYSICAL;
-    caps.VirtualAddressBitCount = VIRTUAL_ADDRESS_BIT_COUNT;
+    caps.VirtualAddressBitCount = if crate::virtio::nvda::enabled() {
+        NATIVE_VIRTUAL_ADDRESS_BIT_COUNT
+    } else {
+        VIRTUAL_ADDRESS_BIT_COUNT
+    };
     // We don't advertise 64-KiB pages; report the 4-KiB leaf size for consistency.
     caps.LeafPageTableSizeFor64KPagesInBytes = LEAF_PAGE_TABLE_SIZE_BYTES;
     caps.PageTableLevelCount = PAGE_TABLE_LEVEL_COUNT;
     // LegacyBehaviors stays zeroed (no SourcePageTableVaInTransfer).
     STATUS_SUCCESS
+}
+
+/// `DXGK_GPUMMUCAPS.Flags` bit 2, `ZeroInPteSupported`.
+const GPUMMU_ZERO_IN_PTE: u32 = 0x4;
+
+/// `NvZeroPte` (default 1, NVIDIA personality only): advertise
+/// `ZeroInPteSupported`, as NVIDIA's KMD does (its GPUMMUCAPS are 0x2dd in the L3
+/// capture). The Vulkan ICD maps the VA past a large (>= 64 MiB) allocation with
+/// `Protection.Zero` and `hAllocation` NULL; without the capability dxgkrnl refuses
+/// that MapGpuVirtualAddress ("Invalid hAllocation", ETW event 494) and the ICD
+/// answers VK_ERROR_OUT_OF_DEVICE_MEMORY for every allocation from 64 MiB on.
+/// A Zero PTE reaches the KMD as an unmapped page (`native_update_leaf`, the
+/// foreign-leaf path): it faults on access unless `NvPtSparse` makes that window
+/// read zero. `NvZeroPteOn` mirrors the value.
+fn zero_pte_supported() -> bool {
+    if !crate::virtio::nvda::enabled() {
+        return false;
+    }
+    let on = crate::diag::read_config_dword(crate::diag::KnobName::new(b"NvZeroPte"), 1) != 0;
+    crate::diag::record_named_bytes(b"NvZeroPteOn", u32::from(on));
+    on
+}
+
+/// `DXGK_GPUMMUCAPS.Flags` bit 3, `ExplicitPageTableInvalidation`.
+const GPUMMU_EXPLICIT_INVALIDATION: u32 = 0x8;
+
+/// `NvPtExplicit` (default 0, NVIDIA personality only): advertise
+/// `ExplicitPageTableInvalidation`, as NVIDIA's KMD does (GPUMMUCAPS 0x2dd). VidMm then
+/// invalidates every entry of a page table or directory through UpdatePageTable
+/// (Repeat, NotifyEviction) before it evicts or frees the table, instead of dropping
+/// tables that still hold valid entries. Leaf updates are this driver's only view of a
+/// process's VA space, so without the capability a mapping can outlive its page table
+/// in the RM mirror. `NvPtExplicitOn` mirrors the value.
+fn explicit_invalidation() -> bool {
+    if !crate::virtio::nvda::enabled() {
+        return false;
+    }
+    let on = crate::diag::read_config_dword(crate::diag::KnobName::new(b"NvPtExplicit"), 0) != 0;
+    crate::diag::record_named_bytes(b"NvPtExplicitOn", u32::from(on));
+    on
 }
 
 /// Fill one `DXGK_PAGE_TABLE_LEVEL_DESC` (`DXGKQAITYPE_PAGETABLELEVELDESC = 14`).
@@ -185,6 +215,7 @@ pub unsafe fn fill_page_table_level_desc(args: &DXGKARG_QUERYADAPTERINFO) -> NTS
     desc.PageTableIndexBitCount = match level_in.LevelIndex as u32 {
         0 => LEAF_PAGE_TABLE_INDEX_BIT_COUNT,
         1 | 2 => INTERMEDIATE_PAGE_TABLE_INDEX_BIT_COUNT,
+        _ if crate::virtio::nvda::enabled() => NATIVE_ROOT_PAGE_TABLE_INDEX_BIT_COUNT,
         _ => ROOT_PAGE_TABLE_INDEX_BIT_COUNT,
     };
     desc.PageTableSegmentId = SYSTEM_MEMORY_SEGMENT_ID;

@@ -72,6 +72,33 @@ impl Zone {
         Some(self.base + start)
     }
 
+    /// Allocate exactly `offset`, splitting the free extent that contains it.
+    /// A fixed placement never displaces a live mapping and never relocates it.
+    fn alloc_at(&mut self, offset: u64, length: u64) -> Option<u64> {
+        let want = align_up(length, PAGE_SIZE);
+        if want == 0 || offset < self.base || offset & (PAGE_SIZE - 1) != 0 {
+            return None;
+        }
+        let start = offset - self.base;
+        let end = start.checked_add(want)?;
+        if end > self.size {
+            return None;
+        }
+        let (&free_start, &free_len) = self.free.range(..=start).next_back()?;
+        let free_end = free_start.checked_add(free_len)?;
+        if free_start > start || free_end < end {
+            return None;
+        }
+        self.free.remove(&free_start);
+        if free_start < start {
+            self.free.insert(free_start, start - free_start);
+        }
+        if free_end > end {
+            self.free.insert(end, free_end - end);
+        }
+        Some(offset)
+    }
+
     /// Return an extent to the zone, coalescing with either neighbour.
     ///
     /// Returns false if the extent is not inside this zone or overlaps a range
@@ -336,6 +363,33 @@ impl ShmAllocator {
                 ),
             ))),
         }
+    }
+
+    /// Allocate at an exact window offset, or refuse without relocating anything.
+    pub fn alloc_at(&mut self, offset: u64, length: u64, pgprot: PgprotKind) -> Result<ShmRegion> {
+        let zone = match pgprot {
+            PgprotKind::Uncached => &mut self.uc,
+            PgprotKind::WriteCombine => &mut self.wc,
+            PgprotKind::WriteBack => &mut self.wb,
+        };
+        zone.alloc_at(offset, length).map_or_else(
+            || {
+                Err(DeviceError::Io(std::io::Error::new(
+                    std::io::ErrorKind::OutOfMemory,
+                    format!(
+                        "SHM {:?} zone cannot satisfy fixed {offset:#x}+{length:#x}",
+                        pgprot
+                    ),
+                )))
+            },
+            |_| {
+                Ok(ShmRegion {
+                    offset,
+                    length,
+                    pgprot,
+                })
+            },
+        )
     }
 
     /// mmap a host fd into the SHM region at the given offset.
@@ -679,6 +733,27 @@ mod tests {
         a.set_base_ptr(fake_ptr);
         assert_eq!(a.base_ptr(), fake_ptr);
         assert_ne!(a.base_ptr(), original);
+    }
+
+    #[test]
+    fn fixed_alloc_splits_free_extents_without_relocating() {
+        let mut a = small_alloc();
+        let fixed = a.wc.base + 4096;
+        let r = a.alloc_at(fixed, 4096, PgprotKind::WriteCombine).unwrap();
+        assert_eq!(r.offset, fixed);
+        assert!(
+            a.alloc_at(fixed + 1, 4096, PgprotKind::WriteCombine)
+                .is_err()
+        );
+        assert!(a.alloc_at(fixed, 4096, PgprotKind::WriteCombine).is_err());
+        let next = a
+            .alloc_at(fixed + 4096, 4096, PgprotKind::WriteCombine)
+            .unwrap();
+        assert_eq!(next.offset, fixed + 4096);
+        a.free(&r).unwrap();
+        a.free(&next).unwrap();
+        let again = a.alloc_at(fixed, 4096, PgprotKind::WriteCombine).unwrap();
+        assert_eq!(again.offset, fixed);
     }
 
     #[test]

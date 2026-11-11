@@ -285,6 +285,13 @@ impl VirtioGpuNvConfig {
         self.features |= protocol::messages::NVGPU_CFG_CURSOR;
     }
 
+    /// Present the captured RTX 5090 PCI identity: sets
+    /// [`protocol::messages::NVGPU_CFG_NVIDIA_UMD`]. Only with
+    /// `CONDUIT_NVIDIA_UMD=1`; the VMM reads this before building PCI config.
+    pub fn set_nvidia_umd(&mut self) {
+        self.features |= protocol::messages::NVGPU_CFG_NVIDIA_UMD;
+    }
+
     /// Serve Venus (docs/VENUS.md): sets
     /// [`protocol::messages::NVGPU_CFG_VENUS`]. Only with `--venus`; a guest
     /// sends `GpuCmd` only when it sees the bit.
@@ -322,6 +329,12 @@ impl VirtioGpuNvConfig {
     /// cursor, by a transport that serves the third queue.
     pub fn set_cursor_queue(&mut self) {
         self.features |= protocol::messages::NVGPU_CFG_CURSOR_QUEUE;
+    }
+
+    /// Serve `MsgType::RmBatch`: sets [`protocol::messages::NVGPU_CFG_RM_BATCH`].
+    /// The dispatcher always can; the bit tells a guest it may send one.
+    pub fn set_rm_batch(&mut self) {
+        self.features |= protocol::messages::NVGPU_CFG_RM_BATCH;
     }
 
     /// Turn host fences into guest fences (docs/SYNC.md): sets
@@ -503,6 +516,18 @@ mod tests {
         assert_eq!(protocol::messages::NVGPU_CFG_CURSOR, 1 << 9);
     }
 
+    #[test]
+    fn nvidia_umd_is_announced_only_when_set() {
+        use protocol::messages::NVGPU_CFG_NVIDIA_UMD;
+        let mut cfg = VirtioGpuNvConfig::new("615.71.09", &[], crate::caps::Caps::DEFAULT, 0);
+        assert_eq!({ cfg.features } & NVGPU_CFG_NVIDIA_UMD, 0);
+        cfg.set_nvidia_umd();
+        assert_eq!(
+            { cfg.features },
+            FEATURE_RMCTRL_SEGMENTS | NVGPU_CFG_NVIDIA_UMD
+        );
+    }
+
     /// Venus is one feature bit, clear unless asked for.
     #[test]
     fn venus_is_announced_only_when_set() {
@@ -589,6 +614,10 @@ mod tests {
             { cfg.features } & protocol::messages::NVGPU_CFG_CURSOR_QUEUE,
             0
         );
+        // The batch bit is one more bit, the number the Windows KMD tests.
+        let before = { cfg.features };
+        cfg.set_rm_batch();
+        assert_eq!({ cfg.features }, before | (1 << 23));
         assert_eq!(CURSOR_QUEUE, 2);
     }
 }

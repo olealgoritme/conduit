@@ -81,6 +81,11 @@ pub(crate) fn drain_used_and_complete(adapter: &AdapterContext) {
             v.drain_nvrm_events()
         })
         .unwrap_or(false);
+    // A native HW-queue completion event came (`virtio::native_completion`): read
+    // the progress fences and signal dxgkrnl now, with no transport lock held.
+    if crate::virtio::native_completion::take_pending() {
+        crate::ddi::hws::event_scan(adapter);
+    }
     if fence_work {
         // A fence a present waits on fired: the PASSIVE worker sends the flip and
         // closes the handle (the host round trips are not DPC work).
@@ -290,14 +295,34 @@ pub(crate) fn drain_used_and_complete(adapter: &AdapterContext) {
                 let _ = guard.with_virtio(|o, v| v.requeue_wddm_front(o, ready));
                 break;
             };
-            // SAFETY: the WDDM notification lock is held; the helper
-            // raises to DIRQL for the callback without re-locking.
-            let status = unsafe {
-                super::submit_command::signal_dma_completed(guard, dxgkrnl, ready.fence(), ready.node())
+            // NVIDIA personality: a software HW queue submission (`ddi::hws`)
+            // reports its queue's progress fence and MONITORED_FENCE_SIGNALED, not
+            // DMA_COMPLETED; it is not part of the node's SubmissionFenceId
+            // sequence. Every other entry (all of them in the default
+            // personality) takes the DMA_COMPLETED arm unchanged.
+            let hw_queue = ready.hw_queue();
+            let status = match hw_queue {
+                // SAFETY: as below; the fence storage lives until DestroyHwQueue,
+                // which purges the queue's entries under this same lock.
+                Some(done) => unsafe {
+                    super::hws::complete_soft_submission(dxgkrnl, &done, ready.node())
+                },
+                // SAFETY: the WDDM notification lock is held; the helper
+                // raises to DIRQL for the callback without re-locking.
+                None => unsafe {
+                    super::submit_command::signal_dma_completed(
+                        guard,
+                        dxgkrnl,
+                        ready.fence(),
+                        ready.node(),
+                    )
+                },
             };
             if status == STATUS_SUCCESS {
                 // Flush-gate trace (atomics only; one load when no `HEFL` fence is queued).
-                super::flush_trace::note_retire(ready.fence(), ready.rebased());
+                if hw_queue.is_none() {
+                    super::flush_trace::note_retire(ready.fence(), ready.rebased());
+                }
                 let terminal_prefix = ready.terminal_prefix();
                 ready.delivered();
                 if let Some(prefix) = terminal_prefix {
@@ -510,17 +535,22 @@ pub unsafe extern "C" fn dxgkddi_control_interrupt(
 ) -> NTSTATUS {
     CONTROL_INT_COUNT.fetch_add(1, Ordering::Relaxed);
     let p = h_adapter as *const AdapterContext;
+    // With MPO3 registered (`ddi::mpo3`, NVIDIA personality) dxgkrnl enables the
+    // vsync by its MPO3 type; the same heartbeat serves both.
+    let vsync = interrupt_type == _DXGK_INTERRUPT_TYPE::DXGK_INTERRUPT_CRTC_VSYNC
+        || interrupt_type
+            == _DXGK_INTERRUPT_TYPE::DXGK_INTERRUPT_CRTC_VSYNC_WITH_MULTIPLANE_OVERLAY3;
     if !p.is_null()
-        && interrupt_type == _DXGK_INTERRUPT_TYPE::DXGK_INTERRUPT_CRTC_VSYNC
+        && vsync
         // SAFETY: dxgkrnl hands our AdapterContext; `display_half` is a plain bool
         // set once at StartDevice.
         && unsafe { (*p).display_half() }
     {
         // SAFETY: valid for the device lifetime.
         let adapter = unsafe { &*p };
-        adapter
-            .vsync_enabled
-            .store((enable != 0) as u32, Ordering::Release);
+        let on = enable != 0
+            || crate::ddi::mpo3::part(crate::ddi::mpo3::PART_VSYNC_ALWAYS);
+        adapter.vsync_enabled.store(on as u32, Ordering::Release);
         // `VsCiT`, `VsCiSt`: atomics only (DIRQL).
         crate::ddi::stall_diag::note_control_vsync(enable != 0);
         return STATUS_SUCCESS;

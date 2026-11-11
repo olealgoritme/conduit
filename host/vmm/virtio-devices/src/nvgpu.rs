@@ -60,6 +60,15 @@ const MSIX_VECTORS: u16 = 3;
 const VIRTIO_ID_GPU_NV: u16 = 45;
 const PCI_DEVICE_ID: u16 = 0x1040 + VIRTIO_ID_GPU_NV;
 
+/// The captured RTX 5090 identity, selected only by the backend's
+/// `NVGPU_CFG_NVIDIA_UMD` config bit.
+const RTX5090_PCI_VENDOR_ID: u16 = 0x10DE;
+const RTX5090_PCI_DEVICE_ID: u16 = 0x2B85;
+const RTX5090_PCI_SUBSYSTEM_VENDOR_ID: u16 = 0x1771;
+const RTX5090_PCI_SUBSYSTEM_ID: u16 = 0x2059;
+const RTX5090_PCI_REVISION_ID: u8 = 0xA1;
+const NVGPU_CFG_NVIDIA_UMD: u32 = 1 << 17;
+
 /// Size of the guest-visible device configuration structure.
 ///
 /// It must fit in one page. A guest maps the device config capability with
@@ -78,6 +87,7 @@ const OFF_NUM_GPUS: usize = 32;
 const MAX_GPUS: u32 = 8;
 const OFF_NUM_FD_TRANSLATIONS: usize = 3880;
 const MAX_FD_TRANSLATIONS: u32 = 16;
+const OFF_FEATURES: usize = 3884;
 const OFF_VRAM_LIMIT_MIB: usize = 4016;
 
 // ── BAR 0 layout, local to this device ──────────────────────────────────────
@@ -846,7 +856,12 @@ impl NvGpuDevice {
             .map(|_| EventFd::new(0).context("failed to create conduit-gpu kick eventfd"))
             .collect::<Result<Vec<_>>>()?;
 
-        let (cfg, msix_cap) = Self::build_pci_config(shm_size);
+        let backend_features = u32::from_le_bytes(
+            device_config[OFF_FEATURES..OFF_FEATURES + 4]
+                .try_into()
+                .expect("4 bytes"),
+        );
+        let (cfg, msix_cap) = Self::build_pci_config(shm_size, backend_features);
         log::info!(
             "conduit-gpu: backend {} ({CONFIG_LEN}-byte config), window {} MiB",
             socket_path.display(),
@@ -983,15 +998,27 @@ impl NvGpuDevice {
         self.inner.lock().unwrap().msix.bind(vectors, router, intx);
     }
 
-    fn build_pci_config(shm_size: u64) -> ([u8; 256], u16) {
+    fn build_pci_config(shm_size: u64, backend_features: u32) -> ([u8; 256], u16) {
+        let (vendor, device, revision, subsystem_vendor, subsystem_id) =
+            if backend_features & NVGPU_CFG_NVIDIA_UMD != 0 {
+                (
+                    RTX5090_PCI_VENDOR_ID,
+                    RTX5090_PCI_DEVICE_ID,
+                    RTX5090_PCI_REVISION_ID,
+                    RTX5090_PCI_SUBSYSTEM_VENDOR_ID,
+                    RTX5090_PCI_SUBSYSTEM_ID,
+                )
+            } else {
+                (0x1AF4, PCI_DEVICE_ID, 0x01, 0x1AF4, VIRTIO_ID_GPU_NV)
+            };
         // Class 0x038000: display controller, other.
         let mut cfg = PciConfig::new(
-            0x1AF4,
-            PCI_DEVICE_ID,
-            0x01,
+            vendor,
+            device,
+            revision,
             0x03_80_00,
-            0x1AF4,
-            VIRTIO_ID_GPU_NV,
+            subsystem_vendor,
+            subsystem_id,
         );
         cfg.set_bar_mem(0, NV_BAR0_SIZE);
         cfg.set_irq_pin(1);
@@ -1310,6 +1337,24 @@ mod tests {
     fn pci_identity_matches_the_guest_driver() {
         assert_eq!(VIRTIO_ID_GPU_NV, 45);
         assert_eq!(PCI_DEVICE_ID, 0x106D);
+    }
+
+    #[test]
+    fn pci_identity_follows_the_backend_feature_word() {
+        let word = |cfg: &[u8; 256], at: usize| u16::from_le_bytes([cfg[at], cfg[at + 1]]);
+        let (virtio, _) = NvGpuDevice::build_pci_config(1 << 20, 0);
+        let (rtx, _) = NvGpuDevice::build_pci_config(1 << 20, NVGPU_CFG_NVIDIA_UMD);
+        for (cfg, vendor, device, revision, subsystem_vendor, subsystem_id) in [
+            (&virtio, 0x1AF4, 0x106D, 0x01, 0x1AF4, 45),
+            (&rtx, 0x10DE, 0x2B85, 0xA1, 0x1771, 0x2059),
+        ] {
+            assert_eq!(word(cfg, 0), vendor);
+            assert_eq!(word(cfg, 2), device);
+            assert_eq!(cfg[8], revision);
+            assert_eq!(word(cfg, 0x2c), subsystem_vendor);
+            assert_eq!(word(cfg, 0x2e), subsystem_id);
+            assert_eq!(&cfg[9..12], &[0x00, 0x80, 0x03]);
+        }
     }
 
     /// The common layout leaves 256 bytes for device config. This one needs

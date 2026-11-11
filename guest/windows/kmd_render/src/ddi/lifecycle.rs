@@ -14,6 +14,10 @@ use crate::dxgk::*;
 
 use super::bar_segment::{build_segment_table, setup_bar_segment};
 
+/// `STATUS_REVISION_MISMATCH`: the start of an NVIDIA personality whose UMDs
+/// are not the host RM's release.
+const STATUS_REVISION_MISMATCH: NTSTATUS = 0xC000_0059_u32 as NTSTATUS;
+
 /// Same-boot zeroing for the PRODUCTION LINEAR-scanout ladder (T6/R901).
 ///
 /// These eight names are written by `venus::create_linear_scanout_image` /
@@ -220,6 +224,8 @@ fn reread_cached_knobs() {
     crate::ddi::stall_diag::reread_knobs();
     // `EscWaitMs`, and the stopping flag back down: a new generation begins (v334).
     crate::ddi::escape_wait::reread_knobs();
+    // `NvHotPath` (`HpKnob`) and `NvHotPubMs`; the hot-path census starts over.
+    crate::ddi::hot_path::reread_knobs();
     // `RmGateMs` (default 6000, 0 = never): the RM gates' lost-fire valve, mirrored `RmGateMsEff`.
     crate::virtio::gpu::RMG_EXPIRE_MS.store(
         helios_kmd_logic::rm_fence_present::clamp_gate_expire_ms(crate::diag::read_config_dword(
@@ -348,7 +354,7 @@ fn stop_unbind_scanout(
 #[inline(never)]
 pub unsafe extern "C" fn dxgkddi_start_device(
     miniport_device_context: *mut c_void,
-    _dxgk_start_info: *mut DXGK_START_INFO,
+    dxgk_start_info: *mut DXGK_START_INFO,
     dxgkrnl_interface: *mut DXGKRNL_INTERFACE,
     number_of_video_present_sources: *mut u32,
     number_of_children: *mut u32,
@@ -377,6 +383,13 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     //
     // SAFETY: Dxgkrnl passes our adapter context and valid out-pointers.
     let adapter = unsafe { &*(miniport_device_context as *const AdapterContext) };
+    // SAFETY: dxgkrnl's DXGK_START_INFO for this call, or null.
+    if let Some(start) = unsafe { dxgk_start_info.as_ref() } {
+        crate::ddi::query_adapter_info::note_adapter_luid(
+            start.AdapterLuid.LowPart,
+            start.AdapterLuid.HighPart,
+        );
+    }
 
     // Clear the start edge FIRST. On a stop/start cycle the flag survives from
     // the previous start (the context does), and `init_hpd` below spawns a fresh
@@ -560,6 +573,17 @@ pub unsafe extern "C" fn dxgkddi_start_device(
             // Now the interrupt can be claimed: hand the host its event buffers.
             let _ = adapter.with_virtio(|v| v.post_nvrm_event_buffers());
 
+            // NVIDIA personality: NVIDIA's UMDs speak the RM ABI of their own
+            // release, and nothing else on their path checks it. The host is
+            // told which release they are, and a release its RM is not ends
+            // the start here (Code 43, `NvUmdChk` = 1) instead of at the first
+            // control RM reads with another layout.
+            if crate::virtio::nvda::enabled()
+                && !crate::virtio::nvda::check_umd_release(passive, adapter)
+            {
+                return STATUS_REVISION_MISMATCH;
+            }
+
             // ── BAR memory segment / CPU host aperture ──────────────────────
             // Reserve the window head BEFORE any blob map can allocate a
             // window offset, and before dxgkrnl queries segments.
@@ -582,8 +606,12 @@ pub unsafe extern "C" fn dxgkddi_start_device(
                 .with_venus_client(passive, |v| v.device_local_heap_bytes())
                 .ok()
                 .flatten();
+            // NVIDIA personality: no Venus device-local heap; the card's framebuffer comes
+            // from the host RM instead. `None` in the Helios personality.
+            let rm_framebuffer = super::bar_segment::nvidia_framebuffer(passive, adapter, &knobs);
             super::bar_segment::resolve_vidmm_vram_mb(
                 &mut knobs,
+                rm_framebuffer,
                 device_local_bytes,
                 host_visible_bytes,
                 backend_limit_mb,
@@ -603,7 +631,7 @@ pub unsafe extern "C" fn dxgkddi_start_device(
                 .msi_state
                 .store(0, core::sync::atomic::Ordering::Release);
             adapter.set_virtio(None);
-            super::bar_segment::resolve_vidmm_vram_mb(&mut knobs, None, None, 0);
+            super::bar_segment::resolve_vidmm_vram_mb(&mut knobs, None, None, None, 0);
         }
     }
 
@@ -727,6 +755,15 @@ pub unsafe extern "C" fn dxgkddi_start_device(
 
     start_stage(3);
 
+    // NVIDIA personality only: the hardware-scheduling handshake NVIDIA's KMD makes
+    // at StartDevice (`NvHwsEn`). A no-op in the default personality.
+    crate::ddi::hws::query_hwsch_at_start(adapter);
+    // The hardware flip queue handshake (`ddi::hwfq`, `NvMpo3` bit 7), as NVIDIA's KMD.
+    if let Some(dxgkrnl) = adapter.dxgkrnl_opt() {
+        crate::ddi::hwfq::reset();
+        crate::ddi::hwfq::query_feature_at_start(dxgkrnl);
+    }
+
     // This generation's identities (section 25): the image salt, the allocation serial and the
     // NVRM epoch (low 32 bits each). After a `pnputil /restart-device` all three must differ from
     // the previous image's, or a client / allocation that survived it is not seen as stale.
@@ -737,9 +774,7 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     );
     crate::diag::record_named_bytes(
         b"GenEpoch",
-        adapter
-            .with_virtio(|v| v.nvrm_epoch())
-            .unwrap_or(0) as u32,
+        adapter.with_virtio(|v| v.nvrm_epoch()).unwrap_or(0) as u32,
     );
 
     if knobs.display_half {
@@ -880,8 +915,8 @@ pub unsafe extern "C" fn dxgkddi_stop_device(miniport_device_context: *mut c_voi
         let marker_from = crate::adapter::foreign_scanout::now_100ns();
         if crate::virtio::msi::service_stop(passive_stop) {
             budget = stop_credit(budget, marker_from);
-        }        // The HPD worker did the `Nv*` registry mirror and is gone: leave the
-        // registry with the final counts (PASSIVE, StopDevice).
+        } // The HPD worker did the `Nv*` registry mirror and is gone: leave the
+          // registry with the final counts (PASSIVE, StopDevice).
         crate::ddi::stall_diag::stop_sub(ss::FINAL_PUBLISH);
         crate::ddi::publish_nvrm_counters();
         crate::ddi::stall_diag::stop_sub(ss::RESET_PUBLICATION);
@@ -1040,6 +1075,9 @@ pub unsafe extern "C" fn dxgkddi_remove_device(miniport_device_context: *mut c_v
     crate::diag::record(0x0C00_0001);
     crate::ddi::stall_diag::stop_sub(helios_kmd_logic::stall_diag::stop_sub::REMOVE_ENTER);
     if !miniport_device_context.is_null() {
+        // The NVIDIA WDM control device survives StopDevice. Final RemoveDevice
+        // stops new work and drains accepted dispatches before deleting it.
+        unsafe { crate::admin::remove_device() };
         // SAFETY: our adapter context; only read here.
         let adapter = unsafe { &*(miniport_device_context as *const AdapterContext) };
         if adapter.hpd_worker_may_be_running() {
@@ -1050,9 +1088,7 @@ pub unsafe extern "C" fn dxgkddi_remove_device(miniport_device_context: *mut c_v
             crate::diag::record(0x0C00_00E1);
         } else {
             // SAFETY: this pointer came from Box::into_raw in AddDevice; freed once.
-            crate::ddi::stall_diag::stop_sub(
-                helios_kmd_logic::stall_diag::stop_sub::REMOVE_DROP,
-            );
+            crate::ddi::stall_diag::stop_sub(helios_kmd_logic::stall_diag::stop_sub::REMOVE_DROP);
             drop(unsafe { Box::from_raw(miniport_device_context as *mut AdapterContext) });
         }
     }

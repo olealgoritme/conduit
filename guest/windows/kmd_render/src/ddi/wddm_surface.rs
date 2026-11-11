@@ -63,6 +63,42 @@ pub(crate) enum WddmSurface {
 /// modern memory model, and 3.2 fails DWM at `E_NOTIMPL` (module docs).
 pub(crate) const SURFACE: WddmSurface = WddmSurface::Wddm2_1GpuMmu;
 
+/// The NVIDIA UMD personality (`NvUmd` != 0) reports WDDM 3.2 like NVIDIA's own
+/// 610.88 KMD: its CUDA loader skips adapters below WDDM 2.5 (`cmp 0x9c4` on
+/// KMTQAITYPE_DRIVERVERSION) and its UMDs expect the 3.x HW-queue model. DWM
+/// runs NVIDIA's UMD there, not ours, so the MPO3 note above does not apply.
+pub(crate) const NVIDIA_SURFACE: WddmSurface = WddmSurface::Wddm3_2GpuMmu;
+
+static NVIDIA_SELECTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Choose the level once, in DriverEntry, before `DxgkInitialize`: the
+/// interface version cannot change per adapter afterwards.
+pub(crate) fn select_at_driver_entry() {
+    let knob = crate::diag::knobs::NVIDIA_UMD;
+    let root = crate::diag::read_config_dword(knob, u32::MAX);
+    let mode = if root == u32::MAX {
+        crate::diag::read_parameters_dword(knob, 0)
+    } else {
+        root
+    };
+    NVIDIA_SELECTED.store(mode != 0, core::sync::atomic::Ordering::Release);
+}
+
+/// Whether DriverEntry selected the NVIDIA UMD personality. Fixed for the
+/// image's lifetime; the DDI table and every NVIDIA-only feature key off it.
+pub(crate) fn nvidia_selected() -> bool {
+    NVIDIA_SELECTED.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// The level every site reads.
+pub(crate) fn surface() -> WddmSurface {
+    if NVIDIA_SELECTED.load(core::sync::atomic::Ordering::Acquire) {
+        NVIDIA_SURFACE
+    } else {
+        SURFACE
+    }
+}
+
 impl WddmSurface {
     /// `DRIVER_INITIALIZATION_DATA.Version` — the PRIMARY lever. The OS infers the
     /// WDDM level from this plus the advertised caps.

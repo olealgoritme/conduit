@@ -15,6 +15,14 @@
 //! some drivers list, overlaps the first and is never added to it.)
 //! A usable backend VRAM limit bounds the reported capacity even when a larger
 //! registry override or host heap is available.
+//!
+//! The NVIDIA UMD personality has no Venus device-local heap to read. Its capacity is the
+//! card's framebuffer as the host RM reports it: StartDevice opens a short-lived RM client
+//! over the NVRM forwarding path and sends `NV2080_CTRL_CMD_FB_GET_INFO_V2` on its subdevice
+//! ([`build_fb_info_v2`], [`parse_fb_info_v2`], [`FbInfo::bytes`]); [`resolve_rm_framebuffer`]
+//! then resolves it exactly as [`resolve`] resolves a heap. The backend clamps every size
+//! index of that control to its VRAM limit, so the figure agrees with what RM lets the guest
+//! allocate.
 
 /// `VK_MEMORY_HEAP_DEVICE_LOCAL_BIT`.
 pub const MEMORY_HEAP_DEVICE_LOCAL: u32 = 0x1;
@@ -90,6 +98,9 @@ pub enum Source {
     HostVisibleWindow,
     /// The VRAM limit enforced by the backend.
     BackendLimit,
+    /// The card's framebuffer as the host RM reports it (`NV2080_CTRL_CMD_FB_GET_INFO_V2`):
+    /// the NVIDIA UMD personality, which has no Venus heap.
+    RmFramebuffer,
     /// Nothing usable: the legacy one-GiB aperture+BAR topology.
     None,
 }
@@ -102,6 +113,7 @@ impl Source {
             Self::DeviceLocalHeap => 2,
             Self::HostVisibleWindow => 3,
             Self::BackendLimit => 4,
+            Self::RmFramebuffer => 5,
             Self::None => 0,
         }
     }
@@ -130,7 +142,39 @@ pub fn resolve(
     host_visible: Option<u64>,
     backend_limit_mb: u64,
 ) -> Resolved {
-    let mut resolved = resolve_capacity(knob, device_local_heap, host_visible);
+    resolve_card(
+        knob,
+        device_local_heap.map(|bytes| (bytes, Source::DeviceLocalHeap)),
+        host_visible,
+        backend_limit_mb,
+    )
+}
+
+/// [`resolve`] for the NVIDIA UMD personality: `framebuffer` is the card's video memory from
+/// the host RM ([`FbInfo::bytes`]) and takes the place of the Venus heap. An explicit
+/// `VidMmVramMB` still wins, the window is still the fallback when RM could not tell, and the
+/// backend limit still bounds the result.
+pub fn resolve_rm_framebuffer(
+    knob: u32,
+    framebuffer: Option<u64>,
+    host_visible: Option<u64>,
+    backend_limit_mb: u64,
+) -> Resolved {
+    resolve_card(
+        knob,
+        framebuffer.map(|bytes| (bytes, Source::RmFramebuffer)),
+        host_visible,
+        backend_limit_mb,
+    )
+}
+
+fn resolve_card(
+    knob: u32,
+    card: Option<(u64, Source)>,
+    host_visible: Option<u64>,
+    backend_limit_mb: u64,
+) -> Resolved {
+    let mut resolved = capacity_from(knob, card, host_visible);
     if backend_limit_mb == 0
         || backend_limit_ignored(backend_limit_mb) != 0
         || resolved.mb == 0
@@ -146,11 +190,22 @@ pub fn resolve(
     resolved
 }
 
+#[cfg(test)]
 fn resolve_capacity(
     knob: u32,
     device_local_heap: Option<u64>,
     host_visible: Option<u64>,
 ) -> Resolved {
+    capacity_from(
+        knob,
+        device_local_heap.map(|bytes| (bytes, Source::DeviceLocalHeap)),
+        host_visible,
+    )
+}
+
+/// The capacity before the backend limit: the registry value, else the card (`card`: its
+/// size in bytes and which source measured it), else the host-visible window.
+fn capacity_from(knob: u32, card: Option<(u64, Source)>, host_visible: Option<u64>) -> Resolved {
     if knob != AUTO {
         return Resolved {
             mb: knob,
@@ -159,13 +214,13 @@ fn resolve_capacity(
             bad_mb: None,
         };
     }
-    if let Some(bytes) = device_local_heap {
+    if let Some((bytes, source)) = card {
         let mb = bytes / MIB;
         if mb >= u64::from(MIN_MB) {
             let clamped = mb > u64::from(MAX_MB);
             return Resolved {
                 mb: mb.min(u64::from(MAX_MB)) as u32,
-                source: Source::DeviceLocalHeap,
+                source,
                 clamped,
                 bad_mb: None,
             };
@@ -197,6 +252,92 @@ fn resolve_capacity(
             }
         }
     }
+}
+
+// ---- the card's framebuffer from the host RM (NVIDIA UMD personality) ----------------------
+
+/// `NV2080_CTRL_CMD_FB_GET_INFO_V2` (subdevice control; the parameter list is inline).
+pub const CTRL_FB_GET_INFO_V2: u32 = 0x2080_1303;
+/// `NV2080_CTRL_FB_INFO_INDEX_RAM_SIZE`: framebuffer physically present, KiB.
+pub const FB_INFO_INDEX_RAM_SIZE: u32 = 0x07;
+/// `NV2080_CTRL_FB_INFO_INDEX_HEAP_SIZE`: framebuffer available for allocations (RAM less
+/// RM's reserved memory), KiB. What NVIDIA's driver reports as dedicated video memory.
+pub const FB_INFO_INDEX_HEAP_SIZE: u32 = 0x09;
+/// `NV2080_CTRL_FB_INFO_MAX_LIST_SIZE` of the releases the parameter block may have to match:
+/// RM refuses a block whose size is not exactly its own. 0x80 on 610 and 615, 0x36 on 535;
+/// tried in this order.
+pub const FB_INFO_LIST_LENS: [u32; 2] = [0x80, 0x36];
+/// One `NV2080_CTRL_FB_INFO { index, data }`.
+const FB_INFO_ENTRY_BYTES: usize = 8;
+/// The indices asked for, in list order.
+const FB_INFO_ASKED: [u32; 2] = [FB_INFO_INDEX_HEAP_SIZE, FB_INFO_INDEX_RAM_SIZE];
+
+/// Size in bytes of an `NV2080_CTRL_FB_GET_INFO_V2_PARAMS` with a `list_len`-entry list.
+pub const fn fb_info_v2_bytes(list_len: u32) -> usize {
+    4 + list_len as usize * FB_INFO_ENTRY_BYTES
+}
+
+/// Fill `buf` with an `NV2080_CTRL_FB_GET_INFO_V2_PARAMS` for a `list_len`-entry list that
+/// asks for the heap and RAM sizes. Returns the parameter size, or `None` when `buf` is too
+/// small or `list_len` cannot hold the two entries.
+pub fn build_fb_info_v2(buf: &mut [u8], list_len: u32) -> Option<usize> {
+    let n = fb_info_v2_bytes(list_len);
+    if (list_len as usize) < FB_INFO_ASKED.len() || buf.len() < n {
+        return None;
+    }
+    let out = &mut buf[..n];
+    out.fill(0);
+    out[..4].copy_from_slice(&(FB_INFO_ASKED.len() as u32).to_le_bytes());
+    for (i, index) in FB_INFO_ASKED.iter().enumerate() {
+        let at = 4 + i * FB_INFO_ENTRY_BYTES;
+        out[at..at + 4].copy_from_slice(&index.to_le_bytes());
+    }
+    Some(n)
+}
+
+/// What RM answered, KiB (0 = not answered).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FbInfo {
+    pub heap_kib: u32,
+    pub ram_kib: u32,
+}
+
+impl FbInfo {
+    /// The card's video memory in bytes: the heap when RM gave one that fits in the RAM it
+    /// reported, else the RAM, else `None`.
+    pub fn bytes(self) -> Option<u64> {
+        let kib = if self.heap_kib != 0 && (self.ram_kib == 0 || self.heap_kib <= self.ram_kib) {
+            self.heap_kib
+        } else {
+            self.ram_kib
+        };
+        (kib != 0).then_some(u64::from(kib) * 1024)
+    }
+}
+
+/// Read the heap and RAM sizes out of RM's answer (the parameter block as RM wrote it back).
+/// `None` when the block is shorter than its list claims or the list is not the one sent.
+pub fn parse_fb_info_v2(params: &[u8]) -> Option<FbInfo> {
+    let get = |at: usize| -> Option<u32> {
+        params
+            .get(at..at + 4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    };
+    let count = get(0)? as usize;
+    if count != FB_INFO_ASKED.len() {
+        return None;
+    }
+    let mut info = FbInfo::default();
+    for i in 0..count {
+        let at = 4 + i * FB_INFO_ENTRY_BYTES;
+        let (index, data) = (get(at)?, get(at + 4)?);
+        match index {
+            FB_INFO_INDEX_HEAP_SIZE => info.heap_kib = data,
+            FB_INFO_INDEX_RAM_SIZE => info.ram_kib = data,
+            _ => return None,
+        }
+    }
+    Some(info)
 }
 
 #[cfg(test)]
@@ -368,6 +509,7 @@ mod tests {
             Source::DeviceLocalHeap.code(),
             Source::HostVisibleWindow.code(),
             Source::BackendLimit.code(),
+            Source::RmFramebuffer.code(),
         ];
         for (i, a) in codes.iter().enumerate() {
             for b in &codes[i + 1..] {
@@ -547,5 +689,151 @@ mod tests {
                 None,
             );
         }
+    }
+    // ---- RM framebuffer (NVIDIA UMD personality) ----
+
+    /// An RTX 5090 as RM reports it: 32 GiB of RAM, 32607 MiB of heap.
+    const RTX_5090_FB: FbInfo = FbInfo {
+        heap_kib: 32_607 * 1024,
+        ram_kib: 32 * 1024 * 1024,
+    };
+
+    #[test]
+    fn rm_framebuffer_reports_the_card_not_the_window() {
+        // The defect: the 8 GiB window made a 32 GiB card report 8 GiB under the NVIDIA UMDs.
+        let r = resolve_rm_framebuffer(AUTO, RTX_5090_FB.bytes(), Some(8 * GIB), 0);
+        assert_eq!(r.mb, 32_607);
+        assert_eq!(r.source, Source::RmFramebuffer);
+        assert_eq!(Source::RmFramebuffer.code(), 5);
+        assert!(!r.clamped);
+        assert_eq!(r.bad_mb, None);
+    }
+
+    #[test]
+    fn rm_framebuffer_registry_override_wins() {
+        for knob in [0, 4096, 32_607] {
+            let r = resolve_rm_framebuffer(knob, RTX_5090_FB.bytes(), Some(8 * GIB), 0);
+            assert_eq!((r.mb, r.source), (knob, Source::Registry));
+        }
+    }
+
+    #[test]
+    fn rm_framebuffer_without_an_answer_falls_back_to_the_window() {
+        let r = resolve_rm_framebuffer(AUTO, None, Some(8 * GIB), 0);
+        assert_eq!(r, resolve(AUTO, None, Some(8 * GIB), 0));
+        assert_eq!((r.mb, r.source), (8 * 1024, Source::HostVisibleWindow));
+        // A framebuffer too small to represent falls through too.
+        let r = resolve_rm_framebuffer(AUTO, Some(128 * MIB), Some(8 * GIB), 0);
+        assert_eq!(r.source, Source::HostVisibleWindow);
+    }
+
+    #[test]
+    fn rm_framebuffer_is_bounded_by_the_backend_limit_and_the_cap() {
+        let r = resolve_rm_framebuffer(AUTO, RTX_5090_FB.bytes(), Some(8 * GIB), 16_384);
+        assert_eq!((r.mb, r.source), (16_384, Source::BackendLimit));
+        let r = resolve_rm_framebuffer(AUTO, Some(96 * GIB), None, 0);
+        assert_eq!(
+            (r.mb, r.source, r.clamped),
+            (MAX_MB, Source::RmFramebuffer, true)
+        );
+    }
+
+    #[test]
+    fn heap_resolution_is_unchanged_by_the_rm_path() {
+        // `resolve` keeps reporting the Venus heap under its own source.
+        let r = resolve(AUTO, Some(32_109 * MIB), Some(8 * GIB), 0);
+        assert_eq!((r.mb, r.source), (32_109, Source::DeviceLocalHeap));
+    }
+
+    #[test]
+    fn fb_bytes_prefers_the_heap() {
+        assert_eq!(RTX_5090_FB.bytes(), Some(32_607 * MIB));
+        // Only one of the two answered.
+        assert_eq!(
+            FbInfo {
+                heap_kib: 0,
+                ram_kib: 8 * 1024 * 1024
+            }
+            .bytes(),
+            Some(8 * GIB)
+        );
+        assert_eq!(
+            FbInfo {
+                heap_kib: 1024,
+                ram_kib: 0
+            }
+            .bytes(),
+            Some(MIB)
+        );
+        // A heap above the RAM is not believed.
+        assert_eq!(
+            FbInfo {
+                heap_kib: 64 * 1024 * 1024,
+                ram_kib: 8 * 1024 * 1024
+            }
+            .bytes(),
+            Some(8 * GIB)
+        );
+        assert_eq!(FbInfo::default().bytes(), None);
+        // The largest KiB value does not overflow.
+        assert_eq!(
+            FbInfo {
+                heap_kib: u32::MAX,
+                ram_kib: 0
+            }
+            .bytes(),
+            Some(u64::from(u32::MAX) * 1024)
+        );
+    }
+
+    #[test]
+    fn fb_info_v2_block_layout() {
+        assert_eq!(CTRL_FB_GET_INFO_V2, 0x2080_1303);
+        assert_eq!(fb_info_v2_bytes(0x80), 1028);
+        assert_eq!(fb_info_v2_bytes(0x36), 436);
+        let mut buf = [0xAAu8; 1100];
+        assert_eq!(build_fb_info_v2(&mut buf, 0x80), Some(1028));
+        assert_eq!(&buf[0..4], &2u32.to_le_bytes());
+        assert_eq!(&buf[4..8], &FB_INFO_INDEX_HEAP_SIZE.to_le_bytes());
+        assert_eq!(&buf[8..12], &0u32.to_le_bytes());
+        assert_eq!(&buf[12..16], &FB_INFO_INDEX_RAM_SIZE.to_le_bytes());
+        assert!(buf[16..1028].iter().all(|&b| b == 0));
+        // Past the block is untouched.
+        assert_eq!(buf[1028], 0xAA);
+        assert_eq!(build_fb_info_v2(&mut buf, 0x36), Some(436));
+    }
+
+    #[test]
+    fn fb_info_v2_refuses_a_short_buffer_or_list() {
+        let mut buf = [0u8; 1027];
+        assert_eq!(build_fb_info_v2(&mut buf, 0x80), None);
+        assert_eq!(build_fb_info_v2(&mut buf, 1), None);
+    }
+
+    #[test]
+    fn fb_info_v2_round_trip() {
+        let mut buf = [0u8; 1028];
+        let n = build_fb_info_v2(&mut buf, 0x80).unwrap();
+        // RM writes the data words back in place.
+        buf[8..12].copy_from_slice(&RTX_5090_FB.heap_kib.to_le_bytes());
+        buf[16..20].copy_from_slice(&RTX_5090_FB.ram_kib.to_le_bytes());
+        assert_eq!(parse_fb_info_v2(&buf[..n]), Some(RTX_5090_FB));
+    }
+
+    #[test]
+    fn fb_info_v2_parse_refuses_what_was_not_sent() {
+        let mut buf = [0u8; 1028];
+        build_fb_info_v2(&mut buf, 0x80).unwrap();
+        // Truncated inside the list.
+        assert_eq!(parse_fb_info_v2(&buf[..10]), None);
+        assert_eq!(parse_fb_info_v2(&[]), None);
+        // Another count.
+        let mut other = buf;
+        other[0..4].copy_from_slice(&3u32.to_le_bytes());
+        assert_eq!(parse_fb_info_v2(&other), None);
+        // Another index.
+        let mut other = buf;
+        other[4..8].copy_from_slice(&0x20u32.to_le_bytes());
+        assert_eq!(parse_fb_info_v2(&other), None);
     }
 }

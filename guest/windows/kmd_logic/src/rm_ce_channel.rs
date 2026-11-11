@@ -284,6 +284,35 @@ pub fn vaspace_params() -> [u8; VASPACE_BYTES] {
     a
 }
 
+/// `NV_VASPACE_ALLOCATION_FLAGS_VA_INTERNAL_LIMIT`: RM's own mappings in the
+/// space (context buffers and the like) stay in [4 GiB, 4.5 GiB), "the range we
+/// use for windows" (RM's SPLIT_VAS_SERVER_RM_MANAGED_VA_START/SIZE).
+pub const VASPACE_FLAGS_VA_INTERNAL_LIMIT: u32 = 1 << 7;
+pub const RM_INTERNAL_VA_START: u64 = 0x1_0000_0000;
+pub const RM_INTERNAL_VA_SIZE: u64 = 0x2000_0000;
+
+/// `NV_VASPACE_ALLOCATION_INDEX_GPU_NEW`: create a new VA space.
+pub const VASPACE_INDEX_GPU_NEW: u32 = 0;
+
+/// `NV_VASPACE_ALLOCATION_FLAGS_ALLOW_ZERO_ADDRESS`: the space starts at 0, so
+/// VidMm's low VAs (monitored fences at 0x10000) are mappable.
+pub const VASPACE_FLAGS_ALLOW_ZERO_ADDRESS: u32 = 1 << 8;
+
+/// A NEW per-process VA space whose addresses VidMm assigns. (`GPU_DEVICE`
+/// would hand every process the one device VA space, and the processes' VidMm
+/// VAs would collide in it.) Not `VA_INTERNAL_LIMIT`: under GSP its internal
+/// window is exactly the server-RM-owned [4 GiB, 4.5 GiB), and kernel RM could
+/// map no GR context buffer (kgraphicsMapCtxBuffer NV_ERR_NO_MEMORY). The KMD
+/// instead fills [64 KiB, 4 GiB) with one window object up front, so RM's
+/// first-fit internal mappings land above 4.5 GiB, inside the range reserved
+/// from VidMm.
+pub fn vaspace_params_vidmm() -> [u8; VASPACE_BYTES] {
+    let mut a = [0u8; VASPACE_BYTES];
+    put32(&mut a, 0, VASPACE_INDEX_GPU_NEW);
+    put32(&mut a, 4, VASPACE_FLAGS_ALLOW_ZERO_ADDRESS);
+    a
+}
+
 /// `NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS { hVASpace, engineType }`.
 pub fn channel_group_params(h_vaspace: u32, engine_type: u32) -> [u8; TSG_BYTES] {
     let mut a = [0u8; TSG_BYTES];
@@ -303,6 +332,24 @@ pub fn ctxshare_params(h_vaspace: u32) -> [u8; CTXSHARE_BYTES] {
     a
 }
 
+/// `NV_CTXSHARE_ALLOCATION_FLAGS_SUBCONTEXT_SPECIFIED`: the VEID is `subctxId`.
+pub const CTXSHARE_FLAGS_SPECIFIED: u32 = 2;
+
+/// `NV_CTXSHARE_ALLOCATION_PARAMETERS { hVASpace, flags = SPECIFIED, subctxId = veid }`: the
+/// subcontext of a compute-only channel next to the graphics channel (VEID 0) of one TSG.
+pub fn ctxshare_specified_params(h_vaspace: u32, veid: u32) -> [u8; CTXSHARE_BYTES] {
+    let mut a = [0u8; CTXSHARE_BYTES];
+    put32(&mut a, 0, h_vaspace);
+    put32(&mut a, 4, CTXSHARE_FLAGS_SPECIFIED);
+    put32(&mut a, 8, veid);
+    a
+}
+
+/// `NV_CHANNEL_ALLOC_PARAMS.flags` of a compute-only channel on a non-zero VEID:
+/// `NVOS04_FLAGS_GROUP_CHANNEL_RUNQUEUE_ONE | NVOS04_FLAGS_GROUP_CHANNEL_THREAD_ONE`. GSP-RM
+/// refuses the compute object on a non-zero VEID channel of runqueue 0.
+pub const CHANNEL_FLAGS_ASYNC_COMPUTE: u32 = 0x1000_0010;
+
 /// What the GPFIFO channel is made of.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ChannelDesc {
@@ -314,17 +361,21 @@ pub struct ChannelDesc {
     pub h_ctxshare: u32,
     pub userd_offset: u64,
     pub engine_type: u32,
+    /// `NV_CHANNEL_ALLOC_PARAMS.flags`: 0, or [`CHANNEL_FLAGS_ASYNC_COMPUTE`].
+    pub flags: u32,
 }
 
 /// `NV_CHANNEL_ALLOC_PARAMS` (376 bytes): `hObjectError` (the error notifier lives at offset 0
 /// of that memory: the "error notifier setup" of the tool), `gpFifoOffset`, `gpFifoEntries`,
 /// `hContextShare`, `hUserdMemory[0]` and `userdOffset[0]` (USERD in the same memory), and
-/// `engineType`. Offsets 0, 8, 16, 24, 36, 72 and 136 (`offsetof` on the tool's struct).
+/// `engineType`, and `flags` at 20. Offsets 0, 8, 16, 20, 24, 36, 72 and 136 (`offsetof` on the
+/// tool's struct).
 pub fn channel_params(d: &ChannelDesc) -> [u8; CHANNEL_BYTES] {
     let mut a = [0u8; CHANNEL_BYTES];
     put32(&mut a, 0, d.h_ctl);
     put64(&mut a, 8, d.gpfifo_va);
     put32(&mut a, 16, d.entries);
+    put32(&mut a, 20, d.flags);
     put32(&mut a, 24, d.h_ctxshare);
     put32(&mut a, 36, d.h_ctl);
     put64(&mut a, 72, d.userd_offset);
@@ -404,6 +455,19 @@ pub fn virtual_params(root: u32, h_vaspace: u32, va: Option<u64>, size: u64) -> 
     put32(&mut a, 8, flags);
     put64(&mut a, 64, size);
     put32(&mut a, 108, h_vaspace);
+    a
+}
+
+/// `NVOS32_ATTR_PAGE_SIZE_4KB` (24:23 = 1).
+const NVOS32_ATTR_PAGE_SIZE_4KB: u32 = 1 << 23;
+
+/// [`virtual_params`] of a virtual object with 4-KiB pages. A fixed-address virtual
+/// object with the default page size takes the space's big pages and RM aligns its
+/// address down to 64 KiB: a mapping of system pages at a 4-KiB-aligned VA (VidMm's
+/// fence and system-placed pieces) came back at the 64-KiB boundary below it.
+pub fn virtual_params_4k(root: u32, h_vaspace: u32, va: Option<u64>, size: u64) -> [u8; MEM_ALLOC_BYTES] {
+    let mut a = virtual_params(root, h_vaspace, va, size);
+    put32(&mut a, 24, NVOS32_ATTR_PAGE_SIZE_4KB);
     a
 }
 
@@ -1412,6 +1476,16 @@ mod tests {
     }
 
     #[test]
+    fn per_process_vaspaces_are_new_and_start_at_zero() {
+        let b = vaspace_params_vidmm();
+        assert_eq!(b.len(), VASPACE_BYTES);
+        // index GPU_NEW (0), flags ALLOW_ZERO_ADDRESS (bit 8), everything else zero.
+        assert_eq!(sparse(&b), [(5, 0x01)]);
+        // The shared device space stays index GPU_DEVICE.
+        assert_eq!(sparse(&vaspace_params()), [(0, 3)]);
+    }
+
+    #[test]
     fn the_device_is_the_tools_block() {
         let b = device_params(ROOT);
         assert_eq!(b.len(), 56);
@@ -1441,6 +1515,26 @@ mod tests {
     }
 
     #[test]
+    fn a_specified_subcontext_names_its_veid() {
+        let b = ctxshare_specified_params(0x4b4d_3001, 2);
+        assert_eq!(sparse(&b), [(0, 0x01), (1, 0x30), (2, 0x4d), (3, 0x4b), (4, 0x02), (8, 0x02)]);
+    }
+
+    #[test]
+    fn a_compute_only_channel_runs_on_runqueue_one() {
+        let b = channel_params(&ChannelDesc {
+            h_ctl: 0,
+            gpfifo_va: 0,
+            entries: 0,
+            h_ctxshare: 0,
+            userd_offset: 0,
+            engine_type: 0,
+            flags: CHANNEL_FLAGS_ASYNC_COMPUTE,
+        });
+        assert_eq!(sparse(&b), [(20, 0x10), (23, 0x10)]);
+    }
+
+    #[test]
     fn the_channel_is_the_tools_block() {
         let b = channel_params(&ChannelDesc {
             h_ctl: 0x4b4d_3003,
@@ -1449,6 +1543,7 @@ mod tests {
             h_ctxshare: 0x4b4d_3007,
             userd_offset: 4096,
             engine_type: COPY2,
+            flags: 0,
         });
         assert_eq!(b.len(), 376);
         assert_eq!(
@@ -2159,5 +2254,20 @@ mod tests {
             !diag.replace(&knob, "").replace(&direct, "").contains("b\"Ce"),
             "diag.rs spells a Ce counter name"
         );
+    }
+}
+
+#[cfg(test)]
+mod virtual_4k_tests {
+    use super::*;
+
+    #[test]
+    fn four_k_virtual_sets_only_the_page_size_attr() {
+        let plain = virtual_params(1, 2, Some(0x2_1179_f000), 0x8_0000);
+        let small = virtual_params_4k(1, 2, Some(0x2_1179_f000), 0x8_0000);
+        assert_eq!(u32::from_le_bytes(small[24..28].try_into().unwrap()), 1 << 23);
+        let mut back = small;
+        back[24..28].copy_from_slice(&[0; 4]);
+        assert_eq!(back, plain);
     }
 }

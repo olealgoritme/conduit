@@ -1,6 +1,7 @@
 ; helios_kmd_render.inx — Helios vGPU WDDM render and display miniport driver.
-; Matches the virtio-gpu PCI device (VEN_1AF4 & DEV_106D / DEV_1069). The wdk-build
-; toolchain stamps DriverVer and produces helios_kmd_render.inf during packaging.
+; Matches the virtio-gpu PCI device (VEN_1AF4 & DEV_106D / DEV_1069) and the
+; opt-in RTX 5090 personality (VEN_10DE & DEV_2B85). The wdk-build toolchain
+; stamps DriverVer and produces helios_kmd_render.inf during packaging.
 ; Test-signed package. FeatureScore is set below the inbox and virtual display
 ; drivers so PnP selects Helios on its own PCI IDs; see Helios_Install below.
 ; Branding strings are synchronized from metadata/helios.env by tools/sync-metadata.py.
@@ -48,6 +49,7 @@ helios_gl32.dll = 1,,
 ; Conduit's device is virtio id 45 (DEV_106D). QEMU cannot express id 45, so
 ; test VMs run it as id 41 (DEV_1069), as `insmod conduit_gpu.ko virtio_id=41`.
 %DeviceDesc% = Helios_Install, PCI\VEN_1AF4&DEV_106D, PCI\VEN_1AF4&DEV_1069
+%NvidiaDeviceDesc% = Helios_NVIDIA_Install, PCI\VEN_10DE&DEV_2B85&SUBSYS_20591771&REV_A1, PCI\VEN_10DE&DEV_2B85&SUBSYS_20591771
 
 ; ──── Installation ─────────────────────────────────────────────────────────
 
@@ -71,11 +73,17 @@ Include = msdv.inf
 ; F6 is below all three, so Helios wins the rank against Basic Display and
 ; the Red Hat DOD and binds on a running system. It is not 0x00, so it makes no
 ; absolute-best claim; the signature byte still carries the test-signing
-; penalty, and this cannot outrank a real GPU's driver because the Models
-; entries match only VEN_1AF4&DEV_106D / DEV_1069.
+; penalty. The Models entries match only Conduit's virtio IDs and the captured
+; RTX 5090 subsystem identity.
 FeatureScore = F6
 CopyFiles = Helios_CopyFiles
 AddReg = Helios_DeviceSettings
+
+[Helios_NVIDIA_Install]
+Include = msdv.inf
+FeatureScore = F6
+CopyFiles = Helios_CopyFiles
+AddReg = Helios_NVIDIA_DeviceSettings
 
 [Helios_CopyFiles]
 helios_kmd_render.sys
@@ -95,6 +103,50 @@ helios_gl32.dll
 [Helios_Install.Services]
 AddService = helios_kmd_render, 0x00000002, Helios_ServiceInstall, Helios_EventLog
 
+[Helios_NVIDIA_Install.Services]
+AddService = helios_kmd_render, 0x00000002, Helios_NVIDIA_ServiceInstall, Helios_EventLog
+AddService = nvlddmkm, 0x00000000, Helios_NVIDIA_AliasServiceInstall
+
+[Helios_NVIDIA_AliasServiceInstall]
+ServiceType   = 1
+StartType     = 3
+ErrorControl  = 0
+ServiceBinary = %13%\helios_kmd_render.sys
+
+[Helios_NVIDIA_ServiceInstall]
+ServiceType    = 1                   ; SERVICE_KERNEL_DRIVER
+StartType      = 3                   ; SERVICE_DEMAND_START
+ErrorControl   = 0                   ; SERVICE_ERROR_IGNORE
+ServiceBinary  = %13%\helios_kmd_render.sys
+AddReg         = Helios_NVIDIA_Service_AddReg
+
+[Helios_NVIDIA_Service_AddReg]
+HKR,Parameters,SingleDeviceInstall,%REG_DWORD%,1
+HKR,Parameters,NvUmd,%REG_DWORD%,2
+; The NVIDIA Windows driver version whose user-mode drivers this KMD speaks.
+; Set-HeliosUmd.ps1 -Nvidia stages only an NVIDIA package of this version (a
+; NvUmdVersion value in the service key itself overrides it), and the KMD
+; reports it to the host at every start of the NVIDIA personality, which
+; refuses a release its RM is not. REG_SZ only. The KMD publishes the host RM's
+; version beside it as NvHostRmVersion.
+HKR,Parameters,NvUmdVersion,%REG_SZ%,"610.88"
+
+[Helios_NVIDIA_DeviceSettings]
+HKR,, UserModeDriverName,       %REG_MULTI_SZ%, %13%\nvldumdx.dll,%13%\nvldumdx.dll,%13%\nvldumdx.dll,%13%\nvldumdx.dll
+HKR,, UserModeDriverNameWoW,    %REG_MULTI_SZ%, %13%\nvldumd.dll,%13%\nvldumd.dll,%13%\nvldumd.dll,%13%\nvldumd.dll
+HKR,, InstalledDisplayDrivers,  %REG_MULTI_SZ%, nvldumdx,nvldumd
+HKR,, HardwareInformation.AdapterString, %REG_SZ%, %NvidiaDeviceDesc%
+HKR,, VulkanDriverName,         %REG_SZ%, %13%\nv-vk64.json
+HKR,, VulkanDriverNameWoW,      %REG_SZ%, %13%\nv-vk32.json
+HKR,, OpenGLDriverName,         %REG_MULTI_SZ%, %13%\nvoglv64.dll
+HKR,, OpenGLDriverNameWoW,      %REG_MULTI_SZ%, %13%\nvoglv32.dll
+HKR,, OpenGLVersion,            %REG_DWORD%, 0x1000
+HKR,, OpenGLFlags,              %REG_DWORD%, 3
+HKR,, OpenGLVersionWoW,         %REG_DWORD%, 0x1000
+HKR,, OpenGLFlagsWoW,           %REG_DWORD%, 3
+HKR,, RMGpuId,                  %REG_DWORD%, 0x100
+HKR,, EnableVGPUIndicator,      %REG_DWORD%, 0
+
 [Helios_ServiceInstall]
 ServiceType    = 1                   ; SERVICE_KERNEL_DRIVER
 StartType      = 3                   ; SERVICE_DEMAND_START
@@ -113,6 +165,9 @@ HKR,,EventMessageFile,%REG_EXPAND_SZ%,"%%SystemRoot%%\System32\IoLogMsg.dll"
 HKR,,TypesSupported,%REG_DWORD%,7
 
 [Helios_Install.HW]
+AddReg = Helios_PCI_MSIX
+
+[Helios_NVIDIA_Install.HW]
 AddReg = Helios_PCI_MSIX
 
 ; Message-signalled interrupts: SHIPPED OFF (INTx), opt-in. The device is vhost-user-test-device-pci
@@ -246,6 +301,7 @@ HKR,, OpenGLFlagsWow,       %REG_DWORD%, 1
 [Strings]
 ProviderName = "WinBoat"
 DeviceDesc   = "Conduit Helios"
+NvidiaDeviceDesc = "NVIDIA GeForce RTX 5090"
 DiskName     = "Conduit Helios Driver Package"
 REG_SZ       = 0x00000000
 REG_DWORD    = 0x00010001

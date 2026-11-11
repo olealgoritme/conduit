@@ -52,7 +52,7 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use wdk_sys::ntddk::{
     KeGetCurrentIrql, MmMapIoSpace, MmMapLockedPagesSpecifyCache, MmUnmapIoSpace,
 };
-use wdk_sys::{_MEMORY_CACHING_TYPE, PHYSICAL_ADDRESS, PMDL};
+use wdk_sys::{PHYSICAL_ADDRESS, PMDL, _MEMORY_CACHING_TYPE};
 
 use crate::adapter::{AdapterContext, SystemBackingGuard, MAX_SYSTEM_BACKING_RANGES};
 use crate::ddi::create_allocation::SystemBackingPolicy;
@@ -61,6 +61,8 @@ use crate::dxgk::*;
 use crate::virtio::rm_client::sysmem_flip::primary_changed;
 use helios_kmd_logic::device_lost as dl;
 use helios_kmd_logic::paging::{self as pg, Clamp};
+use helios_kmd_logic::pg_check as pck;
+use helios_kmd_logic::pg_gpu as pgg;
 use helios_kmd_logic::rm_refresh::Edge;
 
 /// DISPATCH-safe paging tracers (ntoseye reads these by symbol — no IRQL
@@ -1021,7 +1023,10 @@ unsafe fn with_blob_bytes_cached(
         g.1 += 1;
         let tick = g.1;
         let e = g.0.iter_mut().flatten().find(|e| {
-            e.resid == resource_id && e.gpa == prep.gpa && e.size == prep.size && e.cache == prep.map_cache
+            e.resid == resource_id
+                && e.gpa == prep.gpa
+                && e.size == prep.size
+                && e.cache == prep.map_cache
         });
         e.map(|e| {
             e.used = tick;
@@ -1037,22 +1042,21 @@ unsafe fn with_blob_bytes_cached(
             // A stale view of the same resource (moved, resized) goes, then the least recently used.
             let victim = {
                 let mut g = CPU_VIEW_CACHE.lock();
-                let i = g
-                    .0
-                    .iter()
-                    .position(|e| e.is_some_and(|e| e.resid == resource_id))
-                    .or_else(|| g.0.iter().position(Option::is_none))
-                    .unwrap_or_else(|| {
-                        let mut best = 0;
-                        for (k, e) in g.0.iter().enumerate() {
-                            if let (Some(e), Some(b)) = (e, g.0[best]) {
-                                if e.used < b.used {
-                                    best = k;
+                let i =
+                    g.0.iter()
+                        .position(|e| e.is_some_and(|e| e.resid == resource_id))
+                        .or_else(|| g.0.iter().position(Option::is_none))
+                        .unwrap_or_else(|| {
+                            let mut best = 0;
+                            for (k, e) in g.0.iter().enumerate() {
+                                if let (Some(e), Some(b)) = (e, g.0[best]) {
+                                    if e.used < b.used {
+                                        best = k;
+                                    }
                                 }
                             }
-                        }
-                        best
-                    });
+                            best
+                        });
                 (i, g.0[i].take())
             };
             if let (_, Some(old)) = victim {
@@ -1083,7 +1087,10 @@ unsafe fn with_blob_bytes_cached(
     let t1 = now_us();
     f(va, prep.size);
     CPU_MAP_US.store((t1 - t0).min(u64::from(u32::MAX)) as u32, Ordering::Relaxed);
-    CPU_CPY_US.store((now_us() - t1).min(u64::from(u32::MAX)) as u32, Ordering::Relaxed);
+    CPU_CPY_US.store(
+        (now_us() - t1).min(u64::from(u32::MAX)) as u32,
+        Ordering::Relaxed,
+    );
     true
 }
 
@@ -1092,7 +1099,9 @@ unsafe fn with_blob_bytes_cached(
 pub(crate) fn drop_cpu_view(resource_id: u32) {
     let taken = {
         let mut g = CPU_VIEW_CACHE.lock();
-        let i = g.0.iter().position(|e| e.is_some_and(|e| e.resid == resource_id));
+        let i =
+            g.0.iter()
+                .position(|e| e.is_some_and(|e| e.resid == resource_id));
         i.and_then(|i| g.0[i].take())
     };
     if let Some(e) = taken {
@@ -1207,7 +1216,11 @@ pub(crate) fn read_standard_buffer(
         with_blob_bytes_cached(passive, adapter, resource_id, |blob, len| {
             if want_end <= len {
                 // SAFETY: `[offset, want_end)` is inside the mapped blob (`len` bytes).
-                core::ptr::copy_nonoverlapping(blob.add(offset as usize), out.as_mut_ptr(), out.len());
+                core::ptr::copy_nonoverlapping(
+                    blob.add(offset as usize),
+                    out.as_mut_ptr(),
+                    out.len(),
+                );
                 ok = true;
             }
         })
@@ -1245,7 +1258,9 @@ pub(crate) fn write_standard_buffer(
     let Some(end) = offset.checked_add(span) else {
         return std_fail(11);
     };
-    if let Some(ok) = crate::ddi::aperture_pages::write(resource_id, offset, pitch, row_bytes, rows, data) {
+    if let Some(ok) =
+        crate::ddi::aperture_pages::write(resource_id, offset, pitch, row_bytes, rows, data)
+    {
         return ok || std_fail(12);
     }
     let Some(guard) = adapter.system_backings.serialize(passive) else {
@@ -1950,6 +1965,8 @@ enum PagingOperation<'a> {
     DiscardContent(&'a _DXGKARG_BUILDPAGINGBUFFER__bindgen_ty_1__bindgen_ty_3),
     VirtualFill(&'a DXGK_BUILDPAGINGBUFFER_FILLVIRTUAL),
     VirtualTransfer(&'a DXGK_BUILDPAGINGBUFFER_TRANSFERVIRTUAL),
+    NotifyResidency(&'a DXGK_BUILDPAGINGBUFFER_NOTIFYRESIDENCY),
+    FlushTlb,
     /// Any operation this driver does not service — the null engine.
     Other,
 }
@@ -1983,6 +2000,10 @@ impl<'a> PagingOperation<'a> {
                 PagingOp::DXGK_OPERATION_VIRTUAL_TRANSFER => {
                     Self::VirtualTransfer(args.__bindgen_anon_1.TransferVirtual.as_ref())
                 }
+                PagingOp::DXGK_OPERATION_NOTIFY_RESIDENCY => {
+                    Self::NotifyResidency(args.__bindgen_anon_1.NotifyResidency.as_ref())
+                }
+                PagingOp::DXGK_OPERATION_FLUSH_TLB => Self::FlushTlb,
                 _ => Self::Other,
             }
         }
@@ -2178,12 +2199,1032 @@ impl PagingNote {
             PagingOperation::UpdatePageTable(u) => {
                 self.handle = u.hAllocation as usize as u32;
             }
-            PagingOperation::Other => {}
+            PagingOperation::NotifyResidency(n) => {
+                self.handle = n.hAllocation as usize as u32;
+            }
+            PagingOperation::FlushTlb | PagingOperation::Other => {}
         }
     }
 }
 
-/// The body of [`dxgkddi_build_paging_buffer`]; every return records its outcome in `note`.
+/// Native 610.88 paging operations.  `None` means the operation belongs to the
+/// default Venus engine.  Every native failure is returned before a paging
+/// submission can be accepted; no failed operation is converted into a retired
+/// success fence as the legacy decorative engine requires.
+unsafe fn native_paging_operation(
+    adapter: &AdapterContext,
+    operation: &PagingOperation<'_>,
+    note: &mut PagingNote,
+) -> Option<NTSTATUS> {
+    if let PagingOperation::UpdatePageTable(update) = operation {
+        crate::ddi::hot_path::count(&crate::ddi::hot_path::PT_ALL);
+        // Not this driver's RM memory (dxgkrnl's fences, legacy allocations):
+        // mirror its system pages into the process's RM VA space too.
+        let native_id = unsafe { paging_alloc_info(adapter, update.hAllocation) }
+            .map_or(0, |a| a.native_id);
+        let native = native_id != 0;
+        // SAFETY: dxgkrnl's live operation.
+        unsafe { crate::ddi::pt_ring::upt_in(update, native_id) };
+        unsafe { watch_update(update, native) };
+        // An exiting process's channels stop before its VAs are unmapped (`hws::exit_gate`).
+        // SAFETY: dxgkrnl's live operation.
+        unsafe { teardown_gate(adapter, update) };
+        if !native && crate::ddi::wddm_surface::nvidia_selected() {
+            unsafe { foreign_leaf(adapter, update) };
+        }
+    }
+    let allocation = match operation {
+        PagingOperation::UpdatePageTable(u) => unsafe { paging_alloc_info(adapter, u.hAllocation) },
+        PagingOperation::Transfer(t) => unsafe { paging_alloc_info(adapter, t.hAllocation) },
+        PagingOperation::Fill(f) => unsafe { paging_alloc_info(adapter, f.hAllocation) },
+        PagingOperation::DiscardContent(d) => unsafe { paging_alloc_info(adapter, d.hAllocation) },
+        PagingOperation::VirtualFill(f) => unsafe { paging_alloc_info(adapter, f.hAllocation) },
+        PagingOperation::VirtualTransfer(t) => unsafe { paging_alloc_info(adapter, t.hAllocation) },
+        PagingOperation::NotifyResidency(n) => unsafe { paging_alloc_info(adapter, n.hAllocation) },
+        PagingOperation::FlushTlb | PagingOperation::Other => return None,
+    }?;
+    if allocation.native_id == 0 {
+        return None;
+    }
+    // The hot-path block's mirror pass, once per `NvHotPubMs` (`ddi::hot_path`); native
+    // allocations only, so the default personality asks for no extra pass.
+    crate::ddi::hot_path::tick();
+    note.describe(operation, allocation.native_segment);
+
+    if let PagingOperation::NotifyResidency(n) = operation {
+        let flags = unsafe {
+            core::ptr::read_unaligned(
+                (n as *const _ as *const u8)
+                    .add(core::mem::size_of::<DXGK_BUILDPAGINGBUFFER_NOTIFYRESIDENCY>() - 4)
+                    as *const u32,
+            )
+        };
+        return Some(
+            match crate::virtio::native_memory::notify_residency(
+                allocation.native_id,
+                n.PhysicalAddress.SegmentOffset,
+                flags & 1 != 0,
+            ) {
+                Ok(()) => STATUS_SUCCESS,
+                Err(_) => native_refused(6, true),
+            },
+        );
+    }
+    if let PagingOperation::UpdatePageTable(update) = operation {
+        PAGING_HINT.store(
+            (update.FirstPteVirtualAddress >> 16) as u32,
+            core::sync::atomic::Ordering::Relaxed,
+        );
+        if update.PageTableLevel != 0 {
+            // RM owns every non-leaf level of its GPU_DEVICE VA space.
+            crate::ddi::hot_path::count(&crate::ddi::hot_path::PT_UPPER);
+            note.result = dl::paging_result::PTE;
+            return Some(STATUS_SUCCESS);
+        }
+    }
+    if unsafe { KeGetCurrentIrql() } != PASSIVE_LEVEL_IRQL {
+        note.result = dl::paging_result::BAD_IRQL;
+        return Some(native_refused(7, false));
+    }
+    // SAFETY: checked immediately above; all native RM and Mm operations are
+    // synchronous PASSIVE-level work.
+    let passive = unsafe { PassiveLevel::assume() };
+    let result = match operation {
+        PagingOperation::UpdatePageTable(update) => unsafe {
+            native_update_leaf(passive, adapter, allocation, update)
+        },
+        PagingOperation::Transfer(transfer) => unsafe {
+            native_transfer(passive, adapter, allocation, transfer)
+        },
+        PagingOperation::Fill(fill) => unsafe { native_fill(passive, adapter, allocation, fill) },
+        PagingOperation::DiscardContent(_) => Ok(()),
+        PagingOperation::VirtualFill(fill) => unsafe {
+            native_virtual_fill(passive, adapter, allocation, fill)
+        },
+        PagingOperation::VirtualTransfer(transfer) => unsafe {
+            native_virtual_transfer(passive, adapter, allocation, transfer)
+        },
+        PagingOperation::NotifyResidency(_)
+        | PagingOperation::FlushTlb
+        | PagingOperation::Other => Ok(()),
+    };
+    if let PagingOperation::UpdatePageTable(update) = operation {
+        crate::ddi::pt_ring::upt_done(
+            result.is_ok(),
+            allocation.native_id,
+            update.FirstPteVirtualAddress,
+            u64::from(update.NumPageTableEntries) * 4096,
+            update.hProcess as usize,
+        );
+    }
+    note.result = if result.is_ok() {
+        dl::paging_result::EXECUTED
+    } else {
+        dl::paging_result::SKIPPED
+    };
+    let kind = match operation {
+        PagingOperation::UpdatePageTable(_) => 1,
+        PagingOperation::Transfer(_) => 2,
+        PagingOperation::Fill(_) => 3,
+        PagingOperation::VirtualFill(_) => 4,
+        PagingOperation::VirtualTransfer(_) => 5,
+        _ => 0,
+    };
+    if result.is_err() && kind >= 2 {
+        // `NvPgCheck`: a content operation answered success without running.
+        crate::ddi::pg_check::note_op(allocation.native_id, kind, pck::dir::NONE, pck::path::REFUSED);
+    }
+    Some(match result {
+        Ok(()) => STATUS_SUCCESS,
+        Err(()) => native_refused(kind, true),
+    })
+}
+
+static NATIVE_REFUSED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// The VA >> 16 of the last native leaf update handled (`VkF` hint of a refusal).
+static PAGING_HINT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static LEAF_IN_SYSTEM: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static LEAF_IN_APERTURE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static LEAF_IN_SEGMENT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// A native paging operation that could not run. BuildPagingBuffer may only answer success
+/// or a retry status: anything else is bugcheck 0x10E (VIDEO_MEMORY_MANAGEMENT_INTERNAL, 0xB).
+/// The operation is skipped like the legacy path's `SKIPPED`; `NvPgFail` names the last
+/// refused kind (1 leaf update, 2 transfer, 3 fill, 4 virtual fill, 5 virtual transfer,
+/// 6 residency, 7 above PASSIVE) and `NvPgFailN` counts them.
+fn native_refused(kind: u32, passive: bool) -> NTSTATUS {
+    let count = NATIVE_REFUSED.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+    // `VkF` (atomics and a spinlock: fine above PASSIVE too).
+    crate::ddi::vk_fail::note(helios_kmd_logic::vk_fail::kind::PAGING, kind, 0, PAGING_HINT.load(core::sync::atomic::Ordering::Relaxed));
+    if passive {
+        crate::diag::record_named_bytes(b"NvPgFail", kind);
+        crate::diag::record_named_bytes(b"NvPgFailN", count);
+    }
+    STATUS_SUCCESS
+}
+
+/// Whether VidMm's `segment` is where this native allocation lives: its memory segment, or
+/// the aperture segment for a system-memory backed one (`native_segment` 0, see
+/// `create_native_one`).
+fn native_segment_matches(
+    allocation: crate::ddi::create_allocation::PagingAllocInfo,
+    segment: u32,
+) -> bool {
+    segment == allocation.native_segment
+        || (allocation.native_segment == 0 && segment == crate::ddi::gpummu::APERTURE_SEGMENT_ID)
+}
+
+/// `native_memory::update_foreign_leaf` for a leaf update of a non-native
+/// allocation in a user process (PASSIVE only; the system process has no RM
+/// VA space of its own). All-system-page updates are mapped, anything else
+/// drops what was mapped there. Failures are counted (NvFgnFail/NvFgnWhy),
+/// never returned: the legacy path still owns the operation.
+unsafe fn foreign_leaf(adapter: &AdapterContext, update: &DXGK_BUILDPAGINGBUFFER_UPDATEPAGETABLE) {
+    if update.PageTableLevel != 0
+        || update.pPageTableEntries.is_null()
+        || update.NumPageTableEntries == 0
+        || unsafe { KeGetCurrentIrql() } != PASSIVE_LEVEL_IRQL
+        || unsafe { crate::device::ProcessContext::is_system_handle(update.hProcess as usize) }
+        || update.hProcess.is_null()
+    {
+        return;
+    }
+    let count = update.NumPageTableEntries as usize;
+    let repeat = update.Flags.Repeat() != 0;
+    let mut pfns = Vec::new();
+    if pfns.try_reserve_exact(count).is_err() {
+        return;
+    }
+    let mut all_system = true;
+    for index in 0..count {
+        let pte_index = if repeat { 0 } else { index };
+        // SAFETY: DXGK supplies Num entries (one with Repeat).
+        let pte = unsafe { core::ptr::read_unaligned(update.pPageTableEntries.add(pte_index)) };
+        let bits = unsafe { pte.__bindgen_anon_1.__bindgen_anon_1 };
+        if bits.Valid() == 0 || bits.Zero() != 0 || bits.Segment() != 0 || repeat && count != 1 {
+            all_system = false;
+            break;
+        }
+        pfns.push(unsafe { pte.__bindgen_anon_2.PageAddress });
+    }
+    if !all_system {
+        pfns.clear();
+    }
+    let passive = unsafe { PassiveLevel::assume() };
+    // `NvFgnN` is published by the mirror pass (`publish_hot`), `HpPtFgn*` with it.
+    FOREIGN_LEAF.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    crate::ddi::hot_path::count(&crate::ddi::hot_path::PT_FOREIGN);
+    if let Err(error) = crate::virtio::native_memory::update_foreign_leaf(
+        passive,
+        adapter,
+        update.hProcess as usize,
+        update.FirstPteVirtualAddress,
+        count as u64,
+        &pfns,
+    ) {
+        crate::diag::record_named_bytes(b"NvFgnWhy", error as u32);
+        let failed = FOREIGN_FAIL.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+        crate::diag::record_named_bytes(b"NvFgnFail", failed);
+    }
+}
+
+/// `hws::exit_gate` for a teardown invalidation (`native_teardown::teardown_update`: a
+/// leaf update of a user process with any invalid entry), at PASSIVE only (the gate's
+/// unschedule is a host round trip; native leaf updates are PASSIVE anyway).
+unsafe fn teardown_gate(adapter: &AdapterContext, update: &DXGK_BUILDPAGINGBUFFER_UPDATEPAGETABLE) {
+    if update.pPageTableEntries.is_null()
+        || update.NumPageTableEntries == 0
+        || update.PageTableLevel != 0
+        || !crate::ddi::wddm_surface::nvidia_selected()
+        || unsafe { KeGetCurrentIrql() } != PASSIVE_LEVEL_IRQL
+        || !crate::ddi::hws::exit_gate_on()
+    {
+        return;
+    }
+    let process = update.hProcess as usize;
+    // SAFETY: dxgkrnl's hKmdProcess from CreateProcess, or null.
+    let system = process == 0 || unsafe { crate::device::ProcessContext::is_system_handle(process) };
+    let count = if update.Flags.Repeat() != 0 { 1 } else { update.NumPageTableEntries as usize };
+    let any_invalid = (0..count).any(|index| {
+        // SAFETY: DXGK supplies Num entries (one with Repeat).
+        let pte = unsafe { core::ptr::read_unaligned(update.pPageTableEntries.add(index)) };
+        unsafe { pte.__bindgen_anon_1.__bindgen_anon_1 }.Valid() == 0
+    });
+    if helios_kmd_logic::native_teardown::teardown_update(process, system, update.PageTableLevel == 0, any_invalid) {
+        // SAFETY: a user process's live hKmdProcess (VidMm updates it before DestroyProcess).
+        unsafe { crate::ddi::hws::exit_gate(adapter, process) };
+    }
+}
+
+/// `native_memory::watch` op 1: an UpdatePageTable that covers a watched page.
+unsafe fn watch_update(update: &DXGK_BUILDPAGINGBUFFER_UPDATEPAGETABLE, native: bool) {
+    let count = u64::from(update.NumPageTableEntries);
+    let va = update.FirstPteVirtualAddress;
+    if !crate::virtio::native_memory::watch::covers(va, count * 4096) {
+        return;
+    }
+    let mut detail = u32::from(native) | (u32::from(update.PageTableLevel != 0) << 1);
+    if !update.pPageTableEntries.is_null() && count != 0 {
+        // SAFETY: DXGK supplies at least one entry when the count is nonzero.
+        let pte = unsafe { core::ptr::read_unaligned(update.pPageTableEntries) };
+        let bits = unsafe { pte.__bindgen_anon_1.__bindgen_anon_1 };
+        detail |= (u32::from(bits.Valid() != 0) << 2) | (u32::from(bits.Segment() == 0) << 3);
+    }
+    if unsafe { KeGetCurrentIrql() } != PASSIVE_LEVEL_IRQL {
+        detail |= 1 << 4;
+    }
+    if update.hProcess.is_null()
+        || unsafe { crate::device::ProcessContext::is_system_handle(update.hProcess as usize) }
+    {
+        detail |= 1 << 5;
+    }
+    crate::virtio::native_memory::watch::event(va, count * 4096, 1, detail, update.hProcess as usize);
+}
+
+static FOREIGN_LEAF: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// `NvPgZero`: Zero PTEs in native leaf updates (left unmapped).
+static ZERO_PTES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static FOREIGN_FAIL: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// `NvPgLeafSys`: 1 once VidMm's own process updated a native leaf (0 = never).
+static LEAF_SYSTEM_SEEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// `NvPgLeafSeg`: the last segment a native leaf update named that is not the
+/// allocation's own (`u32::MAX` = none yet: not written).
+static LEAF_SEGMENT_LAST: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// `BuildPagingBuffer` calls (`PgCalls`), for `ddi::hot_path`'s rate. Any IRQL.
+pub(crate) fn paging_call_count() -> u32 {
+    PAGING_CALL_COUNT.load(Ordering::Relaxed)
+}
+
+/// The native paging values that were written per leaf update before, now
+/// written by the registry mirror's pass (`ddi::hot_path::publish`), same names:
+/// `NvPgLeafInSys` / `NvPgLeafInApt` / `NvPgLeafInSeg` (native leaf updates by
+/// where VidMm placed the allocation), `NvPgLeafSys`, `NvPgLeafSeg`, `NvFgnN`
+/// (foreign leaf updates). Values that never moved are not written. PASSIVE.
+pub(crate) fn publish_hot() {
+    use core::sync::atomic::Ordering::Relaxed;
+    use crate::diag::record_named_bytes as rec;
+    for (name, counter) in [
+        (&b"NvPgLeafInSys"[..], &LEAF_IN_SYSTEM),
+        (&b"NvPgLeafInApt"[..], &LEAF_IN_APERTURE),
+        (&b"NvPgLeafInSeg"[..], &LEAF_IN_SEGMENT),
+        (&b"NvFgnN"[..], &FOREIGN_LEAF),
+        (&b"NvPgLeafSys"[..], &LEAF_SYSTEM_SEEN),
+        (&b"NvPgZero"[..], &ZERO_PTES),
+    ] {
+        let n = counter.load(Relaxed);
+        if n != 0 {
+            rec(name, n);
+        }
+    }
+    let segment = LEAF_SEGMENT_LAST.load(Relaxed);
+    if segment != u32::MAX {
+        rec(b"NvPgLeafSeg", segment);
+    }
+}
+
+unsafe fn native_update_leaf(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    allocation: crate::ddi::create_allocation::PagingAllocInfo,
+    update: &DXGK_BUILDPAGINGBUFFER_UPDATEPAGETABLE,
+) -> Result<(), ()> {
+    use helios_kmd_logic::native_memory as native;
+
+    // Registry values outlive the boot: the leaf-update failure values are zeroed
+    // once, before this boot's first can be written.
+    crate::virtio::native_memory::reset_leaf_counters_once(passive);
+    let fail = |why: u32| {
+        crate::diag::record_named_bytes(b"NvPgLeafWhy", why);
+        crate::ddi::pt_ring::note_why(why);
+    };
+    if update.pPageTableEntries.is_null() || update.NumPageTableEntries == 0 {
+        fail(1);
+        return Err(());
+    }
+    // VidMm's own (system/paging) process maps native allocations to fill or
+    // transfer them through a GPU VA. Native fills/transfers run through the
+    // allocation's CPU mapping instead (`native_virtual_fill` etc.) and the
+    // system process has no RM VA space: nothing to map. Failing here was a
+    // 0x10E (VIDEO_MEMORY_MANAGEMENT_INTERNAL, 0xB) on the first page-in.
+    // SAFETY: dxgkrnl's hKmdProcess from CreateProcess, or null.
+    if unsafe { crate::device::ProcessContext::is_system_handle(update.hProcess as usize) } {
+        // `NvPgLeafSys` (1 once seen): published by the mirror pass, not per update.
+        LEAF_SYSTEM_SEEN.store(1, core::sync::atomic::Ordering::Relaxed);
+        crate::ddi::hot_path::count(&crate::ddi::hot_path::PT_SYSTEM);
+        // Its system-memory pages are still recorded: VidMm's virtual transfers
+        // name them by this paging-process VA (`native_virtual_transfer`
+        // resolves them here; without them every transfer was refused).
+        if !unsafe { adapter.paging_pte_shadow.update_leaf(update, true) } {
+            fail(5);
+        }
+        return Ok(());
+    }
+    crate::ddi::hot_path::count(&crate::ddi::hot_path::PT_NATIVE);
+    let count = update.NumPageTableEntries as usize;
+    let mut pieces = Vec::new();
+    pieces.try_reserve_exact(count).map_err(|_| ())?;
+    let repeat = update.Flags.Repeat() != 0;
+    // VidMm's system pages for a device-local allocation (`update_leaf_system`).
+    let device_local = allocation.native_segment != 0;
+    let mut system_pfns = Vec::new();
+    // Per page: VidMm placed it in system pages (`update_leaf_system`), for an
+    // update that mixes those with anything else.
+    let mut is_system = Vec::new();
+    is_system.try_reserve_exact(count).map_err(|_| ())?;
+    let mut any_other = false;
+    let mut segment_noted = false;
+    // `NvPgCheck`: what the PTEs name (`pg_check::placement_of`).
+    let (mut in_aperture, mut in_segment, mut invalid) = (0u32, 0u32, 0u32);
+    for index in 0..count {
+        let pte_index = if repeat { 0 } else { index };
+        // SAFETY: Repeat selects one entry; otherwise DXGK supplies Num entries.
+        let pte = unsafe { core::ptr::read_unaligned(update.pPageTableEntries.add(pte_index)) };
+        let bits = unsafe { pte.__bindgen_anon_1.__bindgen_anon_1 };
+        if bits.Zero() != 0 {
+            // A Zero PTE (`ZeroInPteSupported`, `NvZeroPte`) has no page: the VA is
+            // left unmapped, which reads zero in an `NvPtSparse` window and faults
+            // otherwise. `NvPgZero` counts them (mirror pass).
+            ZERO_PTES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            pieces.push(None);
+            is_system.push(false);
+            any_other = true;
+            invalid += 1;
+            continue;
+        }
+        if bits.Valid() == 0 {
+            pieces.push(None);
+            is_system.push(false);
+            any_other = true;
+            invalid += 1;
+            continue;
+        }
+        if repeat && count != 1 {
+            // Repeating one placement cannot describe the sequential allocation
+            // offsets promised for a native multi-page update.
+            fail(3);
+            return Err(());
+        }
+        // System-memory backed native allocations are placed in the aperture
+        // segment (create_native_one); device-local ones in their memory segment.
+        // The mapping target is always the allocation's RM memory at
+        // AllocationOffsetInBytes; VidMm's placement only says where it keeps
+        // its own copy. It may page a device-local allocation into the
+        // aperture (its supported set lists it, as WDDM requires for CPU-visible
+        // allocations): the PTE then names system memory (segment 0) or the
+        // aperture. Refusing that failed every NVIDIA D3D11 page-in.
+        let segment = bits.Segment() as u32;
+        if segment != allocation.native_segment && !segment_noted {
+            // Once per update, and only into an atomic: the mirror pass publishes
+            // `NvPgLeafSeg` (a deferred registry write per leaf update before).
+            segment_noted = true;
+            LEAF_SEGMENT_LAST.store(segment, core::sync::atomic::Ordering::Relaxed);
+        }
+        if index == 0 {
+            // Where VidMm placed native allocations, per leaf update: system
+            // pages (segment 0), the aperture, or the allocation's own segment.
+            let counter = match segment {
+                0 => &LEAF_IN_SYSTEM,
+                crate::ddi::gpummu::APERTURE_SEGMENT_ID => &LEAF_IN_APERTURE,
+                _ => &LEAF_IN_SEGMENT,
+            };
+            // `NvPgLeafIn*`: published by the mirror pass (`publish_hot`).
+            counter.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
+        if !native_segment_matches(allocation, segment)
+            && segment != 0
+            && segment != crate::ddi::gpummu::APERTURE_SEGMENT_ID
+        {
+            fail(0x100 | segment);
+            return Err(());
+        }
+        let page_address = unsafe { pte.__bindgen_anon_2.PageAddress };
+        if page_address > (u64::MAX >> 12) {
+            return Err(());
+        }
+        if device_local && segment == 0 {
+            if system_pfns.try_reserve(1).is_err() {
+                return Err(());
+            }
+            system_pfns.push(page_address);
+            is_system.push(true);
+        } else {
+            is_system.push(false);
+            any_other = true;
+            if segment == crate::ddi::gpummu::APERTURE_SEGMENT_ID {
+                in_aperture += 1;
+            } else {
+                in_segment += 1;
+            }
+        }
+        // PageAddress is VidMm's segment placement, never a host GPA.  The RM
+        // memory offset comes only from AllocationOffsetInBytes + page index.
+        let piece = native::MappingPiece {
+            va: update
+                .FirstPteVirtualAddress
+                .checked_add((index as u64).checked_mul(native::PAGE_BYTES).ok_or(())?)
+                .ok_or(())?,
+            memory_offset: update
+                .AllocationOffsetInBytes
+                .checked_add((index as u64).checked_mul(native::PAGE_BYTES).ok_or(())?)
+                .ok_or(())?,
+            len: native::PAGE_BYTES,
+        };
+        pieces.push(Some(piece));
+    }
+    crate::ddi::pg_check::note_place(
+        allocation.native_id,
+        pck::placement_of(system_pfns.len() as u32, in_aperture, in_segment, invalid),
+    );
+    if !unsafe {
+        adapter
+            .paging_pte_shadow
+            .update_leaf(update, allocation.native_segment == 0)
+    } {
+        // The CPU-side shadow (for VidMm's virtual transfers) could not take it:
+        // noted, but the GPU mapping is still applied. Returning here left the
+        // range unmapped or stale for the GPU.
+        fail(4);
+    }
+    if !system_pfns.is_empty() && (any_other || repeat) {
+        // Part system pages, part something else (invalid PTEs, the aperture):
+        // each run of one kind is its own update, in order. Refusing the whole
+        // update (`NvPgLeafWhy` 6) left all of it as it was.
+        return native_update_leaf_runs(passive, adapter, allocation, update, &pieces, &is_system, &system_pfns)
+            .map_err(|why| fail(why));
+    }
+    if !system_pfns.is_empty() {
+        return crate::virtio::native_memory::update_leaf_system(
+            passive,
+            adapter,
+            allocation.native_id,
+            update.hProcess as usize,
+            update.FirstPteVirtualAddress,
+            update.AllocationOffsetInBytes,
+            &system_pfns,
+        )
+        .map_err(|error| fail(0x300 | (error.ntstatus() as u32 & 0xff)));
+    }
+    crate::virtio::native_memory::update_leaf(
+        passive,
+        adapter,
+        allocation.native_id,
+        update.hProcess as usize,
+        update.FirstPteVirtualAddress,
+        update.AllocationOffsetInBytes,
+        &pieces,
+    )
+    .map_err(|error| fail(0x200 | (error.ntstatus() as u32 & 0xff)))
+}
+
+/// A native leaf update whose PTEs mix VidMm's system pages with other entries:
+/// every maximal run of one kind goes to `update_leaf_system` (system pages) or
+/// `update_leaf` (the rest: RM memory and invalid PTEs), at its own VA and
+/// allocation offset. All runs are applied; the answer is the first failure's
+/// `NvPgLeafWhy` code.
+fn native_update_leaf_runs(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    allocation: crate::ddi::create_allocation::PagingAllocInfo,
+    update: &DXGK_BUILDPAGINGBUFFER_UPDATEPAGETABLE,
+    pieces: &[Option<helios_kmd_logic::native_memory::MappingPiece>],
+    is_system: &[bool],
+    system_pfns: &[u64],
+) -> Result<(), u32> {
+    let page = helios_kmd_logic::native_memory::PAGE_BYTES;
+    let mut first_error = None;
+    let mut start = 0usize;
+    let mut pfn_at = 0usize;
+    while start < pieces.len() {
+        let system = is_system[start];
+        let mut end = start + 1;
+        while end < pieces.len() && is_system[end] == system {
+            end += 1;
+        }
+        let va = update.FirstPteVirtualAddress + start as u64 * page;
+        let offset = update.AllocationOffsetInBytes + start as u64 * page;
+        let result = if system {
+            let pfns = system_pfns.get(pfn_at..pfn_at + (end - start)).ok_or(0x601u32);
+            pfn_at += end - start;
+            pfns.and_then(|pfns| {
+                crate::virtio::native_memory::update_leaf_system(
+                    passive,
+                    adapter,
+                    allocation.native_id,
+                    update.hProcess as usize,
+                    va,
+                    offset,
+                    pfns,
+                )
+                .map_err(|error| 0x300 | (error.ntstatus() as u32 & 0xff))
+            })
+        } else {
+            crate::virtio::native_memory::update_leaf(
+                passive,
+                adapter,
+                allocation.native_id,
+                update.hProcess as usize,
+                va,
+                offset,
+                &pieces[start..end],
+            )
+            .map_err(|error| 0x200 | (error.ntstatus() as u32 & 0xff))
+        };
+        if let Err(why) = result {
+            first_error.get_or_insert(why);
+        }
+        start = end;
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
+unsafe fn native_transfer(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    allocation: crate::ddi::create_allocation::PagingAllocInfo,
+    transfer: &_DXGKARG_BUILDPAGINGBUFFER__bindgen_ty_1__bindgen_ty_1,
+) -> Result<(), ()> {
+    let source = unsafe { TransferEnd::source(&transfer.Source) };
+    let destination = unsafe { TransferEnd::destination(&transfer.Destination) };
+    if transfer.Source.SegmentId != 0
+        && transfer.Destination.SegmentId != 0
+        && native_segment_matches(allocation, transfer.Source.SegmentId)
+        && native_segment_matches(allocation, transfer.Destination.SegmentId)
+    {
+        return Ok(());
+    }
+    let (mdl, to_native) = match (source, destination) {
+        (TransferEnd::SystemMdl(mdl), TransferEnd::Segment)
+            if native_segment_matches(allocation, transfer.Destination.SegmentId) =>
+        {
+            (mdl, true)
+        }
+        (TransferEnd::Segment, TransferEnd::SystemMdl(mdl))
+            if native_segment_matches(allocation, transfer.Source.SegmentId) =>
+        {
+            (mdl, false)
+        }
+        _ => return Err(()),
+    };
+    let offset = transfer.TransferOffset as u64;
+    let size = transfer.TransferSize as u64;
+    if offset
+        .checked_add(size)
+        .is_none_or(|end| end > allocation.size)
+    {
+        return Err(());
+    }
+    // `NvPgGpu` 0x1: on the paging copy engine (`native_memory::gpu_paging`); the CPU copy
+    // below when it cannot.
+    let check_dir = if to_native { pck::dir::TO_NATIVE } else { pck::dir::FROM_NATIVE };
+    // `NvPgCheck` 0x1: both ends read back after the copy (`ddi::pg_check`).
+    let check = |path: u32| {
+        crate::ddi::pg_check::note_op(allocation.native_id, pck::op::TRANSFER, check_dir, path);
+        if let Some((pfns, byte_offset)) = unsafe { mdl_frames(mdl) } {
+            crate::ddi::pg_check::check_transfer(
+                passive,
+                adapter,
+                allocation.native_id,
+                offset,
+                size,
+                pfns,
+                pgg::mdl_start(transfer.MdlOffset, byte_offset),
+                pck::op::TRANSFER,
+                check_dir,
+                path,
+            );
+        }
+    };
+    if allocation.native_segment != 0
+        && crate::virtio::native_memory::gpu_wants(pgg::Op::Transfer, size)
+        && unsafe {
+            gpu_transfer_mdl(passive, adapter, allocation, mdl, transfer.MdlOffset, offset, size, to_native)
+        }
+    {
+        check(pck::path::GPU);
+        return Ok(());
+    }
+    crate::virtio::native_memory::note_cpu_paging(size);
+    let window = unsafe { mdl_system_va(passive, mdl) }.ok_or(())?;
+    let system = window.slice_at_page(transfer.MdlOffset, size).ok_or(())?;
+    let copied = unsafe {
+        crate::virtio::native_memory::with_cpu_range_paging(
+            passive,
+            adapter,
+            allocation.native_id,
+            offset,
+            size,
+            |relative, native, len| {
+                let (Ok(relative), Ok(len)) = (usize::try_from(relative), usize::try_from(len))
+                else {
+                    return false;
+                };
+                let system = system.add(relative);
+                if to_native {
+                    core::ptr::copy_nonoverlapping(system, native, len);
+                } else {
+                    core::ptr::copy_nonoverlapping(native, system, len);
+                }
+                true
+            },
+        )
+    }
+    .map_err(|_| ())?;
+    if copied {
+        check(pck::path::CPU);
+        Ok(())
+    } else {
+        Err(())
+    }
+}
+
+/// The page frames of a locked MDL (one per page it spans) and its `ByteOffset`.
+///
+/// # Safety
+/// `mdl` is a live, locked MDL for as long as the slice is used.
+unsafe fn mdl_frames<'a>(mdl: PMDL) -> Option<(&'a [u64], u32)> {
+    if mdl.is_null() {
+        return None;
+    }
+    // SAFETY: valid MDL per the fn contract.
+    let (byte_offset, byte_count) = unsafe { ((*mdl).ByteOffset & 0xfff, (*mdl).ByteCount) };
+    let pages = usize::try_from(pgg::mdl_pages(byte_offset, byte_count)).ok()?;
+    if pages == 0 {
+        return None;
+    }
+    // SAFETY: a locked MDL's PFN array follows its header, one entry per page it spans.
+    let pfns = unsafe {
+        core::slice::from_raw_parts(
+            (mdl as *const u8).add(core::mem::size_of::<wdk_sys::MDL>()) as *const u64,
+            pages,
+        )
+    };
+    Some((pfns, byte_offset))
+}
+
+/// A `DXGK_OPERATION_TRANSFER` between native allocation `allocation` and the system pages of
+/// `mdl` on the paging copy engine (`native_memory::gpu_paging`): `true` when it ran there.
+/// The range is the CPU path's (`MdlWindow::slice_at_page`): from page `mdl_page` of the MDL's
+/// PFN array (page 0 from its `ByteOffset`), and it must lie inside the MDL's bytes.
+///
+/// # Safety
+/// `mdl` is the live, locked MDL of the operation.
+#[allow(clippy::too_many_arguments)]
+unsafe fn gpu_transfer_mdl(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    allocation: crate::ddi::create_allocation::PagingAllocInfo,
+    mdl: PMDL,
+    mdl_page: u32,
+    offset: u64,
+    size: u64,
+    to_native: bool,
+) -> bool {
+    // SAFETY: the live, locked MDL of the operation (fn contract).
+    let Some((pfns, byte_offset)) = (unsafe { mdl_frames(mdl) }) else {
+        return false;
+    };
+    // SAFETY: as above.
+    let byte_count = unsafe { (*mdl).ByteCount };
+    let start = pgg::mdl_start(mdl_page, byte_offset);
+    let begin = u64::from(byte_offset);
+    let end = begin + u64::from(byte_count);
+    if start < begin || start.checked_add(size).is_none_or(|last| last > end) {
+        return false;
+    }
+    crate::virtio::native_memory::gpu_paging(
+        passive,
+        adapter,
+        pgg::Op::Transfer,
+        allocation.native_id,
+        offset,
+        size,
+        if to_native {
+            pgg::Work::ToVideo
+        } else {
+            pgg::Work::FromVideo
+        },
+        Some(crate::virtio::native_memory::GpuSystem { pfns, start }),
+    )
+}
+
+/// `NvPgCheck`: note a fill of native allocation `allocation` that ran on `path` and read
+/// sampled pieces of it back (`ddi::pg_check`).
+#[allow(clippy::too_many_arguments)]
+fn fill_checked(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    allocation: crate::ddi::create_allocation::PagingAllocInfo,
+    offset: u64,
+    size: u64,
+    pattern: u32,
+    op: u32,
+    path: u32,
+) {
+    crate::ddi::pg_check::note_op(allocation.native_id, op, pck::dir::NONE, path);
+    crate::ddi::pg_check::check_fill(passive, adapter, allocation.native_id, offset, size, pattern, op, path);
+}
+
+unsafe fn native_fill(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    allocation: crate::ddi::create_allocation::PagingAllocInfo,
+    fill: &_DXGKARG_BUILDPAGINGBUFFER__bindgen_ty_1__bindgen_ty_2,
+) -> Result<(), ()> {
+    if !native_segment_matches(allocation, fill.Destination.SegmentId) {
+        return Err(());
+    }
+    let size = fill.FillSize as u64;
+    if size > allocation.size {
+        return Err(());
+    }
+    if allocation.native_segment != 0
+        && size % 4 == 0
+        && crate::virtio::native_memory::gpu_wants(pgg::Op::Fill, size)
+        && crate::virtio::native_memory::gpu_paging(
+            passive,
+            adapter,
+            pgg::Op::Fill,
+            allocation.native_id,
+            0,
+            size,
+            pgg::Work::Fill(fill.FillPattern),
+            None,
+        )
+    {
+        fill_checked(passive, adapter, allocation, 0, size, fill.FillPattern, pck::op::FILL, pck::path::GPU);
+        return Ok(());
+    }
+    crate::virtio::native_memory::note_cpu_paging(size);
+    let filled = unsafe {
+        crate::virtio::native_memory::with_cpu_range_paging(
+            passive,
+            adapter,
+            allocation.native_id,
+            0,
+            size,
+            |_, native, len| {
+                let Ok(len) = usize::try_from(len) else {
+                    return false;
+                };
+                fill_pattern(native, len, fill.FillPattern);
+                true
+            },
+        )
+    }
+    .map_err(|_| ())?;
+    if filled {
+        fill_checked(passive, adapter, allocation, 0, size, fill.FillPattern, pck::op::FILL, pck::path::CPU);
+        Ok(())
+    } else {
+        Err(())
+    }
+}
+
+unsafe fn native_virtual_fill(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    allocation: crate::ddi::create_allocation::PagingAllocInfo,
+    fill: &DXGK_BUILDPAGINGBUFFER_FILLVIRTUAL,
+) -> Result<(), ()> {
+    let offset = fill.AllocationOffsetInBytes;
+    let size = fill.FillSizeInBytes;
+    if offset
+        .checked_add(size)
+        .is_none_or(|end| end > allocation.size)
+    {
+        return Err(());
+    }
+    if allocation.native_segment != 0
+        && size % 4 == 0
+        && crate::virtio::native_memory::gpu_wants(pgg::Op::VirtualFill, size)
+        && crate::virtio::native_memory::gpu_paging(
+            passive,
+            adapter,
+            pgg::Op::VirtualFill,
+            allocation.native_id,
+            offset,
+            size,
+            pgg::Work::Fill(fill.FillPattern),
+            None,
+        )
+    {
+        fill_checked(passive, adapter, allocation, offset, size, fill.FillPattern, pck::op::VIRTUAL_FILL, pck::path::GPU);
+        return Ok(());
+    }
+    crate::virtio::native_memory::note_cpu_paging(size);
+    let filled = unsafe {
+        crate::virtio::native_memory::with_cpu_range_paging(
+            passive,
+            adapter,
+            allocation.native_id,
+            offset,
+            size,
+            |_, native, len| {
+                let Ok(len) = usize::try_from(len) else {
+                    return false;
+                };
+                fill_pattern(native, len, fill.FillPattern);
+                true
+            },
+        )
+    }
+    .map_err(|_| ())?;
+    if filled {
+        fill_checked(passive, adapter, allocation, offset, size, fill.FillPattern, pck::op::VIRTUAL_FILL, pck::path::CPU);
+        Ok(())
+    } else {
+        Err(())
+    }
+}
+
+/// `NvPgCheck`: note a virtual transfer that ran on `path` and compare sampled pieces of its
+/// system pages (`pages`, the first holding `system_va`) and the RM memory.
+#[allow(clippy::too_many_arguments)]
+fn virtual_transfer_checked(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    allocation: crate::ddi::create_allocation::PagingAllocInfo,
+    offset: u64,
+    size: u64,
+    pages: &[u64],
+    system_va: u64,
+    to_system: bool,
+    path: u32,
+) {
+    let dir = if to_system { pck::dir::FROM_NATIVE } else { pck::dir::TO_NATIVE };
+    crate::ddi::pg_check::note_op(allocation.native_id, pck::op::VIRTUAL_TRANSFER, dir, path);
+    crate::ddi::pg_check::check_transfer(
+        passive,
+        adapter,
+        allocation.native_id,
+        offset,
+        size,
+        pages,
+        system_va & 0xfff,
+        pck::op::VIRTUAL_TRANSFER,
+        dir,
+        path,
+    );
+}
+
+unsafe fn native_virtual_transfer(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    allocation: crate::ddi::create_allocation::PagingAllocInfo,
+    transfer: &DXGK_BUILDPAGINGBUFFER_TRANSFERVIRTUAL,
+) -> Result<(), ()> {
+    use crate::dxgk::_DXGK_MEMORY_TRANSFER_DIRECTION as Direction;
+
+    // NvPgVtWhy: 1 range past the allocation, 2 direction, 3 flags, 4 no
+    // shadowed system pages, 5 native CPU range, 6 copy refused.
+    let why = |code: u32| crate::diag::record_named_bytes(b"NvPgVtWhy", code);
+    let offset = transfer.AllocationOffsetInBytes;
+    let size = transfer.TransferSizeInBytes;
+    if offset
+        .checked_add(size)
+        .is_none_or(|end| end > allocation.size)
+    {
+        why(1);
+        return Err(());
+    }
+    let (system_va, to_system) = match transfer.TransferDirection {
+        Direction::DXGK_MEMORY_TRANSFER_LOCAL_TO_SYSTEM => {
+            (transfer.DestinationVirtualAddress, true)
+        }
+        Direction::DXGK_MEMORY_TRANSFER_SYSTEM_TO_LOCAL => (transfer.SourceVirtualAddress, false),
+        Direction::DXGK_MEMORY_TRANSFER_LOCAL_TO_LOCAL => return Ok(()),
+        _ => {
+            why(2);
+            return Err(());
+        }
+    };
+    if unsafe { transfer.Flags.__bindgen_anon_1.Flags } != 0 {
+        why(3);
+        return Err(());
+    }
+    let Some(pages) = adapter.paging_pte_shadow.resolve(passive, system_va, size) else {
+        why(4);
+        return Err(());
+    };
+    // `NvPgGpu` 0x8: the pages are the ones the CPU path visits (`for_each_paging_system_run`),
+    // the first one holding `system_va`.
+    if allocation.native_segment != 0
+        && crate::virtio::native_memory::gpu_wants(pgg::Op::VirtualTransfer, size)
+        && crate::virtio::native_memory::gpu_paging(
+            passive,
+            adapter,
+            pgg::Op::VirtualTransfer,
+            allocation.native_id,
+            offset,
+            size,
+            if to_system {
+                pgg::Work::FromVideo
+            } else {
+                pgg::Work::ToVideo
+            },
+            Some(crate::virtio::native_memory::GpuSystem {
+                pfns: &pages,
+                start: system_va & 0xfff,
+            }),
+        )
+    {
+        virtual_transfer_checked(passive, adapter, allocation, offset, size, &pages, system_va, to_system, pck::path::GPU);
+        return Ok(());
+    }
+    crate::virtio::native_memory::note_cpu_paging(size);
+    let copied = unsafe {
+        crate::virtio::native_memory::with_cpu_range_paging(
+            passive,
+            adapter,
+            allocation.native_id,
+            offset,
+            size,
+            |relative, native, len| {
+                let Some(system_address) = system_va.checked_add(relative) else {
+                    return false;
+                };
+                let page_index = (system_va & 0xFFF)
+                    .checked_add(relative)
+                    .map(|offset| offset >> 12)
+                    .and_then(|index| usize::try_from(index).ok());
+                let Some(pages) = page_index.and_then(|index| pages.get(index..)) else {
+                    return false;
+                };
+                for_each_paging_system_run(
+                    passive,
+                    pages,
+                    system_address,
+                    len,
+                    |system, run_offset, run_size| {
+                        let (Ok(run_offset), Ok(run_size)) =
+                            (usize::try_from(run_offset), usize::try_from(run_size))
+                        else {
+                            return false;
+                        };
+                        let native = native.add(run_offset);
+                        if to_system {
+                            core::ptr::copy_nonoverlapping(native, system, run_size);
+                        } else {
+                            core::ptr::copy_nonoverlapping(system, native, run_size);
+                        }
+                        true
+                    },
+                )
+            },
+        )
+    }
+    .map_err(|_| why(5))?;
+    if copied {
+        virtual_transfer_checked(passive, adapter, allocation, offset, size, &pages, system_va, to_system, pck::path::CPU);
+        Ok(())
+    } else {
+        why(6);
+        Err(())
+    }
+}
+
 #[inline(never)]
 unsafe fn build_paging_buffer_inner(
     h_adapter: *mut c_void,
@@ -2209,15 +3250,18 @@ unsafe fn build_paging_buffer_inner(
 
     // SAFETY: dxgkrnl hands back our AdapterContext as the miniport context.
     let adapter = unsafe { &*(h_adapter as *const AdapterContext) };
+    // ONE union read for the whole DDI.
+    // SAFETY: `Operation` describes the arm dxgkrnl initialised — the DDI
+    // contract, now relied on in exactly one place instead of six.
+    let operation = unsafe { PagingOperation::parse(args) };
+    if let Some(status) = unsafe { native_paging_operation(adapter, &operation, note) } {
+        return status;
+    }
     let Some(bar) = adapter.bar_segment() else {
         note.result = dl::paging_result::NO_BAR;
         return STATUS_SUCCESS; // BAR segment inactive → pure null engine
     };
 
-    // ONE union read for the whole DDI.
-    // SAFETY: `Operation` describes the arm dxgkrnl initialised — the DDI
-    // contract, now relied on in exactly one place instead of six.
-    let operation = unsafe { PagingOperation::parse(args) };
     note.describe(&operation, bar.seg_id);
 
     // Placement harvest is DISPATCH-safe (atomic store only) — no IRQL gate.
@@ -2452,7 +3496,10 @@ unsafe fn build_paging_buffer_inner(
         // Exhaustive: `is_content_op` already returned for these, so reaching
         // them here is impossible. Named rather than wildcarded so a new variant
         // is a compile error in BOTH places at once.
-        PagingOperation::UpdatePageTable(_) | PagingOperation::Other => PagingOpOutcome::NotOurs,
+        PagingOperation::UpdatePageTable(_)
+        | PagingOperation::NotifyResidency(_)
+        | PagingOperation::FlushTlb
+        | PagingOperation::Other => PagingOpOutcome::NotOurs,
     };
     // Counted BEFORE the mirror below, so the registry carries it on this op.
     if matches!(outcome, PagingOpOutcome::Failed(_)) {
