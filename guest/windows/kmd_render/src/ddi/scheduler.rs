@@ -383,6 +383,13 @@ pub(crate) unsafe fn create_native_queue(
     let parsed = match native_format::parse_queue_private(private) {
         Ok(parsed) => parsed,
         Err(error) => {
+            // The words the parser judged, for a record no capture has shown yet.
+            let word = |at| helios_kmd_logic::rm_client::get32(private, at).unwrap_or(0);
+            crate::diag::record_named_bytes(b"NvQPrvRing", word(0x20));
+            crate::diag::record_named_bytes(b"NvQPrvAl", word(0x24));
+            crate::diag::record_named_bytes(b"NvQPrv10", word(0x10));
+            crate::diag::record_named_bytes(b"NvQPrv1c", word(0x1c));
+            crate::diag::record_named_bytes(b"NvQPrvVaL", word(0x18));
             return queue_refused(
                 qr::PRIVATE,
                 private_code(error),

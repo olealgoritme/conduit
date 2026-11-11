@@ -369,6 +369,9 @@ pub(crate) fn publish_counters() {
     crate::diag::record_named_bytes(b"HwsQFull", r(&QUEUE_FULL));
     crate::diag::record_named_bytes(b"HwsSubmit", r(&SUBMITS));
     crate::diag::record_named_bytes(b"HwsSubmitFail", r(&SUBMIT_FAIL));
+    crate::diag::record_named_bytes(b"HwsPrSub", r(&PRESENT_SUBMITS));
+    crate::diag::record_named_bytes(b"HwsPrDone", r(&PRESENT_DONE));
+    crate::diag::record_named_bytes(b"HwsPrNow", r(&PRESENT_NOW));
     crate::diag::record_named_bytes(b"HwsMfSig", r(&MF_SIGNALS));
     crate::diag::record_named_bytes(b"HwsPollTick", r(&POLL_TICKS));
     crate::diag::record_named_bytes(b"HwsSuspend", r(&SUSPENDS));
@@ -608,7 +611,14 @@ struct Slot {
     cover: Cover,
     /// Submissions not seen complete yet, for the latency histograms.
     inflight: Inflight<INFLIGHT>,
+    /// Present submissions (`Flags.Present`: the DMA buffer is the one DxgkDdiPresent
+    /// wrote, nothing for the channel to run) whose progress fence id this KMD writes
+    /// once the queue's earlier work is done ([`settle`]). 0 = free.
+    presents: [u64; PRESENTS],
 }
+
+/// Present submissions one queue may have waiting at once; one more completes at once.
+const PRESENTS: usize = 8;
 
 /// Submissions timed per queue at once (more are counted `HwsLatUntimed`).
 const INFLIGHT: usize = 16;
@@ -620,7 +630,60 @@ const EMPTY: Slot = Slot {
     watch: Watch::new(),
     cover: Cover::new(),
     inflight: Inflight::new(),
+    presents: [0; PRESENTS],
 };
+
+static PRESENT_SUBMITS: AtomicU32 = AtomicU32::new(0);
+static PRESENT_DONE: AtomicU32 = AtomicU32::new(0);
+static PRESENT_NOW: AtomicU32 = AtomicU32::new(0);
+
+/// The queue's progress fence, after completing every waiting Present submission
+/// whose predecessor is done: the GPU writes the ids of the UMD's submissions, in
+/// order, and this KMD writes a Present's id once the fence shows the id before it.
+/// Under the registry lock; atomics only.
+fn settle(slot: &mut Slot, queue: &NativeQueue) -> u64 {
+    let mut value = queue.read_progress();
+    loop {
+        let Some(at) = (0..PRESENTS)
+            .filter(|&i| slot.presents[i] != 0)
+            .min_by_key(|&i| slot.presents[i])
+        else {
+            return value;
+        };
+        let id = slot.presents[at];
+        if value.saturating_add(1) < id {
+            return value;
+        }
+        slot.presents[at] = 0;
+        queue.complete_progress(id);
+        PRESENT_DONE.fetch_add(1, Ordering::Relaxed);
+        value = value.max(id);
+    }
+}
+
+/// A Present submission on a native queue (`Flags.Present`): the copy is the Present
+/// path's own, so the channel gets nothing and the submission's progress fence id is
+/// written by [`settle`] after the queue's earlier submissions. <= DISPATCH.
+fn submit_present(adapter: &AdapterContext, queue: &NativeQueue, fence_id: u64) {
+    PRESENT_SUBMITS.fetch_add(1, Ordering::Relaxed);
+    let key = queue as *const NativeQueue as usize;
+    let waiting = {
+        let mut guard = REGISTRY.lock();
+        guard
+            .slots
+            .iter_mut()
+            .find(|slot| slot.queue == key)
+            .and_then(|slot| slot.presents.iter_mut().find(|id| **id == 0))
+            .map(|free| *free = fence_id)
+            .is_some()
+    };
+    if !waiting {
+        // Not registered, or its table is full: complete it here.
+        PRESENT_NOW.fetch_add(1, Ordering::Relaxed);
+        queue.complete_progress(fence_id);
+    }
+    after_submit(adapter, key, Some(fence_id), 0);
+}
 
 struct Registry {
     slots: [Slot; MAX_QUEUES],
@@ -692,6 +755,7 @@ fn register_queue(queue: &NativeQueue, node: u32) -> bool {
                 watch: Watch::new(),
                 cover: Cover::new(),
                 inflight: Inflight::new(),
+                presents: [0; PRESENTS],
             };
             true
         }
@@ -890,7 +954,7 @@ pub(crate) fn poll_tick(adapter: &AdapterContext) {
             // SAFETY: a registered queue is live until DestroyHwQueue removed its
             // slot under this lock (see `Slot::queue`).
             let queue = unsafe { &*(slot.queue as *const NativeQueue) };
-            let value = queue.read_progress();
+            let value = settle(slot, queue);
             if slot.progress.observe(value) {
                 nodes |= node_bit(slot.node);
                 progressed = true;
@@ -1297,7 +1361,7 @@ fn after_submit(adapter: &AdapterContext, queue: usize, fence_id: Option<u64>, e
             }
             // SAFETY: as in `poll_tick`.
             let q = unsafe { &*(slot.queue as *const NativeQueue) };
-            let value = q.read_progress();
+            let value = settle(slot, q);
             if slot.progress.observe(value) {
                 nodes |= node_bit(slot.node);
                 note_progress(slot, &mut r.lat, Detect::Submit, value, now);
@@ -1332,7 +1396,7 @@ pub(crate) fn event_scan(adapter: &AdapterContext) {
         for slot in r.slots.iter_mut().filter(|slot| slot.queue != 0) {
             // SAFETY: as in `poll_tick`.
             let queue = unsafe { &*(slot.queue as *const NativeQueue) };
-            let value = queue.read_progress();
+            let value = settle(slot, queue);
             if slot.progress.observe(value) {
                 nodes |= node_bit(slot.node);
                 note_progress(slot, &mut r.lat, Detect::Event, value, now);
@@ -1727,6 +1791,17 @@ pub unsafe extern "C" fn dxgkddi_submit_command_to_hw_queue(
         // SAFETY: dxgkrnl's live args (this call) and a live queue.
         unsafe { submit_soft_legacy(adapter, queue, submit, cpu as usize) };
         return STATUS_SUCCESS;
+    }
+    // A Present submission (DXGK_SUBMITCOMMANDFLAGS.Present, bit 1): its private data is
+    // DxgkDdiPresent's, not a UMD record, and it advances no GPFIFO.
+    // SAFETY: Value is the plain UINT arm of DXGK_SUBMITCOMMANDFLAGS.
+    if unsafe { submit.Flags.__bindgen_anon_1.Value } & 0x2 != 0 {
+        if let Some(queue) = unsafe { super::scheduler::native_queue_of(submit.hHwQueue) } {
+            // SAFETY: our adapter (the queue is ours).
+            let adapter = unsafe { &*(h_adapter as *const AdapterContext) };
+            submit_present(adapter, queue, submit.HwQueueProgressFenceId);
+            return STATUS_SUCCESS;
+        }
     }
     // The native path's own cost, DDI entry to the doorbell (`HwsSubAvgNs`).
     let entered = crate::adapter::foreign_scanout::now_100ns();
