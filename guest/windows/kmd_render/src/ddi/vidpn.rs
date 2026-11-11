@@ -1616,6 +1616,98 @@ pub unsafe fn commit_vidpn(adapter: &AdapterContext, arg: *const DXGKARG_COMMITV
     STATUS_SUCCESS
 }
 
+/// `NvSetTim` (NVIDIA personality, default 1): register `DxgkDdiSetTimingsFromVidPn`.
+/// Read once, at DriverEntry.
+pub(crate) fn set_timings_knob() -> bool {
+    crate::diag::read_config_dword(crate::diag::KnobName::new(b"NvSetTim"), 1) != 0
+}
+
+/// `DXGK_CONNECTION_STATUS::ConnectionStatusLinkConfigurationSucceeded`.
+const LINK_CONFIGURATION_SUCCEEDED: u32 = 14;
+/// `DXGK_SET_TIMING_PATH_INFO.Input.Active` (after the two `VidPnPathUpdates` bits).
+const SET_TIMING_ACTIVE: u32 = 1 << 2;
+
+static SET_TIMINGS_CALLS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// The id of the last connection change reported on the target.
+static LINK_CHANGE_ID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// `DxgkDdiSetTimingsFromVidPn`: the WDDM 2.2+ mode set, in place of `CommitVidPn`.
+///
+/// dxgkrnl takes its modern mode-set path only when this DDI exists
+/// (`DriverSupportSetTimingsFromVidPn`: WDDM >= 2.2, this slot and the MPO3 flip
+/// slot). On the legacy path the primary DWM passes to `SetDisplayMode` becomes the
+/// displayed primary, and DWM destroying it right after clears the device's primary
+/// state: every `PresentMultiPlaneOverlay3` is then refused (0xC01E0019) and nothing
+/// DWM composes is ever shown.
+///
+/// There is no timing hardware to program: an active path records the pinned source
+/// mode and refresh rate exactly as `CommitVidPn` does, and reports a new
+/// `LinkConfigurationSucceeded` connection change on the target; an inactive path
+/// reports the last change again.
+///
+/// Counters: `VpSt` calls, `VpStF` the last path's input flags, `VpStId` the last
+/// connection change id.
+///
+/// # Safety
+/// `arg` points to a valid `DXGKARG_SETTIMINGSFROMVIDPN` for the call (PASSIVE).
+pub unsafe fn set_timings_from_vidpn(
+    adapter: &AdapterContext,
+    arg: *mut DXGKARG_SETTIMINGSFROMVIDPN,
+) -> NTSTATUS {
+    use core::sync::atomic::Ordering;
+    if arg.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    // SAFETY: valid per fn contract.
+    let a = unsafe { &*arg };
+    rec(b"VpSt", SET_TIMINGS_CALLS.fetch_add(1, Ordering::Relaxed) + 1);
+    if !a.pResultsFlags.is_null() {
+        // No connector appeared or went away in this call.
+        // SAFETY: a valid out-pointer for the call; the structure is one UINT.
+        unsafe { (a.pResultsFlags as *mut u32).write(0) };
+    }
+    if a.pSetTimingPathInfo.is_null() {
+        return STATUS_SUCCESS;
+    }
+    for i in 0..a.PathCount as usize {
+        // SAFETY: `PathCount` entries per the DDI contract.
+        let path = unsafe { a.pSetTimingPathInfo.add(i) };
+        // SAFETY: the unions are plain UINTs (`InputFlags`, `OutputFlags`).
+        let input = unsafe { (core::ptr::addr_of!((*path).__bindgen_anon_2) as *const u32).read() };
+        rec(b"VpStF", input);
+        // SAFETY: as above; no CheckMPO is needed for this path.
+        unsafe { (core::ptr::addr_of_mut!((*path).__bindgen_anon_3) as *mut u32).write(0) };
+        // SAFETY: `path` is valid for the call.
+        let target = unsafe { (*path).VidPnTargetId };
+        if input & SET_TIMING_ACTIVE != 0 && target == CHILD_UID {
+            // SAFETY: an all-zero DXGKARG_COMMITVIDPN is a valid value (handles and integers).
+            let mut commit: DXGKARG_COMMITVIDPN = unsafe { core::mem::zeroed() };
+            commit.hFunctionalVidPn = a.hFunctionalVidPn;
+            commit.AffectedVidPnSourceId = 0;
+            // SAFETY: a valid commit argument for the duration of this call.
+            let status = unsafe { commit_vidpn(adapter, &commit) };
+            if !ok(status) {
+                return status;
+            }
+            let id = LINK_CHANGE_ID.fetch_add(1, Ordering::Relaxed) + 1;
+            rec(b"VpStId", id as u32);
+        }
+        // `TargetState` (DXGK_CONNECTION_CHANGE): a u64 ConnectionChangeId, then one
+        // u32 bitfield, TargetId:24 | ConnectionStatus:4. dxgkrnl validates it
+        // (`CheckDdiSetTimingsViolationOnPathInfo`): the id must be non-zero and the
+        // status a link-configuration one, `Succeeded` for a mode change. The link
+        // of this virtual target is always configured.
+        // SAFETY: the structure starts with a u64 and a u32.
+        unsafe {
+            let state = core::ptr::addr_of_mut!((*path).TargetState) as *mut u8;
+            (state as *mut u64).write_unaligned(LINK_CHANGE_ID.load(Ordering::Relaxed).max(1));
+            (state.add(8) as *mut u32)
+                .write_unaligned((target & 0x00ff_ffff) | (LINK_CONFIGURATION_SUCCEEDED << 24));
+        }
+    }
+    STATUS_SUCCESS
+}
+
 /// The refresh rate, in millihertz, of `target_id`'s pinned target mode in this
 /// VidPn, or `None` if no target mode is pinned or it carries no usable rate.
 ///

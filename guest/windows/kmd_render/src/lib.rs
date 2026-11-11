@@ -241,6 +241,11 @@ fn build_ddi_table() -> DRIVER_INITIALIZATION_DATA {
                 Some(ddi::mpo3::check_multi_plane_overlay_support3);
             data.DxgkDdiSetVidPnSourceAddressWithMultiPlaneOverlay3 =
                 Some(ddi::mpo3::set_vidpn_source_address_with_multi_plane_overlay3);
+            // The WDDM 2.2+ mode set: without it dxgkrnl takes its legacy mode-set path,
+            // on which DWM's MPO3 presents are refused (`vidpn::set_timings_from_vidpn`).
+            if ddi::vidpn::set_timings_knob() {
+                data.DxgkDdiSetTimingsFromVidPn = Some(ddi::display::dxgkddi_set_timings_from_vidpn);
+            }
             if ddi::mpo3::part(ddi::mpo3::PART_HWFQ) {
                 data.DxgkDdiSetFlipQueueLogBuffer = Some(ddi::hwfq::set_flip_queue_log_buffer);
                 data.DxgkDdiUpdateFlipQueueLog = Some(ddi::hwfq::update_flip_queue_log);
@@ -271,9 +276,11 @@ fn build_ddi_table() -> DRIVER_INITIALIZATION_DATA {
 /// set NVIDIA's 610.88 KMD registers: context-based (`CreateContext` hands the
 /// hHwContext to `CreateHwQueue`), so `CreateHwContext`, `DestroyHwContext` and
 /// `SwitchToHwContextList` stay NULL. `DestroyContext` keeps the shared entry,
-/// which tears a native TSG down first. `PresentToHwQueue` is not in NVIDIA's
-/// table either, and ours only refuses, so it is left NULL here: a registered
-/// refusing slot would invite dxgkrnl to route HW-queue presents into a failure.
+/// which tears a native TSG down first. NVIDIA does register `PresentToHwQueue`
+/// and serves the GDI context's Blt presents through it; ours only refuses, so
+/// the slot stays NULL (dxgkrnl then fails such a present with
+/// STATUS_NOT_IMPLEMENTED). It must be implemented before a GDI/CDD context
+/// gets a HW queue (`GdiAccel`).
 fn register_nvidia_hws(data: &mut DRIVER_INITIALIZATION_DATA) {
     use ddi::hws;
     data.DxgkDdiPresentToHwQueue = None;
