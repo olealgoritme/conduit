@@ -658,6 +658,10 @@ const NVIDIA_UMD_PRIVATE: &[u8; 50_600] = include_bytes!("nvidia_umd_private.bin
 /// (D3DKMTOpenAdapterFromLuid), so it must be this adapter's.
 const UMD_PRIVATE_LUID_AT: usize = 0xc45c;
 
+/// Where the template carries the calling process id (u32): NVIDIA's KMD writes the
+/// caller's there on every query; the template holds its capture process's 12300.
+const UMD_PRIVATE_PID_AT: usize = 0x741f;
+
 /// This adapter's LUID from `DxgkDdiStartDevice` (LowPart | HighPart << 32).
 static ADAPTER_LUID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
@@ -684,6 +688,14 @@ unsafe fn query_umdriver_private(args: &DXGKARG_QUERYADAPTERINFO) -> NTSTATUS {
             NVIDIA_UMD_PRIVATE.as_ptr(),
             args.pOutputData as *mut u8,
             NVIDIA_UMD_PRIVATE.len(),
+        );
+    }
+    // SAFETY: inside the template-sized prefix checked above; `PsGetCurrentProcessId` has
+    // no preconditions at PASSIVE_LEVEL, where this query runs in the caller's context.
+    unsafe {
+        core::ptr::write_unaligned(
+            (args.pOutputData as *mut u8).add(UMD_PRIVATE_PID_AT) as *mut u32,
+            wdk_sys::ntddk::PsGetCurrentProcessId() as usize as u32,
         );
     }
     let luid = ADAPTER_LUID.load(core::sync::atomic::Ordering::Relaxed);
@@ -1161,16 +1173,17 @@ unsafe fn write_aperture_descriptor(
     unsafe { spec.write_into_v4(seg) };
 }
 
-/// Knob `NvBudgetGrp` (REG_DWORD, default 1, NVIDIA personality only): the VidMm budget
+/// Knob `NvBudgetGrp` (REG_DWORD, default 0, NVIDIA personality only): the VidMm budget
 /// groups. dxgmms2 puts a segment in budget group 0 (LOCAL) only with `LocalBudgetGroup`, in
 /// group 1 (NON_LOCAL) only with `NonLocalBudgetGroup`, and otherwise in none. With no
 /// `NonLocalBudgetGroup` segment at all it makes LOCAL a system-memory group (half of the
 /// guest's RAM) and never initialises NON_LOCAL, so DXGI reports a LOCAL budget unrelated to
 /// the card and a NON_LOCAL budget of 0; and `VerifyBudgetGroups` refuses an allocation whose
 /// segment set mixes grouped and ungrouped segments, so the flags go on every segment
-/// together. On: the aperture is `NonLocalBudgetGroup`, the memory segment (BAR, or the
-/// paging-RAM segment of the `BarSegMode=0` shape) `LocalBudgetGroup`. 0 restores the old
-/// flags. Read at each QUERYSEGMENT4 (AddAdapter); `NvBudgetGrpOn` mirrors the effective
+/// together. 1: the aperture is `NonLocalBudgetGroup`, the memory segment (BAR, or the
+/// paging-RAM segment of the `BarSegMode=0` shape) `LocalBudgetGroup`. 0 keeps the ungrouped
+/// flags. Off by default: the memory segment's flags reach VidMm only with `SegStride`, and
+/// without them LOCAL has size 0 and dxgmms2's commit telemetry divides by it (0x7E). Read at each QUERYSEGMENT4 (AddAdapter); `NvBudgetGrpOn` mirrors the effective
 /// value (written only in the NVIDIA personality). A rejected flag would fail AddAdapter
 /// (Code 43): set the value to 0 offline to recover.
 ///
@@ -1178,14 +1191,14 @@ unsafe fn write_aperture_descriptor(
 /// personality reports WDDM 3.2, which dxgkrnl queries with QUERYSEGMENT4 only.
 ///
 /// Split test values: 2 = only the aperture's `NonLocalBudgetGroup`, 4 = only the memory
-/// segment's `LocalBudgetGroup` (each half alone, to find which one hangs the guest).
+/// segment's `LocalBudgetGroup` (each half alone).
 /// `NvBudgetGrpOn` records bit 0 = aperture group, bit 1 = memory group.
 /// Returns (aperture group, memory segment group).
 fn nv_budget_groups() -> (bool, bool) {
     if !crate::ddi::wddm_surface::nvidia_selected() {
         return (false, false);
     }
-    let knob = crate::diag::read_config_dword(crate::diag::KnobName::new(b"NvBudgetGrp"), 1);
+    let knob = crate::diag::read_config_dword(crate::diag::KnobName::new(b"NvBudgetGrp"), 0);
     let (aperture, memory) = match knob {
         0 => (false, false),
         2 => (true, false),
@@ -1284,6 +1297,24 @@ unsafe fn write_bar_knob_descriptor(
     unsafe { spec.write_into_v4(seg) };
 }
 
+/// The element size of dxgkrnl's `pSegmentDescriptor` array.
+///
+/// On the descriptor pass the caller states it in `SegmentDescriptorStride`; a value at
+/// least as large as the WDK structure (and small enough to be a structure size) is used
+/// as it is. The count pass passes 0, and so may an older dxgkrnl: both get the WDK size.
+fn segment_descriptor_stride(caller_stride: usize, descriptor_pass: bool) -> usize {
+    let own = size_of::<DXGK_SEGMENTDESCRIPTOR4>();
+    // `SegStride` (REG_DWORD, default 0): 1 places the descriptors with the caller's stride.
+    // Off by default: with the memory segment's real flags VidMm calls MapCpuHostAperture
+    // for native allocations, and a refusal there is a 0x10E bugcheck.
+    let honour = crate::diag::read_config_dword(crate::diag::KnobName::new(b"SegStride"), 0) != 0;
+    if honour && descriptor_pass && (own..=4 * own).contains(&caller_stride) {
+        caller_stride
+    } else {
+        own
+    }
+}
+
 unsafe fn query_segments(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTERINFO) -> NTSTATUS {
     if (args.OutputDataSize as usize) < size_of::<DXGK_QUERYSEGMENTOUT4>() {
         return STATUS_BUFFER_TOO_SMALL;
@@ -1302,6 +1333,12 @@ unsafe fn query_segments(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTERIN
     // sufficient size, checked above.
     let out = unsafe { &mut *(args.pOutputData as *mut DXGK_QUERYSEGMENTOUT4) };
     let descriptors = out.pSegmentDescriptor;
+    // `SegmentDescriptorStride` is an INPUT on the descriptor pass: dxgmms2 allocates the
+    // array with its own element size, passes that size here and walks the array with it,
+    // whatever the driver writes back. Its element (0x68 bytes on 26100.9711) is larger
+    // than the WDK's `DXGK_SEGMENTDESCRIPTOR4` (0x60), so every descriptor after the first
+    // must be placed with the caller's stride, not with `size_of`.
+    let caller_stride = out.SegmentDescriptorStride as usize;
     unsafe {
         core::ptr::write_bytes(
             out as *mut _ as *mut u8,
@@ -1311,8 +1348,9 @@ unsafe fn query_segments(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTERIN
     }
 
     out.pSegmentDescriptor = descriptors;
-    let stride = size_of::<DXGK_SEGMENTDESCRIPTOR4>();
+    let stride = segment_descriptor_stride(caller_stride, !descriptors.is_null());
     out.SegmentDescriptorStride = stride as u64;
+    crate::diag::record_named_bytes(b"SegStrideEf", stride as u32);
     out.PagingBufferSize = PAGING_BUFFER_BYTES_V4;
     out.PagingBufferPrivateDataSize = 0;
 

@@ -366,8 +366,10 @@ impl Io<'_> {
         data[0..4].copy_from_slice(&client.root.to_le_bytes());
         data[4..8].copy_from_slice(&nd::H_DEVICE.to_le_bytes());
         let mut response = [0u8; 512];
+        // NV_ESC_RM_IDLE_CHANNELS is a control-device ioctl (RM escape.c:
+        // NV_CTL_DEVICE_ONLY); on the GPU device fd it fails with EINVAL.
         let n = self.exchange(
-            client.gpu,
+            client.ctl,
             rc::nv_cmd(0x41, NVOS30_BYTES as u32),
             &data,
             &[],

@@ -16,10 +16,11 @@
 //! `0` every tick, `u64::MAX` none, otherwise once the last logged PresentId reaches it.
 
 /// Flips the queue holds; `MaxHwQueuedFlips` must stay below this.
-pub const CAPACITY: usize = 16;
+pub const CAPACITY: usize = 32;
 
-/// The `MaxHwQueuedFlips` the driver reports when dxgkrnl enables the feature.
-pub const MAX_HW_QUEUED_FLIPS: u32 = 8;
+/// The `MaxHwQueuedFlips` the driver reports when dxgkrnl enables the feature
+/// (NVIDIA's KMD reports 16).
+pub const MAX_HW_QUEUED_FLIPS: u32 = 16;
 
 /// `DXGK_FEATURE_HWFLIPQUEUE` (`DXGK_FEATURE_ID` 1).
 pub const FEATURE_HWFLIPQUEUE: i32 = 1;

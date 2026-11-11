@@ -118,7 +118,8 @@ pub unsafe fn fill_gpummu_caps(args: &DXGKARG_QUERYADAPTERINFO) -> NTSTATUS {
 
     // No optional capability bits in the default personality. NVIDIA's personality
     // advertises ZeroInPteSupported (`zero_pte_supported`).
-    caps.__bindgen_anon_1.Value = if zero_pte_supported() { GPUMMU_ZERO_IN_PTE } else { 0 };
+    caps.__bindgen_anon_1.Value = (if zero_pte_supported() { GPUMMU_ZERO_IN_PTE } else { 0 })
+        | (if explicit_invalidation() { GPUMMU_EXPLICIT_INVALIDATION } else { 0 });
     // GPU_PHYSICAL: page-table updates come through BuildPagingBuffer
     // UPDATE_PAGE_TABLE and are retired by the null engine. CPU_VIRTUAL was proven
     // wrong by KD: it crashes in VidMm's CPU-visible-address resolver before our
@@ -154,6 +155,25 @@ fn zero_pte_supported() -> bool {
     }
     let on = crate::diag::read_config_dword(crate::diag::KnobName::new(b"NvZeroPte"), 1) != 0;
     crate::diag::record_named_bytes(b"NvZeroPteOn", u32::from(on));
+    on
+}
+
+/// `DXGK_GPUMMUCAPS.Flags` bit 3, `ExplicitPageTableInvalidation`.
+const GPUMMU_EXPLICIT_INVALIDATION: u32 = 0x8;
+
+/// `NvPtExplicit` (default 0, NVIDIA personality only): advertise
+/// `ExplicitPageTableInvalidation`, as NVIDIA's KMD does (GPUMMUCAPS 0x2dd). VidMm then
+/// invalidates every entry of a page table or directory through UpdatePageTable
+/// (Repeat, NotifyEviction) before it evicts or frees the table, instead of dropping
+/// tables that still hold valid entries. Leaf updates are this driver's only view of a
+/// process's VA space, so without the capability a mapping can outlive its page table
+/// in the RM mirror. `NvPtExplicitOn` mirrors the value.
+fn explicit_invalidation() -> bool {
+    if !crate::virtio::nvda::enabled() {
+        return false;
+    }
+    let on = crate::diag::read_config_dword(crate::diag::KnobName::new(b"NvPtExplicit"), 0) != 0;
+    crate::diag::record_named_bytes(b"NvPtExplicitOn", u32::from(on));
     on
 }
 

@@ -374,7 +374,13 @@ impl AdapterKnobs {
                 knobs::HW_CURSOR,
                 helios_kmd_logic::hw_cursor::knob_default_for(indep_flip),
             ),
-            cross_adapter: read_config_dword(knobs::CROSS_ADAPT_CAPS, 0) != 0,
+            // NVIDIA's KMD reports `MemoryManagementCaps.CrossAdapterResource`
+            // (DXGK_DRIVERCAPS 0x4e71), and without it legacy BLT-model swapchains
+            // are occluded, so the NVIDIA personality defaults it on.
+            cross_adapter: read_config_dword(
+                knobs::CROSS_ADAPT_CAPS,
+                u32::from(crate::ddi::wddm_surface::nvidia_selected()),
+            ) != 0,
             vidmm_caps_x: read_config_dword(knobs::VIDMM_CAPS_EXTRA, 0),
             bar_seg_flags: read_config_dword(knobs::BAR_SEG_FLAGS, 0x1C),
             bar_seg_base_mb: read_config_dword(knobs::BAR_SEG_BASE_MB, 0),
