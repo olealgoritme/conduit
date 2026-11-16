@@ -29,9 +29,11 @@ pub mod v535_129_03;
 pub mod v565_77_00;
 pub mod v580_178_04;
 pub mod v595_104_02;
+pub mod v595_112_07;
 pub mod v595_44_13;
 pub mod v595_44_14;
 pub mod v595_44_15;
+pub mod v595_44_16;
 pub mod v595_45_04;
 pub mod v595_58_03;
 pub mod v595_71_05;
@@ -43,7 +45,9 @@ pub mod v610_43_02;
 pub mod v610_43_03;
 pub mod v610_57_04;
 pub mod v615_71_09;
+pub mod v615_71_10;
 pub mod v615_78_08;
+pub mod v620_70_06;
 
 use crate::version::DriverVersion;
 
@@ -223,6 +227,10 @@ static PROFILES: &[Profile] = &[
         layout: || v595_44_15::LAYOUT,
     },
     Profile {
+        version: DriverVersion::new(595, 44, 16),
+        layout: || v595_44_16::LAYOUT,
+    },
+    Profile {
         version: DriverVersion::new(595, 45, 4),
         layout: || v595_45_04::LAYOUT,
     },
@@ -255,6 +263,10 @@ static PROFILES: &[Profile] = &[
         layout: || v595_104_02::LAYOUT,
     },
     Profile {
+        version: DriverVersion::new(595, 112, 7),
+        layout: || v595_112_07::LAYOUT,
+    },
+    Profile {
         version: DriverVersion::new(610, 43, 2),
         layout: || v610_43_02::LAYOUT,
     },
@@ -271,8 +283,16 @@ static PROFILES: &[Profile] = &[
         layout: || v615_71_09::LAYOUT,
     },
     Profile {
+        version: DriverVersion::new(615, 71, 10),
+        layout: || v615_71_10::LAYOUT,
+    },
+    Profile {
         version: DriverVersion::new(615, 78, 8),
         layout: || v615_78_08::LAYOUT,
+    },
+    Profile {
+        version: DriverVersion::new(620, 70, 6),
+        layout: || v620_70_06::LAYOUT,
     },
 ];
 
