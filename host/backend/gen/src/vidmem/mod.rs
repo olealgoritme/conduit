@@ -50,6 +50,7 @@ pub mod v610_43_03;
 pub mod v610_57_04;
 pub mod v615_71_09;
 pub mod v615_78_08;
+pub mod v620_70_06;
 
 use crate::version::DriverVersion;
 
@@ -198,6 +199,7 @@ static PROFILES: &[(DriverVersion, &Layout)] = &[
     (DriverVersion::new(610, 57, 4), &v610_57_04::LAYOUT),
     (DriverVersion::new(615, 71, 9), &v615_71_09::LAYOUT),
     (DriverVersion::new(615, 78, 8), &v615_78_08::LAYOUT),
+    (DriverVersion::new(620, 70, 6), &v620_70_06::LAYOUT),
 ];
 
 /// The layout for `v`: its own, or the nearest older release's.

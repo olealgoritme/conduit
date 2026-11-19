@@ -47,6 +47,7 @@ pub mod v610_43_03;
 pub mod v610_57_04;
 pub mod v615_71_09;
 pub mod v615_78_08;
+pub mod v620_70_06;
 
 use crate::version::DriverVersion;
 
@@ -387,6 +388,14 @@ static PROFILES: &[Profile] = &[
         catch_all: || v615_78_08::CATCH_ALL,
         gss: || v615_78_08::GSS,
     },
+    Profile {
+        version: DriverVersion::new(620, 70, 6),
+        ctrl: || v620_70_06::CTRL,
+        class: || v620_70_06::CLASS,
+        deprec: || v620_70_06::DEPREC,
+        catch_all: || v620_70_06::CATCH_ALL,
+        gss: || v620_70_06::GSS,
+    },
 ];
 
 /// The allowlist for one host release.
@@ -638,8 +647,7 @@ mod tests {
     fn an_unknown_release_falls_back_and_says_so() {
         let sel = select(v(615, 999, 0)).unwrap();
         assert!(!sel.exact);
-        let newest = PROFILES.last().unwrap();
-        assert!(std::ptr::eq(sel.ctrl, (newest.ctrl)()));
+        assert!(std::ptr::eq(sel.ctrl, v615_78_08::CTRL));
         assert!(select(v(500, 0, 0)).is_none());
     }
 
@@ -649,6 +657,7 @@ mod tests {
             (v(610, 57, 4), 20),
             (v(615, 71, 9), 28),
             (v(615, 78, 8), 28),
+            (v(620, 70, 6), 32),
         ] {
             let sel = select(version).unwrap();
             assert_eq!(sel.class_entry(0xa06c).unwrap().params_size, size);

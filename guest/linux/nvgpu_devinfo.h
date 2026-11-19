@@ -75,6 +75,7 @@ struct nvgpu_devinfo_layout {
 #include "devinfo/v595_71_05.h"
 #include "devinfo/v610_57_04.h"
 #include "devinfo/v615_71_09.h"
+#include "devinfo/v620_70_06.h"
 
 /* Every release's; a size names one layout, so the first of a size stands for
  * all of them (a test in the backend's `abi` crate holds the releases to it). */
@@ -83,6 +84,7 @@ static const struct nvgpu_devinfo_layout *const nvgpu_devinfo_layouts[] = {
 	&nvgpu_devinfo_v580_178_04, &nvgpu_devinfo_v595_104_02,
 	&nvgpu_devinfo_v595_71_05,  &nvgpu_devinfo_v610_57_04,
 	&nvgpu_devinfo_v615_71_09,
+	&nvgpu_devinfo_v620_70_06,
 };
 
 /* The layout whose struct is exactly `size` bytes, or NULL. */
