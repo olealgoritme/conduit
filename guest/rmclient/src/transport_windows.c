@@ -1198,14 +1198,14 @@ static int win_ioctl(void *vctx, int fd, uint32_t nr, void *arg, uint32_t size)
         {
             NVOS64_PARAMETERS *p = arg;
             NVOS64_PARAMETERS wire;
-            struct crm_channel_group_615 params;
-            if (crm_wire_channel_group_prepare(p, host_alloc_param_size(c, p->hClass),
-                                                &wire, &params)) {
-                const int r = ioctl_wire(c, fd, nr, &wire, sizeof(wire), &params,
-                                          sizeof(params), 0, 0);
+            struct crm_alloc_scratch params;
+            if (crm_wire_alloc_prepare(p, host_alloc_param_size(c, p->hClass),
+                                       &wire, &params)) {
+                const int r = ioctl_wire(c, fd, nr, &wire, sizeof(wire), params.bytes,
+                                         wire.paramsSize, 0, 0);
                 /* Like every other escape, the reply (RM status included) reaches
                  * the caller even when the host returns an error. */
-                crm_wire_channel_group_finish(p, wire, &params);
+                crm_wire_alloc_finish(p, wire, &params);
                 return r;
             }
             nested = (void *)(uintptr_t)p->pAllocParms;

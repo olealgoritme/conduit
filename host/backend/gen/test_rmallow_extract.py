@@ -16,8 +16,10 @@ class ChannelGroupAbiTest(unittest.TestCase):
         NvBool bIsCallingContextVgpuPlugin;
     """
     tail = "NvU32 reserved; NvU32 internalFlags;"
+    tail_620 = "NvU32 reserved; NvHandle reserved2; NvU32 internalFlags;"
+    ctx_620 = "NvHandle hVASpace; NvU32 flags; NvU32 subctxId; NvHandle reserved;"
 
-    def compile_layout(self, fields):
+    def compile_layout(self, fields, ctx=None):
         with tempfile.TemporaryDirectory() as root:
             inc = pathlib.Path(root, rmallow_extract.INC)
             inc.mkdir(parents=True)
@@ -27,6 +29,8 @@ class ChannelGroupAbiTest(unittest.TestCase):
                 typedef uint8_t NvBool;
                 typedef struct {
             """ + fields + "} NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS;"
+            if ctx is not None:
+                header += f"\ntypedef struct {{ {ctx} }} NV_CTXSHARE_ALLOCATION_PARAMETERS;\n"
             (inc / "nvos.h").write_text(header)
             source = '#include <stddef.h>\n#include "nvos.h"\n'
             source += rmallow_extract.channel_group_abi(root)
@@ -40,6 +44,20 @@ class ChannelGroupAbiTest(unittest.TestCase):
             with self.subTest(tail=tail):
                 result = self.compile_layout(self.prefix + tail)
                 self.assertEqual(result.returncode, 0, result.stderr)
+        result = self.compile_layout(self.prefix + self.tail_620, self.ctx_620)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = self.compile_layout(self.prefix + self.tail,
+                                     self.ctx_620.removesuffix(" NvHandle reserved;"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_620_context_share_layout_is_checked(self):
+        moved = "NvHandle hVASpace; NvU32 subctxId; NvU32 flags; NvHandle reserved;"
+        for tail in (self.tail, self.tail_620):
+            result = self.compile_layout(self.prefix + tail, moved)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("context-share flags layout", result.stderr)
+        with self.assertRaisesRegex(SystemExit, "unsupported context-share fields"):
+            self.compile_layout(self.prefix + self.tail_620)
 
     def test_moved_fields_with_the_same_total_size(self):
         prefix = self.prefix.replace("NvHandle hVASpace;", "NvHandle hObjectError;")

@@ -214,61 +214,72 @@ static void test_alloc_sizes(void)
     }
 }
 
-static void test_channel_group_abi(void)
+static void test_alloc_abi(uint32_t cls, uint32_t caller_size, uint32_t host_size,
+                           uint32_t prefix)
 {
-    uint8_t *original = malloc(20);
+    uint8_t *original = malloc(caller_size);
     CHECK(original != NULL);
     if (!original)
         return;
-    for (unsigned i = 0; i < 20; i++)
+    for (unsigned i = 0; i < caller_size; i++)
         original[i] = (uint8_t)(i + 1);
     NVOS64_PARAMETERS p = {
-        .hRoot = 1, .hObjectParent = 2, .hObjectNew = 3, .hClass = KEPLER_CHANNEL_GROUP_A,
-        .pAllocParms = (uint64_t)(uintptr_t)original, .paramsSize = 20,
+        .hRoot = 1, .hObjectParent = 2, .hObjectNew = 3, .hClass = cls,
+        .pAllocParms = (uint64_t)(uintptr_t)original, .paramsSize = caller_size,
     };
     const NVOS64_PARAMETERS before = p;
     NVOS64_PARAMETERS wire;
-    struct crm_channel_group_615 extended;
+    struct crm_alloc_scratch extended;
     memset(&extended, 0xa5, sizeof(extended));
-    CHECK(crm_wire_channel_group_prepare(&p, 28, &wire, &extended) == 1);
+    CHECK(crm_wire_alloc_prepare(&p, host_size, &wire, &extended) == 1);
     CHECK(memcmp(&p, &before, sizeof(p)) == 0);
-    CHECK(wire.paramsSize == 28 && wire.pAllocParms == (uint64_t)(uintptr_t)&extended);
-    CHECK(memcmp(&extended.base, original, 20) == 0);
-    CHECK(extended.reserved == 0 && extended.internalFlags == 0);
+    CHECK(wire.paramsSize == host_size &&
+          wire.pAllocParms == (uint64_t)(uintptr_t)extended.bytes);
+    CHECK(memcmp(extended.bytes, original, prefix) == 0);
+    for (unsigned i = prefix; i < host_size; i++)
+        CHECK(extended.bytes[i] == 0);
 
-    uint8_t request[CRM_WIRE_HDR + CRM_WIRE_IOCTL_REQ + sizeof(wire) + sizeof(extended)];
+    uint8_t request[CRM_WIRE_HDR + CRM_WIRE_IOCTL_REQ + sizeof(wire) + host_size];
     CHECK(crm_wire_ioctl(request, 7, crm_wire_cmd(0x2b, sizeof(wire)), &wire,
-                         sizeof(wire), &extended, sizeof(extended)) == sizeof(request));
-    CHECK(crm_get32(request + CRM_WIRE_HDR + 12) == 28);
-    CHECK(memcmp(request + CRM_WIRE_HDR + CRM_WIRE_IOCTL_REQ + sizeof(wire), &extended, 28) == 0);
+                         sizeof(wire), extended.bytes, host_size) == sizeof(request));
+    CHECK(crm_get32(request + CRM_WIRE_HDR + 12) == host_size);
+    CHECK(memcmp(request + CRM_WIRE_HDR + CRM_WIRE_IOCTL_REQ + sizeof(wire),
+                 extended.bytes, host_size) == 0);
 
-    /* RM output reaches the caller, but its original buffer stays 20 bytes. */
+    /* RM output reaches the caller, but host-only fields never do. */
     wire.hObjectNew = 9;
     wire.status = 0x29;
-    extended.base.hObjectError = 0x5a;
-    extended.reserved = extended.internalFlags = 0xffffffff;
-    crm_wire_channel_group_finish(&p, wire, &extended);
+    extended.bytes[prefix - 1] = 0x5a;
+    memset(extended.bytes + prefix, 0xff, host_size - prefix);
+    crm_wire_alloc_finish(&p, wire, &extended);
     CHECK(p.hObjectNew == 9 && p.status == 0x29);
-    CHECK(p.hRoot == 1 && p.hObjectParent == 2 && p.hClass == KEPLER_CHANNEL_GROUP_A);
-    CHECK(p.pAllocParms == before.pAllocParms && p.paramsSize == 20);
-    CHECK(original[0] == 0x5a && memcmp(original, &extended.base, 20) == 0);
+    CHECK(p.hRoot == 1 && p.hObjectParent == 2 && p.hClass == cls);
+    CHECK(p.pAllocParms == before.pAllocParms && p.paramsSize == caller_size);
+    CHECK(original[prefix - 1] == 0x5a && memcmp(original, extended.bytes, prefix) == 0);
+    for (unsigned i = prefix; i < caller_size; i++)
+        CHECK(original[i] == i + 1);
 
     /* Missing tables, other classes and unknown sizes do not select a layout. */
-    const uint32_t sizes[] = { 0, 16, 20, 24, 28, 32 };
+    const uint32_t sizes[] = { 0, 12, 16, 20, 24, 28, 32 };
     for (unsigned i = 0; i < sizeof(sizes) / sizeof(sizes[0]); i++) {
         for (unsigned j = 0; j < sizeof(sizes) / sizeof(sizes[0]); j++) {
             p = before;
             p.paramsSize = sizes[i];
-            CHECK(crm_wire_channel_group_prepare(&p, sizes[j], &wire, &extended) ==
-                  (sizes[i] == 20 && sizes[j] == 28));
+            const int expected = sizes[i] == caller_size &&
+                (cls == KEPLER_CHANNEL_GROUP_A ? sizes[j] == 28 || sizes[j] == 32
+                                               : sizes[j] == 16);
+            CHECK(crm_wire_alloc_prepare(&p, sizes[j], &wire, &extended) == expected);
         }
     }
     p = before;
     p.hClass = 0x2080;
-    CHECK(crm_wire_channel_group_prepare(&p, 28, &wire, &extended) == 0);
+    CHECK(crm_wire_alloc_prepare(&p, host_size, &wire, &extended) == 0);
     p = before;
     p.pAllocParms = 0;
-    CHECK(crm_wire_channel_group_prepare(&p, 28, &wire, &extended) == 0);
+    CHECK(crm_wire_alloc_prepare(&p, host_size, &wire, &extended) == 0);
+    p = before;
+    p.flags = 1;
+    CHECK(crm_wire_alloc_prepare(&p, host_size, &wire, &extended) == 0);
     free(original);
 }
 
@@ -479,7 +490,9 @@ int main(void)
     test_ioctl_layout();
     test_reply_parse();
     test_alloc_sizes();
-    test_channel_group_abi();
+    test_alloc_abi(KEPLER_CHANNEL_GROUP_A, 20, 28, 17);
+    test_alloc_abi(KEPLER_CHANNEL_GROUP_A, 20, 32, 17);
+    test_alloc_abi(FERMI_CONTEXT_SHARE_A, 12, 16, 12);
     test_scanout_path();
     if (failures) {
         fprintf(stderr, "%d check(s) failed\n", failures);

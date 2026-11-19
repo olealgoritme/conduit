@@ -63,6 +63,7 @@ struct nvgpu_rmctrl_entry {
 #include "rmctrl/v595_71_05.h"
 #include "rmctrl/v610_57_04.h"
 #include "rmctrl/v615_71_09.h"
+#include "rmctrl/v620_70_06.h"
 
 struct nvgpu_rmctrl_table {
 	u32 major, minor, patch;
@@ -89,6 +90,7 @@ static const struct nvgpu_rmctrl_table nvgpu_rmctrl_tables[] = {
 	NVGPU_RMCTRL_TABLE(595, 104, 2, v595_104_02),
 	NVGPU_RMCTRL_TABLE(610, 57, 4, v610_57_04),
 	NVGPU_RMCTRL_TABLE(615, 71, 9, v615_71_09),
+	NVGPU_RMCTRL_TABLE(620, 70, 6, v620_70_06),
 };
 
 /* The most bytes one pointer may address, and one call may ask for. The same

@@ -545,11 +545,11 @@ int main(void) {
 
 
 def channel_group_abi(ogkm):
-    """Check the two channel-group layouts understood by the Windows transport."""
+    """Check channel-group layouts supported by the Conduit transport."""
     name = "NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS"
     with open(os.path.join(ogkm, INC, "nvos.h")) as header:
-        text = header.read()
-    body = re.search(r"typedef struct\s*\{([^{}]*)\}\s*" + name + r"\s*;", text)
+        header_text = header.read()
+    body = re.search(r"typedef struct\s*\{([^{}]*)\}\s*" + name + r"\s*;", header_text)
     if body is None:
         sys.exit(f"{name} is not declared in nvos.h")
     fields = [("NvHandle", "hObjectError", 0, 4), ("NvHandle", "hObjectEccError", 4, 4),
@@ -558,7 +558,11 @@ def channel_group_abi(ogkm):
     text = re.sub(r"/\*.*?\*/|//[^\n]*", "", body.group(1), flags=re.S)
     members = sorted(" ".join(field.split()) for field in text.split(";") if field.strip())
     size = 20
-    if "NvU32 internalFlags" in members:
+    if "NvHandle reserved2" in members:
+        fields += [("NvU32", "reserved", 20, 4), ("NvHandle", "reserved2", 24, 4),
+                   ("NvU32", "internalFlags", 28, 4)]
+        size = 32
+    elif "NvU32 internalFlags" in members:
         fields += [("NvU32", "reserved", 20, 4), ("NvU32", "internalFlags", 24, 4)]
         size = 28
     # A new field can occupy padding without changing sizeof or existing offsets.
@@ -568,6 +572,22 @@ def channel_group_abi(ogkm):
     for _, field, offset, width in fields:
         checks += [f'_Static_assert(offsetof({name}, {field}) == {offset} && '
                    f'sizeof((({name} *)0)->{field}) == {width}, "channel-group {field} layout");']
+    # Windows rmclient also translates the context-share block independently
+    # of the channel-group size, so validate it separately.
+    ctx = "NV_CTXSHARE_ALLOCATION_PARAMETERS"
+    body = re.search(r"typedef struct\s*\{([^{}]*)\}\s*" + ctx + r"\s*;", header_text)
+    if body or size == 32:
+        text = re.sub(r"/\*.*?\*/|//[^\n]*", "", body.group(1), flags=re.S) if body else ""
+        members = sorted(" ".join(field.split()) for field in text.split(";") if field.strip())
+        fields = [("NvHandle", "hVASpace"), ("NvU32", "flags"), ("NvU32", "subctxId")]
+        if "NvHandle reserved" in members:
+            fields += [("NvHandle", "reserved")]
+        if members != sorted(f"{kind} {field}" for kind, field in fields):
+            sys.exit(f"unsupported context-share fields in {ctx}")
+        checks += [f'_Static_assert(sizeof({ctx}) == {4 * len(fields)}, "unsupported context-share ABI");']
+        for i, (_, field) in enumerate(fields):
+            checks += [f'_Static_assert(offsetof({ctx}, {field}) == {i * 4} && '
+                       f'sizeof((({ctx} *)0)->{field}) == 4, "context-share {field} layout");']
     return "\n".join(checks)
 
 

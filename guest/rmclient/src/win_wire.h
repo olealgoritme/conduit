@@ -303,47 +303,48 @@ struct crm_channel_group {
     uint8_t bIsCallingContextVgpuPlugin;
 };
 
-/* NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS in NVIDIA 615.71.09. */
-struct crm_channel_group_615 {
-    struct crm_channel_group base;
-    uint32_t reserved;
-    uint32_t internalFlags;
-};
-
 _Static_assert(sizeof(struct crm_channel_group) == 20, "channel-group legacy size");
 _Static_assert(offsetof(struct crm_channel_group, hObjectError) == 0, "hObjectError");
 _Static_assert(offsetof(struct crm_channel_group, hObjectEccError) == 4, "hObjectEccError");
 _Static_assert(offsetof(struct crm_channel_group, hVASpace) == 8, "hVASpace");
 _Static_assert(offsetof(struct crm_channel_group, engineType) == 12, "engineType");
 _Static_assert(offsetof(struct crm_channel_group, bIsCallingContextVgpuPlugin) == 16, "vgpuPlugin");
-_Static_assert(sizeof(struct crm_channel_group_615) == 28, "channel-group 615 size");
-_Static_assert(offsetof(struct crm_channel_group_615, reserved) == 20, "reserved");
-_Static_assert(offsetof(struct crm_channel_group_615, internalFlags) == 24, "internalFlags");
+/* Only translate layouts with a verified common prefix. The suffix is
+ * padding/reserved or internal to kernel RM, so it stays zero on input. */
+struct crm_alloc_scratch {
+    uint8_t bytes[32];
+    uint32_t prefix;
+};
 
-static inline int crm_wire_channel_group_prepare(const NVOS64_PARAMETERS *p,
-                                                  uint32_t host_size,
-                                                  NVOS64_PARAMETERS *wire,
-                                                  struct crm_channel_group_615 *params)
+static inline int crm_wire_alloc_prepare(const NVOS64_PARAMETERS *p,
+                                          uint32_t host_size,
+                                          NVOS64_PARAMETERS *wire,
+                                          struct crm_alloc_scratch *params)
 {
-    if (p->hClass != KEPLER_CHANNEL_GROUP_A || !p->pAllocParms ||
-        p->paramsSize != sizeof(params->base) ||
-        host_size != sizeof(*params))
+    if (!p->pAllocParms || p->flags != 0)
         return 0;
+    if (p->hClass == KEPLER_CHANNEL_GROUP_A &&
+        p->paramsSize == sizeof(struct crm_channel_group) &&
+        (host_size == 28 || host_size == 32))
+        params->prefix = offsetof(struct crm_channel_group, bIsCallingContextVgpuPlugin) + 1;
+    else if (p->hClass == FERMI_CONTEXT_SHARE_A && p->paramsSize == 12 && host_size == 16)
+        params->prefix = 12;
+    else
+        return 0;
+
     *wire = *p;
-    memcpy(&params->base, (const void *)(uintptr_t)p->pAllocParms, sizeof(params->base));
-    params->reserved = 0;
-    /* Internal flags belong to kernel RM and GSP, not the client. */
-    params->internalFlags = 0;
-    wire->pAllocParms = (uint64_t)(uintptr_t)params;
-    wire->paramsSize = sizeof(*params);
+    memset(params->bytes, 0, sizeof(params->bytes));
+    memcpy(params->bytes, (const void *)(uintptr_t)p->pAllocParms, params->prefix);
+    wire->pAllocParms = (uint64_t)(uintptr_t)params->bytes;
+    wire->paramsSize = host_size;
     return 1;
 }
 
-static inline void crm_wire_channel_group_finish(NVOS64_PARAMETERS *p,
-                                                 NVOS64_PARAMETERS wire,
-                                                 const struct crm_channel_group_615 *params)
+static inline void crm_wire_alloc_finish(NVOS64_PARAMETERS *p,
+                                         NVOS64_PARAMETERS wire,
+                                         const struct crm_alloc_scratch *params)
 {
-    memcpy((void *)(uintptr_t)p->pAllocParms, &params->base, sizeof(params->base));
+    memcpy((void *)(uintptr_t)p->pAllocParms, params->bytes, params->prefix);
     wire.pAllocParms = p->pAllocParms;
     wire.paramsSize = p->paramsSize;
     *p = wire;
